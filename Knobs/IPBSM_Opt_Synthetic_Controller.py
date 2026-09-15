@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
-from IPBSM_Opt import BaseIPBSMController
+from Knobs.IPBSM_Opt import BaseIPBSMController
 
 @dataclass
 class SyntheticGaussianSpec:
@@ -91,7 +91,7 @@ class SyntheticGaussianIPBSMController(BaseIPBSMController):
     def get_ipbsm(self) -> Tuple[float, float]:
         x = np.array([self.state[p] for p in self.spec.params], float)
         dx = (x - self.spec.mu).reshape(-1, 1)
-        y_true = self.spec.amp * float(np.exp(-0.5 * (dx.T @ self.Q @ dx)))
+        y_true = self.spec.amp * np.exp(-0.5 * (dx.T @ self.Q @ dx)).item()
         y_meas = y_true + float(self.rng.normal(0.0, self.spec.meas_sigma))
         # enforce physical bounds for this test model: 0 <= modulation <= amp
         y_meas = float(np.clip(y_meas, 0.0, self.spec.amp))

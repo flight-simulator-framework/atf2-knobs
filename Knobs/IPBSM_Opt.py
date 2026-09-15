@@ -13,8 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import time
 import numpy as np
-from Interfaces.ATF2.InterfaceATF2_Ext import InterfaceATF2_Ext
-from Interfaces.ATF2.InterfaceATF2_Ext import CurrentDropToZeroError
+from machine_interfaces.Interfaces.ATF2.InterfaceATF2_Ext import InterfaceATF2_Ext
+from machine_interfaces.Interfaces.ATF2.InterfaceATF2_Ext import CurrentDropToZeroError
 
 def now_tag() -> str:
     # Asia/Tokyo not enforced here; GUI passes local time anyway.
@@ -310,7 +310,7 @@ class EPICSIPBSMController:
     def get_ipbsm_full(self) -> Dict[str, Any]:
         return self.interface.get_ipbsm_full()
 
-from ipbsm_opt_math import (
+from Knobs.ipbsm_opt_math import (
     GPParams,
     GaussianFitResult,
     SimpleGP,
@@ -2384,4 +2384,4 @@ class Optimizer:
 
         return out
 
-from ipbsm_opt_plotting import build_gf_axiswise_fit, plot_bo_gp_heatmap, plot_results
+from Knobs.ipbsm_opt_plotting import build_gf_axiswise_fit, plot_bo_gp_heatmap, plot_results

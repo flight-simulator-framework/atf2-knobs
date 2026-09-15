@@ -1,4 +1,5 @@
-from Backend.State import State
+import machine_interfaces
+from machine_interfaces.Backend.State import State
 from datetime import datetime
 from collections import deque
 
@@ -463,9 +464,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             "Ext Tuner - " + self.interface.__class__.__name__ + " " + status
         )
-        self.setWindowIcon(QIcon("SysID_GUI/CERN_logo.png"))
+        self.setWindowIcon(QIcon(os.path.join(os.path.dirname(machine_interfaces.__file__), "UI files", "Assets", "CERN_logo.png")))
 
-        self.logo = QPixmap("SysID_GUI/CERN_logo.png")
+        self.logo = QPixmap(os.path.join(os.path.dirname(machine_interfaces.__file__), "UI files", "Assets", "CERN_logo.png"))
         self.logo = self.logo.scaled(
             75,
             75,
@@ -1890,7 +1891,7 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    from Backend.SelectInterface import InterfaceSelectionDialog
+    from machine_interfaces.Backend.SelectInterface import InterfaceSelectionDialog
 
     dialog = InterfaceSelectionDialog("ATF2")
     if dialog.exec():

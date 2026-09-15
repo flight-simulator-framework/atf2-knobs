@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from ipbsm_opt_math import GPParams, GaussianFitResult, SimpleGP
+from Knobs.ipbsm_opt_math import GPParams, GaussianFitResult, SimpleGP
 
 
 def ensure_dir(p: Path) -> Path:
@@ -136,7 +136,7 @@ def plot_results(
 
     def gaussian(x_vec: np.ndarray) -> float:
         dx = (x_vec - mu).reshape(-1, 1)
-        val = amp * float(np.exp(-0.5 * (dx.T @ Q @ dx)))
+        val = amp * np.exp(-0.5 * (dx.T @ Q @ dx)).item()
         return val
 
     saved = []

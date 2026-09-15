@@ -40,12 +40,12 @@ from PyQt6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from IPBSM_Opt import (
+from Knobs.IPBSM_Opt import (
     Optimizer, OptimizerConfig, StopFlag,
     build_gf_axiswise_fit, fit_gaussian_from_samples, plot_bo_gp_heatmap, plot_results, now_tag,
     EPICSIPBSMController, DAT_CSV_COLUMNS,
 )
-from IPBSM_Opt import IPBSMInterface
+from Knobs.IPBSM_Opt import IPBSMInterface
 
 
 ZSCAN_DEFAULT_RANGE = 0.0085

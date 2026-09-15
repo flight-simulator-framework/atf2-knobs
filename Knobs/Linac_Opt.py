@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from Interfaces.ATF2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT, BT_SEQUENCE
+from machine_interfaces.Interfaces.ATF2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT, BT_SEQUENCE
 
 # ----------------------------
 # Scan defaults (same values used by Sequential and Group-LBO)

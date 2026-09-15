@@ -8,7 +8,8 @@ authors = [{name = "wmalek", email = "wiktoria.malek@cern.ch"}]
 dependencies = [
     "numpy>=2.4.2,<3",
     "matplotlib>=3.10.8,<4",
-    "PyQt6>=6.10.2,<7"
+    "PyQt6>=6.10.2,<7",
+    "machine-interfaces[epics,madx,rftrack,tao]>=0.1.0,<0.2.0"
 ]
 
 [build-system]
@@ -16,8 +17,11 @@ requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-package-mode = false
+packages = [{include = "Knobs"}]
+
+[tool.poetry.dependencies]
+machine-interfaces = {path = "../machine-interfaces", develop = true, extras = ["epics", "madx", "rftrack", "tao"]}
 
 [tool.flight-simulator.migration]
-status = "file-layout-prepared-import-migration-pending"
+status = "local-execution-ready"
 repository-dependencies = ["machine-interfaces"]

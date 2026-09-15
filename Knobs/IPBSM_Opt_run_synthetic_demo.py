@@ -12,14 +12,15 @@ This uses linear mode + GF by default.
 from pathlib import Path
 import numpy as np
 
-from IPBSM_Opt import Optimizer, OptimizerConfig, fit_gaussian_from_samples, plot_results, now_tag
-from IPBSM_Opt_Synthetic_Controller import make_random_spec, SyntheticGaussianIPBSMController
+from Knobs.IPBSM_Opt import Optimizer, OptimizerConfig, fit_gaussian_from_samples, plot_results, now_tag
+from Knobs.IPBSM_Opt_Synthetic_Controller import make_random_spec, SyntheticGaussianIPBSMController
 
 
 def build_run_output_dir(base_dir: Path, tag: str, suffix: str) -> Path:
     return base_dir / tag[:4] / f"{tag}-{suffix}"
 
 def main():
+    seed = 123
     params = ["Ay", "Ey", "Coup2"]
     cfg = OptimizerConfig(
         mode_name="linear",
@@ -32,15 +33,14 @@ def main():
         expected_y_max=0.8,
         max_steps=50,
         stop_sigma_ratio=0.25,
-        seed=123,
         n_init_random=8,
         n_candidates=6000,
         n_bootstrap=40,
         ridge_fit=1e-4,
     )
 
-    spec = make_random_spec(params=params, seed=cfg.seed, correlated=False, amp=0.8, meas_sigma=cfg.meas_sigma)
-    ctrl = SyntheticGaussianIPBSMController(spec=spec, seed=cfg.seed+999)
+    spec = make_random_spec(params=params, seed=seed, correlated=False, amp=0.8, meas_sigma=cfg.meas_sigma)
+    ctrl = SyntheticGaussianIPBSMController(spec=spec, seed=seed+999)
 
     tag = now_tag()
     out_dir = build_run_output_dir(Path("Data"), tag, suffix=f"demo-{cfg.mode_name}-{cfg.method}")
@@ -50,7 +50,7 @@ def main():
     # Load and plot
     import csv
     X, y, yerr = [], [], []
-    with open(out_dir/"measurements.csv", "r", encoding="utf-8") as f:
+    with open(opt.measurements_csv_path, "r", encoding="utf-8") as f:
         r = csv.reader(f)
         header = next(r)
         for row in r:

@@ -34,10 +34,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from IPBSM_Opt import IPBSMInterface
-from Interfaces.ATF2.InterfaceATF2_DR import InterfaceATF2_DR
-from Interfaces.ATF2.InterfaceATF2_Ext import InterfaceATF2_Ext
-from Interfaces.ATF2.InterfaceATF2_Linac import InterfaceATF2_Linac
+from Knobs.IPBSM_Opt import IPBSMInterface
+from machine_interfaces.Interfaces.ATF2.InterfaceATF2_DR import InterfaceATF2_DR
+from machine_interfaces.Interfaces.ATF2.InterfaceATF2_Ext import InterfaceATF2_Ext
+from machine_interfaces.Interfaces.ATF2.InterfaceATF2_Linac import InterfaceATF2_Linac
 
 
 def now_tag() -> str:
