@@ -532,7 +532,7 @@ optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 files = []
-develop = true
+develop = false
 
 [package.dependencies]
 cpymad = {version = ">=1,<2", optional = true}
@@ -553,8 +553,10 @@ rftrack = ["rf-track (>=2.6.2,<3)"]
 tao = ["pytao (>=0.5,<2)"]
 
 [package.source]
-type = "directory"
-url = "../machine-interfaces"
+type = "git"
+url = "https://gitlab.cern.ch/flight-simulator/machine-interfaces.git"
+reference = "54490bf072d3db26d98383eeeced1a759e1d4bbb"
+resolved_reference = "54490bf072d3db26d98383eeeced1a759e1d4bbb"
 
 [[package]]
 name = "markdown-it-py"
@@ -1808,4 +1810,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11"
-content-hash = "a7d30486f11215e7751b3c82e742dea69912b81fa4ab10c68bb934743b110286"
+content-hash = "af7cb7441197c1206fe851edc6c86da6bd18bfbf6ac06d44b5940ebca788d6fe"
