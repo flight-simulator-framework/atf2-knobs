@@ -20,4 +20,4 @@ package-mode = false
 
 [tool.flight-simulator.migration]
 status = "file-layout-prepared-import-migration-pending"
-repository-dependencies = ["flight-simulator-common", "machine-interfaces"]
+repository-dependencies = ["machine-interfaces"]

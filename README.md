@@ -12,4 +12,4 @@ poetry install
 
 Each repository has its own `pyproject.toml`, generated `poetry.lock` and `poetry.toml`. Poetry creates `.venv/` locally on installation; virtual environments are not copied or committed.
 
-Required source repositories: `flight-simulator-common`, `machine-interfaces`.
+Required source repositories: `machine-interfaces`.
