@@ -9,7 +9,7 @@ dependencies = [
     "numpy>=2.4.2,<3",
     "matplotlib>=3.10.8,<4",
     "PyQt6>=6.10.2,<7",
-    "machine-interfaces[epics,madx,rftrack,tao] @ git+https://gitlab.cern.ch/flight-simulator/machine-interfaces.git@54490bf072d3db26d98383eeeced1a759e1d4bbb"
+    "machine-interfaces[epics,madx,rftrack,tao] @ git+https://gitlab.cern.ch/flight-simulator/machine-interfaces.git@1fa7fca06f949e085353030f59587a68de7e3baf"
 ]
 
 [build-system]

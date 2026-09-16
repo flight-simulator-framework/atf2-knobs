@@ -555,8 +555,8 @@ tao = ["pytao (>=0.5,<2)"]
 [package.source]
 type = "git"
 url = "https://gitlab.cern.ch/flight-simulator/machine-interfaces.git"
-reference = "54490bf072d3db26d98383eeeced1a759e1d4bbb"
-resolved_reference = "54490bf072d3db26d98383eeeced1a759e1d4bbb"
+reference = "1fa7fca06f949e085353030f59587a68de7e3baf"
+resolved_reference = "1fa7fca06f949e085353030f59587a68de7e3baf"
 
 [[package]]
 name = "markdown-it-py"
@@ -1810,4 +1810,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11"
-content-hash = "af7cb7441197c1206fe851edc6c86da6bd18bfbf6ac06d44b5940ebca788d6fe"
+content-hash = "3ed5d2d00321ecaeb5b9cd9bf64efd152a65e402f9384841e036196d093b13a7"
