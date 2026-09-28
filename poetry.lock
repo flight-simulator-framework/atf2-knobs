@@ -348,8 +348,9 @@ description = "Shared machine interface API, state storage and interface selecti
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
-files = []
-develop = true
+files = [
+    {file = "machine_interfaces-0.2.0-py3-none-any.whl", hash = "sha256:0ec3dea3f9b5a704cc9b31d9f39fdc8771afd078df14183938ad4b86dcb5048a"},
+]
 
 [package.dependencies]
 matplotlib = ">=3.10.8,<4"
@@ -362,8 +363,9 @@ analysis = ["h5py (>=3,<4)"]
 camera-reference = ["pillow (>=12.1.1,<13)"]
 
 [package.source]
-type = "directory"
-url = "../machine-interfaces"
+type = "legacy"
+url = "https://gitlab.cern.ch/api/v4/groups/363527/-/packages/pypi/simple/"
+reference = "flight-simulator"
 
 [[package]]
 name = "machine-interfaces-atf2"
@@ -373,8 +375,9 @@ optional = true
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "extra == \"atf2\""
-files = []
-develop = true
+files = [
+    {file = "machine_interfaces_atf2-0.2.0-py3-none-any.whl", hash = "sha256:e63e3ce6e12d91e35adf028a4e793b325259de5a9c6c19fdfa6210d924101605"},
+]
 
 [package.dependencies]
 cpymad = ">=1,<2"
@@ -383,8 +386,9 @@ pyepics = ">=1.0,<4"
 rf-track = ">=2.6.2,<3"
 
 [package.source]
-type = "directory"
-url = "../machine-interfaces/backends/atf2"
+type = "legacy"
+url = "https://gitlab.cern.ch/api/v4/groups/363527/-/packages/pypi/simple/"
+reference = "flight-simulator"
 
 [[package]]
 name = "matplotlib"
@@ -927,4 +931,4 @@ atf2 = ["machine-interfaces-atf2"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11"
-content-hash = "ef528a8214e56ec1c276c1bd5f804695c4e86c90a7d21ebae13e47f306848903"
+content-hash = "e6a462236f7e7b3fde7f64e4056e11aaba857655b4eeab923084b4fb4df728d2"

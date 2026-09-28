@@ -16,7 +16,6 @@ poetry install --extras atf2
 Use Python 3.11 or newer and Poetry 2 or newer.
 
 ```bash
-git clone https://gitlab.cern.ch/flight-simulator/machine-interfaces.git
 git clone https://gitlab.cern.ch/flight-simulator/atf2-knobs.git
 cd atf2-knobs
 poetry update rf-track --lock

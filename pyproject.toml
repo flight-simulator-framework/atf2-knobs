@@ -24,8 +24,12 @@ build-backend = "poetry.core.masonry.api"
 packages = [{include = "Knobs"}]
 
 [tool.poetry.dependencies]
-machine-interfaces = {path = "../machine-interfaces", develop = true}
-machine-interfaces-atf2 = {path = "../machine-interfaces/backends/atf2", develop = true}
+machine-interfaces = {source = "flight-simulator"}
+machine-interfaces-atf2 = {source = "flight-simulator"}
+
+[[tool.poetry.source]]
+name = "flight-simulator"
+url = "https://gitlab.cern.ch/api/v4/groups/363527/-/packages/pypi/simple/"
+priority = "explicit"
 [tool.flight-simulator.migration]
-status = "local-execution-ready"
-repository-dependencies = ["machine-interfaces"]
+status = "package-registry"
