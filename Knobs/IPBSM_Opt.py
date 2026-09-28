@@ -13,8 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import time
 import numpy as np
-from machine_interfaces.Interfaces.ATF2.InterfaceATF2_Ext import InterfaceATF2_Ext
-from machine_interfaces.Interfaces.ATF2.InterfaceATF2_Ext import CurrentDropToZeroError
+from machine_interfaces_atf2.InterfaceATF2_Ext import InterfaceATF2_Ext
+from machine_interfaces_atf2.InterfaceATF2_Ext import CurrentDropToZeroError
 
 def now_tag() -> str:
     # Asia/Tokyo not enforced here; GUI passes local time anyway.

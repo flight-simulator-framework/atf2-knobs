@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from machine_interfaces.Interfaces.ATF2.InterfaceATF2_DR import InterfaceATF2_DR
+from machine_interfaces_atf2.InterfaceATF2_DR import InterfaceATF2_DR
 
 
 SCAN_WIDTH_A = 3.0
