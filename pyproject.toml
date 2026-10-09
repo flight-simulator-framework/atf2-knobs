@@ -17,19 +17,11 @@ atf2 = [
     "machine-interfaces-atf2>=0.2.0,<0.3",
 ]
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.poetry]
-packages = [{include = "Knobs"}]
+[tool.hatch.build.targets.wheel]
+packages = ["Knobs"]
 
-[tool.poetry.dependencies]
-machine-interfaces = {source = "flight-simulator"}
-machine-interfaces-atf2 = {source = "flight-simulator"}
-
-[[tool.poetry.source]]
-name = "flight-simulator"
-url = "https://gitlab.cern.ch/api/v4/groups/363527/-/packages/pypi/simple/"
-priority = "explicit"
 [tool.flight-simulator.migration]
 status = "package-registry"

@@ -6,7 +6,7 @@ variables:
   TWINE_PASSWORD: $CI_JOB_TOKEN
 
 before_script:
-  - python -m pip install poetry-core==2.4.0 build twine
+  - python -m pip install hatchling build twine
 
 publish:
   script:
