@@ -462,7 +462,7 @@ class EmittingStream(QObject):
 class MainWindow(QMainWindow):
     def __set_status_in_title(self, status):
         self.setWindowTitle(
-            "Ext Tuner - " + self.interface.__class__.__name__ + " " + status
+            "Ext Tuner - " + self.interface.get_name() + " " + status
         )
         self.setWindowIcon(QIcon(os.path.join(os.path.dirname(machine_interfaces.__file__), "UI files", "Assets", "CERN_logo.png")))
 
