@@ -2,11 +2,17 @@ import machine_interfaces
 from machine_interfaces.Backend.State import State
 from datetime import datetime
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import threading
 import sys
 import os
+
+_GUI_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _GUI_DIR.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -59,25 +65,6 @@ def orbit_from_bpms(bpms, names=None):
         "faulty": faulty,
         "nbpms": len(names_use),
     }
-
-
-def save_machine_state(interface, filename):
-    s = State()
-    s.correctors = interface.get_correctors()
-    if hasattr(interface, "get_quadrupoles"):
-        try:
-            s.quadrupoles = interface.get_quadrupoles()
-        except Exception:
-            s.quadrupoles = None
-    else:
-        s.quadrupoles = None
-    s.bpms = interface.get_bpms()
-    s.icts = interface.get_icts() if hasattr(interface, "get_icts") else {"names": [], "charge": np.array([])}
-    s.sequence = interface.get_sequence()
-    s.hcorrectors_names = interface.get_hcorrectors_names()
-    s.vcorrectors_names = interface.get_vcorrectors_names()
-    s.timestamp = datetime.now()
-    s.save(filename=filename)
 
 
 class MatplotlibWidget(FigureCanvas):
@@ -294,7 +281,7 @@ class Worker(QObject):
         vcorrs = set(I.get_vcorrectors_names())
 
         def get_corrector_bdes(name):
-            corr = I.get_correctors()
+            corr = I.get_correctors(name)
             names = list(corr.get("names", []))
             bdes = np.asarray(corr.get("bdes", []), dtype=float)
             for n, v in zip(names, bdes):
@@ -317,27 +304,26 @@ class Worker(QObject):
                 corr_bdes = get_corrector_bdes(corrector)
                 kick = kicks[icorr]
 
-                print(f"Corrector {corrector} '+' excitation...")
-                curr_p = corr_bdes + kick
-                if corrector in hcorrs:
-                    curr_p = clamp(curr_p, self.max_osc_h)
-                else:
-                    curr_p = clamp(curr_p, self.max_osc_v)
-                I.push(corrector, curr_p)
-                save_machine_state(I, filename=f"DATA_{corrector}_p{iter:04d}.pkl")
-                Op = orbit_from_bpms(I.get_bpms(), self.bpms)
+                try:
+                    print(f"Corrector {corrector} '+' excitation...")
+                    curr_p = corr_bdes + kick
+                    if corrector in hcorrs:
+                        curr_p = clamp(curr_p, self.max_osc_h)
+                    else:
+                        curr_p = clamp(curr_p, self.max_osc_v)
+                    I.set_correctors(corrector, curr_p)
+                    Op = orbit_from_bpms(I.get_bpms(), self.bpms)
 
-                print(f"Corrector {corrector} '-' excitation...")
-                curr_m = corr_bdes - kick
-                if corrector in hcorrs:
-                    curr_m = clamp(curr_m, self.max_osc_h)
-                else:
-                    curr_m = clamp(curr_m, self.max_osc_v)
-                I.push(corrector, curr_m)
-                save_machine_state(I, filename=f"DATA_{corrector}_m{iter:04d}.pkl")
-                Om = orbit_from_bpms(I.get_bpms(), self.bpms)
-
-                I.push(corrector, corr_bdes)
+                    print(f"Corrector {corrector} '-' excitation...")
+                    curr_m = corr_bdes - kick
+                    if corrector in hcorrs:
+                        curr_m = clamp(curr_m, self.max_osc_h)
+                    else:
+                        curr_m = clamp(curr_m, self.max_osc_v)
+                    I.set_correctors(corrector, curr_m)
+                    Om = orbit_from_bpms(I.get_bpms(), self.bpms)
+                finally:
+                    I.set_correctors(corrector, corr_bdes)
 
                 Diff_x = (Op["x"] - Om["x"]) / 2.0
                 Diff_y = (Op["y"] - Om["y"]) / 2.0
@@ -487,9 +473,9 @@ class MainWindow(QMainWindow):
 
         self.cwd = os.getcwd()
         self.interface = interface
-        bpms_list = self.interface.get_bpms()["names"]
+        bpms_list = [str(name) for name in self.interface.get_bpms()["names"]]
         correctors = self.interface.get_correctors()
-        correctors_list = correctors["names"]
+        correctors_list = [str(name) for name in correctors["names"]]
 
         if correctors_list is not None:
             hcorrs = self.interface.get_hcorrectors_names()
@@ -813,7 +799,7 @@ class MainWindow(QMainWindow):
         self._target_disp_eta_x = None
         self._target_disp_eta_y = None
         try:
-            tx, ty = self.interface.get_target_dispersion(self.interface.bpms)
+            tx, ty = self.interface.get_target_dispersion(bpms_list)
             self._target_disp_eta_x = np.asarray(tx, dtype=float) * 1e3  # to mm
             self._target_disp_eta_y = np.asarray(ty, dtype=float) * 1e3  # to mm
             print("Target dispersion loaded.")
@@ -1200,7 +1186,7 @@ class MainWindow(QMainWindow):
             with open(filename, "r") as f:
                 selected_correctors = [line.strip() for line in f]
         else:
-            selected_correctors = self.interface.get_correctors_names()
+            selected_correctors = [str(name) for name in self.interface.get_correctors()["names"]]
 
         self.correctors_list.clearSelection()
         for item in selected_correctors:
@@ -1237,7 +1223,7 @@ class MainWindow(QMainWindow):
             with open(filename, "r") as f:
                 selected_bpms = [line.strip() for line in f]
         else:
-            selected_bpms = self.interface.get_bpms_names()
+            selected_bpms = [str(name) for name in self.interface.get_bpms()["names"]]
 
         self.bpms_list.clearSelection()
         for item in selected_bpms:
@@ -1271,15 +1257,13 @@ class MainWindow(QMainWindow):
         if not selected_correctors:
             for i in range(self.correctors_list.count()):
                 self.correctors_list.item(i).setSelected(True)
-            selected_correctors = self.interface.get_correctors_names()
+            selected_correctors = [str(name) for name in self.interface.get_correctors()["names"]]
 
         selected_bpms = [item.text() for item in self.bpms_list.selectedItems()]
         if not selected_bpms:
             for i in range(self.bpms_list.count()):
                 self.bpms_list.item(i).setSelected(True)
-            selected_bpms = self.interface.get_bpms_names()
-
-        save_machine_state(self.interface, filename=f"machine_status_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl")
+            selected_bpms = [str(name) for name in self.interface.get_bpms()["names"]]
 
         kicks = 0.1 * np.ones(len(selected_correctors), dtype=float)
         max_osc_h = self.horizontal_excursion_spinbox.value()

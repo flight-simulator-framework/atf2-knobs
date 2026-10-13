@@ -220,12 +220,12 @@ def bootstrap_fit(
 
 @dataclass
 class GPParams:
-    kernel: str = "matern52"
+    kernel: str = "rbf"
     length_scale: float = 1.0
     signal_var: float = 1.0
     noise_var: float = 1e-4
     zscan_axes: Optional[Sequence[int]] = None
-    zscan_kernel: str = "matern32"
+    zscan_kernel: str = "rbf"
 
 
 def _as_ard_length_scales(length_scale, d: int) -> np.ndarray:
@@ -301,7 +301,7 @@ def kernel_matrix(X1: np.ndarray, X2: np.ndarray, params: GPParams) -> np.ndarra
         return _kernel_by_name(X1, X2, params.kernel, params.length_scale, params.signal_var)
 
     ls_all = _as_ard_length_scales(params.length_scale, d)
-    z_kernel_name = str(getattr(params, "zscan_kernel", "matern32"))
+    z_kernel_name = str(getattr(params, "zscan_kernel", "rbf"))
     non_z_axes = [i for i in range(d) if i not in z_axes]
 
     K = np.ones((X1.shape[0], X2.shape[0]), dtype=float)

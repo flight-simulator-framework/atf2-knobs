@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from Knobs.ipbsm_opt_math import GPParams, GaussianFitResult, SimpleGP
+try:
+    from .ipbsm_opt_math import GPParams, GaussianFitResult, SimpleGP
+except ImportError:
+    from ipbsm_opt_math import GPParams, GaussianFitResult, SimpleGP
 
 
 def ensure_dir(p: Path) -> Path:
@@ -111,6 +114,7 @@ def plot_results(
     include_1d: bool = True,
     save_prefix: str = "",
     bo_data_only_1d: bool = False,
+    discarded_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Path]:
     import matplotlib.pyplot as plt
 
@@ -135,12 +139,38 @@ def plot_results(
         Q = np.eye(d)
 
     def gaussian(x_vec: np.ndarray) -> float:
-        dx = (x_vec - mu).reshape(-1, 1)
-        val = amp * np.exp(-0.5 * (dx.T @ Q @ dx)).item()
+        dx = np.asarray(x_vec - mu, dtype=float).reshape(-1)
+        quad = float(dx @ Q @ dx)
+        val = amp * float(np.exp(-0.5 * quad))
         return val
 
     saved = []
     chosen = list(chosen_by) if chosen_by is not None else None
+    discarded = list(discarded_rows) if discarded_rows is not None else []
+    discarded_steps: List[int] = []
+    discarded_X_rows: List[List[float]] = []
+    discarded_y_vals: List[float] = []
+    discarded_yerr_vals: List[float] = []
+    discarded_avg_vals: List[float] = []
+    discarded_chosen: List[str] = []
+    for item in discarded:
+        x_map = item.get("x", {})
+        if not isinstance(x_map, dict):
+            continue
+        try:
+            discarded_steps.append(int(item.get("step", len(discarded_steps) + 1)))
+            discarded_X_rows.append([float(x_map.get(p, float("nan"))) for p in params])
+            discarded_y_vals.append(float(item.get("y", float("nan"))))
+            discarded_yerr_vals.append(float(item.get("y_err", float("nan"))))
+            discarded_chosen.append(str(item.get("chosen_by", "")))
+            dat = dict(item.get("dat", {}) or {})
+            discarded_avg_vals.append(float(dat.get("average", float("nan"))))
+        except Exception:
+            continue
+    discarded_X = np.asarray(discarded_X_rows, float) if discarded_X_rows else np.zeros((0, d), float)
+    discarded_y = np.asarray(discarded_y_vals, float) if discarded_y_vals else np.zeros((0,), float)
+    discarded_yerr = np.asarray(discarded_yerr_vals, float) if discarded_yerr_vals else np.zeros((0,), float)
+    discarded_avg = np.asarray(discarded_avg_vals, float) if discarded_avg_vals else np.zeros((0,), float)
     method_upper = str(getattr(cfg, "method", "")).upper()
     is_sequential = method_upper in {"GF", "SEQUENTIAL"}
     is_bo = method_upper == "BO"
@@ -167,12 +197,12 @@ def plot_results(
             x_ref = mu.copy()
         try:
             gp_for_zpair = SimpleGP(GPParams(
-                kernel=getattr(cfg, "gp_kernel", "matern52"),
+                kernel=getattr(cfg, "gp_kernel", "rbf"),
                 length_scale=np.asarray(gp_length_scales, float),
                 signal_var=float(getattr(cfg, "gp_signal_var", 0.15)),
                 noise_var=float(getattr(cfg, "gp_noise_var", 1e-4)),
                 zscan_axes=z_axes,
-                zscan_kernel="matern32",
+                zscan_kernel="rbf",
             ))
             gp_for_zpair.fit(np.asarray(X, float), np.asarray(y, float).reshape(-1))
         except Exception:
@@ -199,6 +229,16 @@ def plot_results(
                 if init_last < y.size:
                     ax.text((init_last + 1 + y.size) * 0.5, y_top, "BO", ha="center", va="bottom", color="#8a5a12")
         ax.plot(xs_eval, y, marker="o")
+        if discarded_steps and discarded_y.size:
+            ax.plot(
+                np.asarray(discarded_steps, dtype=float),
+                discarded_y,
+                linestyle="None",
+                marker="x",
+                color="#dc2626",
+                markersize=8,
+                markeredgewidth=2.0,
+            )
         ax.set_xlabel("Evaluation")
         ax.set_ylabel("IPBSM modulation")
         ax.set_title("Modulation vs evaluation")
@@ -215,6 +255,18 @@ def plot_results(
         ax = fig.add_subplot(111)
         xs_eval = np.arange(1, avg.size + 1, dtype=int)
         ax.plot(xs_eval, avg, marker="o", color="#2e8b57")
+        if discarded_steps and discarded_avg.size:
+            mask_disc = np.isfinite(discarded_avg)
+            if np.any(mask_disc):
+                ax.plot(
+                    np.asarray(discarded_steps, dtype=float)[mask_disc],
+                    discarded_avg[mask_disc],
+                    linestyle="None",
+                    marker="x",
+                    color="#dc2626",
+                    markersize=8,
+                    markeredgewidth=2.0,
+                )
 
         lim = float(average_limit) if average_limit is not None else float("nan")
         if not np.isfinite(lim):
@@ -287,6 +339,26 @@ def plot_results(
                 fit_curve = np.array(ys, float)
 
             ax.errorbar(x_plot, y_plot, yerr=yerr_plot, fmt="o", capsize=2, color="black", ecolor="black")
+            disc_idx: List[int] = []
+            if discarded_y.size:
+                if is_sequential and discarded_chosen:
+                    disc_idx = [
+                        k for k, cb in enumerate(discarded_chosen)
+                        if isinstance(cb, str) and cb.startswith(f"GF[{p}]")
+                    ]
+                else:
+                    disc_idx = list(range(discarded_y.size))
+            if disc_idx:
+                disc_idx_arr = np.asarray(disc_idx, dtype=int)
+                ax.plot(
+                    discarded_X[disc_idx_arr, i],
+                    discarded_y[disc_idx_arr],
+                    linestyle="None",
+                    marker="x",
+                    color="#dc2626",
+                    markersize=8,
+                    markeredgewidth=2.0,
+                )
             if fit_curve is not None:
                 ax.plot(xs, fit_curve)
             ax.set_xlabel(p)
@@ -393,8 +465,32 @@ def plot_results(
             ]
             if idx_pair:
                 ax.scatter(X[idx_pair, i], X[idx_pair, j], s=12)
+            if discarded_y.size and discarded_chosen:
+                disc_idx_pair = [
+                    k for k, cb in enumerate(discarded_chosen)
+                    if isinstance(cb, str) and (cb.startswith(f"GF[{params[i]}]") or cb.startswith(f"GF[{params[j]}]"))
+                ]
+                if disc_idx_pair:
+                    disc_idx_arr = np.asarray(disc_idx_pair, dtype=int)
+                    ax.scatter(
+                        discarded_X[disc_idx_arr, i],
+                        discarded_X[disc_idx_arr, j],
+                        s=36,
+                        marker="x",
+                        c="#dc2626",
+                        linewidths=2.0,
+                    )
         else:
             ax.scatter(X[:, i], X[:, j], s=12)
+            if discarded_y.size:
+                ax.scatter(
+                    discarded_X[:, i],
+                    discarded_X[:, j],
+                    s=36,
+                    marker="x",
+                    c="#dc2626",
+                    linewidths=2.0,
+                )
         ax.set_xlabel(params[i])
         ax.set_ylabel(params[j])
         if use_gp_surface:
@@ -458,7 +554,7 @@ def plot_bo_gp_heatmap(
         except Exception:
             length_scales.append(float(getattr(cfg, "gp_length_scale", 1.0)))
     gp = SimpleGP(GPParams(
-        kernel=getattr(cfg, "gp_kernel", "matern52"),
+        kernel=getattr(cfg, "gp_kernel", "rbf"),
         length_scale=np.asarray(length_scales, float),
         signal_var=float(getattr(cfg, "gp_signal_var", 0.15)),
         noise_var=float(getattr(cfg, "gp_noise_var", 1e-4)),

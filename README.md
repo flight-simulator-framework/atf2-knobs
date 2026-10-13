@@ -1,6 +1,6 @@
 # atf2-knobs
 
-ATF2 IPBSM optimization, beam tuning, linac optimization and synthetic controllers.
+ATF2 IPBSM optimization, beam tuning, linac optimization and controllers.
 
 ## Development
 
@@ -22,5 +22,3 @@ make -C machine-interfaces/backends/atf2/machine_interfaces_atf2/libmagnet libma
 cd atf2-knobs
 python Knobs/GUIs/IPBSM_Opt_GUI.py
 ```
-
-Editable installs pick up `git pull` changes without reinstalling.

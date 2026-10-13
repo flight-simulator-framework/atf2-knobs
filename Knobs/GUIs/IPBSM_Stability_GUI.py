@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 import threading
 import time
 import traceback
@@ -13,6 +14,14 @@ from typing import Any, Dict, List, Optional
 import matplotlib
 matplotlib.use("QtAgg")
 import numpy as np
+
+_GUI_DIR = Path(__file__).resolve().parent
+_KNOBS_DIR = _GUI_DIR.parent
+_REPO_ROOT = _KNOBS_DIR.parent
+for _path in (str(_KNOBS_DIR), str(_REPO_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -34,7 +43,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from Knobs.IPBSM_Opt import IPBSMInterface
+try:
+    from Knobs.IPBSM_Opt import IPBSMInterface
+except ModuleNotFoundError as exc:
+    if exc.name not in {"Knobs", "Knobs.IPBSM_Opt"}:
+        raise
+    from IPBSM_Opt import IPBSMInterface
 from machine_interfaces_atf2.InterfaceATF2_DR import InterfaceATF2_DR
 from machine_interfaces_atf2.InterfaceATF2_Ext import InterfaceATF2_Ext
 from machine_interfaces_atf2.InterfaceATF2_Linac import InterfaceATF2_Linac

@@ -9,11 +9,25 @@ Usage:
 This uses linear mode + GF by default.
 """
 
+import sys
 from pathlib import Path
+
 import numpy as np
 
-from Knobs.IPBSM_Opt import Optimizer, OptimizerConfig, fit_gaussian_from_samples, plot_results, now_tag
-from Knobs.IPBSM_Opt_Synthetic_Controller import make_random_spec, SyntheticGaussianIPBSMController
+_KNOBS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _KNOBS_DIR.parent
+for _path in (str(_KNOBS_DIR), str(_REPO_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+try:
+    from Knobs.IPBSM_Opt import Optimizer, OptimizerConfig, fit_gaussian_from_samples, plot_results, now_tag
+    from Knobs.IPBSM_Opt_Synthetic_Controller import make_random_spec, SyntheticGaussianIPBSMController
+except ModuleNotFoundError as exc:
+    if exc.name not in {"Knobs", "Knobs.IPBSM_Opt", "Knobs.IPBSM_Opt_Synthetic_Controller"}:
+        raise
+    from IPBSM_Opt import Optimizer, OptimizerConfig, fit_gaussian_from_samples, plot_results, now_tag
+    from IPBSM_Opt_Synthetic_Controller import make_random_spec, SyntheticGaussianIPBSMController
 
 
 def build_run_output_dir(base_dir: Path, tag: str, suffix: str) -> Path:

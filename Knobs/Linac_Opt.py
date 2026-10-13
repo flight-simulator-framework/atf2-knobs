@@ -27,9 +27,15 @@ from typing import Any, Callable, Dict, List, Tuple, Optional
 
 import numpy as np
 
+_KNOBS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _KNOBS_DIR.parent
+for _path in (str(_KNOBS_DIR), str(_REPO_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal, Qt
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QCheckBox, QLabel, QFileDialog, QTextEdit, QGroupBox,
     QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox, QTabWidget, QSizePolicy, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QStackedWidget
@@ -37,6 +43,14 @@ from PyQt6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from machine_interfaces_atf2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT, BT_SEQUENCE
+
+FLIGHT_SIMULATOR_DATA_ROOT = Path("/atf/data/flight-simulator")
+
+
+def default_linacopt_save_dir(year: Optional[str] = None) -> Path:
+    year_text = str(year or datetime.datetime.now().strftime("%Y"))
+    return FLIGHT_SIMULATOR_DATA_ROOT / "LinacOpt" / year_text
+
 
 # ----------------------------
 # Scan defaults (same values used by Sequential and Group-LBO)
@@ -51,6 +65,8 @@ L0_PHASE_STEP_DEG = 0.1
 SOLENOIDE_MIN_A = 80.0
 SOLENOIDE_MAX_A = 125.0
 SOLENOIDE_STEP_A = 0.5
+SOLENOIDE_WRITE_PV = "SOLENOIDE:currentWrite"
+SOLENOIDE_READ_PV = "SOLENOIDE:internalCurrentWrite"
 
 QA_HALF_RANGE_A = 1.0
 QA_STEP_A = 0.05
@@ -85,6 +101,18 @@ TARGET_LABELS = {
     "qa": "QA",
     "qm": "QM",
 }
+GROUP_BO_MAX_EVAL_SPECS = [
+    {"config_id": "gun_sol_l0", "ui_label": TARGET_LABELS["gun_sol_l0"], "runtime_name": TARGET_LABELS["gun_sol_l0"], "dim": 3},
+    {"config_id": "kly_group_1", "ui_label": TARGET_LABELS["kly_group_1"], "runtime_name": "L1-4", "dim": 4},
+    {"config_id": "kly_group_2", "ui_label": TARGET_LABELS["kly_group_2"], "runtime_name": "L5-8", "dim": 4},
+    {"config_id": "timing", "ui_label": TARGET_LABELS["timing"], "runtime_name": TARGET_LABELS["timing"], "dim": 1},
+    {"config_id": "qa", "ui_label": TARGET_LABELS["qa"], "runtime_name": TARGET_LABELS["qa"], "dim": 5},
+    {"config_id": "qm", "ui_label": TARGET_LABELS["qm"], "runtime_name": TARGET_LABELS["qm"], "dim": 3},
+]
+GROUP_BO_RUNTIME_TO_SPEC = {
+    str(spec["runtime_name"]): spec
+    for spec in GROUP_BO_MAX_EVAL_SPECS
+}
 KLY_GROUP_1_SPECS = [
     (f"L{i}", f"CM{i}L:phaseWrite", f"CM{i}L:phaseRead", "deg")
     for i in range(1, 5)
@@ -96,7 +124,7 @@ KLY_GROUP_2_SPECS = [
 TARGET_VALUE_SPECS = {
     "gun_sol_l0": [
         ("GUN", "RFGUN:PHASE_WRITE", None, "deg"),
-        ("Solenoid", "SOLENOIDE:internalCurrentWrite", None, "A"),
+        ("Solenoid", SOLENOIDE_WRITE_PV, SOLENOIDE_READ_PV, "A"),
         ("L0", "CM0L:phaseWrite", None, "deg"),
     ],
     "kly_group_1": KLY_GROUP_1_SPECS,
@@ -107,12 +135,56 @@ TARGET_VALUE_SPECS = {
 }
 RESTORE_PVS = [
                   "RFGUN:PHASE_WRITE",
-                  "SOLENOIDE:internalCurrentWrite",
+                  SOLENOIDE_WRITE_PV,
                   "CM0L:phaseWrite",
                   "EVE_LINAC:OUT0:SetData",
               ] + [f"CM{i}L:phaseWrite" for i in range(1, 9)] + [f"QA{i}L:currentWrite" for i in range(1, 6)] + [
                   f"QM{i}L:currentWrite" for i in range(1, 4)
               ]
+
+# Conservative ARD priors obtained from the BO2026 offline fit.  These are
+# deliberately not the sharper ternary-only estimates: a production BO run
+# needs a global prior that remains resolvable on the hardware grid.
+LINAC_LEARNED_LENGTH_SCALES = {
+    "RFGUN:PHASE_WRITE": 3.5,
+    SOLENOIDE_WRITE_PV: 12.5,
+    "CM0L:PHASEWRITE": 2.5,
+    **{f"CM{i}L:PHASEWRITE": value for i, value in enumerate((4.6, 4.7, 4.1, 4.0, 4.6, 4.4, 4.5, 4.5), start=1)},
+    "EVE_LINAC:OUT0:SETDATA": 22.4,
+    **{f"QA{i}L:CURRENTWRITE": value for i, value in enumerate((0.50, 0.53, 0.44, 0.61, 0.82), start=1)},
+    **{f"QM{i}L:CURRENTWRITE": value for i, value in enumerate((1.10, 1.19, 1.08), start=1)},
+}
+LINAC_HYPERPARAMETER_MODES = ("legacy_fixed", "learned_fixed")
+LINAC_LEARNED_PRESET_VERSION = "BO2026-conservative-v1"
+
+
+def _linac_axis_key(axis_name: str) -> str:
+    """Return a stable lookup key for a PV or a human-readable LINAC axis."""
+    text = str(axis_name or "").strip().upper().replace(" ", "")
+    return text.replace("PHASEREAD", "PHASEWRITE").replace("CURRENTREAD", "CURRENTWRITE")
+
+
+def resolve_linac_length_scale(
+    axis_name: str,
+    axis_range: float,
+    axis_step: float,
+    *,
+    mode: str = "legacy_fixed",
+    n_step_floor: float = 2.0,
+) -> Tuple[float, str]:
+    """Resolve a safe fixed GP length scale and record its source.
+
+    Unknown/developer axes intentionally retain the historical range/3 rule.
+    """
+    safe_range = max(abs(float(axis_range)), abs(float(axis_step)), 1e-6)
+    legacy = max(safe_range / 3.0, 1e-6)
+    if str(mode).strip().lower() != "learned_fixed":
+        return legacy, "legacy_range_over_3"
+    learned = LINAC_LEARNED_LENGTH_SCALES.get(_linac_axis_key(axis_name))
+    if learned is None:
+        return legacy, "legacy_fallback_unknown_axis"
+    floor = max(float(n_step_floor) * abs(float(axis_step)), 1e-6)
+    return max(float(learned), floor), LINAC_LEARNED_PRESET_VERSION
 
 
 def _format_machine_value(value: float, unit: str) -> str:
@@ -155,6 +227,36 @@ def _auto_group_bo_budget(ndim: int) -> Dict[str, int]:
         "candidate_pool": int(candidate_pool),
         "stall_iters": int(stall_iters),
     }
+
+
+def _recommended_group_bo_max_evals(ndim: int) -> int:
+    dim = max(1, int(ndim))
+    if dim == 1:
+        return 17
+    return int(_auto_group_bo_budget(dim)["max_evals"])
+
+
+def _group_bo_max_evals_config_key(config_id: str) -> str:
+    return f"gbo_max_evals_{str(config_id)}"
+
+
+def _resolve_group_bo_max_evals(config: Dict[str, Any], group_name: str, ndim: int) -> int:
+    fallback = _recommended_group_bo_max_evals(ndim)
+    spec = GROUP_BO_RUNTIME_TO_SPEC.get(str(group_name))
+    if spec is not None:
+        value = config.get(_group_bo_max_evals_config_key(str(spec["config_id"])))
+        if value is not None:
+            return max(1, int(value))
+    value = config.get("gbo_max_evals")
+    if value is not None:
+        return max(1, int(value))
+    return max(1, int(fallback))
+
+
+def _default_readback_pv(pv_write: str) -> Optional[str]:
+    if str(pv_write).strip() == SOLENOIDE_WRITE_PV:
+        return SOLENOIDE_READ_PV
+    return None
 
 
 def build_display_value_texts(pv_values: Dict[str, float]) -> Dict[str, str]:
@@ -444,6 +546,7 @@ class OptimizationWorker(QThread):
             config.get("resume_csv_path", "")).strip() else None
         self._resume_seq_rows: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
         self._resume_group_rows: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        self._resume_discarded_row: Optional[Dict[str, Any]] = None
 
         # Fixed machine interface for Linac operations
         self.interface = InterfaceATF2_LinacBT(nsamples=1)
@@ -498,6 +601,55 @@ class OptimizationWorker(QThread):
 
     def _emit_progress(self, payload: Dict[str, object]):
         self.progress_signal.emit(dict(payload))
+
+    def _emit_bo1d_trace(
+        self,
+        *,
+        axis_name: str,
+        x_grid: np.ndarray,
+        mu: np.ndarray,
+        std: np.ndarray,
+        acq: np.ndarray,
+        chosen_x: float,
+        chosen_acq: float,
+        x_obs: np.ndarray,
+        y_obs: np.ndarray,
+    ) -> None:
+        x_arr = np.asarray(x_grid, dtype=float).reshape(-1)
+        mu_arr = np.asarray(mu, dtype=float).reshape(-1)
+        std_arr = np.asarray(std, dtype=float).reshape(-1)
+        acq_arr = np.asarray(acq, dtype=float).reshape(-1)
+        x_obs_arr = np.asarray(x_obs, dtype=float).reshape(-1)
+        y_obs_arr = np.asarray(y_obs, dtype=float).reshape(-1)
+        if x_arr.size == 0 or mu_arr.size != x_arr.size or std_arr.size != x_arr.size or acq_arr.size != x_arr.size:
+            return
+
+        note = "BO uses the score shown here."
+        if self.objective_type == DEVELOPER_OBJECTIVE_ICT:
+            note = (
+                f"Score = {self.score_w_ttot:g}*Ttot + "
+                f"{self.score_w_downstream:g}*{self.downstream_ict}"
+            )
+
+        self._emit_progress({
+            "kind": "bo1d_trace",
+            "trace": {
+                "axis": str(axis_name),
+                "x_label": str(axis_name),
+                "y_label": "BO score",
+                "direction": "maximize",
+                "note": note,
+                "acquisition_label": "EI",
+                "x_grid": x_arr.tolist(),
+                "y_mean": mu_arr.tolist(),
+                "y_std": std_arr.tolist(),
+                "acquisition": acq_arr.tolist(),
+                "x_obs": x_obs_arr.tolist(),
+                "y_obs": y_obs_arr.tolist(),
+                "chosen_x": float(chosen_x),
+                "chosen_acq": float(chosen_acq),
+            },
+        })
 
     def _emit_group_state(self, group_key: str, state: str):
         self._emit_progress({
@@ -571,7 +723,7 @@ class OptimizationWorker(QThread):
             self.log_signal.emit(f"[RESUME] CSV not found: {self.resume_csv_path}")
             return
 
-        row_count = 0
+        parsed_rows: List[Dict[str, Any]] = []
         with open(self.resume_csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for raw in reader:
@@ -607,17 +759,72 @@ class OptimizationWorker(QThread):
 
                 if row["pv_name"] == "MULTI":
                     vec = self._parse_resume_vector_note(row["note"])
-                    if vec:
-                        row["vector"] = vec
-                        key = self._resume_group_key(row["mode"], row["group"])
-                        self._resume_group_rows.setdefault(key, []).append(row)
-                        row_count += 1
-                else:
-                    key = self._resume_seq_key(row["mode"], row["group"], row["pv_name"])
-                    self._resume_seq_rows.setdefault(key, []).append(row)
-                    row_count += 1
+                    if not vec:
+                        continue
+                    row["vector"] = vec
+                parsed_rows.append(row)
 
-        self.log_signal.emit(f"[RESUME] Loaded {row_count} previous evaluations from {self.resume_csv_path}")
+        if not parsed_rows:
+            self.log_signal.emit(f"[RESUME] No valid resume rows found in {self.resume_csv_path}")
+            return
+
+        self._resume_discarded_row = dict(parsed_rows[-1])
+        kept_rows = parsed_rows[:-1]
+        self._eval_counter = len(kept_rows)
+
+        for row in kept_rows:
+            if row["pv_name"] == "MULTI":
+                key = self._resume_group_key(row["mode"], row["group"])
+                self._resume_group_rows.setdefault(key, []).append(row)
+            else:
+                key = self._resume_seq_key(row["mode"], row["group"], row["pv_name"])
+                self._resume_seq_rows.setdefault(key, []).append(row)
+
+        discarded = self._resume_discarded_row
+        discard_desc = (
+            f"{discarded.get('mode', '')}/{discarded.get('group', '')}/{discarded.get('device_label', discarded.get('pv_name', ''))}"
+            if discarded is not None else "-"
+        )
+        self.log_signal.emit(
+            f"[RESUME] Loaded {len(kept_rows)} previous evaluations from {self.resume_csv_path}. "
+            f"Discarded last row for re-measurement: {discard_desc}"
+        )
+
+    def _resume_note_is_completed(self, row: Optional[Dict[str, Any]]) -> bool:
+        if row is None:
+            return False
+        note = str(row.get("note", ""))
+        return ("OPTIMIZED_SET" in note) or ("RESUME_COMPLETED_SET" in note)
+
+    def _resume_pending_matches_seq(self, mode: str, group: str, pv_name: str) -> bool:
+        row = self._resume_discarded_row
+        if row is None:
+            return False
+        if str(row.get("pv_name", "")) == "MULTI":
+            return False
+        return self._resume_seq_key(row.get("mode", ""), row.get("group", ""), row.get("pv_name", "")) == self._resume_seq_key(mode, group, pv_name)
+
+    def _resume_pending_matches_group(self, mode: str, group: str) -> bool:
+        row = self._resume_discarded_row
+        if row is None:
+            return False
+        if str(row.get("pv_name", "")) != "MULTI":
+            return False
+        return self._resume_group_key(row.get("mode", ""), row.get("group", "")) == self._resume_group_key(mode, group)
+
+    def _consume_resume_pending_seq_row(self, mode: str, group: str, pv_name: str) -> Optional[Dict[str, Any]]:
+        if (not self._resume_pending_matches_seq(mode, group, pv_name)) or self._resume_note_is_completed(self._resume_discarded_row):
+            return None
+        row = dict(self._resume_discarded_row or {})
+        self._resume_discarded_row = None
+        return row
+
+    def _consume_resume_pending_group_row(self, mode: str, group: str) -> Optional[Dict[str, Any]]:
+        if (not self._resume_pending_matches_group(mode, group)) or self._resume_note_is_completed(self._resume_discarded_row):
+            return None
+        row = dict(self._resume_discarded_row or {})
+        self._resume_discarded_row = None
+        return row
 
     def _resume_eval_result(self, row: Dict[str, Any]) -> EvalResult:
         return EvalResult(
@@ -638,13 +845,21 @@ class OptimizationWorker(QThread):
 
     def _resume_seq_completed_row(self, mode: str, group: str, pv_name: str) -> Optional[Dict[str, Any]]:
         rows = self._resume_seq_rows.get(self._resume_seq_key(mode, group, pv_name), [])
-        done_rows = [row for row in rows if "OPTIMIZED_SET" in str(row.get("note", ""))]
-        return done_rows[-1] if done_rows else None
+        done_rows = [row for row in rows if self._resume_note_is_completed(row)]
+        if done_rows:
+            return done_rows[-1]
+        if self._resume_pending_matches_seq(mode, group, pv_name) and self._resume_note_is_completed(self._resume_discarded_row):
+            return dict(self._resume_discarded_row or {})
+        return None
 
     def _resume_group_completed_row(self, mode: str, group: str) -> Optional[Dict[str, Any]]:
         rows = self._resume_group_rows.get(self._resume_group_key(mode, group), [])
-        done_rows = [row for row in rows if "OPTIMIZED_SET" in str(row.get("note", ""))]
-        return done_rows[-1] if done_rows else None
+        done_rows = [row for row in rows if self._resume_note_is_completed(row)]
+        if done_rows:
+            return done_rows[-1]
+        if self._resume_pending_matches_group(mode, group) and self._resume_note_is_completed(self._resume_discarded_row):
+            return dict(self._resume_discarded_row or {})
+        return None
 
     def _resume_scan_candidates(self, mode: str, group: str, pv_name: str, fallback: np.ndarray) -> np.ndarray:
         rows = self._resume_seq_rows.get(self._resume_seq_key(mode, group, pv_name), [])
@@ -670,7 +885,7 @@ class OptimizationWorker(QThread):
         setpoints: Dict[str, float] = {}
         restore_pvs = [str(pv) for pv in list(self.config.get("restore_pvs", RESTORE_PVS))]
         for pv in restore_pvs:
-            setpoints[pv] = float(self._read_current(pv, None))
+            setpoints[pv] = float(self._read_current(pv, _default_readback_pv(pv)))
 
         (
             initial_ict,
@@ -1038,6 +1253,7 @@ class OptimizationWorker(QThread):
         """
         if not self.is_running or len(params) == 0:
             return
+        self._emit_progress({"kind": "bo1d_trace", "trace": {}})
 
         resume_key = self._resume_group_key("GROUP_BO_SIMUL", group_name)
         resume_rows = self._resume_group_rows.get(resume_key, [])
@@ -1097,21 +1313,36 @@ class OptimizationWorker(QThread):
         # Config
         auto_budget = _auto_group_bo_budget(len(params))
         min_init = int(self.config.get("gbo_min_init", auto_budget["min_init"]))
-        max_evals = int(self.config.get("gbo_max_evals", auto_budget["max_evals"]))
+        max_evals = _resolve_group_bo_max_evals(self.config, group_name, len(params))
+        min_init = max(1, min(min_init, max_evals))
         cand_pool = int(self.config.get("gbo_candidate_pool", auto_budget["candidate_pool"]))
         ei_tol = float(self.config.get("bo_ei_tol", 0.0))
         xi = float(self.config.get("bo_xi", 0.1))
         sigma_f = float(self.config.get("bo_sigma_f", 1.0))
-        sigma_n = float(self.config.get("bo_sigma_n", 1e-1))
+        sigma_n = float(self.config.get("bo_sigma_n", 1e-2))
         uncertainty_rel_tol = float(self.config.get("gbo_uncertainty_rel_tol", 0.05))
         uncertainty_abs_tol_cfg = self.config.get("gbo_uncertainty_abs_tol", None)
 
-        # Length scales: heuristic proportional to range per dim
+        # Fixed ARD priors.  legacy_fixed preserves the previous range/3
+        # behavior exactly; learned_fixed uses the BO2026 conservative preset
+        # and never drops below the configured number of hardware steps.
         ranges = np.maximum(hi - lo, steps)
-        ls = np.maximum(ranges / 3.0, 1e-6)
+        hp_mode = str(self.config.get("bo_hyperparameter_mode", "legacy_fixed")).lower()
+        n_step_floor = float(self.config.get("bo_length_scale_n_step_floor", 2.0))
+        resolved_ls = [
+            resolve_linac_length_scale(
+                pv,
+                axis_range=float(ranges[i]),
+                axis_step=float(steps[i]),
+                mode=hp_mode,
+                n_step_floor=n_step_floor,
+            )
+            for i, pv in enumerate(pvs)
+        ]
+        ls = np.asarray([item[0] for item in resolved_ls], dtype=float)
         # Allow override
         if "gbo_length_scale_factor" in self.config:
-            ls = np.maximum(ls * float(self.config["gbo_length_scale_factor"]), 1e-6)
+            ls = np.maximum(ls * float(self.config["gbo_length_scale_factor"]), n_step_floor * steps)
 
         rng = np.random.default_rng()
         grid_max_idx = np.maximum(0, np.round((hi - lo) / steps).astype(int))
@@ -1182,11 +1413,19 @@ class OptimizationWorker(QThread):
             f"[GROUP_BO] {group_name}: lattice_points={total_lattice_points}, "
             f"candidate_mode={'full_lattice' if total_lattice_points <= full_lattice_limit else 'sampled_lattice'}"
         )
+        self.log_signal.emit(
+            f"[GROUP_BO][GP] mode={hp_mode}, preset={LINAC_LEARNED_PRESET_VERSION if hp_mode == 'learned_fixed' else 'legacy'}, "
+            f"length_scales={{" + ", ".join(
+                f"{pv}:{ls_i:.6g} ({source})" for pv, ls_i, (_, source) in zip(pvs, ls, resolved_ls)
+            ) + "} | signal_sd=%.6g noise_sd=%.6g" % (sigma_f, sigma_n)
+        )
         if resume_done_row is not None:
             vec = resume_done_row.get("vector", {})
             if isinstance(vec, dict):
                 x_best = np.array([float(vec.get(pv, np.nan)) for pv in pvs], dtype=float)
                 if np.all(np.isfinite(x_best)):
+                    if self._resume_pending_matches_group("GROUP_BO_SIMUL", group_name):
+                        self._resume_discarded_row = None
                     self.log_signal.emit(
                         f"[RESUME] Group {group_name} already completed previously. Re-applying saved best vector.")
                     _ = self._evaluate_point_multi(
@@ -1224,6 +1463,27 @@ class OptimizationWorker(QThread):
                     eval_cache[key(x_vec)] = resume_r
                 self.log_signal.emit(
                     f"[RESUME] Warm start for group {group_name}: loaded {len(X)} previous evaluations.")
+
+        resume_pending_row = self._consume_resume_pending_group_row("GROUP_BO_SIMUL", group_name)
+        if resume_pending_row is not None:
+            vec = resume_pending_row.get("vector", {})
+            if isinstance(vec, dict):
+                x_resume = quantize_vec(np.array([float(vec.get(pv, np.nan)) for pv in pvs], dtype=float))
+                if np.all(np.isfinite(x_resume)):
+                    self.log_signal.emit(
+                        f"[RESUME] Re-measuring discarded last group point for {group_name} before continuing."
+                    )
+                    r_resume = self._evaluate_point_multi(
+                        device_label=f"Group:{group_name}",
+                        pv_to_value=vec_to_dict(x_resume),
+                        mode="GROUP_BO_SIMUL",
+                        group=group_name,
+                        note="RESUME_REMEASURE_LAST",
+                    )
+                    X.append(x_resume.copy())
+                    Y.append(float(r_resume.score))
+                    R.append(r_resume)
+                    eval_cache[key(x_resume)] = r_resume
 
         # Initial design: current + random points
         if len(X) == 0:
@@ -1387,28 +1647,51 @@ class OptimizationWorker(QThread):
         candidates = np.unique(np.array(scan_values, dtype=float))
         candidates.sort()
 
-        self.log_signal.emit(f"[BO-1D] Optimizing {device_label} ({pv_name}) on {len(candidates)} candidates ...")
-
         # Sequential method selection (user request):
         # - In SEQUENTIAL mode, allow choosing BO or discrete ternary search (unimodal assumption).
         # - In GROUP modes, always use BO.
         seq_method = str(self.config.get("seq_method", "BO")).upper()
         method = seq_method if str(mode).upper() == "SEQUENTIAL" else "BO"
+        log_method = "TERNARY-1D" if method in ("TERNARY", "TERNARY_SEARCH", "BINARY", "BINARY_SEARCH") else "BO-1D"
+        self.log_signal.emit(f"[{log_method}] Optimizing {device_label} ({pv_name}) on {len(candidates)} candidates ...")
+        self._emit_progress({"kind": "bo1d_trace", "trace": {}})
 
         # Config knobs (reasonable defaults)
         min_init = int(self.config.get("bo_min_init", 5))  # initial evaluations
-        max_evals = int(self.config.get("bo_max_evals", min(17, len(candidates))))
+        if str(mode).upper() == "GROUP_BO":
+            max_evals = _resolve_group_bo_max_evals(self.config, group or device_label, 1)
+        else:
+            max_evals = int(self.config.get("bo_max_evals", min(17, len(candidates))))
         ei_tol = float(self.config.get("bo_ei_tol", 1e-6))
         stall_iters = int(self.config.get("bo_stall_iters", 4))
         refine_enabled = bool(self.config.get("bo_refine", True))
         refine_factor = float(self.config.get("bo_refine_factor", 5.0))  # step -> step/refine_factor
 
-        # GP hyperparams (heuristic)
+        # GP hyperparameters.  The historical default was range/3; retain it
+        # under legacy_fixed so loading an older config is behavior-compatible.
         x_range = float(candidates[-1] - candidates[0]) if len(candidates) >= 2 else 1.0
-        length_scale = float(self.config.get("bo_length_scale", max(x_range / 3.0, 1e-6)))
+        axis_step = float(np.median(np.diff(candidates))) if len(candidates) >= 2 else x_range
+        hp_mode = str(self.config.get("bo_hyperparameter_mode", "legacy_fixed")).lower()
+        n_step_floor = float(self.config.get("bo_length_scale_n_step_floor", 2.0))
+        length_scale, length_source = resolve_linac_length_scale(
+            pv_name,
+            axis_range=x_range,
+            axis_step=axis_step,
+            mode=hp_mode,
+            n_step_floor=n_step_floor,
+        )
+        # Preserve an explicit old-style override, which is useful for an
+        # offline comparison and was supported before BO2026.
+        if "bo_length_scale" in self.config:
+            length_scale = max(float(self.config["bo_length_scale"]), n_step_floor * abs(axis_step))
+            length_source = "explicit_config_override"
         sigma_f = float(self.config.get("bo_sigma_f", 1.0))
-        sigma_n = float(self.config.get("bo_sigma_n", 1e-1))
+        sigma_n = float(self.config.get("bo_sigma_n", 1e-2))
         xi = float(self.config.get("bo_xi", 0.0))
+        self.log_signal.emit(
+            f"[BO1D][GP] axis={pv_name}, mode={hp_mode}, length_scale={length_scale:.6g}, "
+            f"source={length_source}, signal_sd={sigma_f:.6g}, noise_sd={sigma_n:.6g}"
+        )
 
         X, Y, R = [], [], []  # store evaluated (x, score, EvalResult)
 
@@ -1416,6 +1699,8 @@ class OptimizationWorker(QThread):
         if resume_done_row is not None:
             best_x = float(resume_done_row.get("set_value", float("nan")))
             if np.isfinite(best_x):
+                if self._resume_pending_matches_seq(mode, group, pv_name):
+                    self._resume_discarded_row = None
                 self.log_signal.emit(
                     f"[RESUME] {device_label} already completed previously. Re-applying x={best_x:.6g}.")
                 _ = self._evaluate_point(device_label, pv_name, best_x, mode=mode, group=group,
@@ -1440,6 +1725,25 @@ class OptimizationWorker(QThread):
                     Y.append(float(row["score"]))
                     R.append(self._resume_eval_result(row))
                 self.log_signal.emit(f"[RESUME] Warm start for {device_label}: loaded {len(X)} previous evaluations.")
+
+        resume_pending_row = self._consume_resume_pending_seq_row(mode, group, pv_name)
+        if resume_pending_row is not None:
+            x_resume = float(resume_pending_row.get("set_value", float("nan")))
+            if np.isfinite(x_resume):
+                self.log_signal.emit(
+                    f"[RESUME] Re-measuring discarded last point for {device_label} before continuing."
+                )
+                r_resume = self._evaluate_point(
+                    device_label,
+                    pv_name,
+                    x_resume,
+                    mode=mode,
+                    group=group,
+                    note="RESUME_REMEASURE_LAST",
+                )
+                X.append(float(x_resume))
+                Y.append(float(r_resume.score))
+                R.append(r_resume)
 
         def eval_at(x: float, note: str = ""):
             reused = self._try_reuse_initial_point(
@@ -1473,9 +1777,6 @@ class OptimizationWorker(QThread):
         # Discrete ternary search (unimodal) on the candidate grid
         # ------------------------------------------------------------------
         if method in ("TERNARY", "TERNARY_SEARCH", "BINARY", "BINARY_SEARCH"):
-            # Use the same evaluation budget knob for simplicity
-            max_evals = int(self.config.get("bo_max_evals", min(17, len(candidates))))
-
             # Cache helper
             def _y_at(xv: float) -> float:
                 # Ensure evaluated
@@ -1553,45 +1854,12 @@ class OptimizationWorker(QThread):
             idx = int(np.argmax(Y))
             return float(X[idx]), float(Y[idx]), R[idx]
 
-        # helper: unimodal bracket shrink (based on evaluated points)
-        def shrink_domain(all_candidates: np.ndarray) -> np.ndarray:
-            if len(X) < 3:
-                return all_candidates
-            xb, yb, _ = current_best()
-            # evaluated points sorted
-            xs = np.array(sorted(set(X)), dtype=float)
-            ys = np.array([Y[X.index(x)] for x in xs], dtype=float)
-            i = int(np.where(xs == xb)[0][0])
-
-            # find nearest left with lower score, and nearest right with lower score
-            xl = all_candidates[0]
-            xr = all_candidates[-1]
-
-            # search left
-            for j in range(i - 1, -1, -1):
-                if ys[j] < yb:
-                    xl = xs[j]
-                    break
-            # search right
-            for j in range(i + 1, len(xs)):
-                if ys[j] < yb:
-                    xr = xs[j]
-                    break
-
-            # Keep a little margin: include one coarse step on each side if possible
-            domain = all_candidates[(all_candidates >= xl) & (all_candidates <= xr)]
-            if domain.size >= 3:
-                return domain
-            return all_candidates
-
-        # 2) BO loop on coarse grid
+        # 2) BO loop on the full candidate grid
         stall = 0
         prev_best_x = None
-        domain = candidates.copy()
 
         while self.is_running and len(X) < max_evals:
-            domain = shrink_domain(domain)
-            remaining = np.array([c for c in domain if c not in set(X)], dtype=float)
+            remaining = np.array([c for c in candidates if c not in set(X)], dtype=float)
             if remaining.size == 0:
                 break
 
@@ -1601,6 +1869,19 @@ class OptimizationWorker(QThread):
             y_best = float(np.max(y_train))
             ei = self._expected_improvement(mu, std, y_best, xi=xi)
             k = int(np.argmax(ei))
+            mu_plot, std_plot = self._gp_posterior(x_train, y_train, candidates, length_scale, sigma_f, sigma_n)
+            ei_plot = self._expected_improvement(mu_plot, std_plot, y_best, xi=xi)
+            self._emit_bo1d_trace(
+                axis_name=device_label,
+                x_grid=candidates,
+                mu=mu_plot,
+                std=std_plot,
+                acq=ei_plot,
+                chosen_x=float(remaining[k]),
+                chosen_acq=float(ei[k]),
+                x_obs=x_train,
+                y_obs=y_train,
+            )
             if float(ei[k]) < ei_tol:
                 break
 
@@ -1630,26 +1911,9 @@ class OptimizationWorker(QThread):
             if coarse_step > 0:
                 fine_step = coarse_step / refine_factor
 
-                # local window: from nearest *observed* points around current best (more consistent skirt/bracket)
-                xs_obs = np.array(sorted(set(X)), dtype=float)
-                left_obs = float(candidates[0])
-                right_obs = float(candidates[-1])
-                if xs_obs.size >= 2:
-                    left_candidates = xs_obs[xs_obs < best_x]
-                    right_candidates = xs_obs[xs_obs > best_x]
-                    if left_candidates.size > 0:
-                        left_obs = float(left_candidates.max())
-                    if right_candidates.size > 0:
-                        right_obs = float(right_candidates.min())
-
-                lo = float(np.clip(left_obs, candidates[0], candidates[-1]))
-                hi = float(np.clip(right_obs, candidates[0], candidates[-1]))
-                if hi <= lo:
-                    # fallback (should be rare): ±1 coarse step
-                    lo = float(np.max([candidates[0], best_x - coarse_step]))
-                    hi = float(np.min([candidates[-1], best_x + coarse_step]))
-
-                # create fine candidates (still discrete)
+                # Keep refinement global: re-sample the full original range with a finer step.
+                lo = float(candidates[0])
+                hi = float(candidates[-1])
                 fine = np.arange(lo, hi + fine_step * 0.5, fine_step, dtype=float)
                 fine = np.unique(np.clip(fine, candidates[0], candidates[-1]))
                 fine.sort()
@@ -1659,7 +1923,7 @@ class OptimizationWorker(QThread):
                 max_total = max_evals + refine_budget
 
                 self.log_signal.emit(
-                    f"[BO-1D] Refinement: step {coarse_step:.6g} -> {fine_step:.6g}, window=[{lo:.6g},{hi:.6g}], budget={refine_budget}"
+                    f"[BO-1D] Refinement: global step {coarse_step:.6g} -> {fine_step:.6g}, range=[{lo:.6g},{hi:.6g}], budget={refine_budget}"
                 )
 
                 stall2 = 0
@@ -1677,6 +1941,24 @@ class OptimizationWorker(QThread):
                     y_best = float(np.max(y_train))
                     ei = self._expected_improvement(mu, std, y_best, xi=xi)
                     k = int(np.argmax(ei))
+                    mu_plot, std_plot = self._gp_posterior(
+                        x_train, y_train, fine,
+                        length_scale=max(fine_step * 3, 1e-6),
+                        sigma_f=sigma_f,
+                        sigma_n=sigma_n,
+                    )
+                    ei_plot = self._expected_improvement(mu_plot, std_plot, y_best, xi=xi)
+                    self._emit_bo1d_trace(
+                        axis_name=device_label,
+                        x_grid=fine,
+                        mu=mu_plot,
+                        std=std_plot,
+                        acq=ei_plot,
+                        chosen_x=float(remaining[k]),
+                        chosen_acq=float(ei[k]),
+                        x_obs=x_train,
+                        y_obs=y_train,
+                    )
                     if float(ei[k]) < ei_tol:
                         break
 
@@ -1715,6 +1997,8 @@ class OptimizationWorker(QThread):
         return float(np.clip(xq, lo, hi))
 
     def _read_current(self, pv_write: str, pv_read: Optional[str] = None) -> float:
+        if pv_read is None:
+            pv_read = _default_readback_pv(pv_write)
         return self.interface.read_current(pv_write=pv_write, pv_read=pv_read, quantize_phase=True)
 
     def _lbo_group(self, group_name: str, params: List[tuple]):
@@ -1729,6 +2013,7 @@ class OptimizationWorker(QThread):
         """
         if not self.is_running:
             return
+        self._emit_progress({"kind": "bo1d_trace", "trace": {}})
 
         # current point
         x0 = []
@@ -2001,7 +2286,7 @@ class OptimizationWorker(QThread):
             sol_hi = max(sol_min, sol_max)
             specs = [
                 ("GUN phase", "RFGUN:PHASE_WRITE", gun_phase_half, gun_phase_step),
-                ("Solenoid current", "SOLENOIDE:internalCurrentWrite", None, sol_step),
+                ("Solenoid current", SOLENOIDE_WRITE_PV, None, sol_step),
                 ("L0 phase", "CM0L:phaseWrite", l0_phase_half, l0_phase_step),
             ]
             for label, pv_write, half, step in specs:
@@ -2096,7 +2381,7 @@ class OptimizationWorker(QThread):
             sol_hi = max(sol_min, sol_max)
             params = [
                 ("GUN phase", "RFGUN:PHASE_WRITE", gun_phase_step, gun_phase_half),
-                ("SOLENOIDE current", "SOLENOIDE:internalCurrentWrite", sol_step, 0.0, sol_lo, sol_hi),
+                ("SOLENOIDE current", SOLENOIDE_WRITE_PV, sol_step, 0.0, sol_lo, sol_hi),
                 ("L0 phase", "CM0L:phaseWrite", l0_phase_step, l0_phase_half),
             ]
             self.log_signal.emit("--- GROUP_LBO: GUN&SOLENOIDE&L0 ---")
@@ -2172,7 +2457,7 @@ class OptimizationWorker(QThread):
             sol_hi = max(sol_min, sol_max)
             params = [
                 ("GUN phase", "RFGUN:PHASE_WRITE", gun_phase_step, gun_phase_half),
-                ("Solenoid current", "SOLENOIDE:internalCurrentWrite", sol_step, 0.0, sol_lo, sol_hi),
+                ("Solenoid current", SOLENOIDE_WRITE_PV, sol_step, 0.0, sol_lo, sol_hi),
                 ("L0 phase", "CM0L:phaseWrite", l0_phase_step, l0_phase_half),
             ]
             self._group_bo_simultaneous(gun_group_name, params)
@@ -2248,7 +2533,7 @@ class MainWindow(QMainWindow):
 
         self.worker: Optional[OptimizationWorker] = None
         self.interface: Optional[InterfaceATF2_LinacBT] = None
-        self.save_path = Path.cwd() / "Data" / datetime.datetime.now().strftime("%Y")
+        self.save_path = default_linacopt_save_dir()
         self._run_profile: str = RUN_PROFILE_MAIN
         self.target_checks: Dict[str, QCheckBox] = {}
         self.target_status_labels: Dict[str, QLabel] = {}
@@ -2265,17 +2550,38 @@ class MainWindow(QMainWindow):
         }
         self.resume_snapshot_state: Optional[Dict[str, Any]] = None
         self._plot_state: Dict[str, Dict[str, Any]] = {
-            RUN_PROFILE_MAIN: {"eval_index": [], "ttot": [], "metric": [], "metric_label": "DR", "measurement_ok": []},
-            RUN_PROFILE_DEVELOPER: {"eval_index": [], "ttot": [], "metric": [], "metric_label": "DR",
-                                    "measurement_ok": []},
+            RUN_PROFILE_MAIN: {
+                "eval_index": [],
+                "ttot": [],
+                "metric": [],
+                "metric_label": "DR",
+                "measurement_ok": [],
+                "discarded_eval_index": [],
+                "discarded_ttot": [],
+                "discarded_metric": [],
+                "bo1d_trace": None,
+            },
+            RUN_PROFILE_DEVELOPER: {
+                "eval_index": [],
+                "ttot": [],
+                "metric": [],
+                "metric_label": "DR",
+                "measurement_ok": [],
+                "discarded_eval_index": [],
+                "discarded_ttot": [],
+                "discarded_metric": [],
+                "bo1d_trace": None,
+            },
         }
         self._status_labels: Dict[str, QLabel] = {}
         self._result_labels: Dict[str, QLabel] = {}
         self._log_widgets: Dict[str, QTextEdit] = {}
         self._plot_widgets: Dict[str, Dict[str, Any]] = {}
+        self._last_setpoint_values: Dict[str, float] = {}
         self.dev_actuator_row_map: Dict[str, int] = {}
         self.dev_actuator_spinboxes: Dict[str, Dict[str, QDoubleSpinBox]] = {}
         self.dev_bpm_row_map: Dict[str, int] = {}
+        self.group_bo_max_eval_spinboxes: Dict[str, QSpinBox] = {}
 
         self._init_ui()
         self._current_value_timer = QTimer(self)
@@ -2299,6 +2605,17 @@ class MainWindow(QMainWindow):
         canvas.setMinimumHeight(340)
         canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
         return fig, canvas, ax_ttot, ax_metric
+
+    def _create_bo1d_plot_bundle(self):
+        fig = Figure(figsize=(8.8, 5.0))
+        ax_obj = fig.add_subplot(211)
+        ax_acq = fig.add_subplot(212, sharex=ax_obj)
+        fig.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.12, hspace=0.42)
+        canvas = FigureCanvas(fig)
+        canvas.setMinimumHeight(280)
+        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        canvas.setVisible(False)
+        return fig, canvas, ax_obj, ax_acq
 
     def _init_ui(self):
         cw = QWidget()
@@ -2461,6 +2778,8 @@ class MainWindow(QMainWindow):
         log_l = QVBoxLayout(log_group)
         self.eval_fig, self.eval_canvas, self.ax_ttot, self.ax_downstream = self._create_eval_plot_bundle()
         log_l.addWidget(self.eval_canvas, stretch=3)
+        self.bo1d_fig, self.bo1d_canvas, self.bo1d_ax_obj, self.bo1d_ax_acq = self._create_bo1d_plot_bundle()
+        log_l.addWidget(self.bo1d_canvas, stretch=2)
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
         log_l.addWidget(self.txt_log, stretch=2)
@@ -2470,6 +2789,10 @@ class MainWindow(QMainWindow):
             "canvas": self.eval_canvas,
             "ax_ttot": self.ax_ttot,
             "ax_metric": self.ax_downstream,
+            "bo1d_fig": self.bo1d_fig,
+            "bo1d_canvas": self.bo1d_canvas,
+            "bo1d_ax_obj": self.bo1d_ax_obj,
+            "bo1d_ax_acq": self.bo1d_ax_acq,
         }
         self._refresh_eval_plot(RUN_PROFILE_MAIN)
 
@@ -2734,6 +3057,8 @@ class MainWindow(QMainWindow):
         log_l = QVBoxLayout(log_group)
         self.dev_eval_fig, self.dev_eval_canvas, self.dev_ax_ttot, self.dev_ax_metric = self._create_eval_plot_bundle()
         log_l.addWidget(self.dev_eval_canvas, stretch=3)
+        self.dev_bo1d_fig, self.dev_bo1d_canvas, self.dev_bo1d_ax_obj, self.dev_bo1d_ax_acq = self._create_bo1d_plot_bundle()
+        log_l.addWidget(self.dev_bo1d_canvas, stretch=2)
         self.dev_txt_log = QTextEdit()
         self.dev_txt_log.setReadOnly(True)
         log_l.addWidget(self.dev_txt_log, stretch=2)
@@ -2743,6 +3068,10 @@ class MainWindow(QMainWindow):
             "canvas": self.dev_eval_canvas,
             "ax_ttot": self.dev_ax_ttot,
             "ax_metric": self.dev_ax_metric,
+            "bo1d_fig": self.dev_bo1d_fig,
+            "bo1d_canvas": self.dev_bo1d_canvas,
+            "bo1d_ax_obj": self.dev_bo1d_ax_obj,
+            "bo1d_ax_acq": self.dev_bo1d_ax_acq,
         }
         self._refresh_eval_plot(RUN_PROFILE_DEVELOPER)
 
@@ -2927,6 +3256,25 @@ class MainWindow(QMainWindow):
         lay_score.addWidget(self.cb_downstream_ict)
         lay_score.addStretch(1)
 
+        self.grp_group_bo_budget = QGroupBox("Group BO Max Evals")
+        layout.addWidget(self.grp_group_bo_budget)
+        lay_gbo = QGridLayout(self.grp_group_bo_budget)
+        lay_gbo.setHorizontalSpacing(18)
+        lay_gbo.setVerticalSpacing(8)
+        for idx, spec in enumerate(GROUP_BO_MAX_EVAL_SPECS):
+            label = QLabel(f"{spec['ui_label']} (D={spec['dim']})")
+            spin = QSpinBox()
+            spin.setRange(1, 999)
+            spin.setValue(_recommended_group_bo_max_evals(int(spec["dim"])))
+            spin.setSuffix(" evals")
+            spin.setToolTip(f"Recommended default for dimension {spec['dim']}.")
+            self.group_bo_max_eval_spinboxes[str(spec["config_id"])] = spin
+
+            row = idx // 2
+            col = (idx % 2) * 2
+            lay_gbo.addWidget(label, row, col)
+            lay_gbo.addWidget(spin, row, col + 1)
+
         grp_adv = QGroupBox("Advanced")
         layout.addWidget(grp_adv)
         lay_adv = QHBoxLayout(grp_adv)
@@ -2937,6 +3285,17 @@ class MainWindow(QMainWindow):
         self.sp_settle_sec.setValue(SETTLE_SEC_DEFAULT)
         lay_adv.addWidget(self.sp_settle_sec)
         lay_adv.addWidget(QLabel("s"))
+        lay_adv.addSpacing(18)
+        lay_adv.addWidget(QLabel("BO GP preset"))
+        self.bo_hyperparameter_mode_box = QComboBox()
+        self.bo_hyperparameter_mode_box.addItems(list(LINAC_HYPERPARAMETER_MODES))
+        # New runs use the conservative offline-derived prior.  Config files
+        # created before this field existed are loaded as legacy_fixed below.
+        self.bo_hyperparameter_mode_box.setCurrentText("learned_fixed")
+        self.bo_hyperparameter_mode_box.setToolTip(
+            "legacy_fixed: historical range/3. learned_fixed: BO2026 conservative ARD priors."
+        )
+        lay_adv.addWidget(self.bo_hyperparameter_mode_box)
         lay_adv.addStretch(1)
 
         path_group = QGroupBox("Data Save Location")
@@ -3389,15 +3748,30 @@ class MainWindow(QMainWindow):
         context = str(profile or self._run_profile or RUN_PROFILE_MAIN).upper()
         state = self._plot_state.setdefault(
             context,
-            {"eval_index": [], "ttot": [], "metric": [], "metric_label": "DR", "measurement_ok": []},
+            {
+                "eval_index": [],
+                "ttot": [],
+                "metric": [],
+                "metric_label": "DR",
+                "measurement_ok": [],
+                "discarded_eval_index": [],
+                "discarded_ttot": [],
+                "discarded_metric": [],
+                "bo1d_trace": None,
+            },
         )
         state["eval_index"] = []
         state["ttot"] = []
         state["metric"] = []
         state["measurement_ok"] = []
+        state["discarded_eval_index"] = []
+        state["discarded_ttot"] = []
+        state["discarded_metric"] = []
+        state["bo1d_trace"] = None
         if metric_label is not None:
             state["metric_label"] = str(metric_label)
         self._refresh_eval_plot(context)
+        self._refresh_bo1d_plot(context)
 
     def _refresh_eval_plot(self, profile: Optional[str] = None):
         context = str(profile or RUN_PROFILE_MAIN).upper()
@@ -3456,7 +3830,127 @@ class MainWindow(QMainWindow):
                     markeredgewidth=2.0,
                 )
 
+        discarded_eval = np.asarray(state.get("discarded_eval_index", []), dtype=float)
+        discarded_ttot = np.asarray(state.get("discarded_ttot", []), dtype=float)
+        discarded_metric = np.asarray(state.get("discarded_metric", []), dtype=float)
+        if discarded_eval.size > 0:
+            ax_ttot.plot(
+                discarded_eval,
+                discarded_ttot,
+                linestyle="None",
+                marker="x",
+                color="#dc2626",
+                markersize=8,
+                markeredgewidth=2.0,
+            )
+            ax_metric.plot(
+                discarded_eval,
+                discarded_metric,
+                linestyle="None",
+                marker="x",
+                color="#dc2626",
+                markersize=8,
+                markeredgewidth=2.0,
+            )
+
         widgets["canvas"].draw_idle()
+
+    def _refresh_bo1d_plot(self, profile: Optional[str] = None):
+        context = str(profile or RUN_PROFILE_MAIN).upper()
+        widgets = self._plot_widgets.get(context)
+        state = self._plot_state.get(context)
+        if not widgets or not state:
+            return
+
+        canvas = widgets.get("bo1d_canvas")
+        ax_obj = widgets.get("bo1d_ax_obj")
+        ax_acq = widgets.get("bo1d_ax_acq")
+        if canvas is None or ax_obj is None or ax_acq is None:
+            return
+
+        ax_obj.clear()
+        ax_acq.clear()
+        trace = dict(state.get("bo1d_trace") or {})
+        visible = bool(trace and trace.get("x_grid"))
+        canvas.setVisible(visible)
+        if not visible:
+            canvas.draw_idle()
+            return
+
+        x_grid = np.asarray(trace.get("x_grid", []), dtype=float)
+        y_mean = np.asarray(trace.get("y_mean", []), dtype=float)
+        y_std = np.asarray(trace.get("y_std", []), dtype=float)
+        acq = np.asarray(trace.get("acquisition", []), dtype=float)
+        x_obs = np.asarray(trace.get("x_obs", []), dtype=float)
+        y_obs = np.asarray(trace.get("y_obs", []), dtype=float)
+        chosen_x = float(trace.get("chosen_x", float("nan")))
+        chosen_acq = float(trace.get("chosen_acq", float("nan")))
+        axis_name = str(trace.get("axis", "Parameter"))
+        y_label = str(trace.get("y_label", "Score"))
+        acq_label = str(trace.get("acquisition_label", "Acquisition"))
+        note = str(trace.get("note", "") or "")
+
+        if x_grid.size and y_mean.size == x_grid.size and y_std.size == x_grid.size:
+            lo_band = y_mean - y_std
+            hi_band = y_mean + y_std
+            band_mask = np.isfinite(x_grid) & np.isfinite(lo_band) & np.isfinite(hi_band)
+            if np.any(band_mask):
+                ax_obj.fill_between(
+                    x_grid[band_mask], lo_band[band_mask], hi_band[band_mask],
+                    color="#cfe8ff", alpha=0.65, label="Surrogate ±1σ",
+                )
+            mean_mask = np.isfinite(x_grid) & np.isfinite(y_mean)
+            if np.any(mean_mask):
+                ax_obj.plot(
+                    x_grid[mean_mask], y_mean[mean_mask],
+                    linestyle="--", linewidth=1.8, color="#1d4ed8", label="Surrogate mean",
+                )
+
+        obs_mask = np.isfinite(x_obs) & np.isfinite(y_obs)
+        if np.any(obs_mask):
+            ax_obj.plot(
+                x_obs[obs_mask], y_obs[obs_mask],
+                linestyle="None", marker="o", markersize=6,
+                color="#111827", label="Measured points",
+            )
+
+        if np.isfinite(chosen_x):
+            ax_obj.axvline(chosen_x, color="#b45309", linestyle=":", linewidth=1.6, label="Chosen x")
+            ax_acq.axvline(chosen_x, color="#b45309", linestyle=":", linewidth=1.6)
+
+        acq_mask = np.isfinite(x_grid) & np.isfinite(acq)
+        if np.any(acq_mask):
+            ax_acq.plot(
+                x_grid[acq_mask], acq[acq_mask],
+                color="#d97706", linewidth=1.8, label=f"{acq_label} acquisition",
+            )
+        if np.isfinite(chosen_x) and np.isfinite(chosen_acq):
+            ax_acq.plot(
+                [chosen_x], [chosen_acq],
+                linestyle="None", marker="o", markersize=7,
+                color="#92400e", label="Chosen: max acquisition",
+            )
+
+        ax_obj.set_title(f"1D BO surrogate for {axis_name}")
+        ax_obj.set_ylabel(y_label)
+        ax_obj.grid(True, alpha=0.3)
+        if note:
+            ax_obj.text(
+                0.01, 0.98, note,
+                transform=ax_obj.transAxes,
+                ha="left", va="top", fontsize=8.5, color="#475569",
+            )
+
+        ax_acq.set_title("Why this point was chosen")
+        ax_acq.set_xlabel(axis_name)
+        ax_acq.set_ylabel(acq_label)
+        ax_acq.grid(True, alpha=0.3)
+
+        if ax_obj.get_legend_handles_labels()[0]:
+            ax_obj.legend(loc="best")
+        if ax_acq.get_legend_handles_labels()[0]:
+            ax_acq.legend(loc="best")
+        canvas.draw_idle()
 
     def _on_worker_progress(self, payload: dict):
         context = self._run_profile
@@ -3493,11 +3987,40 @@ class MainWindow(QMainWindow):
             self._set_status("Status: FAILED", state="error", profile=context)
             return
 
+        if kind == "bo1d_trace":
+            state = self._plot_state.setdefault(
+                context,
+                {
+                    "eval_index": [],
+                    "ttot": [],
+                    "metric": [],
+                    "metric_label": "DR",
+                    "measurement_ok": [],
+                    "discarded_eval_index": [],
+                    "discarded_ttot": [],
+                    "discarded_metric": [],
+                    "bo1d_trace": None,
+                },
+            )
+            state["bo1d_trace"] = dict(payload.get("trace") or {})
+            self._refresh_bo1d_plot(context)
+            return
+
         if kind == "evaluation":
             self._update_value_labels(dict(payload.get("display_values") or {}))
             state = self._plot_state.setdefault(
                 context,
-                {"eval_index": [], "ttot": [], "metric": [], "metric_label": "DR", "measurement_ok": []},
+                {
+                    "eval_index": [],
+                    "ttot": [],
+                    "metric": [],
+                    "metric_label": "DR",
+                    "measurement_ok": [],
+                    "discarded_eval_index": [],
+                    "discarded_ttot": [],
+                    "discarded_metric": [],
+                    "bo1d_trace": None,
+                },
             )
             state["eval_index"].append(int(payload.get("eval_index", len(state["eval_index"]) + 1)))
             state["ttot"].append(float(payload.get("ttot", float("nan"))))
@@ -3538,6 +4061,7 @@ class MainWindow(QMainWindow):
     def _update_mode_ui(self):
         is_seq = (self.mode_box.currentText() == "SEQUENTIAL")
         self.seq_method_box.setEnabled(is_seq)
+        self.grp_group_bo_budget.setEnabled(not is_seq)
         enable_kly_subgroups = (self.mode_box.currentText() == "GROUP_BO") and self.chk_kly_phase.isChecked()
         self.chk_kly_group1.setEnabled(enable_kly_subgroups)
         self.chk_kly_group2.setEnabled(enable_kly_subgroups)
@@ -3545,7 +4069,10 @@ class MainWindow(QMainWindow):
     def _capture_machine_origin(self, config: Dict[str, Any]) -> Dict[str, Any]:
         interface = self._ensure_interface()
         restore_pvs = [str(pv) for pv in list(config.get("restore_pvs", RESTORE_PVS))]
-        setpoints = {pv: float(interface.read_current(pv, None)) for pv in restore_pvs}
+        setpoints = {
+            pv: float(interface.read_current(pv, _default_readback_pv(pv)))
+            for pv in restore_pvs
+        }
         initial_ict, initial_measurement_ok, initial_measurement_reason = _read_icts_with_retry(
             interface,
             downstream_key=str(config.get("downstream_ict", "DR")).upper().replace("LN0", "L0"),
@@ -3624,18 +4151,18 @@ class MainWindow(QMainWindow):
             str(pv): float(value)
             for pv, value in dict(origin.get("initial_setpoints", {}) or {}).items()
         }
-        interface = self._ensure_interface()
+        final_setpoints = {
+            str(pv): float(value)
+            for pv, value in dict(self._last_setpoint_values or {}).items()
+        }
         lines = [
-            "[FINAL DELTA] final - initial",
+            "[FINAL DELTA] final set - initial set",
             "Device | Initial | Final | Delta",
         ]
         has_row = False
         for label, pv_write, pv_read, unit in specs:
             initial = float(initial_setpoints.get(pv_write, float("nan")))
-            try:
-                final = float(interface.read_current(pv_write, pv_read))
-            except Exception:
-                final = float("nan")
+            final = float(final_setpoints.get(pv_write, float("nan")))
             delta = final - initial if np.isfinite(initial) and np.isfinite(final) else float("nan")
             lines.append(
                 f"{label} | {_format_machine_value(initial, unit)} | "
@@ -3687,6 +4214,100 @@ class MainWindow(QMainWindow):
         with open(snap_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _resume_plot_metric_value(self, row: Dict[str, Any], fallback_label: Optional[str] = None) -> tuple[str, float]:
+        metric_label = str(row.get("ObjectiveLabel", "") or fallback_label or row.get("ScoreDownstreamICT", "Metric"))
+        objective_type = str(row.get("ObjectiveType", DEVELOPER_OBJECTIVE_ICT)).upper()
+        try:
+            metric_value = float(row.get("ObjectiveValue", float("nan")))
+        except Exception:
+            metric_value = float("nan")
+        if objective_type == DEVELOPER_OBJECTIVE_BPM and not np.isfinite(metric_value):
+            try:
+                metric_value = float(row.get("BPMMetric", float("nan")))
+            except Exception:
+                metric_value = float("nan")
+        if np.isfinite(metric_value):
+            return metric_label, metric_value
+
+        downstream_name = str(row.get("ScoreDownstreamICT", metric_label)).upper()
+        if downstream_name == "L0":
+            downstream_name = "LN0"
+        downstream_column = "ICT_L0" if downstream_name == "LN0" else f"ICT_{downstream_name}"
+        try:
+            metric_value = float(row.get(downstream_column, float("nan")))
+        except Exception:
+            metric_value = float("nan")
+        if not metric_label:
+            metric_label = downstream_name or "Metric"
+        return metric_label, metric_value
+
+    def _prime_eval_plot_from_resume(self, csv_path: Path, *, profile: str, metric_label: Optional[str] = None) -> None:
+        if not csv_path.exists():
+            return
+
+        resume_rows: List[Dict[str, Any]] = []
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for raw in reader:
+                if not raw:
+                    continue
+                label, metric_value = self._resume_plot_metric_value(raw, metric_label)
+                try:
+                    ttot = float(raw.get("Ttot", float("nan")))
+                except Exception:
+                    ttot = float("nan")
+                note = str(raw.get("Note", ""))
+                resume_rows.append({
+                    "ttot": ttot,
+                    "metric": metric_value,
+                    "metric_label": label,
+                    "measurement_ok": "ICT_INVALID_ZERO" not in note,
+                })
+
+        if not resume_rows:
+            return
+
+        kept_rows = resume_rows[:-1]
+        discarded_rows = resume_rows[-1:]
+        context = str(profile or RUN_PROFILE_MAIN).upper()
+        state = self._plot_state.setdefault(
+            context,
+            {
+                "eval_index": [],
+                "ttot": [],
+                "metric": [],
+                "metric_label": "DR",
+                "measurement_ok": [],
+                "discarded_eval_index": [],
+                "discarded_ttot": [],
+                "discarded_metric": [],
+            },
+        )
+        state["eval_index"] = [idx for idx in range(1, len(kept_rows) + 1)]
+        state["ttot"] = [float(row["ttot"]) for row in kept_rows]
+        state["metric"] = [float(row["metric"]) for row in kept_rows]
+        state["measurement_ok"] = [bool(row["measurement_ok"]) for row in kept_rows]
+        if metric_label is not None:
+            state["metric_label"] = str(metric_label)
+        elif resume_rows:
+            state["metric_label"] = str(resume_rows[-1].get("metric_label", state.get("metric_label", "DR")))
+
+        if discarded_rows:
+            discarded = discarded_rows[0]
+            state["discarded_eval_index"] = [len(kept_rows) + 1]
+            state["discarded_ttot"] = [float(discarded.get("ttot", float("nan")))]
+            state["discarded_metric"] = [float(discarded.get("metric", float("nan")))]
+            self._append_log_text(
+                f"[RESUME] Dropped last plot point from {csv_path.name}; it will be re-measured.",
+                profile=context,
+            )
+        else:
+            state["discarded_eval_index"] = []
+            state["discarded_ttot"] = []
+            state["discarded_metric"] = []
+
+        self._refresh_eval_plot(context)
+
     def _apply_config_to_ui(self, payload: Dict[str, Any]):
         run_profile = str(payload.get("run_profile", RUN_PROFILE_MAIN)).upper()
         mode = str(payload.get("mode", self.mode_box.currentText()))
@@ -3703,6 +4324,12 @@ class MainWindow(QMainWindow):
         self.chk_qa.setChecked(bool(payload.get("qa", self.chk_qa.isChecked())))
         self.chk_qm.setChecked(bool(payload.get("qm", self.chk_qm.isChecked())))
         self.sp_settle_sec.setValue(float(payload.get("settle_sec", self.sp_settle_sec.value())))
+        # Old saved configurations predate this setting; they must retain the
+        # historical effective GP behavior rather than inheriting the GUI's
+        # learned-preset default.
+        hp_mode = str(payload.get("bo_hyperparameter_mode", "legacy_fixed"))
+        if self.bo_hyperparameter_mode_box.findText(hp_mode) >= 0:
+            self.bo_hyperparameter_mode_box.setCurrentText(hp_mode)
         self.sp_score_w_ttot.setValue(float(payload.get("score_w_ttot", self.sp_score_w_ttot.value())))
         self.sp_score_w_downstream.setValue(
             float(payload.get("score_w_downstream", self.sp_score_w_downstream.value())))
@@ -3724,6 +4351,12 @@ class MainWindow(QMainWindow):
         self.sp_qm_step.setValue(float(payload.get("qm_step_a", self.sp_qm_step.value())))
         self.sp_timing_step.setValue(float(payload.get("timing_step_ns", self.sp_timing_step.value())))
         self.sp_timing_half_steps.setValue(int(payload.get("timing_half_steps", self.sp_timing_half_steps.value())))
+        for spec in GROUP_BO_MAX_EVAL_SPECS:
+            box = self.group_bo_max_eval_spinboxes.get(str(spec["config_id"]))
+            if box is None:
+                continue
+            key = _group_bo_max_evals_config_key(str(spec["config_id"]))
+            box.setValue(int(payload.get(key, box.value())))
         self._update_mode_ui()
 
         if run_profile == RUN_PROFILE_DEVELOPER:
@@ -3956,6 +4589,8 @@ class MainWindow(QMainWindow):
             "score_w_downstream": float(self.dev_sp_score_w_downstream.value()),
             "downstream_ict": str(self.dev_downstream_ict_box.currentText()),
             "settle_sec": float(self.sp_settle_sec.value()),
+            "bo_hyperparameter_mode": str(self.bo_hyperparameter_mode_box.currentText()),
+            "bo_length_scale_n_step_floor": 2.0,
             "restore_pvs": restore_pvs,
             "reuse_initial_eval": True,
             "resume_csv_path": str(Path(resume_path_text).expanduser().resolve()) if resume_path_text else "",
@@ -3981,6 +4616,12 @@ class MainWindow(QMainWindow):
         metric_label = str(
             self.dev_downstream_ict_box.currentText()) if objective_key == DEVELOPER_OBJECTIVE_ICT else f"BPM {self.dev_bpm_plane_box.currentText()} sumsq"
         self._reset_eval_plot(metric_label, profile=RUN_PROFILE_DEVELOPER)
+        if resume_path_text:
+            self._prime_eval_plot_from_resume(
+                Path(resume_path_text).expanduser(),
+                profile=RUN_PROFILE_DEVELOPER,
+                metric_label=metric_label,
+            )
         self._refresh_current_values()
         self._refresh_developer_live_values()
         self._set_status(f"Status: RUNNING {mode}", state="running", profile=RUN_PROFILE_DEVELOPER)
@@ -4008,6 +4649,8 @@ class MainWindow(QMainWindow):
         config = {
             "mode": mode,
             "settle_sec": float(self.sp_settle_sec.value()),
+            "bo_hyperparameter_mode": str(self.bo_hyperparameter_mode_box.currentText()),
+            "bo_length_scale_n_step_floor": 2.0,
             "score_w_ttot": float(getattr(self, "sp_score_w_ttot").value()),
             "score_w_downstream": float(getattr(self, "sp_score_w_downstream").value()),
             "downstream_ict": str(getattr(self, "cb_downstream_ict").currentText()),
@@ -4045,6 +4688,11 @@ class MainWindow(QMainWindow):
             "restore_pvs": list(RESTORE_PVS),
             "resume_csv_path": str(Path(resume_path_text).expanduser().resolve()) if resume_path_text else "",
         }
+        for spec in GROUP_BO_MAX_EVAL_SPECS:
+            box = self.group_bo_max_eval_spinboxes.get(str(spec["config_id"]))
+            if box is None:
+                continue
+            config[_group_bo_max_evals_config_key(str(spec["config_id"]))] = int(box.value())
 
         if not (config["gun_sol_l0_phase"] or config["kly_phase"] or config["timing"] or config["qa"] or config["qm"]):
             QMessageBox.warning(self, "Warning", "Please select at least one target.")
@@ -4072,6 +4720,12 @@ class MainWindow(QMainWindow):
         self._update_result_label("Result: running...", profile=RUN_PROFILE_MAIN)
         self._prepare_target_states_for_run(mode)
         self._reset_eval_plot(config["downstream_ict"], profile=RUN_PROFILE_MAIN)
+        if resume_path_text:
+            self._prime_eval_plot_from_resume(
+                Path(resume_path_text).expanduser(),
+                profile=RUN_PROFILE_MAIN,
+                metric_label=config["downstream_ict"],
+            )
         self._refresh_current_values()
         self._set_status(f"Status: RUNNING {mode}", state="running", profile=RUN_PROFILE_MAIN)
         self._set_main_run_controls_enabled(False)
@@ -4116,6 +4770,11 @@ class MainWindow(QMainWindow):
 
     def optimization_finished(self):
         finished_profile = self._run_profile
+        if self.worker is not None:
+            self._last_setpoint_values = {
+                str(pv): float(value)
+                for pv, value in dict(getattr(self.worker, "_current_pv_values", {}) or {}).items()
+            }
         self.worker = None
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)

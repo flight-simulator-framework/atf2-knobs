@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import csv
+import importlib.util
+import sys
 import traceback
 import threading
 from dataclasses import asdict
@@ -26,6 +28,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+
+_GUI_DIR = Path(__file__).resolve().parent
+_KNOBS_DIR = _GUI_DIR.parent
+_REPO_ROOT = _KNOBS_DIR.parent
+for _path in (str(_KNOBS_DIR), str(_REPO_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
@@ -40,16 +49,43 @@ from PyQt6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from Knobs.IPBSM_Opt import (
-    Optimizer, OptimizerConfig, StopFlag,
-    build_gf_axiswise_fit, fit_gaussian_from_samples, plot_bo_gp_heatmap, plot_results, now_tag,
-    EPICSIPBSMController, DAT_CSV_COLUMNS,
-)
-from Knobs.IPBSM_Opt import IPBSMInterface
+def _load_ipbsm_opt_module():
+    module_name = "Knobs.IPBSM_Opt"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    legacy_name = "IPBSM_Opt"
+    if legacy_name in sys.modules:
+        return sys.modules[legacy_name]
+
+    module_path = _KNOBS_DIR / "IPBSM_Opt.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(f"Could not load module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    sys.modules.setdefault(legacy_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+_IPBSM_OPT = _load_ipbsm_opt_module()
+
+Optimizer = _IPBSM_OPT.Optimizer
+OptimizerConfig = _IPBSM_OPT.OptimizerConfig
+StopFlag = _IPBSM_OPT.StopFlag
+build_gf_axiswise_fit = _IPBSM_OPT.build_gf_axiswise_fit
+fit_gaussian_from_samples = _IPBSM_OPT.fit_gaussian_from_samples
+plot_bo_gp_heatmap = _IPBSM_OPT.plot_bo_gp_heatmap
+plot_results = _IPBSM_OPT.plot_results
+now_tag = _IPBSM_OPT.now_tag
+EPICSIPBSMController = _IPBSM_OPT.EPICSIPBSMController
+DAT_CSV_COLUMNS = _IPBSM_OPT.DAT_CSV_COLUMNS
+IPBSMInterface = _IPBSM_OPT.IPBSMInterface
 
 
 ZSCAN_DEFAULT_RANGE = 0.0085
 ZSCAN_DEFAULT_STEP = 0.001
+DEFAULT_IPBSM_OUTPUT_BASE_DIR = Path("/atf/data/flight-simulator/IPBSMOpt")
 ZAY_PRESET_INIT_POINTS = 9
 ZAY_PRESET_MAX_STEPS = 20
 ZSCAN_KNOBS = ["Z scan knob"]
@@ -119,6 +155,10 @@ EI_STOP_MODES = {
 }
 
 
+def default_output_base_dir() -> Path:
+    return DEFAULT_IPBSM_OUTPUT_BASE_DIR
+
+
 def recommended_initial_points(d: int) -> int:
     if d <= 0:
         return 3
@@ -166,7 +206,9 @@ class OptimizerWorker(QThread):
         self._pause_event.wait()
         return self._pause_continue
 
-    def resume_from_pause(self, should_continue: bool = True) -> None:
+    def resume_from_pause(self, should_continue: bool = True, *, remeasure_current_point: bool = False) -> None:
+        if should_continue and remeasure_current_point:
+            self.optimizer.request_remeasure_current_point()
         self._pause_continue = bool(should_continue)
         self._pause_event.set()
 
@@ -220,6 +262,12 @@ class MainWindow(QMainWindow):
         self.live_average: List[float] = []
         self.live_average_limit: Optional[float] = None
         self.live_chosen_by: List[str] = []
+        self.live_discarded_eval_index: List[int] = []
+        self.live_discarded_modulation: List[float] = []
+        self.live_discarded_average: List[float] = []
+        self.live_discarded_chosen_by: List[str] = []
+        self.resume_discarded_rows: List[Dict[str, Any]] = []
+        self.bo1d_trace: Optional[Dict[str, Any]] = None
         self._last_recommended_n_init = 0
         self._last_recommended_max_steps = 0
         self._last_recommended_candidate_pool = 0
@@ -507,6 +555,12 @@ class MainWindow(QMainWindow):
         self.ax_live = self.fig.add_subplot(211)
         self.ax_live_avg = self.fig.add_subplot(212, sharex=self.ax_live)
         live_layout.addWidget(self.canvas)
+        self.bo1d_fig = Figure(figsize=(9, 5.2), tight_layout=True)
+        self.bo1d_canvas = FigureCanvas(self.bo1d_fig)
+        self.bo1d_ax_obj = self.bo1d_fig.add_subplot(211)
+        self.bo1d_ax_acq = self.bo1d_fig.add_subplot(212, sharex=self.bo1d_ax_obj)
+        self.bo1d_canvas.setVisible(False)
+        live_layout.addWidget(self.bo1d_canvas)
         self.main_view_stack.addWidget(live_view)
 
         self.gallery_scroll = QScrollArea()
@@ -581,8 +635,8 @@ class MainWindow(QMainWindow):
         self.acq_box.setEnabled(False)
 
         self.kernel_box = QComboBox()
-        self.kernel_box.addItems(["matern52", "matern32"])
-        self.kernel_box.setCurrentText("matern52")
+        self.kernel_box.addItems(["rbf", "matern52", "matern32"])
+        self.kernel_box.setCurrentText("rbf")
 
         self.bounds_sigma_mult = QDoubleSpinBox()
         self.bounds_sigma_mult.setRange(0.5, 10.0)
@@ -607,7 +661,13 @@ class MainWindow(QMainWindow):
         self.zscan_step.setSingleStep(0.0001)
         self.zscan_step.setValue(ZSCAN_DEFAULT_STEP)
 
-        self.output_dir_edit = QLineEdit(str(Path("Data").resolve()))
+        self.zscan_sigma_box = QDoubleSpinBox()
+        self.zscan_sigma_box.setRange(0.0001, 1.0)
+        self.zscan_sigma_box.setDecimals(4)
+        self.zscan_sigma_box.setSingleStep(0.0001)
+        self.zscan_sigma_box.setValue(float(DEFAULT_SIGMAS["Z scan knob"]))
+
+        self.output_dir_edit = QLineEdit(str(default_output_base_dir()))
         self.output_dir_browse_btn = QPushButton("Browse...")
 
         self.n_init = QSpinBox()
@@ -682,6 +742,9 @@ class MainWindow(QMainWindow):
         form.addRow("Method", self.method_box)
         form.addRow("Acquisition", self.acq_box)
         form.addRow("GP kernel", self.kernel_box)
+        form.addRow("GP hyperparameter mode", self.hyperparameter_mode_box)
+        form.addRow("Z-scan kernel", self.zscan_kernel_box)
+        form.addRow("Z-scan initial points", self.zscan_initial_points_box)
         form.addRow("Bounds = +/- n sigma", self.bounds_sigma_mult)
         form.addRow("Knob step", self.knob_step)
         out_row = QWidget()
@@ -717,20 +780,6 @@ class MainWindow(QMainWindow):
         form.addRow("EI stop rule", self.ei_stop_row)
         form.addRow("EI stop guide", self.ei_stop_hint_lbl)
 
-        zscan_cfg_group = QGroupBox("Z Scan Settings")
-        layout.addWidget(zscan_cfg_group)
-        zscan_cfg_layout = QHBoxLayout(zscan_cfg_group)
-        zscan_cfg_layout.setContentsMargins(14, 12, 14, 12)
-        zscan_cfg_layout.addWidget(QLabel("Range (+/-)"))
-        zscan_cfg_layout.addWidget(self.zscan_range)
-        zscan_cfg_layout.addSpacing(12)
-        zscan_cfg_layout.addWidget(QLabel("Step"))
-        zscan_cfg_layout.addWidget(self.zscan_step)
-        zscan_cfg_layout.addSpacing(16)
-        zscan_cfg_hint = QLabel("Visible and editable here for quick tuning.")
-        zscan_cfg_hint.setStyleSheet("color: #5c6670;")
-        zscan_cfg_layout.addWidget(zscan_cfg_hint, stretch=1)
-
         sigma_group = QGroupBox("Representative Sigma Per Axis")
         layout.addWidget(sigma_group)
         sigma_layout = QVBoxLayout(sigma_group)
@@ -759,6 +808,26 @@ class MainWindow(QMainWindow):
             box.setMaximumWidth(120)
             self.sigma_boxes[name] = box
             sigma_form.addRow(f"sigma[{name}]", box)
+
+        zscan_group = QGroupBox("Z Scan Parameter")
+        sigma_layout.addWidget(zscan_group)
+        zscan_param_layout = QGridLayout(zscan_group)
+        zscan_param_layout.setContentsMargins(12, 10, 12, 10)
+        zscan_param_layout.setHorizontalSpacing(10)
+        zscan_param_layout.setVerticalSpacing(6)
+        zscan_param_layout.addWidget(QLabel("Knob"), 0, 0)
+        zscan_param_layout.addWidget(QLabel("Sigma (GF)"), 0, 1)
+        zscan_param_layout.addWidget(QLabel("Range (+/-) (BO)"), 0, 2)
+        zscan_param_layout.addWidget(QLabel("Step"), 0, 3)
+        zscan_param_layout.addWidget(QLabel("Z scan knob"), 1, 0)
+        zscan_param_layout.addWidget(self.zscan_sigma_box, 1, 1)
+        zscan_param_layout.addWidget(self.zscan_range, 1, 2)
+        zscan_param_layout.addWidget(self.zscan_step, 1, 3)
+        self.zscan_param_hint_lbl = QLabel(
+            "GF uses Sigma and Step. BO uses Range(+/-) and Step."
+        )
+        self.zscan_param_hint_lbl.setStyleSheet("color: #5c6670;")
+        zscan_param_layout.addWidget(self.zscan_param_hint_lbl, 2, 0, 1, 4)
 
         corrector_cfg_group = QGroupBox("Corrector Range / Origin")
         layout.addWidget(corrector_cfg_group)
@@ -860,6 +929,7 @@ class MainWindow(QMainWindow):
         self.main_sigma_mode_box.currentTextChanged.connect(self._sync_config_sigma_mode_box)
         self.zscan_method_bo.toggled.connect(self._on_zscan_method_changed)
         self.zscan_method_gf.toggled.connect(self._on_zscan_method_changed)
+        self.zscan_sigma_box.valueChanged.connect(self._refresh_zscan_status_label)
         self.zscan_range.valueChanged.connect(self._refresh_zscan_status_label)
         self.zscan_step.valueChanged.connect(self._refresh_zscan_status_label)
         self.output_dir_browse_btn.clicked.connect(self._browse_output_dir)
@@ -1080,13 +1150,14 @@ class MainWindow(QMainWindow):
     def _on_zscan_method_changed(self) -> None:
         if self.method_box.currentText().upper() == "BO":
             self._set_zscan_method("BO")
+        self._refresh_zscan_status_label()
 
     def _apply_sigma_mode(self, mode: str):
         for name, box in self.sigma_boxes.items():
             box.setValue(sigma_for_mode(mode, name))
 
     def _browse_output_dir(self):
-        current = self.output_dir_edit.text().strip() or str(Path("Data").resolve())
+        current = self.output_dir_edit.text().strip() or str(default_output_base_dir())
         path = QFileDialog.getExistingDirectory(self, "Select save directory", current)
         if path:
             self.output_dir_edit.setText(path)
@@ -1141,10 +1212,12 @@ class MainWindow(QMainWindow):
 
         pos_txt = f"{pos:+.4f}" if np.isfinite(pos) else "n/a"
 
+        sigma = float(self.zscan_sigma_box.value()) if hasattr(self, "zscan_sigma_box") else float(DEFAULT_SIGMAS["Z scan knob"])
         rng = float(self.zscan_range.value()) if hasattr(self, "zscan_range") else float(ZSCAN_DEFAULT_RANGE)
         step = float(self.zscan_step.value()) if hasattr(self, "zscan_step") else float(ZSCAN_DEFAULT_STEP)
+        z_method = "BO" if self.method_box.currentText().upper() == "BO" else self._get_zscan_method()
         self.zscan_status_lbl.setText(
-            f"{axis_name}:({pos_txt})  Range:+/-{rng:.4f}  Step:{step:.4f}"
+            f"{axis_name}:({pos_txt})  Zscan:{z_method}  Sigma:{sigma:.4f}  Range:+/-{rng:.4f}  Step:{step:.4f}"
         )
 
     def _find_resume_origin_file(self, csv_path: Path) -> Optional[Path]:
@@ -1163,7 +1236,8 @@ class MainWindow(QMainWindow):
             return json.load(f)
 
     def _browse_resume_file(self):
-        current = self.resume_file_edit.text().strip() or str(Path(self.output_dir_edit.text().strip() or "Data").resolve())
+        current_base = self.output_dir_edit.text().strip() or str(default_output_base_dir())
+        current = self.resume_file_edit.text().strip() or str(Path(current_base).expanduser().resolve())
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select interrupted measurements.csv",
@@ -1248,6 +1322,11 @@ class MainWindow(QMainWindow):
                 })
         return rows_out
 
+    def _split_resume_rows_for_remeasure(self, rows: List[Dict]) -> tuple[List[Dict], List[Dict]]:
+        if not rows:
+            return [], []
+        return list(rows[:-1]), [dict(rows[-1])]
+
     def _update_method_visibility(self):
         method = self.method_box.currentText().upper()
         is_gf = self._is_sequential_method(method)
@@ -1312,19 +1391,27 @@ class MainWindow(QMainWindow):
         if not params:
             raise ValueError("Select at least one knob.")
 
+        zscan_sigma_val = float(self.zscan_sigma_box.value())
         zscan_range_val = float(self.zscan_range.value())
         zscan_step_val = float(self.zscan_step.value())
+        if zscan_sigma_val <= 0.0:
+            raise ValueError("Z scan sigma must be positive.")
         if zscan_range_val <= 0.0:
             raise ValueError("Z scan range must be positive.")
         if zscan_step_val <= 0.0:
             raise ValueError("Z scan step must be positive.")
 
         sigma_map = {}
+        top_method = self.method_box.currentText().upper()
+        zscan_scan_method = "BO" if top_method == "BO" else self._get_zscan_method()
         for p in params:
             if p in self.sigma_boxes:
                 sigma_map[p] = float(self.sigma_boxes[p].value())
             elif p in ZSCAN_KNOBS:
-                sigma_map[p] = max(zscan_step_val, 0.5 * zscan_range_val)
+                if zscan_scan_method == "GF":
+                    sigma_map[p] = float(zscan_sigma_val)
+                else:
+                    sigma_map[p] = max(zscan_step_val, 0.5 * zscan_range_val)
             else:
                 sigma_map[p] = float(DEFAULT_SIGMAS.get(p, 0.5))
         knob_step = float(self.knob_step.value())
@@ -1341,8 +1428,13 @@ class MainWindow(QMainWindow):
                 hi = round(float(self.upper_bound_boxes[p].value()) / axis_step) * axis_step
             elif p in ZSCAN_KNOBS:
                 origin_map[p] = float(DEFAULT_ORIGINS.get(p, 0.0))
-                lo = round((-zscan_range_val) / axis_step) * axis_step
-                hi = round((+zscan_range_val) / axis_step) * axis_step
+                if zscan_scan_method == "BO":
+                    lo = round((-zscan_range_val) / axis_step) * axis_step
+                    hi = round((+zscan_range_val) / axis_step) * axis_step
+                else:
+                    span = half_range_mult * sigma_map[p]
+                    lo = round((-span) / axis_step) * axis_step
+                    hi = round((+span) / axis_step) * axis_step
             else:
                 origin_map[p] = float(DEFAULT_ORIGINS.get(p, 0.0))
                 span = half_range_mult * sigma_map[p]
@@ -1371,7 +1463,7 @@ class MainWindow(QMainWindow):
             knob_step=knob_step,
             param_steps=param_steps,
             zscan_axis_names=list(ZSCAN_KNOBS),
-            zscan_method=("BO" if self.method_box.currentText().upper() == "BO" else self._get_zscan_method()),
+            zscan_method=zscan_scan_method,
             zscan_range=float(zscan_range_val),
             zscan_step=float(zscan_step_val),
             max_steps=int(self.bo_max_steps.value()),
@@ -1384,6 +1476,11 @@ class MainWindow(QMainWindow):
             gp_kernel=self.kernel_box.currentText(),
             gp_length_scale=1.0,
             gp_ard_length_scales=sigma_map,
+            hyperparameter_mode=self.hyperparameter_mode_box.currentText(),
+            zscan_kernel=self.zscan_kernel_box.currentText(),
+            zscan_initial_points=int(self.zscan_initial_points_box.value()),
+            length_scale_n_step_floor=2.0,
+            hyperparameter_preset_version="BO2026-conservative-v1",
             gp_signal_var=float(self.gp_sig.value()),
             gp_noise_var=float(self.gp_noise.value()),
             ucb_beta=float(self.ucb_beta.value()),
@@ -1404,14 +1501,22 @@ class MainWindow(QMainWindow):
         elif method_name.upper() in {"TRBO", "LQO", "LQF"}:
             method_name = "BO"
         self.method_box.setCurrentText(method_name)
-        self.kernel_box.setCurrentText(cfg.get("gp_kernel", "matern52"))
+        self.kernel_box.setCurrentText(cfg.get("gp_kernel", "rbf"))
         self.acq_box.setCurrentText(cfg.get("acquisition", "EI"))
+        # Pre-BO2026 config files do not have this key and must retain their
+        # previous init_sigma-derived ARD behavior.
+        self.hyperparameter_mode_box.setCurrentText(cfg.get("hyperparameter_mode", "legacy_fixed"))
+        self.zscan_kernel_box.setCurrentText(cfg.get("zscan_kernel", "rbf"))
+        self.zscan_initial_points_box.setValue(int(cfg.get("zscan_initial_points", 3)))
 
         init_sigma = cfg.get("init_sigma", {})
         param_origins = cfg.get("param_origins", {})
         bounds = cfg.get("bounds", {})
         for name, box in self.sigma_boxes.items():
             box.setValue(float(init_sigma.get(name, DEFAULT_SIGMAS[name])))
+        self.zscan_sigma_box.setValue(
+            float(cfg.get("zscan_sigma", init_sigma.get("Z scan knob", DEFAULT_SIGMAS["Z scan knob"])))
+        )
         self._set_zscan_method(str(cfg.get("zscan_method", "BO")))
         self.zscan_range.setValue(float(cfg.get("zscan_range", ZSCAN_DEFAULT_RANGE)))
         self.zscan_step.setValue(float(cfg.get("zscan_step", ZSCAN_DEFAULT_STEP)))
@@ -1797,6 +1902,7 @@ class MainWindow(QMainWindow):
             average_pause_ratio=float(getattr(cfg, "average_pause_ratio", 0.80)),
             include_1d=True,
             bo_data_only_1d=bool(bo_data_only_1d),
+            discarded_rows=self.resume_discarded_rows,
         )
         png_saved = [p for p in saved if str(p).lower().endswith(".png")]
         self._populate_gallery(
@@ -1829,15 +1935,118 @@ class MainWindow(QMainWindow):
         self.live_average = []
         self.live_average_limit = None
         self.live_chosen_by = []
+        self.live_discarded_eval_index = []
+        self.live_discarded_modulation = []
+        self.live_discarded_average = []
+        self.live_discarded_chosen_by = []
+        self.resume_discarded_rows = []
+        self._set_bo1d_trace(None)
         self._redraw_live_plot()
 
-    def _prime_live_history(self, warm_start_rows: List[Dict]) -> None:
+    def _set_bo1d_trace(self, trace: Optional[Dict[str, Any]]) -> None:
+        self.bo1d_trace = dict(trace or {}) if trace else None
+        visible = bool(self.bo1d_trace and self.bo1d_trace.get("x_grid"))
+        self.bo1d_canvas.setVisible(visible)
+        self._redraw_bo1d_plot()
+
+    def _redraw_bo1d_plot(self) -> None:
+        self.bo1d_ax_obj.clear()
+        self.bo1d_ax_acq.clear()
+        trace = dict(self.bo1d_trace or {})
+        if not trace:
+            self.bo1d_canvas.draw_idle()
+            return
+
+        x_grid = np.asarray(trace.get("x_grid", []), dtype=float)
+        y_mean = np.asarray(trace.get("y_mean", []), dtype=float)
+        y_std = np.asarray(trace.get("y_std", []), dtype=float)
+        acq = np.asarray(trace.get("acquisition", []), dtype=float)
+        x_obs = np.asarray(trace.get("x_obs", []), dtype=float)
+        y_obs = np.asarray(trace.get("y_obs", []), dtype=float)
+        chosen_x = float(trace.get("chosen_x", float("nan")))
+        chosen_acq = float(trace.get("chosen_acq", float("nan")))
+        axis_name = str(trace.get("axis", "Parameter"))
+        y_label = str(trace.get("y_label", "Objective"))
+        acq_label = str(trace.get("acquisition_label", "Acquisition"))
+        direction = str(trace.get("direction", "maximize")).lower()
+        note = str(trace.get("note", "") or "")
+
+        if x_grid.size and y_mean.size == x_grid.size and y_std.size == x_grid.size:
+            lo_band = y_mean - y_std
+            hi_band = y_mean + y_std
+            mask = np.isfinite(x_grid) & np.isfinite(lo_band) & np.isfinite(hi_band)
+            if np.any(mask):
+                self.bo1d_ax_obj.fill_between(
+                    x_grid[mask], lo_band[mask], hi_band[mask],
+                    color="#cfe8ff", alpha=0.65, label="Surrogate ±1σ",
+                )
+            mean_mask = np.isfinite(x_grid) & np.isfinite(y_mean)
+            if np.any(mean_mask):
+                self.bo1d_ax_obj.plot(
+                    x_grid[mean_mask], y_mean[mean_mask],
+                    linestyle="--", linewidth=1.8, color="#1d4ed8", label="Surrogate mean",
+                )
+
+        obs_mask = np.isfinite(x_obs) & np.isfinite(y_obs)
+        if np.any(obs_mask):
+            self.bo1d_ax_obj.plot(
+                x_obs[obs_mask], y_obs[obs_mask],
+                linestyle="None", marker="o", markersize=6,
+                color="#111827", label="Measured points",
+            )
+
+        if np.isfinite(chosen_x):
+            self.bo1d_ax_obj.axvline(chosen_x, color="#b45309", linestyle=":", linewidth=1.6, label="Chosen x")
+            self.bo1d_ax_acq.axvline(chosen_x, color="#b45309", linestyle=":", linewidth=1.6)
+
+        acq_mask = np.isfinite(x_grid) & np.isfinite(acq)
+        if np.any(acq_mask):
+            self.bo1d_ax_acq.plot(
+                x_grid[acq_mask], acq[acq_mask],
+                color="#d97706", linewidth=1.8, label=f"{acq_label} acquisition",
+            )
+        if np.isfinite(chosen_x) and np.isfinite(chosen_acq):
+            self.bo1d_ax_acq.plot(
+                [chosen_x], [chosen_acq],
+                linestyle="None", marker="o", markersize=7,
+                color="#92400e", label="Chosen: max acquisition",
+            )
+
+        goal_text = "higher is better" if direction == "maximize" else "lower is better"
+        self.bo1d_ax_obj.set_title(f"1D BO surrogate for {axis_name} ({goal_text})")
+        self.bo1d_ax_obj.set_ylabel(y_label)
+        self.bo1d_ax_obj.grid(True, alpha=0.3)
+        if note:
+            self.bo1d_ax_obj.text(
+                0.01, 0.98, note,
+                transform=self.bo1d_ax_obj.transAxes,
+                ha="left", va="top", fontsize=8.5, color="#475569",
+            )
+
+        self.bo1d_ax_acq.set_title("Why this point was chosen")
+        self.bo1d_ax_acq.set_xlabel(axis_name)
+        self.bo1d_ax_acq.set_ylabel(acq_label)
+        self.bo1d_ax_acq.grid(True, alpha=0.3)
+
+        handles_obj, labels_obj = self.bo1d_ax_obj.get_legend_handles_labels()
+        if handles_obj:
+            self.bo1d_ax_obj.legend(loc="best")
+        handles_acq, labels_acq = self.bo1d_ax_acq.get_legend_handles_labels()
+        if handles_acq:
+            self.bo1d_ax_acq.legend(loc="best")
+        self.bo1d_canvas.draw_idle()
+
+    def _prime_live_history(self, warm_start_rows: List[Dict], discarded_rows: Optional[List[Dict]] = None) -> None:
         self.live_eval_index = []
         self.live_modulation = []
         self.live_best = []
         self.live_average = []
         self.live_average_limit = None
         self.live_chosen_by = []
+        self.live_discarded_eval_index = []
+        self.live_discarded_modulation = []
+        self.live_discarded_average = []
+        self.live_discarded_chosen_by = []
         best = None
         ratio = float(getattr(self.last_run_cfg, "average_pause_ratio", self.avg_pause_ratio.value()))
         for idx, item in enumerate(warm_start_rows, start=1):
@@ -1858,6 +2067,24 @@ class MainWindow(QMainWindow):
             self.live_average.append(avg)
             if self.live_average_limit is None and np.isfinite(avg):
                 self.live_average_limit = float(avg) * ratio
+        for item in list(discarded_rows or []):
+            try:
+                step = int(item.get("step", len(self.live_eval_index) + len(self.live_discarded_eval_index) + 1))
+                y = float(item.get("y", float("nan")))
+            except Exception:
+                continue
+            if not np.isfinite(y):
+                continue
+            self.live_discarded_eval_index.append(step)
+            self.live_discarded_modulation.append(y)
+            self.live_discarded_chosen_by.append(str(item.get("chosen_by", "warm_start_discarded")))
+            dat = dict(item.get("dat", {}) or {})
+            try:
+                avg = float(dat.get("average", float("nan")))
+            except Exception:
+                avg = float("nan")
+            self.live_discarded_average.append(avg)
+        self._set_bo1d_trace(None)
         self._redraw_live_plot()
 
     def _redraw_live_plot(self):
@@ -1922,6 +2149,30 @@ class MainWindow(QMainWindow):
                         label=f"Pause limit: {lim:.3f}",
                     )
                     self.ax_live_avg.legend(loc="best")
+        if self.live_discarded_eval_index:
+            self.ax_live.plot(
+                self.live_discarded_eval_index,
+                self.live_discarded_modulation,
+                linestyle="None",
+                marker="x",
+                color="#dc2626",
+                markersize=8,
+                markeredgewidth=2.0,
+                zorder=4,
+            )
+            xs_disc = np.asarray(self.live_discarded_eval_index, float)
+            ys_disc = np.asarray(self.live_discarded_average, float)
+            disc_mask = np.isfinite(xs_disc) & np.isfinite(ys_disc)
+            if np.any(disc_mask):
+                self.ax_live_avg.plot(
+                    xs_disc[disc_mask],
+                    ys_disc[disc_mask],
+                    linestyle="None",
+                    marker="x",
+                    color="#dc2626",
+                    markersize=8,
+                    markeredgewidth=2.0,
+                )
         self.ax_live.set_title("IPBSM modulation vs evaluation")
         self.ax_live.set_ylabel("Modulation")
         self.ax_live.grid(True, alpha=0.3)
@@ -1939,6 +2190,7 @@ class MainWindow(QMainWindow):
             return
         payload = asdict(cfg)
         payload["output_base_dir"] = self.output_dir_edit.text().strip()
+        payload["zscan_sigma"] = float(self.zscan_sigma_box.value())
         path, _ = QFileDialog.getSaveFileName(self, "Save config", "", "JSON (*.json)")
         if not path:
             return
@@ -1974,7 +2226,7 @@ class MainWindow(QMainWindow):
             return
 
         tag = now_tag()
-        output_base_dir = Path(self.output_dir_edit.text().strip() or "Data")
+        output_base_dir = Path(self.output_dir_edit.text().strip() or str(default_output_base_dir())).expanduser()
         out_dir = self._build_run_output_dir(
             output_base_dir,
             tag,
@@ -1985,21 +2237,23 @@ class MainWindow(QMainWindow):
         self.last_run_cfg = cfg
         self.stop_flag = StopFlag()
         warm_start_rows: List[Dict] = []
+        warm_start_rows_all: List[Dict] = []
+        resume_discarded_rows: List[Dict] = []
         baseline_state: Optional[Dict[str, Any]] = None
 
         resume_path_text = self.resume_file_edit.text().strip()
         if resume_path_text:
             try:
                 resume_path = Path(resume_path_text).expanduser().resolve()
-                warm_start_rows = self._load_warm_start_rows(resume_path)
+                warm_start_rows_all = self._load_warm_start_rows(resume_path)
                 baseline_state = self._load_resume_origin_state(resume_path)
             except Exception as e:
                 QMessageBox.warning(self, "Resume file error", str(e))
                 return
-            if not warm_start_rows:
+            if not warm_start_rows_all:
                 QMessageBox.warning(self, "Resume file error", "Resume CSV did not contain any valid measurements.")
                 return
-            resume_params = list(warm_start_rows[0]["x"].keys())
+            resume_params = list(warm_start_rows_all[0]["x"].keys())
             if resume_params != list(cfg.params):
                 QMessageBox.warning(
                     self,
@@ -2020,6 +2274,13 @@ class MainWindow(QMainWindow):
                         f"Resume: {resume_mode}",
                     )
                     return
+            warm_start_rows, resume_discarded_rows = self._split_resume_rows_for_remeasure(warm_start_rows_all)
+            if resume_discarded_rows:
+                discard_step = int(resume_discarded_rows[0].get("step", len(warm_start_rows) + 1))
+                discard_by = str(resume_discarded_rows[0].get("chosen_by", "warm_start"))
+                self._append_log(
+                    f"Resume: dropping previous step={discard_step} by={discard_by} and re-measuring it first."
+                )
 
         try:
             ctrl = self._make_controller(cfg, baseline_state=baseline_state)
@@ -2051,6 +2312,7 @@ class MainWindow(QMainWindow):
             out_dir=out_dir,
             stop_flag=self.stop_flag,
             warm_start_data=warm_start_rows,
+            resume_pending_row=resume_discarded_rows[0] if resume_discarded_rows else None,
         )
         self.current_measurements_csv = Path(opt.measurements_csv_path)
         self.worker = OptimizerWorker(opt)
@@ -2059,8 +2321,9 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self._on_failed)
         self.worker.pause_requested.connect(self._on_pause_requested)
 
-        if warm_start_rows:
-            self._prime_live_history(warm_start_rows)
+        self.resume_discarded_rows = list(resume_discarded_rows)
+        if warm_start_rows or resume_discarded_rows:
+            self._prime_live_history(warm_start_rows, discarded_rows=resume_discarded_rows)
         else:
             self._reset_live_history()
         self._clear_gallery()
@@ -2101,6 +2364,11 @@ class MainWindow(QMainWindow):
             self._set_active_scan_knobs(list(cfg.params))
         self._append_log(
             f"Run started: method={cfg.method} acquisition={cfg.acquisition} kernel={cfg.gp_kernel} params={cfg.params}"
+        )
+        self._append_log(
+            f"GP: mode={cfg.hyperparameter_mode} preset={cfg.hyperparameter_preset_version} "
+            f"z_kernel={cfg.zscan_kernel} z_init={cfg.zscan_initial_points} "
+            f"signal/noise=variance ({cfg.gp_signal_var:.6g}/{cfg.gp_noise_var:.6g})"
         )
         self._append_log(
             f"origin={cfg.param_origins} sigma={cfg.init_sigma} bounds={cfg.bounds} n_init={cfg.n_init_random} max_steps={cfg.bo_max_steps}"
@@ -2218,8 +2486,8 @@ class MainWindow(QMainWindow):
                 self._set_status("Status: stop requested from pause", state="warning")
                 self.worker.resume_from_pause(False)
             else:
-                self._set_status("Status: resumed", state="running")
-                self.worker.resume_from_pause(True)
+                self._set_status("Status: re-measuring paused point", state="running")
+                self.worker.resume_from_pause(True, remeasure_current_point=True)
             return
 
         avg = float(info.get("average", float("nan")))
@@ -2247,13 +2515,17 @@ class MainWindow(QMainWindow):
             self._set_status("Status: stop requested from average warning", state="warning")
             self.worker.resume_from_pause(False)
         else:
-            self._set_status("Status: resumed after warning", state="running")
-            self.worker.resume_from_pause(True)
+            self._set_status("Status: re-measuring warning point", state="running")
+            self.worker.resume_from_pause(True, remeasure_current_point=True)
 
     def _on_progress(self, payload: dict):
         step = int(payload.get("step", 0))
         info = payload.get("info", {})
         phase = str(info.get("phase", ""))
+        bo1d_trace = dict(info.get("bo1d_trace", {}) or {})
+        if bo1d_trace:
+            self._set_bo1d_trace(bo1d_trace)
+            self.main_view_stack.setCurrentIndex(0)
         y = info.get("y", None)
         best_y = info.get("best_y", None)
         chosen_by = str(info.get("chosen_by", ""))
@@ -2271,7 +2543,36 @@ class MainWindow(QMainWindow):
                     if ch in machine_vals:
                         self._run_current_values[ch] = float(machine_vals[ch])
 
-        if y is not None and phase in ("init", "loop", "axis_finalize"):
+        if phase == "discarded_measurement":
+            try:
+                avg = float(info.get("average", float("nan")))
+            except Exception:
+                avg = float("nan")
+            if not np.isfinite(avg):
+                avg = self._lookup_average_from_csv(step)
+            self.live_discarded_eval_index.append(step)
+            self.live_discarded_modulation.append(float(y) if y is not None else float("nan"))
+            self.live_discarded_average.append(float(avg))
+            self.live_discarded_chosen_by.append(chosen_by)
+            self.resume_discarded_rows.append({
+                "step": int(step),
+                "x": dict(x_map),
+                "y": float(y) if y is not None else float("nan"),
+                "y_err": float(info.get("y_err", float("nan"))),
+                "chosen_by": chosen_by,
+                "dat": {
+                    "average": float(avg),
+                },
+            })
+            try:
+                threshold_average = float(info.get("threshold_average", float("nan")))
+            except Exception:
+                threshold_average = float("nan")
+            if np.isfinite(threshold_average):
+                self.live_average_limit = threshold_average
+            self._redraw_live_plot()
+
+        if y is not None and phase in ("init", "loop", "axis_finalize", "resume_remeasure"):
             try:
                 avg = float(info.get("average", float("nan")))
             except Exception:
@@ -2354,6 +2655,14 @@ class MainWindow(QMainWindow):
                             v = float(machine_final[ch])
                             self._run_current_values[ch] = v
                             self._run_final_values[ch] = v
+        elif phase == "resume_remeasure":
+            self._append_log(
+                f"step={int(step):02d} re-measured discarded resume point by={chosen_by}"
+            )
+        elif phase == "discarded_measurement":
+            self._append_log(
+                f"step={int(step):02d} discarded measurement by={chosen_by} reason={info.get('reason', '')}"
+            )
 
         if y is not None:
             line = (
@@ -2451,6 +2760,7 @@ class MainWindow(QMainWindow):
             average_pause_ratio=float(getattr(cfg, "average_pause_ratio", 0.80)),
             include_1d=True,
             bo_data_only_1d=bool(str(getattr(cfg, "method", "")).upper() == "BO"),
+            discarded_rows=self.resume_discarded_rows,
         )
         png_saved = [p for p in saved if str(p).lower().endswith(".png")]
         if self._is_sequential_method(cfg.method):
