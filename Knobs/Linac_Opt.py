@@ -147,7 +147,7 @@ RESTORE_PVS = [
 # needs a global prior that remains resolvable on the hardware grid.
 LINAC_LEARNED_LENGTH_SCALES = {
     "RFGUN:PHASE_WRITE": 3.5,
-    SOLENOIDE_WRITE_PV: 12.5,
+    SOLENOIDE_WRITE_PV.upper(): 12.5,
     "CM0L:PHASEWRITE": 2.5,
     **{f"CM{i}L:PHASEWRITE": value for i, value in enumerate((4.6, 4.7, 4.1, 4.0, 4.6, 4.4, 4.5, 4.5), start=1)},
     "EVE_LINAC:OUT0:SETDATA": 22.4,

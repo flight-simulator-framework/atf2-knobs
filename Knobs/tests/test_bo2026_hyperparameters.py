@@ -9,7 +9,11 @@ from pathlib import Path
 import numpy as np
 
 from Knobs.IPBSM_Opt import BaseIPBSMController, Optimizer, OptimizerConfig
-from Knobs.Linac_Opt import resolve_linac_length_scale
+from Knobs.Linac_Opt import (
+    LINAC_LEARNED_LENGTH_SCALES,
+    SOLENOIDE_WRITE_PV,
+    resolve_linac_length_scale,
+)
 
 
 class _NoopController(BaseIPBSMController):
@@ -24,6 +28,31 @@ class _NoopController(BaseIPBSMController):
 
 
 class BO2026HyperparameterTests(unittest.TestCase):
+    def test_linac_solenoid_preset_case_and_read_alias(self):
+        for axis in (SOLENOIDE_WRITE_PV, SOLENOIDE_WRITE_PV.upper(),
+                     "solenoide:currentRead"):
+            with self.subTest(axis=axis):
+                self.assertEqual(
+                    resolve_linac_length_scale(axis, 45.0, 0.5, mode="learned_fixed"),
+                    (12.5, "BO2026-conservative-v1"),
+                )
+        self.assertEqual(
+            resolve_linac_length_scale(SOLENOIDE_WRITE_PV, 45.0, 0.5),
+            (15.0, "legacy_range_over_3"),
+        )
+
+    def test_all_linac_presets_resolve_and_respect_step_floor(self):
+        for axis, expected in LINAC_LEARNED_LENGTH_SCALES.items():
+            with self.subTest(axis=axis):
+                self.assertEqual(
+                    resolve_linac_length_scale(axis.lower(), 60.0, 0.001, mode="learned_fixed"),
+                    (expected, "BO2026-conservative-v1"),
+                )
+                self.assertEqual(
+                    resolve_linac_length_scale(axis, 60.0, 20.0, mode="learned_fixed"),
+                    (40.0, "BO2026-conservative-v1"),
+                )
+
     def test_linac_learned_preset_and_safe_fallback(self):
         scale, source = resolve_linac_length_scale(
             "CM1L:phaseWrite", axis_range=16.0, axis_step=1.0, mode="learned_fixed"
