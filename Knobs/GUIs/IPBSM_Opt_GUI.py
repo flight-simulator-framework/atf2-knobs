@@ -638,6 +638,16 @@ class MainWindow(QMainWindow):
         self.kernel_box.addItems(["rbf", "matern52", "matern32"])
         self.kernel_box.setCurrentText("rbf")
 
+        self.hyperparameter_mode_box = QComboBox()
+        self.hyperparameter_mode_box.addItems(["legacy_fixed", "learned_fixed"])
+        self.hyperparameter_mode_box.setCurrentText("legacy_fixed")
+        self.zscan_kernel_box = QComboBox()
+        self.zscan_kernel_box.addItems(["rbf", "matern52", "matern32"])
+        self.zscan_initial_points_box = QSpinBox()
+        self.zscan_initial_points_box.setRange(3, 5)
+        self.zscan_initial_points_box.setSingleStep(2)
+        self.zscan_initial_points_box.setValue(3)
+
         self.bounds_sigma_mult = QDoubleSpinBox()
         self.bounds_sigma_mult.setRange(0.5, 10.0)
         self.bounds_sigma_mult.setDecimals(2)
