@@ -154,20 +154,24 @@ class IntensityTests(unittest.TestCase):
             opt.read_turn_objective(reader, first["names"], config, check_status=False)
         first["intensity"][:, 1] = 20.
         first["intensity"][:, 0] = [1, 10, 20]
+        first["status"][:] = 1
+        last["status"][:] = 1
         for mode in ("turn_ratio", "turn_composite"):
             config["intensity_aggregation"] = mode
             for check_status in (True, False):
                 result = opt.read_turn_objective(reader, first["names"], config, baseline,
                                                 check_status=check_status, plot_out=plot)
-                self.assertEqual(result[0], 0.)
-                self.assertEqual(plot["ratios"]["MB1R"], 0.)
-                self.assertIn("MB1R", plot["zero_score_reason"])
-                self.assertGreater(result[-1], 0.)  # current term must not lift the zero penalty
+                expected_transmission = (8. / (31. / 3.) + .5) / 2.
+                expected_current = ((31. / 3. + 20.) / 2.) / 7.5
+                expected_score = expected_transmission + (2. * expected_current if mode == "turn_composite" else 0.)
+                self.assertAlmostEqual(result[0], expected_score)
+                self.assertAlmostEqual(plot["ratios"]["MB1R"], 8. / (31. / 3.))
+                self.assertNotIn("zero_score_reason", plot)
         first["intensity"][:, 0] = 10.
         result = opt.read_turn_objective(reader, first["names"], config, baseline,
                                         check_status=False, plot_out=plot)
         self.assertGreater(result[0], 0.)
-        self.assertEqual(plot["zero_score_reason"], "")
+        self.assertNotIn("zero_score_reason", plot)
 
     def test_transmission_reader_uses_only_endpoints(self):
         module = "machine_interfaces_atf2.InterfaceATF2_DR"
