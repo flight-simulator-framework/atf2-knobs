@@ -16,6 +16,108 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_mixed_sources_sampling_baseline_and_failure(self):
+        linac_data, dr_data = data(), data()
+        linac_data["names"] = ["MB5L", "ML1T"]
+        dr_data["names"] = ["MB1R", "MB2R"]
+        linac = SimpleNamespace(nsamples=1, get_bpms=Mock())
+        dr = SimpleNamespace(nsamples=1, bpm_sample_interval_s=.5, get_bpms=Mock())
+        def read(reader, payload):
+            self.assertEqual(reader.nsamples, 3)
+            self.assertEqual(reader.bpm_sample_interval_s, .5)
+            return payload
+        linac.get_bpms.side_effect = lambda: read(linac, linac_data)
+        dr.get_bpms.side_effect = lambda: read(dr, dr_data)
+        names = ["MB1R", "MB5L", "ML1T"]
+        snapshot = {"old": 123.}
+        values = opt.read_selected_bpm_intensities(linac, dr, names, baseline=True, snapshot_out=snapshot)
+        self.assertEqual(values, {"MB1R": 2., "MB5L": 2., "ML1T": 20.})
+        self.assertEqual(list(values), names)
+        self.assertEqual(opt.intensity_score(values, values, "relative_mean"), 1.)
+        self.assertEqual(opt.intensity_sources(names), ["LINAC:monitors", "DR:monitors"])
+        self.assertEqual(set(snapshot), {"MB1R", "MB2R", "MB5L", "ML1T"})
+        self.assertEqual((linac.nsamples, dr.nsamples), (1, 1))
+        self.assertFalse(hasattr(linac, "bpm_sample_interval_s"))
+        dr.get_bpms.reset_mock()
+        opt.read_selected_bpm_intensities(linac, dr, ["ML1T"])
+        dr.get_bpms.assert_not_called()
+        linac_data["status"][:, 1] = 0
+        with self.assertRaises(RuntimeError):
+            opt.read_selected_bpm_intensities(linac, dr, names)
+        self.assertEqual(linac.nsamples, 1)
+        self.assertFalse(hasattr(linac, "bpm_sample_interval_s"))
+        with self.assertRaises(ValueError):
+            opt.read_selected_bpm_intensities(linac, dr, ["unknown"])
+
+    def test_linac_bt_waveform_matches_each_name_without_duplicates(self):
+        from machine_interfaces_atf2.InterfaceATF2_Linac import InterfaceATF2_Linac, LINAC_MONITORS, _build_beamline
+        interface = InterfaceATF2_Linac.__new__(InterfaceATF2_Linac)
+        _, interface.bpms, _, interface.bpm_indexes = _build_beamline(opt.BT_SEQUENCE, LINAC_MONITORS)
+        interface.nsamples, interface.bpm_sample_interval_s = 3, .5
+        self.assertEqual(tuple(interface.bpms), opt.LINAC_BT_BPM_NAMES)
+        self.assertEqual(len(interface.bpms), len(set(interface.bpms)))
+        raw = np.zeros((len(LINAC_MONITORS), 20))
+        raw[:, 0] = 1
+        raw[:, 3] = np.arange(len(raw)) + 100
+        module = "machine_interfaces_atf2.InterfaceATF2_Linac"
+        with patch(module + ".PV") as pv, patch(module + ".time.sleep") as sleep:
+            pv.return_value.get.return_value = raw.reshape(-1)
+            result = interface.get_bpms()
+            pv.assert_called_once_with("LINAC:monitors")
+            pv.return_value.put.assert_not_called()
+            self.assertEqual([call.args for call in sleep.call_args_list], [(.5,)] * 3)
+        for i, name in enumerate(result["names"]):
+            np.testing.assert_equal(result["intensity"][:, i], [100 + LINAC_MONITORS.index(name)] * 3)
+
+    def test_gui_mixed_region_selection_and_manual_snapshot(self):
+        app = QApplication.instance() or QApplication([])
+        with patch.object(opt.MainWindow, "_refresh_current_values"):
+            window = opt.MainWindow()
+            window._current_value_timer.stop()
+            try:
+                for region, name in (("LINAC", "MB5L"), ("BT", "ML1T"), ("DR", "MB1R")):
+                    window.dev_bpm_region_box.setCurrentText(region)
+                    for candidate, row in window.dev_bpm_row_map.items():
+                        expected_region = "DR" if candidate in opt.DR_BPM_NAMES else opt._machine_region(candidate)
+                        self.assertEqual(window.dev_bpm_table.isRowHidden(row), expected_region != region)
+                    window.dev_bpm_table.item(window.dev_bpm_row_map[name], 0).setCheckState(opt.Qt.CheckState.Checked)
+                window.objective_box.setCurrentText("BPM intensity")
+                selected = {"MB5L", "ML1T", "MB1R"}
+                self.assertEqual(set(window._selected_developer_bpms()), selected)
+                window.objective_box.setCurrentText("BPM sumsq")
+                window.objective_box.setCurrentText("BPM intensity")
+                self.assertEqual(set(window._selected_developer_bpms()), selected)
+                linac, dr = Mock(nsamples=1), Mock(nsamples=1)
+                linac.get_correctors.return_value = {"names": [], "bact": []}
+                linac.get_bpms.return_value = data()
+                linac.get_bpms.return_value["names"] = ["MB5L", "ML1T"]
+                dr.get_bpms.return_value = data()
+                dr.get_bpms.return_value["names"] = ["MB1R", "MB2R"]
+                window.dr_bpm_reader = dr
+                with patch.object(window, "_ensure_interface", return_value=linac):
+                    window._refresh_developer_live_values()
+                    for name in selected:
+                        self.assertEqual(window.dev_bpm_table.item(window.dev_bpm_row_map[name], 4).text(), "VALID")
+                    config = {"objective_type": opt.DEVELOPER_OBJECTIVE_INTENSITY,
+                              "objective_bpm_names": ["MB5L", "ML1T", "MB1R"],
+                              "intensity_aggregation": "relative_mean", "restore_pvs": []}
+                    origin = window._capture_machine_origin(config)
+                    self.assertEqual(origin["initial_score"], 1.)
+                    self.assertEqual(config["intensity_baseline"], {"MB5L": 2., "ML1T": 20., "MB1R": 2.})
+                    with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT", return_value=linac), patch.object(opt, "DRBPMReader", return_value=dr):
+                        worker = opt.OptimizationWorker(config, directory)
+                        self.assertEqual(worker._measure_objective()[4], 1.)
+                        self.assertEqual(set(worker._last_intensities), selected)
+                        self.assertIn("MB2R", worker._last_bpm_snapshot)
+                    dr.get_bpms.side_effect = RuntimeError("Disconnected")
+                    window._refresh_developer_live_values()
+                    self.assertEqual(window.dev_bpm_table.item(window.dev_bpm_row_map["MB1R"], 4).text(), "INVALID")
+                    self.assertEqual(window.dev_bpm_table.item(window.dev_bpm_row_map["ML1T"], 4).text(), "VALID")
+                linac.pv_put.assert_not_called()
+            finally:
+                window.close()
+                app.processEvents()
+
     def test_all_bpm_snapshot_does_not_change_selected_objective(self):
         payload = data()
         payload["status"][:, 1] = 0
@@ -67,11 +169,12 @@ class IntensityTests(unittest.TestCase):
         fake.get_bpms.return_value = data()
         config = {"run_profile": opt.RUN_PROFILE_DEVELOPER,
                   "objective_type": opt.DEVELOPER_OBJECTIVE_INTENSITY,
-                  "objective_bpm_names": ["A", "B"],
+                  "objective_bpm_names": ["MB1R", "MB2R"],
                   "developer_actuators": [{"pv_write": "Z:currentWrite"}],
                   "actuator_limits": {"Z:currentWrite": [-.5, .5]}}
         dr = Mock(nsamples=3)
         dr.get_bpms.return_value = data()
+        dr.get_bpms.return_value["names"] = ["MB1R", "MB2R"]
         with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT", return_value=fake), patch.object(opt, "DRBPMReader", return_value=dr):
             worker = opt.OptimizationWorker(config, directory)
             worker._read_icts = Mock(side_effect=AssertionError("Intensity must not require ICT"))
@@ -86,6 +189,7 @@ class IntensityTests(unittest.TestCase):
                     worker._write_setpoints(values)
             self.assertEqual(fake.pv_put.call_count, 1)
             dr.get_bpms.return_value = data(0)
+            dr.get_bpms.return_value["names"] = ["MB1R", "MB2R"]
             with self.assertRaises(RuntimeError):
                 worker._measure_objective()
 
@@ -112,9 +216,10 @@ class IntensityTests(unittest.TestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control, patch.object(opt, "DRBPMReader") as reader:
                 reader.return_value.nsamples = 3
                 reader.return_value.get_bpms.return_value = data()
+                reader.return_value.get_bpms.return_value["names"] = ["MB1R", "MB2R"]
                 cfg = {"run_profile": opt.RUN_PROFILE_MAIN, "mode": mode,
                        "objective_type": opt.DEVELOPER_OBJECTIVE_INTENSITY,
-                       "objective_bpm_names": ["A", "B"], "gun_sol_l0_phase": True,
+                       "objective_bpm_names": ["MB1R", "MB2R"], "gun_sol_l0_phase": True,
                        "kly_phase": True, "correctors": True,
                        "developer_actuators": [{"name": "ZH1L", "pv_write": "ZH1L:currentWrite", "half_range": .5, "step": .1}],
                        "actuator_limits": {"ZH1L:currentWrite": [-.5, .5]}}
@@ -178,7 +283,7 @@ class IntensityTests(unittest.TestCase):
             try:
                 self.assertEqual(window.objective_box.currentText(), "ICT")
                 self.assertFalse(window.dev_objective_stack.isHidden())
-                self.assertEqual(set(window.dev_bpm_row_map), set(opt.DR_BPM_NAMES))
+                self.assertEqual(set(window.dev_bpm_row_map), set(opt.INTENSITY_BPM_NAMES))
                 window.dev_bpm_table.item(0, 0).setCheckState(opt.Qt.CheckState.Checked)
                 window.dev_objective_box.setCurrentText("BPM intensity")
                 self.assertEqual(window._selected_developer_bpms(), ["MB1R"])
@@ -187,7 +292,7 @@ class IntensityTests(unittest.TestCase):
                 self.assertIs(window.objective_box, window.dev_objective_box)
                 self.assertTrue(window.selection_page.isAncestorOf(window.dev_actuator_table))
                 window.chk_correctors.setChecked(True)
-                self.assertEqual(set(window.dev_bpm_row_map), set(opt.DR_BPM_NAMES))
+                self.assertEqual(set(window.dev_bpm_row_map), set(opt.INTENSITY_BPM_NAMES))
                 self.assertTrue(all(not name.endswith("R") for name in window.dev_actuator_row_map))
                 self.assertEqual(window.dev_bpm_table.horizontalHeaderItem(3).text(), "Intensity")
                 self.assertTrue(window.dev_bpm_plane_box.isHidden())
@@ -231,8 +336,8 @@ class IntensityTests(unittest.TestCase):
                                             "downstream_value": 11., "downstream_label": "BPM intensity raw_mean"})
                 lower = window._plot_widgets[opt.RUN_PROFILE_MAIN]["ax_metric"]
                 upper = window._plot_widgets[opt.RUN_PROFILE_MAIN]["ax_ttot"]
-                self.assertEqual(len(lower.patches), len(opt.DR_BPM_NAMES))
-                self.assertEqual([t.get_text() for t in lower.get_xticklabels()], list(opt.DR_BPM_NAMES))
+                self.assertEqual(len(lower.patches), len(opt.INTENSITY_BPM_NAMES))
+                self.assertEqual([t.get_text() for t in lower.get_xticklabels()], list(opt.INTENSITY_BPM_NAMES))
                 self.assertEqual(lower.patches[2].get_height(), 5.)
                 self.assertNotEqual(lower.patches[0].get_facecolor(), lower.patches[2].get_facecolor())
                 self.assertFalse(lower.get_shared_x_axes().joined(lower, upper))

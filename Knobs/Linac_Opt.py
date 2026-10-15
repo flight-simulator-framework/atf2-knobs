@@ -45,6 +45,9 @@ from matplotlib.figure import Figure
 from machine_interfaces_atf2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT, BT_SEQUENCE
 from machine_interfaces_atf2.InterfaceATF2_DR import DRBPMReader, DR_BPM_NAMES
 
+LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
+INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
+
 FLIGHT_SIMULATOR_DATA_ROOT = Path("/atf/data/flight-simulator")
 
 
@@ -161,6 +164,47 @@ def intensity_score(values, baseline, aggregation):
     if any(n not in baseline or not np.isfinite(baseline[n]) or baseline[n] <= 1e-12 for n in values):
         raise ValueError("Relative intensity needs a positive, non-zero baseline for every BPM.")
     return float(np.mean([v / baseline[n] for n, v in values.items()]))
+
+
+def intensity_sources(names):
+    return [source for source, available in (("LINAC:monitors", LINAC_BT_BPM_NAMES),
+                                             ("DR:monitors", DR_BPM_NAMES))
+            if any(name in available for name in names)]
+
+
+def read_selected_bpm_intensities(linac, dr, names, log=lambda message: None,
+                                 baseline=False, snapshot_out=None):
+    """Read only selected source regions; mixed sources are sampled sequentially.
+
+    Each source supplies three samples at 0.5 s intervals. A missing/invalid
+    selected monitor aborts the whole measurement, never a partial score.
+    """
+    unknown = set(names) - set(INTENSITY_BPM_NAMES)
+    if not names or unknown:
+        raise ValueError(f"Empty or unknown intensity BPM selection: {sorted(unknown)}")
+    values, snapshot = {}, {}
+    for reader, available in ((linac, LINAC_BT_BPM_NAMES), (dr, DR_BPM_NAMES)):
+        selected = [name for name in names if name in available]
+        if not selected:
+            continue
+        previous_interval = getattr(reader, "bpm_sample_interval_s", None)
+        reader.bpm_sample_interval_s = 0.5
+        try:
+            source_snapshot = {}
+            values.update(read_bpm_intensities(reader, selected, log, baseline=baseline,
+                                               snapshot_out=source_snapshot))
+            snapshot.update(source_snapshot)
+        finally:
+            if previous_interval is None:
+                del reader.bpm_sample_interval_s
+            else:
+                reader.bpm_sample_interval_s = previous_interval
+    if snapshot_out is not None:
+        snapshot_out.clear()
+        snapshot_out.update(snapshot)
+    return {name: values[name] for name in names}
+
+
 DEVELOPER_GROUP_NAME = "Correctors"
 
 TARGET_LABELS = {
@@ -1158,8 +1202,8 @@ class OptimizationWorker(QThread):
 
     def _measure_objective(self) -> Tuple[Dict[str, float], float, float, str, float, bool, str]:
         if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY:
-            self._last_intensities = read_bpm_intensities(
-                self.dr_bpm_reader, self.objective_bpm_names, self.log_signal.emit,
+            self._last_intensities = read_selected_bpm_intensities(
+                self.interface, self.dr_bpm_reader, self.objective_bpm_names, self.log_signal.emit,
                 snapshot_out=self._last_bpm_snapshot)
             metric = intensity_score(self._last_intensities, self.intensity_baseline, self.intensity_aggregation)
             return {}, metric, metric, self._objective_label(), metric, True, ""
@@ -2758,7 +2802,7 @@ class MainWindow(QMainWindow):
         self.objective_row.addWidget(QLabel("Objective"))
         self.objective_box = self.dev_objective_box
         self.objective_row.addWidget(self.objective_box)
-        self.objective_row.addWidget(QLabel("BPM intensity uses DR:monitors"))
+        self.objective_row.addWidget(QLabel("BPM intensity: LINAC / BT / DR"))
         self.objective_row.addStretch(1)
         refresh_row = QHBoxLayout()
         self.dev_refresh_btn.setFixedWidth(240)
@@ -3119,7 +3163,7 @@ class MainWindow(QMainWindow):
         objective_group = QGroupBox("Objective")
         selection_row.addWidget(objective_group, stretch=6)
         objective_layout = QVBoxLayout(objective_group)
-        self.selection_objective_hint = QLabel("DR BPMs can be preselected here. They are used when Objective = BPM intensity.")
+        self.selection_objective_hint = QLabel("LINAC / BT / DR BPMs can be preselected here. Used when Objective = BPM intensity.")
         self.selection_objective_hint.setWordWrap(True)
         objective_layout.addWidget(self.selection_objective_hint)
         self.dev_objective_stack = QStackedWidget()
@@ -3169,7 +3213,7 @@ class MainWindow(QMainWindow):
         bpm_row.addWidget(self.dev_intensity_aggregation)
         self.dev_intensity_plot = QComboBox()
         self.dev_intensity_plot.addItem("All selected BPMs")
-        self.dev_intensity_plot.setToolTip("Individual intensity traces (upper plot); aggregate score stays below.")
+        self.dev_intensity_plot.setToolTip("Individual intensity traces (upper plot); latest BPM snapshot is below.")
         self.dev_intensity_plot.currentTextChanged.connect(lambda: self._refresh_eval_plot(RUN_PROFILE_DEVELOPER))
         bpm_row.addWidget(self.dev_intensity_plot)
         bpm_row.addStretch(1)
@@ -3178,6 +3222,10 @@ class MainWindow(QMainWindow):
             "Raw mean: average of selected BPM intensities.\n"
             "Mean / initial baseline: average of each BPM's current / initial intensity (start = 1).")
         self.intensity_help.setWordWrap(True)
+        self.intensity_help.setToolTip(
+            "Raw intensities may have different scales across BPMs/regions. "
+            "Mean / initial baseline compares fractional changes, not calibrated charge. "
+            "Optimization reads selected source regions only; Refresh reads all regions.")
         self.intensity_help.setStyleSheet("font-size: 12px; color: #475569;")
         bpm_layout.addWidget(self.intensity_help)
 
@@ -3540,15 +3588,15 @@ class MainWindow(QMainWindow):
     def _populate_developer_bpm_table(self, intensity):
         if not hasattr(self, "_bpm_selections"):
             self._bpm_selections = {}
-        if hasattr(self, "_bpm_table_is_dr"):
-            self._bpm_selections[self._bpm_table_is_dr] = set(self._selected_developer_bpms())
+        if hasattr(self, "_bpm_table_is_intensity"):
+            self._bpm_selections[self._bpm_table_is_intensity] = set(self._selected_developer_bpms())
         selected = self._bpm_selections.get(intensity, set())
         self.dev_bpm_table.blockSignals(True)
         self.dev_bpm_table.setRowCount(0)
         self.dev_bpm_row_map.clear()
-        bpm_names = DR_BPM_NAMES if intensity else [name for name in BT_SEQUENCE if not str(name).lower().startswith("z")]
+        bpm_names = INTENSITY_BPM_NAMES if intensity else LINAC_BT_BPM_NAMES
         for name in bpm_names:
-            region = "DR" if intensity else _machine_region(name)
+            region = "DR" if name in DR_BPM_NAMES else _machine_region(name)
             row = self.dev_bpm_table.rowCount()
             self.dev_bpm_table.insertRow(row)
             self.dev_bpm_row_map[str(name)] = row
@@ -3561,10 +3609,10 @@ class MainWindow(QMainWindow):
         self.dev_bpm_table.blockSignals(False)
         self.dev_bpm_region_box.blockSignals(True)
         self.dev_bpm_region_box.clear()
-        self.dev_bpm_region_box.addItems(["All", "DR"] if intensity else ["All", "LINAC", "BT"])
+        self.dev_bpm_region_box.addItems(["All", "LINAC", "BT", "DR"] if intensity else ["All", "LINAC", "BT"])
         self.dev_bpm_region_box.blockSignals(False)
         self.dev_bpm_search.clear()
-        self._bpm_table_is_dr = intensity
+        self._bpm_table_is_intensity = intensity
         self._apply_developer_bpm_filters()
         self._refresh_developer_selection_counts()
 
@@ -3577,7 +3625,7 @@ class MainWindow(QMainWindow):
     def _on_developer_bpm_item_changed(self, item: QTableWidgetItem):
         if item.column() == 0:
             self._refresh_developer_selection_counts()
-            if self._bpm_table_is_dr and (self.worker is None or not self.worker.isRunning()):
+            if self._bpm_table_is_intensity and (self.worker is None or not self.worker.isRunning()):
                 state = self._plot_state.get(RUN_PROFILE_MAIN, {})
                 state["selected_bpms"] = self._selected_developer_bpms()
                 self._refresh_eval_plot(RUN_PROFILE_MAIN)
@@ -3685,21 +3733,23 @@ class MainWindow(QMainWindow):
 
     def _update_developer_objective_ui(self):
         intensity = self.dev_objective_box.currentText() == "BPM intensity"
-        show_dr = self.dev_objective_box.currentText() != "BPM sumsq"
-        if show_dr != getattr(self, "_bpm_table_is_dr", False):
-            self._populate_developer_bpm_table(show_dr)
-        self.dev_bpm_count_lbl.setToolTip("DR:monitors" if show_dr else "LINAC:monitors")
+        show_intensity = self.dev_objective_box.currentText() != "BPM sumsq"
+        if show_intensity != getattr(self, "_bpm_table_is_intensity", False):
+            self._populate_developer_bpm_table(show_intensity)
+        self.dev_bpm_count_lbl.setToolTip(
+            "LINAC / BT: LINAC:monitors; DR: DR:monitors. Selected sources are sampled sequentially, not simultaneously."
+            if show_intensity else "LINAC:monitors")
         is_bpm = self.dev_objective_box.currentText() != "ICT"
         self.selection_objective_hint.setVisible(not is_bpm)
         self.dev_objective_stack.setVisible(True)
         self.dev_objective_stack.setCurrentIndex(1)
-        self.dev_bpm_plane_box.setVisible(not show_dr)
-        self.dev_bpm_mode_label.setText("Aggregate" if show_dr else "Plane")
-        self.dev_intensity_aggregation.setVisible(show_dr)
-        self.intensity_help.setVisible(show_dr)
+        self.dev_bpm_plane_box.setVisible(not show_intensity)
+        self.dev_bpm_mode_label.setText("Aggregate" if show_intensity else "Plane")
+        self.dev_intensity_aggregation.setVisible(show_intensity)
+        self.intensity_help.setVisible(show_intensity)
         self.dev_intensity_plot.setVisible(intensity)
         self.dev_bpm_table.setHorizontalHeaderLabels(
-            ["Use", "Name", "Region", "Intensity", "Status"] if show_dr else
+            ["Use", "Name", "Region", "Intensity", "Status"] if show_intensity else
             ["Use", "Name", "Region", "Live X [mm]", "Live Y [mm]"])
         # Never relabel stale position numbers as intensity (or vice versa).
         for row in range(self.dev_bpm_table.rowCount()):
@@ -3760,12 +3810,23 @@ class MainWindow(QMainWindow):
                     val = corr_map.get(name, float("nan"))
                     item.setText(_format_significant_value(val, digits=4))
 
-            bpms = (self.dr_bpm_reader if self._bpm_table_is_dr else interface).get_bpms()
-            if self._bpm_table_is_dr:
+            if self._bpm_table_is_intensity:
+                snapshot = {}
+                for source, reader in (("LINAC:monitors", interface), ("DR:monitors", self.dr_bpm_reader)):
+                    try:
+                        snapshot.update(bpm_intensity_snapshot(reader.get_bpms()))
+                    except Exception as exc:
+                        self.append_log(f"[BPM] {source} refresh failed: {exc}")
                 state = self._plot_state.get(RUN_PROFILE_MAIN, {})
-                state["bpm_snapshot"] = bpm_intensity_snapshot(bpms)
+                state["bpm_snapshot"] = snapshot
                 state["selected_bpms"] = self._selected_developer_bpms()
                 self._refresh_eval_plot(RUN_PROFILE_MAIN)
+                for name, row in self.dev_bpm_row_map.items():
+                    value = snapshot.get(name, float("nan"))
+                    self.dev_bpm_table.item(row, 3).setText(f"{value:.5g}" if np.isfinite(value) else "-")
+                    self.dev_bpm_table.item(row, 4).setText("VALID" if np.isfinite(value) else "INVALID")
+                return
+            bpms = interface.get_bpms()
             bpm_names = [str(name) for name in list(bpms.get("names", []))]
             x_all = np.asarray(bpms.get("x", []), dtype=float)
             y_all = np.asarray(bpms.get("y", []), dtype=float)
@@ -3787,15 +3848,6 @@ class MainWindow(QMainWindow):
                     continue
                 x_item = self.dev_bpm_table.item(row, 3)
                 y_item = self.dev_bpm_table.item(row, 4)
-                if self._bpm_table_is_dr:
-                    try:
-                        value = bpm_intensity_values(bpms, [name])[name]
-                        x_item.setText(f"{value:.5g}")
-                        y_item.setText("VALID")
-                    except ValueError:
-                        x_item.setText("-")
-                        y_item.setText("INVALID")
-                    continue
                 x_val = x_avg[idx] if idx < x_avg.size else float("nan")
                 y_val = y_avg[idx] if idx < y_avg.size else float("nan")
                 if x_item is not None:
@@ -4132,7 +4184,7 @@ class MainWindow(QMainWindow):
             ax_ttot.set_xlabel("")
             ax_metric.clear()
             snapshot = state.get("bpm_snapshot", {})
-            names = list(DR_BPM_NAMES)
+            names = list(INTENSITY_BPM_NAMES)
             positions = np.arange(len(names))
             values = np.array([snapshot.get(name, np.nan) for name in names])
             selected_names = set(state.get("selected_bpms", self._selected_developer_bpms()))
@@ -4149,9 +4201,9 @@ class MainWindow(QMainWindow):
                     tick.set_color("#c2410c")
                     tick.set_fontweight("bold")
             ax_metric.set_xlim(-1, len(names))
-            ax_metric.set_title("Latest intensity by DR BPM (sample mean)", pad=10)
+            ax_metric.set_title("Latest intensity by BPM (sample mean)", pad=10)
             ax_metric.set_ylabel("Intensity (raw)")
-            ax_metric.set_xlabel("DR BPM")
+            ax_metric.set_xlabel("BPM (DR / LINAC / BT; unread regions shown as gaps)")
             ax_metric.grid(axis="y", alpha=.3)
             handles, labels = ax_metric.get_legend_handles_labels()
             ax_metric.legend([Patch(color="#ea580c"), Patch(color="#94a3b8")] + handles,
@@ -4392,7 +4444,7 @@ class MainWindow(QMainWindow):
             for pv in restore_pvs
         }
         if config.get("objective_type") == DEVELOPER_OBJECTIVE_INTENSITY:
-            values = read_bpm_intensities(self.dr_bpm_reader, config["objective_bpm_names"], self.append_log,
+            values = read_selected_bpm_intensities(interface, self.dr_bpm_reader, config["objective_bpm_names"], self.append_log,
                                          baseline=config["intensity_aggregation"] == "relative_mean")
             config["intensity_baseline"] = values
             score = intensity_score(values, values, config["intensity_aggregation"])
@@ -4944,7 +4996,7 @@ class MainWindow(QMainWindow):
             "seq_method": str(self.dev_seq_method_box.currentText()),
             "objective_type": objective_key,
             "intensity_aggregation": self.dev_intensity_aggregation.currentData(),
-            "intensity_source": "DR:monitors",
+            "intensity_source": ", ".join(intensity_sources(bpm_names)),
             "objective_bpm_plane": str(self.dev_bpm_plane_box.currentText()),
             "objective_bpm_names": bpm_names,
             "developer_actuators": actuators,
@@ -4963,7 +5015,7 @@ class MainWindow(QMainWindow):
             message = (f"Objective: {self.dev_objective_box.currentText()}\n"
                        f"Correctors: {len(actuators)}; BPMs: {len(bpm_names)}\n"
                        + ("BPMs: " + ", ".join(bpm_names) + "\n" if bpm_names else "")
-                       + (f"BPM source: DR:monitors\nAggregate: {self.dev_intensity_aggregation.currentText()}\n" if objective_key == DEVELOPER_OBJECTIVE_INTENSITY else "")
+                       + (f"BPM source: {config['intensity_source']}\nAggregate: {self.dev_intensity_aggregation.currentText()}\n" if objective_key == DEVELOPER_OBJECTIVE_INTENSITY else "")
                        + "\n".join(summary) + "\n\nStart optimization? This will change selected corrector currents.")
             if QMessageBox.question(self, "Confirm Developer run", message,
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -5057,7 +5109,7 @@ class MainWindow(QMainWindow):
             "objective_bpm_names": bpms,
             "objective_bpm_plane": self.dev_bpm_plane_box.currentText(),
             "intensity_aggregation": self.dev_intensity_aggregation.currentData(),
-            "intensity_source": "DR:monitors",
+            "intensity_source": ", ".join(intensity_sources(bpms)),
             "grp_L1_4": self.chk_kly_group1.isChecked(),
             "grp_L5_8": self.chk_kly_group2.isChecked(),
             # Sequential method + scan settings
@@ -5102,7 +5154,7 @@ class MainWindow(QMainWindow):
                           ("correctors", "Selected LINAC/BT correctors")] if config[key]]
                 message = (f"Objective: {self.objective_box.currentText()}\nTargets: {', '.join(groups)}\n"
                            + (f"BPMs: {', '.join(bpms)}\n" if bpms else "")
-                           + (f"Source: DR:monitors; aggregate: {self.dev_intensity_aggregation.currentText()}\n"
+                           + (f"Source: {config['intensity_source']}; aggregate: {self.dev_intensity_aggregation.currentText()}\n"
                               if objective == DEVELOPER_OBJECTIVE_INTENSITY else "")
                            + "\n".join(summary) + "\n\nStart? Selected machine settings will change.")
                 if QMessageBox.question(self, "Confirm optimization", message,
