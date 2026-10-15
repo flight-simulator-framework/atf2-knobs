@@ -16,6 +16,28 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_l8_phase_uses_search_range_without_ioc_limits(self):
+        interface = Mock()
+        interface.read_current.return_value = 350.
+        window = SimpleNamespace(_ensure_interface=lambda: interface)
+        spec = {"name": "L8 phase", "pv_write": "CM8L:phaseWrite", "pv_read": "CM8L:phaseRead",
+                "unit": "deg", "step": 1., "half_range": 20.}
+        with patch("epics.PV") as pv:
+            limits, _ = opt.MainWindow._checked_corrector_ranges(window, [spec])
+            self.assertEqual(limits, {"CM8L:phaseWrite": [330., 370.]})
+            pv.assert_not_called()
+            for value in (float("nan"), float("inf")):
+                interface.read_current.return_value = value
+                with self.assertRaises(ValueError):
+                    opt.MainWindow._checked_corrector_ranges(window, [spec])
+            interface.read_current.return_value = 350.
+            with self.assertRaises(ValueError):
+                opt.MainWindow._checked_corrector_ranges(window, [{**spec, "half_range": float("inf")}])
+            pv.return_value.get_ctrlvars.return_value = {}
+            for name, unit in (("ZH1L:currentWrite", "A"), ("EVE_LINAC:OUT0:SetData", "ns")):
+                with self.assertRaisesRegex(ValueError, "Cannot verify EPICS limits"):
+                    opt.MainWindow._checked_corrector_ranges(window, [{**spec, "pv_write": name, "unit": unit}])
+
     def test_initial_bo_background_phases_and_restarts(self):
         from matplotlib.figure import Figure
         from matplotlib.colors import to_rgba

@@ -5459,20 +5459,27 @@ class MainWindow(QMainWindow):
         interface = self._ensure_interface()
         for spec in actuators:
             pv = spec["pv_write"]
-            ctrl = PV(pv).get_ctrlvars(timeout=1.0) or {}
-            lo = float(ctrl.get("lower_ctrl_limit", float("nan")))
-            hi = float(ctrl.get("upper_ctrl_limit", float("nan")))
-            if not np.isfinite([lo, hi]).all() or lo >= hi:
-                raise ValueError(f"Cannot verify EPICS current limits: {pv}. Check IOC configuration before running.")
             unit = spec.get("unit", "A")
+            if pv == "CM8L:phaseWrite":
+                # RF phase has no absolute IOC bounds; retain the configured
+                # finite, centered search range as the command guard instead.
+                lo, hi = -float("inf"), float("inf")
+            else:
+                ctrl = PV(pv).get_ctrlvars(timeout=1.0) or {}
+                lo = float(ctrl.get("lower_ctrl_limit", float("nan")))
+                hi = float(ctrl.get("upper_ctrl_limit", float("nan")))
+                if not np.isfinite([lo, hi]).all() or lo >= hi:
+                    raise ValueError(f"Cannot verify EPICS limits: {pv} [{unit}]. Check IOC configuration before running.")
             if unit == "A":
                 lo, hi = max(lo, STEER_CURRENT_MIN_A), min(hi, STEER_CURRENT_MAX_A)
             current = float(interface.read_current(pv, spec["pv_read"]))
             if not np.isfinite(current) or not lo <= current <= hi or lo >= hi:
-                raise ValueError(f"Unsafe current/range: {pv}, {current} A, limits [{lo}, {hi}] A")
-            if not 0 < spec["step"] <= 2 * spec["half_range"]:
+                raise ValueError(f"Unsafe value/range: {pv}, {current} {unit}, limits [{lo}, {hi}] {unit}")
+            if not np.isfinite([spec["step"], spec["half_range"]]).all() or not 0 < spec["step"] <= 2 * spec["half_range"]:
                 raise ValueError(f"Invalid step/range: {pv}")
             lower, upper = max(lo, current - spec["half_range"]), min(hi, current + spec["half_range"])
+            if not np.isfinite([lower, upper]).all() or lower >= upper:
+                raise ValueError(f"Invalid finite search range: {pv}")
             limits[pv] = [lower, upper]
             summary.append(f"{spec['name']}: {current:g} {unit} -> [{lower:g}, {upper:g}] {unit}; step {spec['step']:g} {unit}")
         return limits, summary
