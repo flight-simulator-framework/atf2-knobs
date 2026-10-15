@@ -34,9 +34,34 @@ class IntensityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 opt.MainWindow._checked_corrector_ranges(window, [{**spec, "half_range": float("inf")}])
             pv.return_value.get_ctrlvars.return_value = {}
-            for name, unit in (("ZH1L:currentWrite", "A"), ("EVE_LINAC:OUT0:SetData", "ns")):
+            for name, unit in (("ZH1L:currentWrite", "A"),):
                 with self.assertRaisesRegex(ValueError, "Cannot verify EPICS limits"):
                     opt.MainWindow._checked_corrector_ranges(window, [{**spec, "pv_write": name, "unit": unit}])
+
+    def test_timing_uses_finite_configured_range_without_ioc_limits(self):
+        interface = Mock()
+        interface.read_current.return_value = 1000.
+        window = SimpleNamespace(_ensure_interface=lambda: interface)
+        spec = {"name": "Timing", "pv_write": "EVE_LINAC:OUT0:SetData", "pv_read": None,
+                "unit": "ns", "step": 11.2, "half_range": 112.}
+        with patch("epics.PV") as pv:
+            limits, _ = opt.MainWindow._checked_corrector_ranges(window, [spec])
+            self.assertEqual(limits, {spec["pv_write"]: [888., 1112.]})
+            for value in (float("nan"), float("inf")):
+                interface.read_current.return_value = value
+                with self.assertRaises(ValueError):
+                    opt.MainWindow._checked_corrector_ranges(window, [spec])
+            interface.read_current.return_value = 1000.
+            for changes in ({"step": 0.}, {"half_range": float("inf")}, {"half_range": 0.}):
+                with self.assertRaises(ValueError):
+                    opt.MainWindow._checked_corrector_ranges(window, [{**spec, **changes}])
+            pv.assert_not_called()
+        config = {"correctors": True, "developer_actuators": [spec], "actuator_limits": limits}
+        with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control:
+            worker = opt.OptimizationWorker(config, directory)
+            with self.assertRaises(ValueError):
+                worker._write_setpoints({spec["pv_write"]: 1113.})
+            control.return_value.pv_put.assert_not_called()
 
     def test_initial_bo_background_phases_and_restarts(self):
         from matplotlib.figure import Figure

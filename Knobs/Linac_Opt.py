@@ -5460,9 +5460,9 @@ class MainWindow(QMainWindow):
         for spec in actuators:
             pv = spec["pv_write"]
             unit = spec.get("unit", "A")
-            if pv == "CM8L:phaseWrite":
-                # RF phase has no absolute IOC bounds; retain the configured
-                # finite, centered search range as the command guard instead.
+            if pv in ("CM8L:phaseWrite", "EVE_LINAC:OUT0:SetData"):
+                # Phase/timing use the user-configured finite, centered search
+                # range as the command guard, without requiring IOC bounds.
                 lo, hi = -float("inf"), float("inf")
             else:
                 ctrl = PV(pv).get_ctrlvars(timeout=1.0) or {}
