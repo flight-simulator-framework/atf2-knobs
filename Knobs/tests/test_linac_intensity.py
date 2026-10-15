@@ -16,6 +16,17 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_intensity_plot_beamline_order_and_dr_wrap(self):
+        names = opt.INTENSITY_PLOT_BPM_NAMES
+        expected_dr = [f"MB{i}R" for i in list(range(21, 99)) + list(range(1, 21))
+                       if i not in (20, 75)]
+        self.assertEqual(list(names),
+                         [n for n in opt.LINAC_BT_BPM_NAMES if n.endswith("L")]
+                         + [n for n in opt.LINAC_BT_BPM_NAMES if n.endswith("T")]
+                         + expected_dr)
+        self.assertEqual(set(names), set(opt.INTENSITY_BPM_NAMES))
+        self.assertEqual(len(names), len(set(names)))
+
     def test_mixed_sources_sampling_baseline_and_failure(self):
         linac_data, dr_data = data(), data()
         linac_data["names"] = ["MB5L", "ML1T"]
@@ -109,6 +120,10 @@ class IntensityTests(unittest.TestCase):
                         self.assertEqual(worker._measure_objective()[4], 1.)
                         self.assertEqual(set(worker._last_intensities), selected)
                         self.assertIn("MB2R", worker._last_bpm_snapshot)
+                    config["intensity_aggregation"] = "raw_sum"
+                    origin = window._capture_machine_origin(config)
+                    self.assertEqual(origin["initial_score"], 24.)
+                    self.assertEqual(origin["initial_objective_label"], "BPM intensity raw_sum")
                     dr.get_bpms.side_effect = RuntimeError("Disconnected")
                     window._refresh_developer_live_values()
                     self.assertEqual(window.dev_bpm_table.item(window.dev_bpm_row_map["MB1R"], 4).text(), "INVALID")
@@ -131,6 +146,11 @@ class IntensityTests(unittest.TestCase):
     def test_aggregation_and_fixed_baseline(self):
         values = opt.bpm_intensity_values(data(), ["B", "A"], 3)
         self.assertEqual(opt.intensity_score(values, {}, "raw_mean"), 11.)
+        self.assertEqual(opt.intensity_score(values, {}, "raw_sum"), 22.)
+        self.assertEqual(opt.intensity_score({"A": 0., "B": 0.}, {}, "raw_sum"), 0.)
+        for invalid in ({}, {"A": np.nan}, {"A": np.inf}):
+            with self.assertRaises(ValueError):
+                opt.intensity_score(invalid, {}, "raw_sum")
         baseline = {"A": 1., "B": 20.}
         self.assertEqual(opt.intensity_score(values, baseline, "relative_mean"), 1.5)
         self.assertEqual(baseline, {"A": 1., "B": 20.})
@@ -181,6 +201,10 @@ class IntensityTests(unittest.TestCase):
             self.assertEqual(worker._measure_objective()[4], 11.)
             fake.get_bpms.assert_not_called()
             dr.get_bpms.assert_called_once_with()
+            worker.intensity_aggregation = "raw_sum"
+            measurement = worker._measure_objective()
+            self.assertEqual(measurement[4], 22.)
+            self.assertEqual(measurement[3], "BPM intensity raw_sum")
             worker._read_icts.assert_not_called()
             worker._write_setpoints({"Z:currentWrite": .2})
             fake.pv_put.assert_called_once_with("Z:currentWrite", .2)
@@ -286,6 +310,9 @@ class IntensityTests(unittest.TestCase):
                 self.assertEqual(set(window.dev_bpm_row_map), set(opt.INTENSITY_BPM_NAMES))
                 window.dev_bpm_table.item(0, 0).setCheckState(opt.Qt.CheckState.Checked)
                 window.dev_objective_box.setCurrentText("BPM intensity")
+                self.assertEqual(window.dev_intensity_aggregation.currentData(), "raw_mean")
+                window.dev_intensity_aggregation.setCurrentText("Raw sum")
+                self.assertEqual(window.dev_intensity_aggregation.currentData(), "raw_sum")
                 self.assertEqual(window._selected_developer_bpms(), ["MB1R"])
                 self.assertEqual(window.dev_refresh_btn.maximumWidth(), 240)
                 self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())], ["Main", "Config"])
@@ -319,6 +346,7 @@ class IntensityTests(unittest.TestCase):
                     cfg = worker.call_args.args[0]
                     self.assertEqual(cfg["objective_type"], opt.DEVELOPER_OBJECTIVE_INTENSITY)
                     self.assertEqual(cfg["intensity_source"], "DR:monitors")
+                    self.assertEqual(cfg["intensity_aggregation"], "raw_sum")
                     self.assertEqual(cfg["objective_bpm_names"], ["MB1R", "MB2R"])
                     self.assertTrue(cfg["correctors"])
                     self.assertEqual(len(cfg["developer_actuators"]), 1)
@@ -337,9 +365,11 @@ class IntensityTests(unittest.TestCase):
                 lower = window._plot_widgets[opt.RUN_PROFILE_MAIN]["ax_metric"]
                 upper = window._plot_widgets[opt.RUN_PROFILE_MAIN]["ax_ttot"]
                 self.assertEqual(len(lower.patches), len(opt.INTENSITY_BPM_NAMES))
-                self.assertEqual([t.get_text() for t in lower.get_xticklabels()], list(opt.INTENSITY_BPM_NAMES))
-                self.assertEqual(lower.patches[2].get_height(), 5.)
-                self.assertNotEqual(lower.patches[0].get_facecolor(), lower.patches[2].get_facecolor())
+                self.assertEqual([t.get_text() for t in lower.get_xticklabels()], list(opt.INTENSITY_PLOT_BPM_NAMES))
+                bars = dict(zip(opt.INTENSITY_PLOT_BPM_NAMES, lower.patches))
+                self.assertEqual(bars["MB3R"].get_height(), 5.)
+                self.assertEqual(bars["MB1R"].get_height(), 2.)
+                self.assertNotEqual(bars["MB1R"].get_facecolor(), bars["MB3R"].get_facecolor())
                 self.assertFalse(lower.get_shared_x_axes().joined(lower, upper))
                 self.assertEqual(len(window._plot_widgets[opt.RUN_PROFILE_MAIN]["ax_ttot"].lines), 2)
                 window.dev_intensity_plot.addItem("A")

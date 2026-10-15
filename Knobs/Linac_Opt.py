@@ -47,6 +47,13 @@ from machine_interfaces_atf2.InterfaceATF2_DR import DRBPMReader, DR_BPM_NAMES
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
+# Display order only: preserve acquisition/selection order and rotate the ring
+# so that MB21R is the first DR monitor (wrap to MB1R after MB98R).
+INTENSITY_PLOT_BPM_NAMES = (
+    LINAC_BT_BPM_NAMES
+    + tuple(DR_BPM_NAMES[DR_BPM_NAMES.index("MB21R"):])
+    + tuple(DR_BPM_NAMES[:DR_BPM_NAMES.index("MB21R")])
+)
 
 FLIGHT_SIMULATOR_DATA_ROOT = Path("/atf/data/flight-simulator")
 
@@ -157,6 +164,8 @@ def intensity_score(values, baseline, aggregation):
         raise ValueError("Empty or non-finite BPM intensity values")
     if aggregation == "raw_mean":
         return float(np.mean(list(values.values())))
+    if aggregation == "raw_sum":
+        return float(np.sum(list(values.values())))
     if aggregation != "relative_mean":
         raise ValueError("Unknown intensity aggregation")
     # No universal calibrated noise floor exists. Acquisition separately rejects
@@ -3208,8 +3217,9 @@ class MainWindow(QMainWindow):
         bpm_row.addWidget(self.dev_bpm_plane_box)
         self.dev_intensity_aggregation = QComboBox()
         self.dev_intensity_aggregation.addItem("Raw mean", "raw_mean")
+        self.dev_intensity_aggregation.addItem("Raw sum", "raw_sum")
         self.dev_intensity_aggregation.addItem("Mean / initial baseline", "relative_mean")
-        self.dev_intensity_aggregation.setToolTip("Maximize the mean over all selected BPMs. Relative mode fixes each baseline before the run.")
+        self.dev_intensity_aggregation.setToolTip("Maximize the selected BPMs' mean or sum. Relative mode fixes each baseline before the run.")
         bpm_row.addWidget(self.dev_intensity_aggregation)
         self.dev_intensity_plot = QComboBox()
         self.dev_intensity_plot.addItem("All selected BPMs")
@@ -3220,6 +3230,7 @@ class MainWindow(QMainWindow):
         bpm_layout.addLayout(bpm_row)
         self.intensity_help = QLabel(
             "Raw mean: average of selected BPM intensities.\n"
+            "Raw sum: sum of selected BPM intensities (no normalization).\n"
             "Mean / initial baseline: average of each BPM's current / initial intensity (start = 1).")
         self.intensity_help.setWordWrap(True)
         self.intensity_help.setToolTip(
@@ -4184,7 +4195,7 @@ class MainWindow(QMainWindow):
             ax_ttot.set_xlabel("")
             ax_metric.clear()
             snapshot = state.get("bpm_snapshot", {})
-            names = list(INTENSITY_BPM_NAMES)
+            names = list(INTENSITY_PLOT_BPM_NAMES)
             positions = np.arange(len(names))
             values = np.array([snapshot.get(name, np.nan) for name in names])
             selected_names = set(state.get("selected_bpms", self._selected_developer_bpms()))
@@ -4203,7 +4214,7 @@ class MainWindow(QMainWindow):
             ax_metric.set_xlim(-1, len(names))
             ax_metric.set_title("Latest intensity by BPM (sample mean)", pad=10)
             ax_metric.set_ylabel("Intensity (raw)")
-            ax_metric.set_xlabel("BPM (DR / LINAC / BT; unread regions shown as gaps)")
+            ax_metric.set_xlabel("BPM (LINAC / BT / DR from MB21R; unread regions shown as gaps)")
             ax_metric.grid(axis="y", alpha=.3)
             handles, labels = ax_metric.get_legend_handles_labels()
             ax_metric.legend([Patch(color="#ea580c"), Patch(color="#94a3b8")] + handles,
