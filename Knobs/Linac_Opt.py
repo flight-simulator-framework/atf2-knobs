@@ -21,6 +21,7 @@ import csv
 import math
 import json
 import itertools
+import threading
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, Optional
@@ -763,6 +764,9 @@ class OptimizationWorker(QThread):
         self.config = config
         self.save_dir = Path(save_dir)
         self.is_running = True
+        self._pause_condition = threading.Condition()
+        self.pause_requested = False
+        self.is_paused = False
         self.run_profile = str(config.get("run_profile", RUN_PROFILE_MAIN)).upper()
 
         self.settle_sec = float(config.get("settle_sec", SETTLE_SEC_DEFAULT))
@@ -963,6 +967,7 @@ class OptimizationWorker(QThread):
             "measurement_reason": str(r.measurement_reason),
             "display_values": build_display_value_texts(self._current_pv_values),
         })
+        self._pause_checkpoint()
 
     def _resume_seq_key(self, mode: str, group: str, pv_name: str) -> Tuple[str, str, str]:
         return (str(mode), str(group), str(pv_name))
@@ -1152,6 +1157,7 @@ class OptimizationWorker(QThread):
 
     def _dump_initial_snapshot(self):
         """Dump initial machine/config snapshot for reproducibility."""
+        self._pause_checkpoint()
         snapshot_path = self.run_dir / f"InitialSnapshot_{self.run_tag}.json"
         setpoints: Dict[str, float] = {}
         restore_pvs = [str(pv) for pv in list(self.config.get("restore_pvs", RESTORE_PVS))]
@@ -1188,6 +1194,7 @@ class OptimizationWorker(QThread):
         self._current_pv_values = {str(k): float(v) for k, v in setpoints.items()}
         self._emit_display_values()
         self.log_signal.emit(f"[INIT] Snapshot dumped: {snapshot_path}")
+        self._pause_checkpoint()
 
     def _try_reuse_initial_point(self, device_label: str, pv_name: str, set_value: float,
                                  mode: str, group: str, note: str) -> Optional[EvalResult]:
@@ -1283,8 +1290,39 @@ class OptimizationWorker(QThread):
     # Stop
     # ----------------------------
     def stop(self):
-        self.is_running = False
+        with self._pause_condition:
+            self.is_running = False
+            self.pause_requested = False
+            self._pause_condition.notify_all()
         self.log_signal.emit("!!! Stop Requested !!!")
+
+    def request_pause(self):
+        with self._pause_condition:
+            if self.is_running:
+                self.pause_requested = True
+        self.log_signal.emit("[PAUSE] Requested; finish the current evaluation before waiting.")
+
+    def resume(self):
+        with self._pause_condition:
+            self.pause_requested = False
+            self._pause_condition.notify_all()
+
+    def _pause_checkpoint(self):
+        with self._pause_condition:
+            if self.pause_requested and self.is_running:
+                self.is_paused = True
+                self.log_signal.emit("[PAUSE] Paused; history, baseline and machine settings retained.")
+                self._emit_progress({"kind": "pause_state", "paused": True})
+                try:
+                    while self.pause_requested and self.is_running:
+                        self._pause_condition.wait()
+                finally:
+                    self.is_paused = False
+                if self.is_running:
+                    self.log_signal.emit("[RESUME] Continuing the same run.")
+                    self._emit_progress({"kind": "pause_state", "paused": False})
+            if not self.is_running:
+                raise InterruptedError("Optimization stopped")
 
     # ----------------------------
     # Measurement
@@ -2517,6 +2555,11 @@ class OptimizationWorker(QThread):
                 self._run_correctors()
                 if self.is_running:
                     self._emit_group_state("correctors", "done")
+        except InterruptedError as e:
+            if self.is_running:
+                self._emit_progress({"kind": "run_error", "message": str(e)})
+            else:
+                self.log_signal.emit("[STOP] Optimization stopped by user.")
         except Exception as e:
             self._emit_progress({"kind": "run_error", "message": str(e)})
             self.log_signal.emit(f"Error: {str(e)}")
@@ -2525,6 +2568,7 @@ class OptimizationWorker(QThread):
             self.finished_signal.emit()
 
     def _write_setpoints(self, values):
+        self._pause_checkpoint()
         if self.run_profile == RUN_PROFILE_DEVELOPER or self.config.get("correctors"):
             selected = {spec["pv_write"] for spec in self.developer_actuators}
             limits = self.config.get("actuator_limits", {})
@@ -3107,6 +3151,10 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_start = QPushButton("START")
         self.btn_stop = QPushButton("PAUSE")
+        self.btn_end = QPushButton("STOP")
+        self.btn_end.setToolTip("End this run (cannot resume in memory). Does not restore initial settings.")
+        self.btn_end.setEnabled(False)
+        self.btn_end.clicked.connect(self.cancel_optimization)
         self.reset_initial_btn = QPushButton("Reset To Initial")
         self.btn_stop.setEnabled(False)
         self.btn_start.clicked.connect(self.start_optimization)
@@ -3122,6 +3170,7 @@ class MainWindow(QMainWindow):
         )
         btn_row.addWidget(self.btn_start)
         btn_row.addWidget(self.btn_stop)
+        btn_row.addWidget(self.btn_end)
         btn_row.addWidget(self.reset_initial_btn)
         ctrl.addLayout(btn_row)
 
@@ -4837,6 +4886,17 @@ class MainWindow(QMainWindow):
             self._set_status("Status: FAILED", state="error", profile=context)
             return
 
+        if kind == "pause_state":
+            if self.worker is not None and not self.worker.is_running:
+                return  # A queued pause acknowledgement must not undo STOP.
+            paused = bool(payload.get("paused"))
+            for button in (self.btn_stop, self.dev_btn_stop):
+                button.setText("RESUME" if paused else "PAUSE")
+                button.setEnabled(True)
+            self._set_status("Status: PAUSED — settings retained" if paused else "Status: RUNNING",
+                             state="paused" if paused else "running", profile=context)
+            return
+
         if kind == "bo1d_trace":
             state = self._plot_state.setdefault(
                 context,
@@ -5621,6 +5681,7 @@ class MainWindow(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self._on_worker_progress)
         self.worker.finished_signal.connect(self.optimization_finished)
+        self.btn_end.setEnabled(True)
         self.worker.start()
 
     def start_optimization(self):
@@ -5777,14 +5838,28 @@ class MainWindow(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self._on_worker_progress)
         self.worker.finished_signal.connect(self.optimization_finished)
+        self.btn_end.setEnabled(True)
         self.worker.start()
 
     def stop_optimization(self):
         if self.worker and self.worker.isRunning():
+            was_paused = self.worker.is_paused
+            if was_paused:
+                self.worker.resume()
+            else:
+                self.worker.request_pause()
+            self.btn_stop.setEnabled(False)
+            self.dev_btn_stop.setEnabled(False)
+            self._set_status("Status: resuming" if was_paused else "Status: pause requested — completing evaluation",
+                             state="paused", profile=self._run_profile)
+
+    def cancel_optimization(self):
+        if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.btn_stop.setEnabled(False)
             self.dev_btn_stop.setEnabled(False)
-            self._set_status("Status: pause requested", state="paused", profile=self._run_profile)
+            self.btn_end.setEnabled(False)
+            self._set_status("Status: stopping", state="paused", profile=self._run_profile)
 
     def closeEvent(self, event):  # type: ignore[override]
         timer_was_active = self._current_value_timer.isActive()
@@ -5808,12 +5883,16 @@ class MainWindow(QMainWindow):
 
     def optimization_finished(self):
         finished_profile = self._run_profile
+        stopped = self.worker is not None and not self.worker.is_running
         if self.worker is not None:
             self._last_setpoint_values = {
                 str(pv): float(value)
                 for pv, value in dict(getattr(self.worker, "_current_pv_values", {}) or {}).items()
             }
         self.worker = None
+        self.btn_end.setEnabled(False)
+        self.btn_stop.setText("PAUSE")
+        self.dev_btn_stop.setText("PAUSE")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.dev_btn_start.setEnabled(True)
@@ -5839,11 +5918,13 @@ class MainWindow(QMainWindow):
         self._update_result_label(profile=finished_profile)
         if self._run_failed:
             self._set_status("Status: FAILED", state="error", profile=finished_profile)
+        elif stopped:
+            self._set_status("Status: STOPPED", state="paused", profile=finished_profile)
         else:
             self._set_status("Status: DONE", state="success", profile=finished_profile)
         self._run_mode = ""
         self._run_profile = RUN_PROFILE_MAIN
-        if self._shutdown_in_progress:
+        if self._shutdown_in_progress or stopped:
             return
         if self._run_failed:
             QMessageBox.warning(self, "Finished with Error", "Optimization ended with an error. Please check the log.")

@@ -2,6 +2,7 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,6 +17,114 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_gui_pause_resume_and_stop_controls(self):
+        app = QApplication.instance() or QApplication([])
+        with patch.object(opt.MainWindow, "_refresh_current_values"):
+            window = opt.MainWindow()
+            window._current_value_timer.stop()
+            fake = SimpleNamespace(isRunning=lambda: True, is_running=True, is_paused=False,
+                                   request_pause=Mock(), resume=Mock(), stop=Mock())
+            window.worker = fake
+            try:
+                window.stop_optimization()
+                fake.request_pause.assert_called_once()
+                fake.stop.assert_not_called()
+                self.assertFalse(window.btn_stop.isEnabled())
+                fake.is_paused = True
+                window._on_worker_progress({"kind": "pause_state", "paused": True})
+                self.assertEqual(window.btn_stop.text(), "RESUME")
+                self.assertTrue(window.btn_stop.isEnabled())
+                window.stop_optimization()
+                fake.resume.assert_called_once()
+                self.assertIs(window.worker, fake)
+                fake.is_paused = False
+                window._on_worker_progress({"kind": "pause_state", "paused": False})
+                self.assertEqual(window.btn_stop.text(), "PAUSE")
+                window.cancel_optimization()
+                fake.stop.assert_called_once()
+                self.assertFalse(window.btn_stop.isEnabled())
+            finally:
+                window.worker = None
+                window.close()
+
+    def test_pause_finishes_evaluation_and_resumes_same_worker(self):
+        for objective in (opt.DEVELOPER_OBJECTIVE_ICT, opt.DEVELOPER_OBJECTIVE_INTENSITY):
+            with self.subTest(objective=objective), tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control:
+                worker = opt.OptimizationWorker({"mode": "GROUP_BO", "objective_type": objective,
+                    "settle_sec": 0., "intensity_baseline": {"MB1R": 10.}}, directory)
+                entered, finish_measurement, paused = threading.Event(), threading.Event(), threading.Event()
+                progress, results = [], []
+                def measure():
+                    entered.set()
+                    if not finish_measurement.wait(3):
+                        raise RuntimeError("Test measurement timeout")
+                    return {}, 2., 2., "BPM intensity turn_composite", 2., True, ""
+                def emit(payload):
+                    progress.append(payload)
+                    if payload.get("kind") == "pause_state" and payload["paused"]:
+                        paused.set()
+                def optimize():
+                    for value in (1., 2.):
+                        results.append(worker._evaluate_point("L8", "CM8L:phaseWrite", value, "GROUP_BO", "test"))
+                worker._dump_initial_snapshot = Mock()
+                worker._measure_objective = Mock(side_effect=measure)
+                worker._emit_progress = emit
+                worker._run_group_bo = optimize
+                thread = threading.Thread(target=worker.run)
+                thread.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    worker.request_pause()
+                    self.assertTrue(worker.is_running)
+                    self.assertFalse(worker.is_paused)  # still completing the current measurement
+                    finish_measurement.set()
+                    self.assertTrue(paused.wait(2))
+                    self.assertTrue(thread.is_alive())
+                    self.assertEqual(worker._eval_counter, 1)
+                    self.assertEqual(worker._measure_objective.call_count, 1)
+                    self.assertEqual(control.return_value.pv_put.call_count, 1)
+                    self.assertEqual(worker.intensity_baseline, {"MB1R": 10.})
+                    run_dir = worker.run_dir
+                    worker.resume()
+                    thread.join(3)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(worker._eval_counter, 2)
+                    self.assertEqual(len(results), 2)
+                    self.assertEqual(worker.run_dir, run_dir)
+                    self.assertEqual(worker.intensity_baseline, {"MB1R": 10.})
+                    self.assertFalse(any(p["kind"] == "run_error" for p in progress))
+                finally:
+                    finish_measurement.set()
+                    worker.stop()
+                    thread.join(3)
+
+    def test_stop_wakes_pause_without_error_or_new_pv_writes(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control:
+            worker = opt.OptimizationWorker({"mode": "GROUP_BO"}, directory)
+            paused = threading.Event()
+            progress = []
+            def emit(payload):
+                progress.append(payload)
+                if payload.get("kind") == "pause_state" and payload["paused"]:
+                    paused.set()
+            worker._emit_progress = emit
+            worker.request_pause()
+            thread = threading.Thread(target=worker.run)
+            thread.start()
+            try:
+                self.assertTrue(paused.wait(2))
+                worker.stop()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertFalse(worker.is_paused)
+                self.assertFalse(any(p["kind"] == "run_error" for p in progress))
+                control.return_value.pv_put.assert_not_called()
+                control.return_value.pv_put_many.assert_not_called()
+                control.return_value.read_current.assert_not_called()
+            finally:
+                worker.stop()
+                thread.join(3)
+
     def test_dr_orbit_mode_apply_and_read_order(self):
         module = "machine_interfaces_atf2.InterfaceATF2_DR"
         for mode in (0, 1, 2, 3):
