@@ -16,6 +16,73 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_group_budget_formula_and_overrides(self):
+        for dim in (1, 2, 4, 8, 16, 32, 64):
+            budget = opt._auto_group_bo_budget(dim)
+            self.assertEqual(budget["min_init"], 2 * dim + 8)
+            self.assertEqual(budget["max_evals"], 10 * dim + 20)
+            self.assertEqual(opt._resolve_group_bo_max_evals({}, "Correctors", dim), 10 * dim + 20)
+        self.assertEqual(opt._resolve_group_bo_max_evals({"gbo_max_evals_correctors": 77}, "Correctors", 8), 77)
+        self.assertEqual(opt._resolve_group_bo_max_evals({"gbo_max_evals": 65}, "Correctors", 8), 65)
+        self.assertEqual(opt._resolve_group_bo_max_evals(
+            {"gbo_max_evals_correctors": 77, "gbo_correctors_auto": True}, "Correctors", 8), 100)
+        self.assertEqual(opt._resolve_group_bo_max_evals({"gbo_max_evals_qa": 91}, "QA", 5), 91)
+
+    def test_group_budget_gui_tracks_corrector_count_and_manual_override(self):
+        app = QApplication.instance() or QApplication([])
+        with patch.object(opt.MainWindow, "_refresh_current_values"):
+            window = opt.MainWindow()
+            window._current_value_timer.stop()
+            try:
+                window.mode_box.setCurrentText("GROUP_BO")
+                spin = window.group_bo_max_eval_spinboxes["correctors"]
+                self.assertTrue(window.corrector_budget_auto.isChecked())
+                for row in (0, 1):
+                    window.dev_actuator_table.item(row, 0).setCheckState(opt.Qt.CheckState.Checked)
+                self.assertEqual(spin.value(), 40)
+                self.assertIn("D=2", window.group_bo_budget_labels["correctors"].text())
+                self.assertIn("init ≤ 12", window.group_bo_budget_labels["correctors"].text())
+                self.assertFalse(spin.isEnabled())
+                window.corrector_budget_auto.setChecked(False)
+                self.assertTrue(spin.isEnabled())
+                spin.setValue(77)
+                window.dev_actuator_table.item(2, 0).setCheckState(opt.Qt.CheckState.Checked)
+                self.assertEqual(spin.value(), 77)
+                self.assertIn("D=3", window.group_bo_budget_labels["correctors"].text())
+                spin.setValue(5)
+                self.assertIn("init ≤ 5", window.group_bo_budget_labels["correctors"].text())
+                window.corrector_budget_auto.setChecked(True)
+                self.assertEqual(spin.value(), 50)
+                self.assertEqual(window.group_bo_max_eval_spinboxes["qa"].value(), 70)
+                self.assertEqual(window.group_bo_max_eval_spinboxes["timing"].value(), 30)
+            finally:
+                window.close()
+                app.processEvents()
+
+    def test_group_budget_limit_and_small_grid_exhaustion(self):
+        for dimension, half_range, max_evals, expected_count, reason in (
+                (1, 1., 30, 3, "candidate_exhausted"),
+                (2, 2., 14, 14, "max_evals_reached(14)")):
+            with self.subTest(dimension=dimension), tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT"):
+                config = {"gbo_max_evals_correctors": max_evals,
+                          "gbo_uncertainty_rel_tol": 0., "gbo_uncertainty_abs_tol": 0.}
+                worker = opt.OptimizationWorker(config, directory)
+                worker._read_current = Mock(return_value=0.)
+                worker._try_reuse_initial_vector = Mock(return_value=None)
+                worker._evaluate_point_multi = Mock(return_value=SimpleNamespace(score=1., ict={}, bpm_metric=1.))
+                worker._objective_metric_text = Mock(return_value="score=1")
+                worker._gp_posterior_nd = Mock(side_effect=lambda x, y, c, **kw: (np.zeros(len(c)), np.ones(len(c))))
+                messages = []
+                worker.log_signal.connect(messages.append)
+                params = [(f"Z{i}", f"Z{i}:currentWrite", 1., half_range) for i in range(dimension)]
+                worker._group_bo_simultaneous("Correctors", params)
+                calls = worker._evaluate_point_multi.call_args_list
+                self.assertEqual(len(calls), expected_count + 1)
+                self.assertEqual(calls[-1].kwargs["note"], "OPTIMIZED_SET")
+                vectors = [tuple(call.kwargs["pv_to_value"].values()) for call in calls[:-1]]
+                self.assertEqual(len(set(vectors)), expected_count)
+                self.assertTrue(any(f"stop_reason={reason}" in message for message in messages))
+
     def test_gp_log_is_only_shown_for_bo_scans(self):
         for method in ("TERNARY", "BO"):
             with self.subTest(method=method), tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT"):
@@ -393,6 +460,8 @@ class IntensityTests(unittest.TestCase):
                     self.assertEqual(cfg["intensity_aggregation"], "raw_sum")
                     self.assertEqual(cfg["objective_bpm_names"], ["MB1R", "MB2R"])
                     self.assertTrue(cfg["correctors"])
+                    self.assertTrue(cfg["gbo_correctors_auto"])
+                    self.assertEqual(cfg["gbo_max_evals_correctors"], 30)
                     self.assertEqual(len(cfg["developer_actuators"]), 1)
                     self.assertTrue(cfg["gun_sol_l0_phase"])
                     self.assertTrue(cfg["kly_phase"])

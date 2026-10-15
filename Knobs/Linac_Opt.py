@@ -237,6 +237,8 @@ GROUP_BO_MAX_EVAL_SPECS = [
     {"config_id": "timing", "ui_label": TARGET_LABELS["timing"], "runtime_name": TARGET_LABELS["timing"], "dim": 1},
     {"config_id": "qa", "ui_label": TARGET_LABELS["qa"], "runtime_name": TARGET_LABELS["qa"], "dim": 5},
     {"config_id": "qm", "ui_label": TARGET_LABELS["qm"], "runtime_name": TARGET_LABELS["qm"], "dim": 3},
+    # Corrector dimension is resolved from the current selection at runtime.
+    {"config_id": "correctors", "ui_label": "Correctors", "runtime_name": "Correctors", "dim": 0},
 ]
 GROUP_BO_RUNTIME_TO_SPEC = {
     str(spec["runtime_name"]): spec
@@ -346,8 +348,10 @@ def _format_significant_value(value: float, digits: int = 4) -> str:
 
 def _auto_group_bo_budget(ndim: int) -> Dict[str, int]:
     dim = max(1, int(ndim))
-    min_init = min(max(8, dim + 4), 18)
-    max_evals = min(max(24, 3 * dim + 12), 60)
+    # Heuristic evaluation budgets, not convergence guarantees. Keep growing
+    # with dimension instead of saturating at the old 18 / 60 point caps.
+    min_init = 2 * dim + 8
+    max_evals = 10 * dim + 20
     candidate_pool = min(max(1024, 256 * dim), 4096)
     stall_iters = max(6, min(12, dim + 2))
     return {
@@ -360,8 +364,6 @@ def _auto_group_bo_budget(ndim: int) -> Dict[str, int]:
 
 def _recommended_group_bo_max_evals(ndim: int) -> int:
     dim = max(1, int(ndim))
-    if dim == 1:
-        return 17
     return int(_auto_group_bo_budget(dim)["max_evals"])
 
 
@@ -371,6 +373,8 @@ def _group_bo_max_evals_config_key(config_id: str) -> str:
 
 def _resolve_group_bo_max_evals(config: Dict[str, Any], group_name: str, ndim: int) -> int:
     fallback = _recommended_group_bo_max_evals(ndim)
+    if group_name == DEVELOPER_GROUP_NAME and config.get("gbo_correctors_auto", False):
+        return fallback
     spec = GROUP_BO_RUNTIME_TO_SPEC.get(str(group_name))
     if spec is not None:
         value = config.get(_group_bo_max_evals_config_key(str(spec["config_id"])))
@@ -1503,6 +1507,7 @@ class OptimizationWorker(QThread):
         total_lattice_points = 1
         for axis in grid_axes:
             total_lattice_points *= max(1, int(axis.size))
+        min_init = min(min_init, total_lattice_points)
 
         X, Y, R = [], [], []
 
@@ -1634,13 +1639,6 @@ class OptimizationWorker(QThread):
                     R.append(r_resume)
                     eval_cache[key(x_resume)] = r_resume
 
-        # Initial design: current + random points
-        if len(X) == 0:
-            eval_vec(cur, note="GBO_INIT_CUR")
-        while self.is_running and len(X) < min_init and len(X) < max_evals:
-            rnd = lo + (hi - lo) * np.random.rand(len(params))
-            eval_vec(rnd, note="GBO_INIT_RAND")
-
         stop_reason = "max_evals_reached"
 
         def build_candidate_set(X_train: np.ndarray) -> Tuple[np.ndarray, str]:
@@ -1677,10 +1675,24 @@ class OptimizationWorker(QThread):
 
         self.log_signal.emit(
             f"[GROUP_BO] {group_name}: D={len(params)}, min_init={min_init}, "
-            f"max_evals={max_evals}, cand_pool={cand_pool}"
+            f"max_evals={max_evals}, cand_pool={cand_pool}; "
+            f"default max=10D+20={auto_budget['max_evals']}, initial=2D+8={auto_budget['min_init']}"
         )
 
-        while self.is_running and len(X) < max_evals:
+        # Initial design: current + unique random lattice points. Larger
+        # budgets must not loop forever when the configured grid is small.
+        if not self.is_running:
+            return
+        if len(X) == 0:
+            eval_vec(cur, note="GBO_INIT_CUR")
+        while self.is_running and len(X) < min_init and len(X) < max_evals:
+            candidates, candidate_mode = build_candidate_set(np.vstack(X))
+            if candidates.size == 0:
+                stop_reason = candidate_mode
+                break
+            eval_vec(candidates[int(rng.integers(len(candidates)))], note="GBO_INIT_RAND")
+
+        while self.is_running and len(X) < max_evals and stop_reason == "max_evals_reached":
             X_train = np.vstack(X)
             y_train = np.array(Y, dtype=float)
 
@@ -2757,6 +2769,7 @@ class MainWindow(QMainWindow):
         self.dev_actuator_spinboxes: Dict[str, Dict[str, QDoubleSpinBox]] = {}
         self.dev_bpm_row_map: Dict[str, int] = {}
         self.group_bo_max_eval_spinboxes: Dict[str, QSpinBox] = {}
+        self.group_bo_budget_labels: Dict[str, QLabel] = {}
 
         self._init_ui()
         self._current_value_timer = QTimer(self)
@@ -3495,19 +3508,33 @@ class MainWindow(QMainWindow):
         lay_gbo = QGridLayout(self.grp_group_bo_budget)
         lay_gbo.setHorizontalSpacing(18)
         lay_gbo.setVerticalSpacing(8)
+        budget_help = QLabel(
+            "Default max = 10D + 20; initial = 2D + 8 (included in max). D = number of variables.\n"
+            "Heuristic budget, not a convergence guarantee. Early stopping may finish sooner.\n"
+            "Initial points are limited by max / available grid points. Final best-point measurement is extra.\n"
+            "Timing uses the 1D BO initial design; its maximum follows the same 10D + 20 rule.")
+        budget_help.setWordWrap(True)
+        lay_gbo.addWidget(budget_help, 0, 0, 1, 4)
         for idx, spec in enumerate(GROUP_BO_MAX_EVAL_SPECS):
             label = QLabel(f"{spec['ui_label']} (D={spec['dim']})")
+            self.group_bo_budget_labels[str(spec["config_id"])] = label
             spin = QSpinBox()
-            spin.setRange(1, 999)
+            spin.setRange(1, 1000000)
             spin.setValue(_recommended_group_bo_max_evals(int(spec["dim"])))
             spin.setSuffix(" evals")
-            spin.setToolTip(f"Recommended default for dimension {spec['dim']}.")
+            spin.setToolTip("Maximum search evaluations, including initial points. Editable budget; default = 10D + 20.")
             self.group_bo_max_eval_spinboxes[str(spec["config_id"])] = spin
 
-            row = idx // 2
+            row = 1 + idx // 2
             col = (idx % 2) * 2
             lay_gbo.addWidget(label, row, col)
             lay_gbo.addWidget(spin, row, col + 1)
+            spin.valueChanged.connect(self._refresh_group_bo_budget_labels)
+        self.corrector_budget_auto = QCheckBox("Correctors: auto max = 10D + 20 (follow selected count)")
+        self.corrector_budget_auto.setChecked(True)
+        self.corrector_budget_auto.toggled.connect(self._refresh_group_bo_budget_labels)
+        lay_gbo.addWidget(self.corrector_budget_auto, 1 + (len(GROUP_BO_MAX_EVAL_SPECS) + 1) // 2, 0, 1, 4)
+        self._refresh_group_bo_budget_labels()
 
         grp_adv = QGroupBox("Advanced")
         layout.addWidget(grp_adv)
@@ -3641,6 +3668,28 @@ class MainWindow(QMainWindow):
             if self.dev_bpm_selected_only.isChecked():
                 self._apply_developer_bpm_filters()
 
+    def _refresh_group_bo_budget_labels(self, *_args):
+        corrector_dim = len(self._selected_developer_actuators()) if hasattr(self, "dev_actuator_table") else 0
+        for spec in GROUP_BO_MAX_EVAL_SPECS:
+            config_id = str(spec["config_id"])
+            dim = corrector_dim if config_id == "correctors" else int(spec["dim"])
+            spin = self.group_bo_max_eval_spinboxes[config_id]
+            if config_id == "correctors":
+                auto = self.corrector_budget_auto.isChecked()
+                spin.setSpecialValueText("—" if dim == 0 and auto else "")
+                if auto:
+                    spin.blockSignals(True)
+                    spin.setValue(_recommended_group_bo_max_evals(dim) if dim else 1)
+                    spin.blockSignals(False)
+                spin.setEnabled(dim > 0 and not auto)
+            initial = min(_auto_group_bo_budget(dim)["min_init"], spin.value())
+            detail = "not selected" if dim == 0 else ("1D BO init" if config_id == "timing" else f"init ≤ {initial}")
+            self.group_bo_budget_labels[config_id].setText(f"{spec['ui_label']} (D={dim}; {detail})")
+            self.group_bo_budget_labels[config_id].setToolTip(
+                (f"Default max: 10 × {dim} + 20 = {10 * dim + 20}. "
+                 "Corrector D is the selected actuator count, not BPM count.")
+                if dim else "Select correctors to calculate their evaluation budget.")
+
     def _refresh_developer_selection_counts(self):
         actuator_count = sum(
             1
@@ -3660,6 +3709,7 @@ class MainWindow(QMainWindow):
         self.corrector_summary.setText("Selected: " + (summary if len(summary) <= 100 else summary[:97] + "..."))
         self.corrector_summary.setToolTip(summary)
         self.dev_bpm_count_lbl.setText(f"Selected BPMs: {bpm_count}")
+        self._refresh_group_bo_budget_labels()
 
     def _apply_developer_actuator_filters(self, *_args):
         search = self.dev_actuator_search.text().strip().lower()
@@ -4735,12 +4785,15 @@ class MainWindow(QMainWindow):
         self.sp_qm_step.setValue(float(payload.get("qm_step_a", self.sp_qm_step.value())))
         self.sp_timing_step.setValue(float(payload.get("timing_step_ns", self.sp_timing_step.value())))
         self.sp_timing_half_steps.setValue(int(payload.get("timing_half_steps", self.sp_timing_half_steps.value())))
+        self.corrector_budget_auto.setChecked(bool(payload.get(
+            "gbo_correctors_auto", "gbo_max_evals_correctors" not in payload)))
         for spec in GROUP_BO_MAX_EVAL_SPECS:
             box = self.group_bo_max_eval_spinboxes.get(str(spec["config_id"]))
             if box is None:
                 continue
             key = _group_bo_max_evals_config_key(str(spec["config_id"]))
             box.setValue(int(payload.get(key, box.value())))
+        self._refresh_group_bo_budget_labels()
         self._update_mode_ui()
 
         if run_profile == RUN_PROFILE_DEVELOPER:
@@ -4994,6 +5047,8 @@ class MainWindow(QMainWindow):
         config = {
             "run_profile": RUN_PROFILE_DEVELOPER,
             "mode": mode,
+            "gbo_correctors_auto": self.corrector_budget_auto.isChecked(),
+            "gbo_max_evals_correctors": self.group_bo_max_eval_spinboxes["correctors"].value(),
             "seq_method": str(self.dev_seq_method_box.currentText()),
             "objective_type": objective_key,
             "intensity_aggregation": self.dev_intensity_aggregation.currentData(),
@@ -5097,6 +5152,7 @@ class MainWindow(QMainWindow):
             "lbo_line_samples": 11,
             "group_bo_passes": 2,
             "group_bo_score_eps": 0.0,
+            "gbo_correctors_auto": self.corrector_budget_auto.isChecked(),
             "reuse_initial_eval": True,
             "gun_sol_l0_phase": self.chk_gun_sol_l0_phase.isChecked(),
             "kly_phase": self.chk_kly_phase.isChecked(),
