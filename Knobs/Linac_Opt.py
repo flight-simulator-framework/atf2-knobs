@@ -104,36 +104,40 @@ DEVELOPER_OBJECTIVE_BPM = "BPM_SQSUM"
 DEVELOPER_OBJECTIVE_INTENSITY = "BPM_INTENSITY"
 
 
-def bpm_intensity_values(bpms, names, min_samples=1):
-    """Require every selected monitor/sample; never silently drop bad data."""
+def bpm_intensity_values(bpms, names, min_samples=1, check_status=True):
+    """Require all selected data; status validation is optional after preflight."""
     available = list(bpms.get("names", []))
     raw = np.asarray(bpms.get("intensity", []), dtype=float)
-    status = np.asarray(bpms.get("status", []), dtype=float)
-    if not names or raw.ndim != 2 or raw.shape != status.shape or raw.shape[0] < min_samples:
+    status = np.asarray(bpms.get("status", []), dtype=float) if check_status else None
+    if (not names or raw.ndim != 2 or raw.shape[0] < min_samples
+            or (check_status and raw.shape != status.shape)):
         raise ValueError("BPM intensity/status data missing or incomplete; update machine-interfaces.")
     result = {}
     for name in names:
         if name not in available:
             raise ValueError(f"Missing selected BPM: {name}")
         i = available.index(name)
-        if i >= raw.shape[1] or not np.all(status[:, i] == 1) or not np.all(np.isfinite(raw[:, i])):
-            raise ValueError(f"Invalid intensity/status at {name}")
+        if i >= raw.shape[1] or not np.all(np.isfinite(raw[:, i])):
+            raise ValueError(f"Missing or non-finite intensity at {name}")
+        if check_status and not np.all(status[:, i] == 1):
+            raise ValueError(f"Invalid status at {name}")
         result[name] = float(np.mean(raw[:, i]))
     return result
 
 
-def bpm_intensity_snapshot(data):
+def bpm_intensity_snapshot(data, check_status=True):
     """Display all monitors, retaining invalid ones as gaps rather than zeros."""
     values = {}
     for name in data.get("names", []):
         try:
-            values[name] = bpm_intensity_values(data, [name])[name]
+            values[name] = bpm_intensity_values(data, [name], check_status=check_status)[name]
         except ValueError:
             values[name] = float("nan")
     return values
 
 
-def read_bpm_intensities(interface, names, log=lambda message: None, baseline=False, snapshot_out=None):
+def read_bpm_intensities(interface, names, log=lambda message: None, baseline=False, snapshot_out=None,
+                         check_status=True):
     error = "No measurement"
     for attempt in range(3):
         try:
@@ -141,7 +145,7 @@ def read_bpm_intensities(interface, names, log=lambda message: None, baseline=Fa
             try:
                 interface.nsamples = max(3, int(previous_samples))
                 data = interface.get_bpms()
-                values = bpm_intensity_values(data, names, min_samples=interface.nsamples)
+                values = bpm_intensity_values(data, names, min_samples=interface.nsamples, check_status=check_status)
             finally:
                 interface.nsamples = previous_samples
             if baseline:
@@ -151,7 +155,7 @@ def read_bpm_intensities(interface, names, log=lambda message: None, baseline=Fa
                         raise ValueError(f"Baseline too small/noisy for relative intensity: {name}; use raw mean.")
             if snapshot_out is not None:
                 snapshot_out.clear()
-                snapshot_out.update(bpm_intensity_snapshot(data))
+                snapshot_out.update(bpm_intensity_snapshot(data, check_status=check_status))
             return values
         except (ValueError, RuntimeError, TypeError, IndexError) as exc:
             error = str(exc)
@@ -182,11 +186,11 @@ def intensity_sources(names):
 
 
 def read_selected_bpm_intensities(linac, dr, names, log=lambda message: None,
-                                 baseline=False, snapshot_out=None):
+                                 baseline=False, snapshot_out=None, check_status=True):
     """Read only selected source regions; mixed sources are sampled sequentially.
 
-    Each source supplies three samples at 0.5 s intervals. A missing/invalid
-    selected monitor aborts the whole measurement, never a partial score.
+    Each source supplies three samples at 0.5 s intervals. All selected monitors
+    must supply finite data; status is checked at preflight, not during scans.
     """
     unknown = set(names) - set(INTENSITY_BPM_NAMES)
     if not names or unknown:
@@ -201,7 +205,7 @@ def read_selected_bpm_intensities(linac, dr, names, log=lambda message: None,
         try:
             source_snapshot = {}
             values.update(read_bpm_intensities(reader, selected, log, baseline=baseline,
-                                               snapshot_out=source_snapshot))
+                                               snapshot_out=source_snapshot, check_status=check_status))
             snapshot.update(source_snapshot)
         finally:
             if previous_interval is None:
@@ -1213,7 +1217,7 @@ class OptimizationWorker(QThread):
         if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY:
             self._last_intensities = read_selected_bpm_intensities(
                 self.interface, self.dr_bpm_reader, self.objective_bpm_names, self.log_signal.emit,
-                snapshot_out=self._last_bpm_snapshot)
+                snapshot_out=self._last_bpm_snapshot, check_status=False)
             metric = intensity_score(self._last_intensities, self.intensity_baseline, self.intensity_aggregation)
             return {}, metric, metric, self._objective_label(), metric, True, ""
         ict, measurement_ok, measurement_reason = self._read_icts()
@@ -4391,7 +4395,7 @@ class MainWindow(QMainWindow):
                     row = self.dev_bpm_row_map.get(name)
                     if row is not None:
                         self.dev_bpm_table.item(row, 3).setText(f"{value:.5g}")
-                        self.dev_bpm_table.item(row, 4).setText("VALID")
+                        self.dev_bpm_table.item(row, 4).setText("READ (status unchecked)")
             self._refresh_eval_plot(context)
             if self._run_mode:
                 self._set_status(

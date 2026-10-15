@@ -55,6 +55,11 @@ class IntensityTests(unittest.TestCase):
         linac_data["status"][:, 1] = 0
         with self.assertRaises(RuntimeError):
             opt.read_selected_bpm_intensities(linac, dr, names)
+        linac.get_bpms.reset_mock()
+        unchecked = opt.read_selected_bpm_intensities(linac, dr, names, check_status=False, snapshot_out=snapshot)
+        self.assertEqual(unchecked, values)
+        self.assertEqual(snapshot["ML1T"], 20.)
+        linac.get_bpms.assert_called_once_with()
         self.assertEqual(linac.nsamples, 1)
         self.assertFalse(hasattr(linac, "bpm_sample_interval_s"))
         with self.assertRaises(ValueError):
@@ -124,6 +129,9 @@ class IntensityTests(unittest.TestCase):
                     origin = window._capture_machine_origin(config)
                     self.assertEqual(origin["initial_score"], 24.)
                     self.assertEqual(origin["initial_objective_label"], "BPM intensity raw_sum")
+                    dr.get_bpms.return_value["status"][:] = 0
+                    with self.assertRaises(RuntimeError):
+                        window._capture_machine_origin(config)
                     dr.get_bpms.side_effect = RuntimeError("Disconnected")
                     window._refresh_developer_live_values()
                     self.assertEqual(window.dev_bpm_table.item(window.dev_bpm_row_map["MB1R"], 4).text(), "INVALID")
@@ -214,8 +222,28 @@ class IntensityTests(unittest.TestCase):
             self.assertEqual(fake.pv_put.call_count, 1)
             dr.get_bpms.return_value = data(0)
             dr.get_bpms.return_value["names"] = ["MB1R", "MB2R"]
+            dr.get_bpms.reset_mock()
+            self.assertEqual(worker._measure_objective()[4], 22.)
+            dr.get_bpms.assert_called_once_with()
+            self.assertEqual(worker._last_bpm_snapshot["MB1R"], 2.)
+            dr.get_bpms.return_value["intensity"][0, 0] = np.nan
             with self.assertRaises(RuntimeError):
                 worker._measure_objective()
+
+    def test_unchecked_status_still_requires_complete_finite_data(self):
+        payload = data(0)
+        payload.pop("status")
+        self.assertEqual(opt.bpm_intensity_values(payload, ["A", "B"], 3, check_status=False),
+                         {"A": 2., "B": 20.})
+        with self.assertRaises(ValueError):
+            opt.bpm_intensity_values(payload, ["missing"], 3, check_status=False)
+        for value in (np.nan, np.inf, -np.inf):
+            payload["intensity"][0, 0] = value
+            with self.assertRaises(ValueError):
+                opt.bpm_intensity_values(payload, ["A", "B"], 3, check_status=False)
+        payload["intensity"] = np.zeros((2, 2))
+        with self.assertRaises(ValueError):
+            opt.bpm_intensity_values(payload, ["A", "B"], 3, check_status=False)
 
     def test_dr_reader_uses_numbered_slots_and_only_reads_dr(self):
         module = "machine_interfaces_atf2.InterfaceATF2_DR"
