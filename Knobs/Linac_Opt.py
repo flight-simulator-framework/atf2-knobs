@@ -196,6 +196,7 @@ def read_bpm_intensities(interface, names, log=lambda message: None, baseline=Fa
 
 
 def configure_dr_turns(reader, config, cancelled=None):
+    reader.configure_orbit_mode(config.get("dr_orbit_mode", 2))
     if config.get("intensity_aggregation") in ("turn_ratio", "turn_composite"):
         reader.configure_turn_scan(True, 1, config.get("dr_ratio_turn", 10), "mean",
                                    cancelled=cancelled, endpoints_only=True)
@@ -3443,6 +3444,19 @@ class MainWindow(QMainWindow):
 
         self.dr_turn_group = QGroupBox("DR BPM turn selection")
         turn_layout = QVBoxLayout(self.dr_turn_group)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("DR BPM mode"))
+        self.dr_orbit_mode = QComboBox()
+        for label, value in (("TBT (0)", 0), ("COD (1)", 1), ("Injection (2)", 2), ("Extraction (3)", 3)):
+            self.dr_orbit_mode.addItem(label, value)
+        self.dr_orbit_mode.setCurrentIndex(2)
+        self.dr_orbit_mode.setToolTip("DRBPM:ORBIT_MODE. Applied before DR acquisition or with Apply mode. No PV write on GUI startup; mode is not restored.")
+        mode_row.addWidget(self.dr_orbit_mode)
+        self.dr_orbit_apply = QPushButton("Apply mode")
+        self.dr_orbit_apply.clicked.connect(self._apply_dr_orbit_mode)
+        mode_row.addWidget(self.dr_orbit_apply)
+        mode_row.addStretch()
+        turn_layout.addLayout(mode_row)
         self.dr_turn_enabled = QCheckBox("Scan turns (writes DRBPM:INJ:TURN_COUNT)")
         turn_layout.addWidget(self.dr_turn_enabled)
         turn_row = QHBoxLayout()
@@ -3464,7 +3478,7 @@ class MainWindow(QMainWindow):
         turn_layout.addLayout(turn_row)
         turn_help = QLabel("Wait 0.5 s after each turn change, then sample. Optimization: 3 samples/turn "
                            "at 0.5 s intervals (~2 s/turn). Average samples, then Mean/Sum across turns, "
-                           "then Aggregate across BPMs. Shared PV is restored after acquisition. "
+                           "then Aggregate across BPMs. Shared PV stays at the last commanded turn (also on stop/error). "
                            "Refresh also scans when enabled; LINAC/BT are unchanged.")
         turn_help.setWordWrap(True)
         turn_layout.addWidget(turn_help)
@@ -3491,7 +3505,7 @@ class MainWindow(QMainWindow):
                             "Overrides the turn-range scan above. Score = mean(I_N / I_1), optionally + w × "
                             "mean(I_1) / initial mean(I_1). Fixed baseline; finite turn 1 intensity at/below the minimum "
                             "counts as loss (0 transmission, retained in the BPM mean). Noisy turn 1 sets the entire score to 0 and continues; missing data stops the run. "
-                            "These modes write and restore the turn selector PV.")
+                            "Each acquisition writes turn 1 then N; the selector stays at N after completion.")
         ratio_help.setWordWrap(True)
         bpm_layout.addWidget(ratio_help)
 
@@ -4170,9 +4184,17 @@ class MainWindow(QMainWindow):
             self._set_developer_actuator_status(name, "idle")
 
     def _dr_turn_config_from_ui(self):
-        return {"dr_turn_scan": self.dr_turn_enabled.isChecked(),
+        return {"dr_orbit_mode": self.dr_orbit_mode.currentData(), "dr_turn_scan": self.dr_turn_enabled.isChecked(),
                 "dr_turn_start": self.dr_turn_start.value(), "dr_turn_end": self.dr_turn_end.value(),
                 "dr_turn_aggregation": self.dr_turn_aggregation.currentData()}
+
+    def _apply_dr_orbit_mode(self):
+        try:
+            self.dr_bpm_reader.configure_orbit_mode(self.dr_orbit_mode.currentData())
+            self.dr_bpm_reader.apply_orbit_mode()
+            self.append_log(f"[DR BPM] DRBPM:ORBIT_MODE = {self.dr_orbit_mode.currentText()}")
+        except Exception as exc:
+            QMessageBox.critical(self, "DR BPM mode", str(exc))
 
     def _transmission_config_from_ui(self):
         return {"dr_ratio_turn": self.dr_ratio_turn.value(), "dr_current_weight": self.dr_current_weight.value(),
@@ -5196,6 +5218,7 @@ class MainWindow(QMainWindow):
         self._refresh_eval_plot(context)
 
     def _apply_config_to_ui(self, payload: Dict[str, Any]):
+        self.dr_orbit_mode.setCurrentIndex(max(0, self.dr_orbit_mode.findData(payload.get("dr_orbit_mode", 2))))
         if "objective_type" in payload:
             self.objective_box.setCurrentText({DEVELOPER_OBJECTIVE_INTENSITY: "BPM intensity",
                                               DEVELOPER_OBJECTIVE_BPM: "BPM sumsq"}.get(payload["objective_type"], "ICT"))
@@ -5566,7 +5589,7 @@ class MainWindow(QMainWindow):
                        f"Correctors: {len(actuators)}; BPMs: {len(bpm_names)}\n"
                        + ("BPMs: " + ", ".join(bpm_names) + "\n" if bpm_names else "")
                        + (f"BPM source: {config['intensity_source']}\nAggregate: {self.dev_intensity_aggregation.currentText()}\n" if objective_key == DEVELOPER_OBJECTIVE_INTENSITY else "")
-                       + (dr_turn_label(config) + "; selector PV will be written and restored.\n" if objective_key == DEVELOPER_OBJECTIVE_INTENSITY and dr_turn_label(config) and any(n in DR_BPM_NAMES for n in bpm_names) else "")
+                       + (dr_turn_label(config) + "; selector PV stays at the last commanded turn.\n" if objective_key == DEVELOPER_OBJECTIVE_INTENSITY and dr_turn_label(config) and any(n in DR_BPM_NAMES for n in bpm_names) else "")
                        + "\n".join(summary) + "\n\nStart optimization? This will change selected corrector currents.")
             if QMessageBox.question(self, "Confirm Developer run", message,
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -5722,7 +5745,7 @@ class MainWindow(QMainWindow):
                            + (f"BPMs: {', '.join(bpms)}\n" if bpms else "")
                            + (f"Source: {config['intensity_source']}; aggregate: {self.dev_intensity_aggregation.currentText()}\n"
                               if objective == DEVELOPER_OBJECTIVE_INTENSITY else "")
-                           + (dr_turn_label(config) + f"; w={config['dr_current_weight']:g}; selector PV will be written and restored.\n" if objective == DEVELOPER_OBJECTIVE_INTENSITY and dr_turn_label(config) and any(n in DR_BPM_NAMES for n in bpms) else "")
+                           + (dr_turn_label(config) + f"; w={config['dr_current_weight']:g}; selector PV stays at the last commanded turn.\n" if objective == DEVELOPER_OBJECTIVE_INTENSITY and dr_turn_label(config) and any(n in DR_BPM_NAMES for n in bpms) else "")
                            + "\n".join(summary) + "\n\nStart? Selected machine settings will change.")
                 if QMessageBox.question(self, "Confirm optimization", message,
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

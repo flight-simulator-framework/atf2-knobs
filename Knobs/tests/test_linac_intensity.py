@@ -16,6 +16,36 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_dr_orbit_mode_apply_and_read_order(self):
+        module = "machine_interfaces_atf2.InterfaceATF2_DR"
+        for mode in (0, 1, 2, 3):
+            reader = opt.DRBPMReader()
+            events, current = [], [-1]
+            pv = Mock()
+            pv.get.side_effect = lambda **kwargs: current[0]
+            def put(value, **kwargs):
+                current[0] = value
+                events.append(("put", value))
+                return 1
+            pv.put.side_effect = put
+            with patch(module + ".PV", return_value=pv) as factory, patch(module + ".time.sleep", side_effect=lambda seconds: events.append(("sleep", seconds))), patch(
+                    module + ".InterfaceATF2_DR.get_bpms", side_effect=lambda *args: events.append(("read", current[0]))):
+                reader.configure_orbit_mode(mode)
+                factory.assert_not_called()
+                reader.get_bpms(["MB1R"])
+                reader.get_bpms(["MB1R"])
+                self.assertEqual(events, [("put", mode), ("sleep", .5), ("read", mode), ("read", mode)])
+                factory.assert_called_with("DRBPM:ORBIT_MODE")
+                pv.put.assert_called_once_with(mode, wait=True, timeout=2.)
+            with self.assertRaises(ValueError):
+                reader.configure_orbit_mode(4)
+        reader.configure_orbit_mode(2)
+        with patch(module + ".PV") as factory:
+            factory.return_value.wait_for_connection.return_value = False
+            with self.assertRaises(opt.DRBPMTurnControlError):
+                reader.get_bpms(["MB1R"])
+            factory.return_value.put.assert_not_called()
+
     def test_l8_phase_uses_search_range_without_ioc_limits(self):
         interface = Mock()
         interface.read_current.return_value = 350.
@@ -144,6 +174,7 @@ class IntensityTests(unittest.TestCase):
         reader = opt.DRBPMReader(nsamples=3)
         reader.log = lambda message: None
         opt.configure_dr_turns(reader, {"intensity_aggregation": "turn_ratio", "dr_ratio_turn": 10})
+        reader.configure_orbit_mode(None)  # Mode control is covered independently above.
         current = [5]
         selector = Mock()
         selector.get.return_value = 5
@@ -157,10 +188,12 @@ class IntensityTests(unittest.TestCase):
             return {"names": names, **{key: np.ones((3, len(names))) for key in ("intensity", "status", "x", "y", "tmit")}}
         with patch(module + ".PV", return_value=selector), patch(module + ".time.sleep"), patch(module + ".InterfaceATF2_DR.get_bpms", autospec=True, side_effect=sample) as read:
             result = reader.get_bpms(["MB1R"])
+            reader.get_bpms(["MB1R"])
         self.assertEqual(result["turns"], [1, 10])
         self.assertEqual(set(result["turn_data"]), {1, 10})
-        self.assertEqual(read.call_count, 2)
-        self.assertEqual([call.args[0] for call in selector.put.call_args_list], [1, 10, 5])
+        self.assertEqual(read.call_count, 4)
+        self.assertEqual([call.args[0] for call in selector.put.call_args_list], [1, 10, 1, 10])
+        self.assertEqual(current[0], 10)
 
     def test_turn_live_plots_components_bars_and_no_pv_reads(self):
         app = QApplication.instance() or QApplication([])
@@ -262,7 +295,7 @@ class IntensityTests(unittest.TestCase):
                 worker._run_group_bo()
                 self.assertNotIn("CM8L:phaseWrite", [p[1] for p in run.call_args.args[1]])
 
-    def test_dr_turn_scan_mean_sum_settle_and_restore(self):
+    def test_dr_turn_scan_mean_sum_settle_and_leave_last_turn(self):
         module = "machine_interfaces_atf2.InterfaceATF2_DR"
         for aggregation, expected, bad_status in (("mean", 20., False), ("sum", 60., False), ("sum", 60., True)):
             with self.subTest(aggregation=aggregation, bad_status=bad_status):
@@ -295,7 +328,7 @@ class IntensityTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         opt.bpm_intensity_values(values, ["MB1R"])
                     self.assertEqual(opt.bpm_intensity_values(values, ["MB1R"], check_status=False), {"MB1R": expected})
-                self.assertEqual(current[0], 7)
+                self.assertEqual(current[0], 3)
                 self.assertEqual(values["turns"], [1, 2, 3])
                 self.assertEqual(waveform.get.call_count, 9)
                 for turn in (1, 2, 3):
@@ -309,7 +342,7 @@ class IntensityTests(unittest.TestCase):
         for args in ((True, 0, 3, "mean"), (True, 3, 1, "mean"), (True, 1, 3, "invalid")):
             with self.assertRaises(ValueError):
                 reader.configure_turn_scan(*args)
-        for failure in ("put", "cancel", "restore"):
+        for failure in ("put", "cancel"):
             with self.subTest(failure=failure):
                 current, stopped = [7], [False]
                 selector = Mock()
@@ -317,7 +350,7 @@ class IntensityTests(unittest.TestCase):
                 selector.get_ctrlvars.return_value = {}
                 selector.get.side_effect = lambda **kwargs: current[0]
                 def put(value, **kwargs):
-                    if (failure == "put" and value == 1) or (failure == "restore" and value == 7):
+                    if failure == "put" and value == 1:
                         return -1
                     current[0] = value
                     return 1
@@ -329,9 +362,9 @@ class IntensityTests(unittest.TestCase):
                     with self.assertRaises(InterruptedError if failure == "cancel" else opt.DRBPMTurnControlError):
                         opt.read_bpm_intensities(reader, ["MB1R"])
                 # A selector error must not trigger the three measurement retries.
-                self.assertEqual(selector.put.call_count, 2)
-                if failure != "restore":
-                    self.assertEqual(current[0], 7)
+                self.assertEqual(selector.put.call_count, 1)
+                self.assertEqual(current[0], 7 if failure == "put" else 1)
+                self.assertFalse(reader.bpm_force_read)
 
         reader.configure_turn_scan(True, 1, 10)
         selector = Mock()
@@ -349,9 +382,10 @@ class IntensityTests(unittest.TestCase):
             window._current_value_timer.stop()
             try:
                 self.assertFalse(window.dr_turn_enabled.isChecked())
+                self.assertEqual(window.dr_orbit_mode.currentData(), 2)
                 self.assertFalse(window.dr_turn_start.isEnabled())
                 config = {"dr_turn_scan": True, "dr_turn_start": 2, "dr_turn_end": 10,
-                          "dr_turn_aggregation": "sum"}
+                          "dr_turn_aggregation": "sum", "dr_orbit_mode": 3}
                 window._apply_config_to_ui(config)
                 self.assertEqual(window._dr_turn_config_from_ui(), config)
                 self.assertTrue(window.dr_turn_start.isEnabled())
@@ -359,6 +393,7 @@ class IntensityTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT"):
                     worker = opt.OptimizationWorker(config, directory)
                     self.assertTrue(worker.dr_bpm_reader.turn_scan_enabled)
+                    self.assertEqual(worker.dr_bpm_reader.orbit_mode, 3)
                     self.assertEqual(worker.dr_bpm_reader.turn_aggregation, "sum")
                     self.assertEqual(worker.dr_bpm_reader.turn_start, 2)
                     worker.stop()
