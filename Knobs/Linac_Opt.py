@@ -1837,10 +1837,11 @@ class OptimizationWorker(QThread):
         sigma_f = float(self.config.get("bo_sigma_f", 1.0))
         sigma_n = float(self.config.get("bo_sigma_n", 1e-2))
         xi = float(self.config.get("bo_xi", 0.0))
-        self.log_signal.emit(
-            f"[BO1D][GP] axis={pv_name}, mode={hp_mode}, length_scale={length_scale:.6g}, "
-            f"source={length_source}, signal_sd={sigma_f:.6g}, noise_sd={sigma_n:.6g}"
-        )
+        if log_method == "BO-1D":
+            self.log_signal.emit(
+                f"[BO1D][GP] axis={pv_name}, mode={hp_mode}, length_scale={length_scale:.6g}, "
+                f"source={length_source}, signal_sd={sigma_f:.6g}, noise_sd={sigma_n:.6g}"
+            )
 
         X, Y, R = [], [], []  # store evaluated (x, score, EvalResult)
 

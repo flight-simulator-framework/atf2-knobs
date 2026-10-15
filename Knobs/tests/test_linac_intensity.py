@@ -16,6 +16,22 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_gp_log_is_only_shown_for_bo_scans(self):
+        for method in ("TERNARY", "BO"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT"):
+                worker = opt.OptimizationWorker({"seq_method": method, "bo_max_evals": 3,
+                                                 "bo_refine": False}, directory)
+                messages = []
+                worker.log_signal.connect(messages.append)
+                worker._try_reuse_initial_point = Mock(return_value=None)
+                worker._evaluate_point = Mock(return_value=SimpleNamespace(score=1., ict={"Ttot": 1.}, bpm_metric=1.))
+                worker._objective_metric_text = Mock(return_value="score=1")
+                worker.perform_1d_scan("L0 phase", "CM0L:phaseWrite", np.array([-1., 0., 1.]))
+                self.assertTrue(worker._evaluate_point.called)
+                self.assertEqual(any("[BO1D][GP]" in message for message in messages), method == "BO")
+                expected_label = "TERNARY-1D" if method == "TERNARY" else "BO-1D"
+                self.assertTrue(any(f"[{expected_label}] Optimizing" in message for message in messages))
+
     def test_intensity_plot_beamline_order_and_dr_wrap(self):
         names = opt.INTENSITY_PLOT_BPM_NAMES
         expected_dr = [f"MB{i}R" for i in list(range(21, 99)) + list(range(1, 21))
