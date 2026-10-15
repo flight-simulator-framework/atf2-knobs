@@ -17,6 +17,38 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_transmission_clips_each_bpm_but_not_normalized_current(self):
+        first, last = data(), data()
+        first["names"] = last["names"] = ["MB1R", "MB2R"]
+        first["intensity"] = np.full((3, 2), 10.)
+        last["intensity"] = np.tile([18., 2.], (3, 1))
+        acquired = {"turn_data": {1: first, 10: last}}
+        reader = Mock(nsamples=3)
+        reader.get_bpms.return_value = acquired
+        config = {"objective_type": opt.DEVELOPER_OBJECTIVE_INTENSITY, "intensity_aggregation": "turn_composite",
+                  "objective_bpm_names": first["names"], "dr_current_weight": 2.,
+                  "intensity_baseline": {"MB1R": 5., "MB2R": 5.}}
+        plot = {}
+        result = opt.read_turn_objective(reader, first["names"], config, config["intensity_baseline"], plot_out=plot)
+        self.assertAlmostEqual(result[0], 4.6)
+        self.assertAlmostEqual(result[-2], .6)  # mean(1, .2), NOT clip(mean(1.8, .2))
+        self.assertEqual(result[-1], 2.)
+        self.assertEqual(plot["ratios"], {"MB1R": 1., "MB2R": .2})
+        self.assertEqual(plot["raw_ratios"], {"MB1R": 1.8, "MB2R": .2})
+        with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT"):
+            worker = opt.OptimizationWorker(config, directory)
+            logs = []
+            worker.log_signal.connect(logs.append)
+            with patch.object(worker.dr_bpm_reader, "get_bpms", return_value=acquired):
+                self.assertAlmostEqual(worker._measure_objective()[4], 4.6)
+            self.assertTrue(any("MB1R=1.8" in message for message in logs))
+        config["intensity_aggregation"] = "turn_ratio"
+        last["intensity"][:, 1] = -2.
+        self.assertEqual(opt.read_turn_objective(reader, first["names"], config)[0], .5)
+        last["intensity"][:, 1] = np.nan
+        with self.assertRaises(ValueError):
+            opt.read_turn_objective(reader, first["names"], config)
+
     def test_gui_pause_resume_and_stop_controls(self):
         app = QApplication.instance() or QApplication([])
         with patch.object(opt.MainWindow, "_refresh_current_values"):

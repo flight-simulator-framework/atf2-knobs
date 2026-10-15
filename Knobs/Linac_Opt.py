@@ -261,7 +261,8 @@ def read_turn_objective(reader, names, config, baseline=None, check_status=True,
         if name in lost:
             first[name] = 0.
             continue
-    transmission = float(np.mean([0. if name in lost else last[name] / first[name] for name in names]))
+    selected_raw_ratios = {name: 0. if name in lost else last[name] / first[name] for name in names}
+    transmission = float(np.mean([np.clip(value, 0., 1.) for value in selected_raw_ratios.values()]))
     initial = first if baseline is None else baseline
     if any(n not in initial or not np.isfinite(initial[n]) or initial[n] < 0 for n in names):
         raise ValueError("Invalid fixed turn 1 baseline; start a fresh run.")
@@ -285,7 +286,9 @@ def read_turn_objective(reader, names, config, baseline=None, check_status=True,
             ratios[name] = (last_snapshot.get(name, np.nan) / value
                             if np.isfinite(value) and value > floor else float("nan"))
         plot_out.clear()
-        plot_out.update(first=first_snapshot, last=last_snapshot, ratios=ratios,
+        plot_out.update(first=first_snapshot, last=last_snapshot,
+                        raw_ratios=ratios, selected_raw_ratios=selected_raw_ratios,
+                        ratios={name: float(np.clip(value, 0., 1.)) for name, value in ratios.items()},
                         transmission=transmission, normalized_current=normalized,
                         weight=weight, target=target, aggregation=config["intensity_aggregation"])
     return score, first, last, bpm_intensity_snapshot(last_data, check_status=check_status), transmission, normalized
@@ -1393,6 +1396,11 @@ class OptimizationWorker(QThread):
                     self.dr_bpm_reader, self.objective_bpm_names, self.config, self.intensity_baseline,
                     check_status=False, plot_out=self._last_turn_plot)
                 self.log_signal.emit(f"[DR] mean transmission={transmission:.6g}; normalized turn 1 meanCurrent={normalized:.6g}; score={metric:.6g}")
+                clipped = {name: value for name, value in self._last_turn_plot.get("selected_raw_ratios", {}).items()
+                           if value < 0. or value > 1.}
+                if clipped:
+                    self.log_signal.emit("[DR] Transmission clipped to [0, 1] per BPM; raw N/1: " +
+                                         ", ".join(f"{name}={value:.6g}" for name, value in clipped.items()))
                 return {}, metric, metric, self._objective_label(), metric, True, ""
             self._last_intensities = read_selected_bpm_intensities(
                 self.interface, self.dr_bpm_reader, self.objective_bpm_names, self.log_signal.emit,
@@ -3537,7 +3545,7 @@ class MainWindow(QMainWindow):
             ratio_row.addWidget(widget)
         bpm_layout.addLayout(ratio_row)
         ratio_help = QLabel("Transmission modes: DR BPMs only; read turns 1 and N (0.5 s settle each). "
-                            "Overrides the turn-range scan above. Score = mean(I_N / I_1), optionally + w × "
+                            "Overrides the turn-range scan above. Score = mean(clip(I_N / I_1, 0, 1)), optionally + w × "
                             "mean(I_1) / initial mean(I_1). Fixed baseline; finite turn 1 intensity at/below the minimum "
                             "counts as loss (0 transmission, retained in the BPM mean). No standard-deviation/noise threshold is applied; missing data stops the run. "
                             "Each acquisition writes turn 1 then N; the selector stays at N after completion.")
@@ -4745,7 +4753,7 @@ class MainWindow(QMainWindow):
         axis.set_xlim(-1, len(names))
         target = data.get("target", "N")
         axis.set_title(f"Latest BPM intensities: turn 1 / turn {target}" if intensity else f"Latest BPM transmission: turn {target} / turn 1", pad=10)
-        axis.set_ylabel("Intensity (raw)" if intensity else "Transmission N / 1")
+        axis.set_ylabel("Intensity (raw)" if intensity else "Transmission N / 1 (clipped 0–1)")
         axis.set_xlabel("BPM (LINAC / BT: not applicable; DR from MB21R; × = missing/invalid, not zero)")
         axis.grid(axis="y", alpha=.3)
         handles = [Patch(color="#ea580c", label="Selected"), Patch(color="#94a3b8", label="Not selected")]
