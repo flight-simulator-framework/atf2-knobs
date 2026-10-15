@@ -43,7 +43,8 @@ from PyQt6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from machine_interfaces_atf2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT, BT_SEQUENCE
-from machine_interfaces_atf2.InterfaceATF2_DR import DRBPMReader, DR_BPM_NAMES
+from machine_interfaces_atf2.InterfaceATF2_DR import DRBPMReader, DR_BPM_NAMES, DRBPMTurnControlError
+from linac_gp import CorrectorGPModel
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
@@ -104,6 +105,35 @@ DEVELOPER_OBJECTIVE_BPM = "BPM_SQSUM"
 DEVELOPER_OBJECTIVE_INTENSITY = "BPM_INTENSITY"
 
 
+def evaluation_phase(note):
+    tags = str(note or "").split("|")
+    if any(tag in ("GBO_INIT_CUR", "GBO_INIT_RAND", "BO_INIT", "REUSE_INIT") for tag in tags):
+        return "Initial"
+    if any(tag in ("GBO_EI", "BO_EI", "BO_REFINE") for tag in tags):
+        return "BO"
+    return ""
+
+
+def shade_evaluation_phases(axis, indices, phases):
+    """Shade actual acquisition phases, including restarts for later groups."""
+    if len(indices) != len(phases) or len(indices) == 0:
+        return
+    colors = {"Initial": ("#d8ecff", "#355c7d"), "BO": ("#fff0cc", "#8a5a12")}
+    start = 0
+    for end in range(1, len(indices) + 1):
+        if end < len(indices) and phases[end] == phases[start]:
+            continue
+        phase = phases[start]
+        if phase in colors:
+            left = (indices[start - 1] + indices[start]) / 2 if start else indices[0] - .5
+            right = (indices[end - 1] + indices[end]) / 2 if end < len(indices) else indices[-1] + .5
+            color, text_color = colors[phase]
+            axis.axvspan(left, right, color=color, alpha=.35, lw=0, zorder=0)
+            axis.text((left + right) / 2, .98, phase, transform=axis.get_xaxis_transform(),
+                      ha="center", va="top", fontsize=8, color=text_color)
+        start = end
+
+
 def bpm_intensity_values(bpms, names, min_samples=1, check_status=True):
     """Require all selected data; status validation is optional after preflight."""
     available = list(bpms.get("names", []))
@@ -157,10 +187,32 @@ def read_bpm_intensities(interface, names, log=lambda message: None, baseline=Fa
                 snapshot_out.clear()
                 snapshot_out.update(bpm_intensity_snapshot(data, check_status=check_status))
             return values
+        except (DRBPMTurnControlError, InterruptedError):
+            raise
         except (ValueError, RuntimeError, TypeError, IndexError) as exc:
             error = str(exc)
             log(f"BPM measurement retry {attempt + 1}/3: {error}")
     raise RuntimeError(f"BPM measurement invalid; optimization stopped: {error}")
+
+
+def configure_dr_turns(reader, config, cancelled=None):
+    if config.get("intensity_aggregation") in ("turn_ratio", "turn_composite"):
+        reader.configure_turn_scan(True, 1, config.get("dr_ratio_turn", 10), "mean",
+                                   cancelled=cancelled, endpoints_only=True)
+        return
+    reader.configure_turn_scan(
+        enabled=bool(config.get("dr_turn_scan", False)),
+        start=config.get("dr_turn_start", 1), end=config.get("dr_turn_end", 10),
+        aggregation=config.get("dr_turn_aggregation", "mean"), cancelled=cancelled)
+
+
+def dr_turn_label(config):
+    if config.get("intensity_aggregation") in ("turn_ratio", "turn_composite"):
+        return f"DR intensity: turn {config.get('dr_ratio_turn', 10)}; objective uses N / 1"
+    if not config.get("dr_turn_scan", False):
+        return ""
+    return (f"DR turns {config.get('dr_turn_start', 1)}–{config.get('dr_turn_end', 10)}: "
+            f"{config.get('dr_turn_aggregation', 'mean')}")
 
 
 def intensity_score(values, baseline, aggregation):
@@ -177,6 +229,52 @@ def intensity_score(values, baseline, aggregation):
     if any(n not in baseline or not np.isfinite(baseline[n]) or baseline[n] <= 1e-12 for n in values):
         raise ValueError("Relative intensity needs a positive, non-zero baseline for every BPM.")
     return float(np.mean([v / baseline[n] for n, v in values.items()]))
+
+
+def read_turn_objective(reader, names, config, baseline=None, check_status=True, plot_out=None):
+    """Ratio of per-turn sample means, then equal-weight mean across DR BPMs."""
+    if not names or any(name not in DR_BPM_NAMES for name in names):
+        raise ValueError("Turn transmission objectives require DR BPMs only.")
+    target = int(config.get("dr_ratio_turn", 10))
+    floor = float(config.get("dr_ratio_floor", 1e-12))
+    weight = float(config.get("dr_current_weight", 1.0))
+    if target < 2 or not np.isfinite([floor, weight]).all() or floor <= 0 or weight < 0:
+        raise ValueError("Require N >= 2, positive intensity floor and non-negative finite weight.")
+    previous = reader.nsamples
+    try:
+        reader.nsamples = max(3, int(previous))
+        data = reader.get_bpms()
+    finally:
+        reader.nsamples = previous
+    first_data, last_data = data["turn_data"][1], data["turn_data"][target]
+    first = bpm_intensity_values(first_data, names, min_samples=3, check_status=check_status)
+    last = bpm_intensity_values(last_data, names, min_samples=3, check_status=check_status)
+    for name in names:
+        samples = np.asarray(first_data["intensity"])[:, list(first_data["names"]).index(name)]
+        if first[name] <= max(floor, 5 * float(np.std(samples))):
+            raise ValueError(f"Turn 1 intensity too small/noisy for transmission: {name}")
+    transmission = float(np.mean([last[name] / first[name] for name in names]))
+    initial = first if baseline is None else baseline
+    if any(n not in initial or not np.isfinite(initial[n]) or initial[n] <= floor for n in names):
+        raise ValueError("Invalid fixed turn 1 baseline; start a fresh run.")
+    normalized = float(np.mean(list(first.values())) / np.mean([initial[n] for n in names]))
+    score = transmission + weight * normalized if config["intensity_aggregation"] == "turn_composite" else transmission
+    if not np.isfinite(score):
+        raise ValueError("Non-finite turn transmission score")
+    if plot_out is not None:
+        first_snapshot = bpm_intensity_snapshot(first_data, check_status=check_status)
+        last_snapshot = bpm_intensity_snapshot(last_data, check_status=check_status)
+        ratios = {}
+        for name, value in first_snapshot.items():
+            samples = np.asarray(first_data["intensity"])[:, list(first_data["names"]).index(name)]
+            limit = max(floor, 5 * float(np.std(samples)))
+            ratios[name] = (last_snapshot.get(name, np.nan) / value
+                            if np.isfinite(value) and value > limit else float("nan"))
+        plot_out.clear()
+        plot_out.update(first=first_snapshot, last=last_snapshot, ratios=ratios,
+                        transmission=transmission, normalized_current=normalized,
+                        weight=weight, target=target, aggregation=config["intensity_aggregation"])
+    return score, first, last, bpm_intensity_snapshot(last_data, check_status=check_status), transmission, normalized
 
 
 def intensity_sources(names):
@@ -346,12 +444,24 @@ def _format_significant_value(value: float, digits: int = 4) -> str:
     return f"{float(value):.{max(1, int(digits))}g}"
 
 
-def _auto_group_bo_budget(ndim: int) -> Dict[str, int]:
+GROUP_BO_BUDGET_PRESETS = {
+    "quick": {"label": "Quick", "max_slope": 5, "max_offset": 10, "init_slope": 1, "init_offset": 4},
+    "standard": {"label": "Standard", "max_slope": 10, "max_offset": 20, "init_slope": 2, "init_offset": 8},
+    "explore": {"label": "Explore", "max_slope": 20, "max_offset": 40, "init_slope": 4, "init_offset": 12},
+}
+
+
+def _group_bo_preset(preset: str = "standard") -> Dict[str, Any]:
+    return GROUP_BO_BUDGET_PRESETS.get(str(preset), GROUP_BO_BUDGET_PRESETS["standard"])
+
+
+def _auto_group_bo_budget(ndim: int, preset: str = "standard") -> Dict[str, int]:
     dim = max(1, int(ndim))
     # Heuristic evaluation budgets, not convergence guarantees. Keep growing
     # with dimension instead of saturating at the old 18 / 60 point caps.
-    min_init = 2 * dim + 8
-    max_evals = 10 * dim + 20
+    spec = _group_bo_preset(preset)
+    min_init = spec["init_slope"] * dim + spec["init_offset"]
+    max_evals = spec["max_slope"] * dim + spec["max_offset"]
     candidate_pool = min(max(1024, 256 * dim), 4096)
     stall_iters = max(6, min(12, dim + 2))
     return {
@@ -362,9 +472,9 @@ def _auto_group_bo_budget(ndim: int) -> Dict[str, int]:
     }
 
 
-def _recommended_group_bo_max_evals(ndim: int) -> int:
+def _recommended_group_bo_max_evals(ndim: int, preset: str = "standard") -> int:
     dim = max(1, int(ndim))
-    return int(_auto_group_bo_budget(dim)["max_evals"])
+    return int(_auto_group_bo_budget(dim, preset)["max_evals"])
 
 
 def _group_bo_max_evals_config_key(config_id: str) -> str:
@@ -372,7 +482,7 @@ def _group_bo_max_evals_config_key(config_id: str) -> str:
 
 
 def _resolve_group_bo_max_evals(config: Dict[str, Any], group_name: str, ndim: int) -> int:
-    fallback = _recommended_group_bo_max_evals(ndim)
+    fallback = _recommended_group_bo_max_evals(ndim, config.get("gbo_budget_preset", "standard"))
     if group_name == DEVELOPER_GROUP_NAME and config.get("gbo_correctors_auto", False):
         return fallback
     spec = GROUP_BO_RUNTIME_TO_SPEC.get(str(group_name))
@@ -665,6 +775,7 @@ class OptimizationWorker(QThread):
         self.intensity_baseline = dict(config.get("intensity_baseline", {}))
         self._last_intensities = {}
         self._last_bpm_snapshot = {}
+        self._last_turn_plot = {}
         self.developer_actuators = [dict(item) for item in list(config.get("developer_actuators", [])) if
                                     isinstance(item, dict)]
         self.reuse_initial_eval = bool(config.get("reuse_initial_eval", True))
@@ -688,6 +799,8 @@ class OptimizationWorker(QThread):
         # Fixed machine interface for Linac operations
         self.interface = InterfaceATF2_LinacBT(nsamples=1)
         self.dr_bpm_reader = DRBPMReader(nsamples=3) if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY else None
+        if self.dr_bpm_reader is not None:
+            configure_dr_turns(self.dr_bpm_reader, config, cancelled=lambda: not self.is_running)
 
         # Date folder + timestamped run files
         self.run_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -816,6 +929,7 @@ class OptimizationWorker(QThread):
         self._eval_counter += 1
         self._emit_progress({
             "kind": "evaluation",
+            "evaluation_phase": evaluation_phase(r.note),
             "eval_index": int(self._eval_counter),
             "group": str(r.group),
             "mode": str(r.mode),
@@ -828,7 +942,10 @@ class OptimizationWorker(QThread):
             "bpm_metric": float(r.bpm_metric),
             "bpm_intensities": dict(self._last_intensities),
             "bpm_snapshot": dict(self._last_bpm_snapshot),
+            "turn_plot": dict((self._initial_snapshot or {}).get("turn_plot", {})
+                              if "REUSE_INIT" in r.note else self._last_turn_plot),
             "selected_bpms": list(self.objective_bpm_names),
+            "dr_turn_label": dr_turn_label(self.config) if any(n in DR_BPM_NAMES for n in self.objective_bpm_names) else "",
             "measurement_ok": bool(r.measurement_ok),
             "measurement_reason": str(r.measurement_reason),
             "display_values": build_display_value_texts(self._current_pv_values),
@@ -1050,6 +1167,7 @@ class OptimizationWorker(QThread):
             "initial_score": initial_score,
             "initial_measurement_ok": bool(initial_measurement_ok),
             "initial_measurement_reason": str(initial_measurement_reason),
+            "turn_plot": dict(self._last_turn_plot),
         }
         with open(snapshot_path, "w") as f:
             json.dump(data, f, indent=2)
@@ -1219,6 +1337,12 @@ class OptimizationWorker(QThread):
 
     def _measure_objective(self) -> Tuple[Dict[str, float], float, float, str, float, bool, str]:
         if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY:
+            if self.intensity_aggregation in ("turn_ratio", "turn_composite"):
+                metric, _, self._last_intensities, self._last_bpm_snapshot, transmission, normalized = read_turn_objective(
+                    self.dr_bpm_reader, self.objective_bpm_names, self.config, self.intensity_baseline,
+                    check_status=False, plot_out=self._last_turn_plot)
+                self.log_signal.emit(f"[DR] mean transmission={transmission:.6g}; normalized turn 1 meanCurrent={normalized:.6g}; score={metric:.6g}")
+                return {}, metric, metric, self._objective_label(), metric, True, ""
             self._last_intensities = read_selected_bpm_intensities(
                 self.interface, self.dr_bpm_reader, self.objective_bpm_names, self.log_signal.emit,
                 snapshot_out=self._last_bpm_snapshot, check_status=False)
@@ -1374,7 +1498,6 @@ class OptimizationWorker(QThread):
 
         K = self._kernel_rbf_ard(X_train, X_train, length_scales, sigma_f) + (sigma_n ** 2) * np.eye(X_train.shape[0])
         Ks = self._kernel_rbf_ard(X_train, X_test, length_scales, sigma_f)
-        Kss = self._kernel_rbf_ard(X_test, X_test, length_scales, sigma_f)
 
         # Solve K^{-1} y via Cholesky for stability
         try:
@@ -1382,14 +1505,14 @@ class OptimizationWorker(QThread):
             alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
             mu = Ks.T @ alpha
             v = np.linalg.solve(L, Ks)
-            cov = Kss - v.T @ v
+            var = sigma_f ** 2 - np.sum(v * v, axis=0)
         except np.linalg.LinAlgError:
             # Fallback: pseudo-inverse
             Kinv = np.linalg.pinv(K)
             mu = Ks.T @ (Kinv @ y_train)
-            cov = Kss - Ks.T @ (Kinv @ Ks)
+            var = sigma_f ** 2 - np.sum(Ks * (Kinv @ Ks), axis=0)
 
-        var = np.clip(np.diag(cov), 1e-12, None)
+        var = np.clip(var, 1e-12, None)
         std = np.sqrt(var)
         return mu.reshape(-1), std.reshape(-1)
 
@@ -1464,7 +1587,8 @@ class OptimizationWorker(QThread):
         hi = np.array(hi_list, dtype=float)
 
         # Config
-        auto_budget = _auto_group_bo_budget(len(params))
+        budget_preset = self.config.get("gbo_budget_preset", "standard")
+        auto_budget = _auto_group_bo_budget(len(params), budget_preset)
         min_init = int(self.config.get("gbo_min_init", auto_budget["min_init"]))
         max_evals = _resolve_group_bo_max_evals(self.config, group_name, len(params))
         min_init = max(1, min(min_init, max_evals))
@@ -1496,6 +1620,14 @@ class OptimizationWorker(QThread):
         # Allow override
         if "gbo_length_scale_factor" in self.config:
             ls = np.maximum(ls * float(self.config["gbo_length_scale_factor"]), n_step_floor * steps)
+
+        # Only Corrector GroupBO opts into online fitting. Missing config keys
+        # preserve historical behavior for existing saved runs.
+        online_model = None
+        if group_name == DEVELOPER_GROUP_NAME and self.config.get("corrector_gp_mode", "fixed") == "online_fit":
+            online_model = CorrectorGPModel(
+                lo, hi, steps, refit_interval=self.config.get("corrector_gp_refit_interval", 5),
+                log=self.log_signal.emit, cancelled=lambda: not self.is_running, names=pvs)
 
         rng = np.random.default_rng()
         grid_max_idx = np.maximum(0, np.round((hi - lo) / steps).astype(int))
@@ -1567,12 +1699,18 @@ class OptimizationWorker(QThread):
             f"[GROUP_BO] {group_name}: lattice_points={total_lattice_points}, "
             f"candidate_mode={'full_lattice' if total_lattice_points <= full_lattice_limit else 'sampled_lattice'}"
         )
-        self.log_signal.emit(
-            f"[GROUP_BO][GP] mode={hp_mode}, preset={LINAC_LEARNED_PRESET_VERSION if hp_mode == 'learned_fixed' else 'legacy'}, "
-            f"length_scales={{" + ", ".join(
-                f"{pv}:{ls_i:.6g} ({source})" for pv, ls_i, (_, source) in zip(pvs, ls, resolved_ls)
-            ) + "} | signal_sd=%.6g noise_sd=%.6g" % (sigma_f, sigma_n)
-        )
+        if online_model is None:
+            self.log_signal.emit(
+                f"[GROUP_BO][GP] mode={hp_mode}, preset={LINAC_LEARNED_PRESET_VERSION if hp_mode == 'learned_fixed' else 'legacy'}, "
+                f"length_scales={{" + ", ".join(
+                    f"{pv}:{ls_i:.6g} ({source})" for pv, ls_i, (_, source) in zip(pvs, ls, resolved_ls)
+                ) + "} | signal_sd=%.6g noise_sd=%.6g" % (sigma_f, sigma_n)
+            )
+        if online_model is not None:
+            self.log_signal.emit(
+                f"[Corrector GP] online_fit; refit every {online_model.refit_interval} evaluations; "
+                "normalized length bounds=[min(2, max(0.02, 2*step/range)), 2], signal_sd=[0.1,10], noise_sd=[0.001,1]. "
+                "EI and uncertainty thresholds use standardized scores; displayed/saved scores stay raw.")
         if resume_done_row is not None:
             vec = resume_done_row.get("vector", {})
             if isinstance(vec, dict):
@@ -1676,7 +1814,7 @@ class OptimizationWorker(QThread):
         self.log_signal.emit(
             f"[GROUP_BO] {group_name}: D={len(params)}, min_init={min_init}, "
             f"max_evals={max_evals}, cand_pool={cand_pool}; "
-            f"default max=10D+20={auto_budget['max_evals']}, initial=2D+8={auto_budget['min_init']}"
+            f"budget_preset={budget_preset}, default max={auto_budget['max_evals']}, initial={auto_budget['min_init']}"
         )
 
         # Initial design: current + unique random lattice points. Larger
@@ -1701,9 +1839,21 @@ class OptimizationWorker(QThread):
                 stop_reason = cand_mode
                 break
 
-            mu, std = self._gp_posterior_nd(X_train, y_train, C2, length_scales=ls, sigma_f=sigma_f, sigma_n=sigma_n)
-            y_best = float(np.max(y_train))
-            score_scale = max(float(np.std(y_train)), float(np.ptp(y_train)) * 0.25, max(abs(y_best), 1e-6))
+            if online_model is not None:
+                model_x, model_y = online_model.prepare(X_train, y_train)
+                if not self.is_running:
+                    return
+                model_ls, model_signal, model_noise = online_model.parameters
+                mu, std = self._gp_posterior_nd(
+                    model_x, model_y, online_model.transform_inputs(C2),
+                    length_scales=model_ls, sigma_f=model_signal, sigma_n=model_noise)
+                y_best = float(np.max(model_y))
+                # Fixed standardized reference, independent of raw sum/offset.
+                score_scale = 1.0
+            else:
+                mu, std = self._gp_posterior_nd(X_train, y_train, C2, length_scales=ls, sigma_f=sigma_f, sigma_n=sigma_n)
+                y_best = float(np.max(y_train))
+                score_scale = max(float(np.std(y_train)), float(np.ptp(y_train)) * 0.25, max(abs(y_best), 1e-6))
             uncertainty_abs_tol = (
                 float(uncertainty_abs_tol_cfg)
                 if uncertainty_abs_tol_cfg is not None
@@ -1711,7 +1861,8 @@ class OptimizationWorker(QThread):
             )
             std_tol = max(uncertainty_abs_tol, uncertainty_rel_tol * max(score_scale, 1.0))
             max_std = float(np.max(std)) if std.size else 0.0
-            if len(X) >= min_init and max_std <= std_tol:
+            if (len(X) >= min_init and max_std <= std_tol
+                    and (online_model is None or online_model.scale_frozen)):
                 stop_reason = (
                     f"uncertainty_small(max_std={max_std:.6g} <= tol={std_tol:.6g}, "
                     f"mode={cand_mode})"
@@ -1726,6 +1877,8 @@ class OptimizationWorker(QThread):
 
             eval_vec(C2[j], note="GBO_EI")
 
+        if online_model is not None and not self.is_running:
+            return
         best_x, best_score, best_r = current_best()
         if len(X) >= max_evals and stop_reason == "max_evals_reached":
             stop_reason = f"max_evals_reached({max_evals})"
@@ -2048,7 +2201,7 @@ class OptimizationWorker(QThread):
                 break
 
             cand = float(remaining[k])
-            eval_at(cand)
+            eval_at(cand, note="BO_EI")
 
             bx, by, _ = current_best()
             if prev_best_x is not None and bx == prev_best_x:
@@ -2660,7 +2813,8 @@ class OptimizationWorker(QThread):
                     self._emit_group_state("kly_group_1", "done")
             if self.config.get("grp_L5_8", True):
                 self._emit_group_state("kly_group_2", "running")
-                params = [(f"L{i}", f"CM{i}L:phaseWrite", phase_step, phase_half) for i in range(5, 9)]
+                params = [(f"L{i}", f"CM{i}L:phaseWrite", phase_step, phase_half) for i in range(5, 9)
+                          if not (i == 8 and self.config.get("correctors_l8", False))]
                 self._group_bo_simultaneous("L5-8", params)
                 if self.is_running:
                     self._emit_group_state("kly_group_2", "done")
@@ -2985,6 +3139,14 @@ class MainWindow(QMainWindow):
         log_group.setMinimumHeight(520)
         layout.addWidget(log_group, stretch=2)
         log_l = QVBoxLayout(log_group)
+        self.turn_plot_view = QComboBox()
+        self.turn_plot_view.addItem("BPM transmission N / 1", "ratio")
+        self.turn_plot_view.addItem("BPM intensity: turn 1 / turn N", "intensity")
+        self.turn_plot_view.setMaximumWidth(340)
+        self.turn_plot_view.setToolTip("Display acquired data only; switching does not read PVs.")
+        self.turn_plot_view.currentIndexChanged.connect(lambda: self._refresh_eval_plot(RUN_PROFILE_MAIN))
+        self.turn_plot_view.hide()
+        log_l.addWidget(self.turn_plot_view)
         self.eval_fig, self.eval_canvas, self.ax_ttot, self.ax_downstream = self._create_eval_plot_bundle()
         log_l.addWidget(self.eval_canvas, stretch=3)
         self.bo1d_fig, self.bo1d_canvas, self.bo1d_ax_obj, self.bo1d_ax_acq = self._create_bo1d_plot_bundle()
@@ -3235,6 +3397,8 @@ class MainWindow(QMainWindow):
         self.dev_intensity_aggregation.addItem("Raw mean", "raw_mean")
         self.dev_intensity_aggregation.addItem("Raw sum", "raw_sum")
         self.dev_intensity_aggregation.addItem("Mean / initial baseline", "relative_mean")
+        self.dev_intensity_aggregation.addItem("DR transmission: turn N / turn 1", "turn_ratio")
+        self.dev_intensity_aggregation.addItem("DR transmission + normalized meanCurrent", "turn_composite")
         self.dev_intensity_aggregation.setToolTip("Maximize the selected BPMs' mean or sum. Relative mode fixes each baseline before the run.")
         bpm_row.addWidget(self.dev_intensity_aggregation)
         bpm_row.addStretch(1)
@@ -3250,6 +3414,59 @@ class MainWindow(QMainWindow):
             "Optimization reads selected source regions only; Refresh reads all regions.")
         self.intensity_help.setStyleSheet("font-size: 12px; color: #475569;")
         bpm_layout.addWidget(self.intensity_help)
+
+        self.dr_turn_group = QGroupBox("DR BPM turn selection")
+        turn_layout = QVBoxLayout(self.dr_turn_group)
+        self.dr_turn_enabled = QCheckBox("Scan turns (writes DRBPM:INJ:TURN_COUNT)")
+        turn_layout.addWidget(self.dr_turn_enabled)
+        turn_row = QHBoxLayout()
+        self.dr_turn_start = QSpinBox()
+        self.dr_turn_end = QSpinBox()
+        for spin in (self.dr_turn_start, self.dr_turn_end):
+            spin.setRange(1, 1000000)
+        self.dr_turn_end.setValue(10)
+        self.dr_turn_start.valueChanged.connect(self.dr_turn_end.setMinimum)
+        self.dr_turn_aggregation = QComboBox()
+        self.dr_turn_aggregation.addItem("Mean", "mean")
+        self.dr_turn_aggregation.addItem("Sum", "sum")
+        for label, widget in (("First turn", self.dr_turn_start), ("Last turn (inclusive)", self.dr_turn_end),
+                              ("Across turns", self.dr_turn_aggregation)):
+            turn_row.addWidget(QLabel(label))
+            turn_row.addWidget(widget)
+            widget.setEnabled(False)
+            self.dr_turn_enabled.toggled.connect(widget.setEnabled)
+        turn_layout.addLayout(turn_row)
+        turn_help = QLabel("Wait 0.5 s after each turn change, then sample. Optimization: 3 samples/turn "
+                           "at 0.5 s intervals (~2 s/turn). Average samples, then Mean/Sum across turns, "
+                           "then Aggregate across BPMs. Shared PV is restored after acquisition. "
+                           "Refresh also scans when enabled; LINAC/BT are unchanged.")
+        turn_help.setWordWrap(True)
+        turn_layout.addWidget(turn_help)
+        bpm_layout.addWidget(self.dr_turn_group)
+
+        ratio_row = QHBoxLayout()
+        self.dr_ratio_turn = QSpinBox()
+        self.dr_ratio_turn.setRange(2, 1000000)
+        self.dr_ratio_turn.setValue(10)
+        self.dr_current_weight = QDoubleSpinBox()
+        self.dr_current_weight.setRange(0, 1000)
+        self.dr_current_weight.setDecimals(3)
+        self.dr_current_weight.setValue(1)
+        self.dr_ratio_floor = QDoubleSpinBox()
+        self.dr_ratio_floor.setDecimals(12)
+        self.dr_ratio_floor.setRange(1e-12, 1e12)
+        self.dr_ratio_floor.setValue(1e-12)
+        for label, widget in (("Transmission N", self.dr_ratio_turn), ("Current weight w", self.dr_current_weight),
+                              ("Min turn 1 intensity", self.dr_ratio_floor)):
+            ratio_row.addWidget(QLabel(label))
+            ratio_row.addWidget(widget)
+        bpm_layout.addLayout(ratio_row)
+        ratio_help = QLabel("Transmission modes: DR BPMs only; read turns 1 and N (0.5 s settle each). "
+                            "Overrides the turn-range scan above. Score = mean(I_N / I_1), optionally + w × "
+                            "mean(I_1) / initial mean(I_1). Fixed baseline; reject weak/noisy denominators. "
+                            "These modes write and restore the turn selector PV.")
+        ratio_help.setWordWrap(True)
+        bpm_layout.addWidget(ratio_help)
 
         bpm_filter = QHBoxLayout()
         bpm_filter.addWidget(QLabel("Search"))
@@ -3479,6 +3696,20 @@ class MainWindow(QMainWindow):
         lay_timing.addStretch()
         lay_seq.addLayout(lay_timing)
 
+        self.correctors_l8 = QCheckBox("Correctors & L8: include L8 phase + Timing in one Group BO")
+        self.correctors_l8.setToolTip("Timing = EVE_LINAC:OUT0:SetData (existing LINAC timing). Uses Timing range/step above. L8 is excluded from the separate L5–L8 group.")
+        lay_seq.addWidget(self.correctors_l8)
+        self.l8_phase_half = QDoubleSpinBox()
+        self.l8_phase_half.setRange(0.001, 180.)
+        self.l8_phase_half.setDecimals(3)
+        self.l8_phase_half.setValue(PHASE_HALF_RANGE_DEG)
+        self.l8_phase_step = QDoubleSpinBox()
+        self.l8_phase_step.setRange(0.001, 180.)
+        self.l8_phase_step.setDecimals(3)
+        self.l8_phase_step.setValue(PHASE_STEP_DEG)
+        _row("Correctors & L8 phase", self.l8_phase_half, self.l8_phase_step, "deg", "deg")
+        self.correctors_l8.toggled.connect(self._update_correctors_l8_ui)
+
         grp_score = QGroupBox("Scoring")
         layout.addWidget(grp_score)
         lay_score = QHBoxLayout(grp_score)
@@ -3508,13 +3739,18 @@ class MainWindow(QMainWindow):
         lay_gbo = QGridLayout(self.grp_group_bo_budget)
         lay_gbo.setHorizontalSpacing(18)
         lay_gbo.setVerticalSpacing(8)
-        budget_help = QLabel(
-            "Default max = 10D + 20; initial = 2D + 8 (included in max). D = number of variables.\n"
-            "Heuristic budget, not a convergence guarantee. Early stopping may finish sooner.\n"
-            "Initial points are limited by max / available grid points. Final best-point measurement is extra.\n"
-            "Timing uses the 1D BO initial design; its maximum follows the same 10D + 20 rule.")
-        budget_help.setWordWrap(True)
-        lay_gbo.addWidget(budget_help, 0, 0, 1, 4)
+        self.group_bo_budget_preset_box = QComboBox()
+        for key, preset_spec in GROUP_BO_BUDGET_PRESETS.items():
+            self.group_bo_budget_preset_box.addItem(preset_spec["label"], key)
+        self.group_bo_budget_preset_box.setCurrentIndex(self.group_bo_budget_preset_box.findData("standard"))
+        self.group_bo_budget_preset_box.setToolTip(
+            "Changing preset resets ALL group maximum budgets and enables Corrector Auto. "
+            "Only evaluation counts change, not scan ranges, steps, GP settings or early stopping.")
+        lay_gbo.addWidget(QLabel("Evaluation budget preset"), 0, 0)
+        lay_gbo.addWidget(self.group_bo_budget_preset_box, 0, 1, 1, 3)
+        self.group_bo_budget_help = QLabel()
+        self.group_bo_budget_help.setWordWrap(True)
+        lay_gbo.addWidget(self.group_bo_budget_help, 1, 0, 1, 4)
         for idx, spec in enumerate(GROUP_BO_MAX_EVAL_SPECS):
             label = QLabel(f"{spec['ui_label']} (D={spec['dim']})")
             self.group_bo_budget_labels[str(spec["config_id"])] = label
@@ -3522,19 +3758,47 @@ class MainWindow(QMainWindow):
             spin.setRange(1, 1000000)
             spin.setValue(_recommended_group_bo_max_evals(int(spec["dim"])))
             spin.setSuffix(" evals")
-            spin.setToolTip("Maximum search evaluations, including initial points. Editable budget; default = 10D + 20.")
+            spin.setToolTip("Maximum search evaluations, including initial points. Editable override of the selected preset.")
             self.group_bo_max_eval_spinboxes[str(spec["config_id"])] = spin
 
-            row = 1 + idx // 2
+            row = 2 + idx // 2
             col = (idx % 2) * 2
             lay_gbo.addWidget(label, row, col)
             lay_gbo.addWidget(spin, row, col + 1)
             spin.valueChanged.connect(self._refresh_group_bo_budget_labels)
-        self.corrector_budget_auto = QCheckBox("Correctors: auto max = 10D + 20 (follow selected count)")
+        self.corrector_budget_auto = QCheckBox("Correctors: auto max from preset (follow selected count)")
         self.corrector_budget_auto.setChecked(True)
         self.corrector_budget_auto.toggled.connect(self._refresh_group_bo_budget_labels)
-        lay_gbo.addWidget(self.corrector_budget_auto, 1 + (len(GROUP_BO_MAX_EVAL_SPECS) + 1) // 2, 0, 1, 4)
+        lay_gbo.addWidget(self.corrector_budget_auto, 2 + (len(GROUP_BO_MAX_EVAL_SPECS) + 1) // 2, 0, 1, 4)
+        self.group_bo_budget_preset_box.currentIndexChanged.connect(self._apply_group_bo_budget_preset)
         self._refresh_group_bo_budget_labels()
+
+        corrector_gp_group = QGroupBox("Corrector Group BO model")
+        layout.addWidget(corrector_gp_group)
+        corrector_gp_layout = QGridLayout(corrector_gp_group)
+        self.corrector_gp_mode_box = QComboBox()
+        self.corrector_gp_mode_box.addItem("Online fit (standardized)", "online_fit")
+        self.corrector_gp_mode_box.addItem("Fixed (legacy)", "fixed")
+        corrector_gp_layout.addWidget(QLabel("Hyperparameters"), 0, 0)
+        corrector_gp_layout.addWidget(self.corrector_gp_mode_box, 0, 1)
+        corrector_gp_layout.addWidget(QLabel("Refit every"), 0, 2)
+        self.corrector_gp_refit_spin = QSpinBox()
+        self.corrector_gp_refit_spin.setRange(1, 1000)
+        self.corrector_gp_refit_spin.setValue(5)
+        self.corrector_gp_refit_spin.setSuffix(" evaluations")
+        corrector_gp_layout.addWidget(self.corrector_gp_refit_spin, 0, 3)
+        self.corrector_gp_mode_box.currentIndexChanged.connect(
+            lambda: self.corrector_gp_refit_spin.setEnabled(self.corrector_gp_mode_box.currentData() == "online_fit"))
+        gp_help = QLabel(
+            "Online: fit length scales, signal and noise after initial data, then periodically. "
+            "Bounds and a 5 s fit time budget apply; failure keeps previous parameters.\n"
+            "Scores are standardized internally (scaling frozen once data varies). Display / CSV remain raw. "
+            "Corrector GroupBO only; other groups and Sequential are unchanged.")
+        gp_help.setWordWrap(True)
+        gp_help.setToolTip("Normalized length scale: max(0.02, 2 steps) to 2 ranges (lower bound capped at 2). "
+                           "Signal SD: 0.1–10; noise SD: 0.001–1 in standardized score units. "
+                           "No additional machine measurements are made for fitting.")
+        corrector_gp_layout.addWidget(gp_help, 1, 0, 1, 4)
 
         grp_adv = QGroupBox("Advanced")
         layout.addWidget(grp_adv)
@@ -3554,7 +3818,8 @@ class MainWindow(QMainWindow):
         # created before this field existed are loaded as legacy_fixed below.
         self.bo_hyperparameter_mode_box.setCurrentText("learned_fixed")
         self.bo_hyperparameter_mode_box.setToolTip(
-            "legacy_fixed: historical range/3. learned_fixed: BO2026 conservative ARD priors."
+            "legacy_fixed: historical range/3. learned_fixed: BO2026 conservative ARD priors. "
+            "Corrector GroupBO Online fit uses its separate fitted model instead."
         )
         lay_adv.addWidget(self.bo_hyperparameter_mode_box)
         lay_adv.addStretch(1)
@@ -3668,8 +3933,30 @@ class MainWindow(QMainWindow):
             if self.dev_bpm_selected_only.isChecked():
                 self._apply_developer_bpm_filters()
 
+    def _apply_group_bo_budget_preset(self, *_args):
+        preset = self.group_bo_budget_preset_box.currentData()
+        for spec in GROUP_BO_MAX_EVAL_SPECS:
+            spin = self.group_bo_max_eval_spinboxes[str(spec["config_id"])]
+            spin.blockSignals(True)
+            spin.setValue(_recommended_group_bo_max_evals(int(spec["dim"]), preset))
+            spin.blockSignals(False)
+        self.corrector_budget_auto.setChecked(True)
+        self._refresh_group_bo_budget_labels()
+
     def _refresh_group_bo_budget_labels(self, *_args):
+        preset = self.group_bo_budget_preset_box.currentData()
+        preset_spec = _group_bo_preset(preset)
+        max_formula = f"{preset_spec['max_slope']}D + {preset_spec['max_offset']}"
+        init_formula = f"{preset_spec['init_slope']}D + {preset_spec['init_offset']}"
+        self.group_bo_budget_help.setText(
+            f"Preset max = {max_formula}; initial = {init_formula} (included in max). D = number of variables.\n"
+            "Heuristic budget only; early stopping is unchanged. Ranges and steps are unchanged.\n"
+            "Initial points are limited by max / available grid points. Final best-point measurement is extra.\n"
+            "Timing uses the 1D BO initial design; only its maximum follows the preset.\n"
+            "Changing preset replaces manual maximum budgets; edit individual values afterwards if needed.")
         corrector_dim = len(self._selected_developer_actuators()) if hasattr(self, "dev_actuator_table") else 0
+        if hasattr(self, "correctors_l8") and self.correctors_l8.isChecked():
+            corrector_dim += 2
         for spec in GROUP_BO_MAX_EVAL_SPECS:
             config_id = str(spec["config_id"])
             dim = corrector_dim if config_id == "correctors" else int(spec["dim"])
@@ -3679,14 +3966,16 @@ class MainWindow(QMainWindow):
                 spin.setSpecialValueText("—" if dim == 0 and auto else "")
                 if auto:
                     spin.blockSignals(True)
-                    spin.setValue(_recommended_group_bo_max_evals(dim) if dim else 1)
+                    spin.setValue(_recommended_group_bo_max_evals(dim, preset) if dim else 1)
                     spin.blockSignals(False)
                 spin.setEnabled(dim > 0 and not auto)
-            initial = min(_auto_group_bo_budget(dim)["min_init"], spin.value())
+            initial = min(_auto_group_bo_budget(dim, preset)["min_init"], spin.value())
             detail = "not selected" if dim == 0 else ("1D BO init" if config_id == "timing" else f"init ≤ {initial}")
+            if dim and spin.value() != _recommended_group_bo_max_evals(dim, preset):
+                detail += "; manual max"
             self.group_bo_budget_labels[config_id].setText(f"{spec['ui_label']} (D={dim}; {detail})")
             self.group_bo_budget_labels[config_id].setToolTip(
-                (f"Default max: 10 × {dim} + 20 = {10 * dim + 20}. "
+                (f"Preset max: {max_formula}, D={dim}: {_recommended_group_bo_max_evals(dim, preset)}. "
                  "Corrector D is the selected actuator count, not BPM count.")
                 if dim else "Select correctors to calculate their evaluation budget.")
 
@@ -3806,6 +4095,7 @@ class MainWindow(QMainWindow):
         self.dev_bpm_mode_label.setText("Aggregate" if show_intensity else "Plane")
         self.dev_intensity_aggregation.setVisible(show_intensity)
         self.intensity_help.setVisible(show_intensity)
+        self.dr_turn_group.setVisible(show_intensity)
         self.dev_bpm_table.setHorizontalHeaderLabels(
             ["Use", "Name", "Region", "Intensity", "Status"] if show_intensity else
             ["Use", "Name", "Region", "Live X [mm]", "Live Y [mm]"])
@@ -3852,6 +4142,31 @@ class MainWindow(QMainWindow):
         for name in list(self.dev_actuator_row_map.keys()):
             self._set_developer_actuator_status(name, "idle")
 
+    def _dr_turn_config_from_ui(self):
+        return {"dr_turn_scan": self.dr_turn_enabled.isChecked(),
+                "dr_turn_start": self.dr_turn_start.value(), "dr_turn_end": self.dr_turn_end.value(),
+                "dr_turn_aggregation": self.dr_turn_aggregation.currentData()}
+
+    def _transmission_config_from_ui(self):
+        return {"dr_ratio_turn": self.dr_ratio_turn.value(), "dr_current_weight": self.dr_current_weight.value(),
+                "dr_ratio_floor": self.dr_ratio_floor.value()}
+
+    def _update_correctors_l8_ui(self, checked):
+        self.chk_correctors.setText("Correctors & L8" if checked else "Correctors")
+        if checked:
+            self.chk_correctors.setChecked(True)
+            self.mode_box.setCurrentText("GROUP_BO")
+        if hasattr(self, "group_bo_budget_help"):
+            self._refresh_group_bo_budget_labels()
+
+    def _l8_actuators(self):
+        return [
+            {"name": "L8 phase", "pv_write": "CM8L:phaseWrite", "pv_read": "CM8L:phaseRead",
+             "half_range": self.l8_phase_half.value(), "step": self.l8_phase_step.value(), "unit": "deg"},
+            {"name": "Timing", "pv_write": "EVE_LINAC:OUT0:SetData", "pv_read": None,
+             "half_range": self.sp_timing_step.value() * self.sp_timing_half_steps.value(),
+             "step": self.sp_timing_step.value(), "unit": "ns"}]
+
     def _refresh_developer_live_values(self):
         try:
             interface = self._ensure_interface()
@@ -3869,14 +4184,21 @@ class MainWindow(QMainWindow):
                     item.setText(_format_significant_value(val, digits=4))
 
             if self._bpm_table_is_intensity:
+                refresh_config = {**self._dr_turn_config_from_ui(), **self._transmission_config_from_ui(),
+                                  "intensity_aggregation": self.dev_intensity_aggregation.currentData()}
+                configure_dr_turns(self.dr_bpm_reader, refresh_config)
                 snapshot = {}
                 for source, reader in (("LINAC:monitors", interface), ("DR:monitors", self.dr_bpm_reader)):
                     try:
-                        snapshot.update(bpm_intensity_snapshot(reader.get_bpms()))
+                        data = reader.get_bpms()
+                        if source == "DR:monitors" and refresh_config["intensity_aggregation"] in ("turn_ratio", "turn_composite"):
+                            data = data["turn_data"][refresh_config["dr_ratio_turn"]]
+                        snapshot.update(bpm_intensity_snapshot(data))
                     except Exception as exc:
                         self.append_log(f"[BPM] {source} refresh failed: {exc}")
                 state = self._plot_state.get(RUN_PROFILE_MAIN, {})
                 state["bpm_snapshot"] = snapshot
+                state["dr_turn_label"] = dr_turn_label(refresh_config)
                 state["selected_bpms"] = self._selected_developer_bpms()
                 self._refresh_eval_plot(RUN_PROFILE_MAIN)
                 for name, row in self.dev_bpm_row_map.items():
@@ -4124,10 +4446,15 @@ class MainWindow(QMainWindow):
             },
         )
         state["eval_index"] = []
+        state["evaluation_phase"] = []
         state["ttot"] = []
         state["metric"] = []
         state["bpm_intensities"] = []
         state["bpm_snapshot"] = {}
+        state["turn_plot"] = {}
+        state["turn_transmission"] = []
+        state["turn_normalized_current"] = []
+        state["dr_turn_label"] = ""
         state["selected_bpms"] = self._selected_developer_bpms()
         state["measurement_ok"] = []
         state["discarded_eval_index"] = []
@@ -4158,18 +4485,28 @@ class MainWindow(QMainWindow):
 
         metric_label = str(state.get("metric_label", "Metric") or "Metric")
         is_intensity = metric_label.startswith("BPM intensity")
+        is_turn = metric_label in ("BPM intensity turn_ratio", "BPM intensity turn_composite")
+        if context == RUN_PROFILE_MAIN:
+            self.turn_plot_view.setVisible(is_turn)
         if is_intensity:
             aggregation = metric_label.removeprefix("BPM intensity").strip()
             objective_label = {"raw_sum": "Raw sum", "raw_mean": "Raw mean",
                                "relative_mean": "Mean / initial baseline"}.get(aggregation, "Score")
             ax_ttot.set_title(f"BPM intensity objective ({objective_label}) vs evaluation")
             ax_ttot.set_ylabel(objective_label)
+        if is_turn:
+            ax_ttot.set_title("DR objective and components vs evaluation")
+            ax_ttot.set_ylabel("Dimensionless")
         ax_metric.set_title(f"{metric_label} vs evaluation", pad=10)
         ax_metric.set_ylabel(metric_label)
         ax_metric.set_xlabel("Evaluation")
         ax_metric.grid(True, alpha=0.3)
 
         if state["eval_index"]:
+            phases = state.get("evaluation_phase", [])
+            shade_evaluation_phases(ax_ttot, state["eval_index"], phases)
+            if not is_intensity:
+                shade_evaluation_phases(ax_metric, state["eval_index"], phases)
             eval_index = np.asarray(state["eval_index"], dtype=float)
             ttot = np.asarray(state["ttot"], dtype=float)
             metric = np.asarray(state["metric"], dtype=float)
@@ -4180,7 +4517,25 @@ class MainWindow(QMainWindow):
             upper_values = metric if is_intensity else ttot
             valid_ttot = np.where(measurement_ok, upper_values, np.nan)
             valid_metric = np.where(measurement_ok, metric, np.nan)
-            ax_ttot.plot(eval_index, valid_ttot, marker="o", color="#2563eb", linewidth=1.8)
+            ax_ttot.plot(eval_index, valid_ttot, marker="o", color="#2563eb", linewidth=2.4 if is_turn else 1.8,
+                         label="Score (= mean transmission)" if metric_label.endswith("turn_ratio") else "Score")
+            if is_turn:
+                if metric_label.endswith("turn_composite"):
+                    transmission = np.asarray(state.get("turn_transmission", []), dtype=float)
+                    if transmission.size == eval_index.size:
+                        ax_ttot.plot(eval_index, np.where(measurement_ok, transmission, np.nan),
+                                     color="#0f766e", linewidth=1.2, label="Mean transmission")
+                normalized = np.asarray(state.get("turn_normalized_current", []), dtype=float)
+                if normalized.size == eval_index.size:
+                    weight = state.get("turn_plot", {}).get("weight", 1.)
+                    label = (f"Normalized turn 1 current (unweighted; w={weight:g})"
+                             if metric_label.endswith("turn_composite") else "Normalized turn 1 current (reference)")
+                    ax_ttot.plot(eval_index, np.where(measurement_ok, normalized, np.nan),
+                                 color="#ea580c", linewidth=1.2, label=label)
+                valid_scores = np.where(measurement_ok & np.isfinite(metric), metric, np.nan)
+                ax_ttot.plot(eval_index, np.fmax.accumulate(valid_scores), color="#64748b",
+                             linestyle="--", linewidth=1.2, label="Best score so far")
+                ax_ttot.legend(fontsize=7, loc="best", ncol=2)
             ax_metric.plot(eval_index, valid_metric, marker="o", color="#0f766e", linewidth=1.8)
 
             invalid_mask = ~measurement_ok
@@ -4228,6 +4583,12 @@ class MainWindow(QMainWindow):
             )
 
         if is_intensity:
+            if is_turn:
+                ax_ttot.tick_params(axis="x", labelbottom=True)
+                self._draw_turn_bpm_plot(ax_metric, state)
+                widgets["fig"].subplots_adjust(bottom=.20, hspace=.65)
+                widgets["canvas"].draw_idle()
+                return
             from matplotlib.patches import Patch
             ax_ttot.tick_params(axis="x", labelbottom=True)
             # The title already identifies evaluation count; leave space for
@@ -4252,7 +4613,8 @@ class MainWindow(QMainWindow):
                     tick.set_color("#c2410c")
                     tick.set_fontweight("bold")
             ax_metric.set_xlim(-1, len(names))
-            ax_metric.set_title("Latest intensity by BPM (sample mean)", pad=10)
+            turn_label = state.get("dr_turn_label", "")
+            ax_metric.set_title("Latest intensity by BPM (sample mean)" + ("\n" + turn_label if turn_label else ""), pad=10)
             ax_metric.set_ylabel("Intensity (raw)")
             ax_metric.set_xlabel("BPM (LINAC / BT / DR from MB21R; unread regions shown as gaps)")
             ax_metric.grid(axis="y", alpha=.3)
@@ -4264,6 +4626,49 @@ class MainWindow(QMainWindow):
         else:
             widgets["fig"].subplots_adjust(bottom=.12, hspace=.42)
         widgets["canvas"].draw_idle()
+
+    def _draw_turn_bpm_plot(self, axis, state):
+        """Only render cached evaluation data; never access the machine."""
+        from matplotlib.patches import Patch
+        axis.clear()
+        data = state.get("turn_plot", {})
+        names = list(INTENSITY_PLOT_BPM_NAMES)
+        positions = np.arange(len(names))
+        selected = set(state.get("selected_bpms", []))
+        colors = ["#ea580c" if name in selected else "#94a3b8" for name in names]
+        dr_mask = np.array([name in DR_BPM_NAMES for name in names])
+        intensity = self.turn_plot_view.currentData() == "intensity"
+        keys = ("first", "last") if intensity else ("ratios",)
+        for index, key in enumerate(keys):
+            values = np.array([data.get(key, {}).get(name, np.nan) if name in DR_BPM_NAMES else np.nan for name in names])
+            offset = (-.21 if index == 0 else .21) if intensity else 0
+            axis.bar(positions + offset, values, width=.4 if intensity else .8,
+                     color=colors, alpha=.45 if intensity and index == 0 else 1.,
+                     hatch="//" if intensity and index == 0 else None)
+            missing = dr_mask & ~np.isfinite(values)
+            if missing.any():
+                axis.scatter(positions[missing] + offset, np.full(missing.sum(), .025),
+                             transform=axis.get_xaxis_transform(), marker="x", s=12, color="#64748b")
+        if not intensity:
+            axis.axhline(1., color="#64748b", linestyle="--", linewidth=1.)
+        if (~dr_mask).any():
+            axis.axvspan(-.5, np.flatnonzero(~dr_mask)[-1] + .5, color="#e2e8f0", alpha=.5)
+        axis.set_xticks(positions, names, rotation=90, fontsize=6)
+        for tick, name in zip(axis.get_xticklabels(), names):
+            if name in selected:
+                tick.set_color("#c2410c")
+                tick.set_fontweight("bold")
+        axis.set_xlim(-1, len(names))
+        target = data.get("target", "N")
+        axis.set_title(f"Latest BPM intensities: turn 1 / turn {target}" if intensity else f"Latest BPM transmission: turn {target} / turn 1", pad=10)
+        axis.set_ylabel("Intensity (raw)" if intensity else "Transmission N / 1")
+        axis.set_xlabel("BPM (LINAC / BT: not applicable; DR from MB21R; × = missing/invalid, not zero)")
+        axis.grid(axis="y", alpha=.3)
+        handles = [Patch(color="#ea580c", label="Selected"), Patch(color="#94a3b8", label="Not selected")]
+        if intensity:
+            handles += [Patch(facecolor="#94a3b8", alpha=.45, hatch="//", label="Turn 1"),
+                        Patch(facecolor="#94a3b8", label=f"Turn {target}")]
+        axis.legend(handles=handles, fontsize=7, ncol=len(handles), loc="upper right")
 
     def _refresh_bo1d_plot(self, profile: Optional[str] = None):
         context = str(profile or RUN_PROFILE_MAIN).upper()
@@ -4433,15 +4838,23 @@ class MainWindow(QMainWindow):
                 },
             )
             state["eval_index"].append(int(payload.get("eval_index", len(state["eval_index"]) + 1)))
+            state.setdefault("evaluation_phase", [""] * (len(state["eval_index"]) - 1)).append(
+                str(payload.get("evaluation_phase", "")))
             state["ttot"].append(float(payload.get("ttot", float("nan"))))
             state["metric"].append(float(payload.get("downstream_value", float("nan"))))
             state["measurement_ok"].append(bool(payload.get("measurement_ok", True)))
             state["metric_label"] = str(payload.get("downstream_label", state.get("metric_label", "DR")))
+            turn_data = dict(payload.get("turn_plot") or {})
+            state["turn_plot"] = turn_data
+            for key, field in (("turn_transmission", "transmission"), ("turn_normalized_current", "normalized_current")):
+                history = state.setdefault(key, [float("nan")] * (len(state["eval_index"]) - 1))
+                history.append(float(turn_data.get(field, float("nan"))))
             if payload.get("bpm_intensities"):
                 values = payload["bpm_intensities"]
                 state.setdefault("bpm_intensities", []).append(values)
                 state["bpm_snapshot"] = dict(payload.get("bpm_snapshot", values))
                 state["selected_bpms"] = list(payload.get("selected_bpms", values))
+                state["dr_turn_label"] = payload.get("dr_turn_label", "")
                 for name, value in values.items():
                     row = self.dev_bpm_row_map.get(name)
                     if row is not None:
@@ -4495,6 +4908,17 @@ class MainWindow(QMainWindow):
             for pv in restore_pvs
         }
         if config.get("objective_type") == DEVELOPER_OBJECTIVE_INTENSITY:
+            configure_dr_turns(self.dr_bpm_reader, config)
+            if config["intensity_aggregation"] in ("turn_ratio", "turn_composite"):
+                score, first, _, _, transmission, normalized = read_turn_objective(
+                    self.dr_bpm_reader, config["objective_bpm_names"], config)
+                config["intensity_baseline"] = first
+                self.append_log(f"[DR baseline] transmission={transmission:.6g}; normalized meanCurrent={normalized:.6g}")
+                return {"config": dict(config), "initial_setpoints": setpoints,
+                        "initial_ict": {}, "initial_bpm_metric": score,
+                        "initial_objective_value": score, "initial_score": score,
+                        "initial_objective_label": "BPM intensity " + config["intensity_aggregation"],
+                        "initial_measurement_ok": True, "initial_measurement_reason": ""}
             values = read_selected_bpm_intensities(interface, self.dr_bpm_reader, config["objective_bpm_names"], self.append_log,
                                          baseline=config["intensity_aggregation"] == "relative_mean")
             config["intensity_baseline"] = values
@@ -4569,7 +4993,7 @@ class MainWindow(QMainWindow):
                 specs.append((label, pv_write, pv_read, unit))
             return specs
         specs = _main_run_delta_specs(config)
-        specs.extend((item["name"], item["pv_write"], item.get("pv_read"), "A")
+        specs.extend((item["name"], item["pv_write"], item.get("pv_read"), item.get("unit", "A"))
                      for item in config.get("developer_actuators", []))
         return specs
 
@@ -4696,6 +5120,7 @@ class MainWindow(QMainWindow):
                     "metric": metric_value,
                     "metric_label": label,
                     "measurement_ok": "ICT_INVALID_ZERO" not in note,
+                    "evaluation_phase": evaluation_phase(note),
                 })
 
         if not resume_rows:
@@ -4718,6 +5143,7 @@ class MainWindow(QMainWindow):
             },
         )
         state["eval_index"] = [idx for idx in range(1, len(kept_rows) + 1)]
+        state["evaluation_phase"] = [row["evaluation_phase"] for row in kept_rows]
         state["ttot"] = [float(row["ttot"]) for row in kept_rows]
         state["metric"] = [float(row["metric"]) for row in kept_rows]
         state["measurement_ok"] = [bool(row["measurement_ok"]) for row in kept_rows]
@@ -4743,6 +5169,22 @@ class MainWindow(QMainWindow):
         self._refresh_eval_plot(context)
 
     def _apply_config_to_ui(self, payload: Dict[str, Any]):
+        if "objective_type" in payload:
+            self.objective_box.setCurrentText({DEVELOPER_OBJECTIVE_INTENSITY: "BPM intensity",
+                                              DEVELOPER_OBJECTIVE_BPM: "BPM sumsq"}.get(payload["objective_type"], "ICT"))
+        self.dev_intensity_aggregation.setCurrentIndex(max(0, self.dev_intensity_aggregation.findData(
+            payload.get("intensity_aggregation", "raw_mean"))))
+        self.dr_ratio_turn.setValue(int(payload.get("dr_ratio_turn", 10)))
+        self.dr_current_weight.setValue(float(payload.get("dr_current_weight", 1.)))
+        self.dr_ratio_floor.setValue(float(payload.get("dr_ratio_floor", 1e-12)))
+        self.correctors_l8.setChecked(bool(payload.get("correctors_l8", False)))
+        self.l8_phase_half.setValue(float(payload.get("l8_phase_half", PHASE_HALF_RANGE_DEG)))
+        self.l8_phase_step.setValue(float(payload.get("l8_phase_step", PHASE_STEP_DEG)))
+        self.dr_turn_enabled.setChecked(bool(payload.get("dr_turn_scan", False)))
+        self.dr_turn_start.setValue(int(payload.get("dr_turn_start", 1)))
+        self.dr_turn_end.setValue(int(payload.get("dr_turn_end", 10)))
+        self.dr_turn_aggregation.setCurrentIndex(max(0, self.dr_turn_aggregation.findData(
+            payload.get("dr_turn_aggregation", "mean"))))
         run_profile = str(payload.get("run_profile", RUN_PROFILE_MAIN)).upper()
         mode = str(payload.get("mode", self.mode_box.currentText()))
         if mode not in ("SEQUENTIAL", "GROUP_BO"):
@@ -4785,6 +5227,16 @@ class MainWindow(QMainWindow):
         self.sp_qm_step.setValue(float(payload.get("qm_step_a", self.sp_qm_step.value())))
         self.sp_timing_step.setValue(float(payload.get("timing_step_ns", self.sp_timing_step.value())))
         self.sp_timing_half_steps.setValue(int(payload.get("timing_half_steps", self.sp_timing_half_steps.value())))
+        gp_mode = payload.get("corrector_gp_mode", "fixed")
+        gp_index = self.corrector_gp_mode_box.findData(gp_mode)
+        self.corrector_gp_mode_box.setCurrentIndex(gp_index if gp_index >= 0 else 1)
+        self.corrector_gp_refit_spin.setValue(int(payload.get("corrector_gp_refit_interval", 5)))
+        preset = str(payload.get("gbo_budget_preset", "standard"))
+        if preset not in GROUP_BO_BUDGET_PRESETS:
+            preset = "standard"
+        self.group_bo_budget_preset_box.blockSignals(True)
+        self.group_bo_budget_preset_box.setCurrentIndex(self.group_bo_budget_preset_box.findData(preset))
+        self.group_bo_budget_preset_box.blockSignals(False)
         self.corrector_budget_auto.setChecked(bool(payload.get(
             "gbo_correctors_auto", "gbo_max_evals_correctors" not in payload)))
         for spec in GROUP_BO_MAX_EVAL_SPECS:
@@ -4792,7 +5244,7 @@ class MainWindow(QMainWindow):
             if box is None:
                 continue
             key = _group_bo_max_evals_config_key(str(spec["config_id"]))
-            box.setValue(int(payload.get(key, box.value())))
+            box.setValue(int(payload.get(key, _recommended_group_bo_max_evals(int(spec["dim"]), preset))))
         self._refresh_group_bo_budget_labels()
         self._update_mode_ui()
 
@@ -4975,7 +5427,8 @@ class MainWindow(QMainWindow):
             self.dev_bpm_search, self.dev_bpm_region_box, self.dev_bpm_selected_only,
             self.dev_bpm_select_visible_btn, self.dev_bpm_clear_visible_btn,
             self.dev_bpm_plane_box, self.dev_sp_score_w_ttot, self.dev_sp_score_w_downstream,
-            self.dev_intensity_aggregation,
+            self.dev_intensity_aggregation, self.dr_turn_group, self.dr_ratio_turn, self.dr_current_weight, self.dr_ratio_floor,
+            self.correctors_l8, self.l8_phase_half, self.l8_phase_step,
             self.dev_refresh_btn,
             self.dev_downstream_ict_box, self.dev_bpm_table, self.dev_actuator_table,
         ]:
@@ -5011,7 +5464,9 @@ class MainWindow(QMainWindow):
             hi = float(ctrl.get("upper_ctrl_limit", float("nan")))
             if not np.isfinite([lo, hi]).all() or lo >= hi:
                 raise ValueError(f"Cannot verify EPICS current limits: {pv}. Check IOC configuration before running.")
-            lo, hi = max(lo, STEER_CURRENT_MIN_A), min(hi, STEER_CURRENT_MAX_A)
+            unit = spec.get("unit", "A")
+            if unit == "A":
+                lo, hi = max(lo, STEER_CURRENT_MIN_A), min(hi, STEER_CURRENT_MAX_A)
             current = float(interface.read_current(pv, spec["pv_read"]))
             if not np.isfinite(current) or not lo <= current <= hi or lo >= hi:
                 raise ValueError(f"Unsafe current/range: {pv}, {current} A, limits [{lo}, {hi}] A")
@@ -5019,7 +5474,7 @@ class MainWindow(QMainWindow):
                 raise ValueError(f"Invalid step/range: {pv}")
             lower, upper = max(lo, current - spec["half_range"]), min(hi, current + spec["half_range"])
             limits[pv] = [lower, upper]
-            summary.append(f"{spec['name']}: {current:g} A -> [{lower:g}, {upper:g}] A; step {spec['step']:g} A")
+            summary.append(f"{spec['name']}: {current:g} {unit} -> [{lower:g}, {upper:g}] {unit}; step {spec['step']:g} {unit}")
         return limits, summary
 
     def start_developer_optimization(self):
@@ -5046,7 +5501,12 @@ class MainWindow(QMainWindow):
         restore_pvs = sorted({str(spec["pv_write"]) for spec in actuators})
         config = {
             "run_profile": RUN_PROFILE_DEVELOPER,
+            **self._dr_turn_config_from_ui(),
+            **self._transmission_config_from_ui(),
             "mode": mode,
+            "corrector_gp_mode": self.corrector_gp_mode_box.currentData(),
+            "corrector_gp_refit_interval": self.corrector_gp_refit_spin.value(),
+            "gbo_budget_preset": self.group_bo_budget_preset_box.currentData(),
             "gbo_correctors_auto": self.corrector_budget_auto.isChecked(),
             "gbo_max_evals_correctors": self.group_bo_max_eval_spinboxes["correctors"].value(),
             "seq_method": str(self.dev_seq_method_box.currentText()),
@@ -5072,6 +5532,7 @@ class MainWindow(QMainWindow):
                        f"Correctors: {len(actuators)}; BPMs: {len(bpm_names)}\n"
                        + ("BPMs: " + ", ".join(bpm_names) + "\n" if bpm_names else "")
                        + (f"BPM source: {config['intensity_source']}\nAggregate: {self.dev_intensity_aggregation.currentText()}\n" if objective_key == DEVELOPER_OBJECTIVE_INTENSITY else "")
+                       + (dr_turn_label(config) + "; selector PV will be written and restored.\n" if objective_key == DEVELOPER_OBJECTIVE_INTENSITY and dr_turn_label(config) and any(n in DR_BPM_NAMES for n in bpm_names) else "")
                        + "\n".join(summary) + "\n\nStart optimization? This will change selected corrector currents.")
             if QMessageBox.question(self, "Confirm Developer run", message,
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -5128,6 +5589,15 @@ class MainWindow(QMainWindow):
         if self.chk_correctors.isChecked() and not actuators:
             QMessageBox.warning(self, "Correctors", "Select correctors in Config > Correctors / BPMs.")
             return
+        if self.chk_correctors.isChecked() and self.correctors_l8.isChecked():
+            if mode != "GROUP_BO":
+                QMessageBox.warning(self, "Correctors & L8", "Select GROUP_BO for simultaneous optimization.")
+                return
+            actuators += self._l8_actuators()
+        if objective == DEVELOPER_OBJECTIVE_INTENSITY and self.dev_intensity_aggregation.currentData() in ("turn_ratio", "turn_composite"):
+            if not bpms or any(name not in DR_BPM_NAMES for name in bpms):
+                QMessageBox.warning(self, "DR transmission", "Select only DR BPMs for turn transmission objectives.")
+                return
         if objective != DEVELOPER_OBJECTIVE_ICT and not bpms:
             QMessageBox.warning(self, "BPMs", "Select target BPMs in Config > Correctors / BPMs.")
             return
@@ -5142,6 +5612,10 @@ class MainWindow(QMainWindow):
                 return
         config = {
             "mode": mode,
+            **self._dr_turn_config_from_ui(),
+            **self._transmission_config_from_ui(),
+            "correctors_l8": self.correctors_l8.isChecked() and self.chk_correctors.isChecked(),
+            "l8_phase_half": self.l8_phase_half.value(), "l8_phase_step": self.l8_phase_step.value(),
             "settle_sec": float(self.sp_settle_sec.value()),
             "bo_hyperparameter_mode": str(self.bo_hyperparameter_mode_box.currentText()),
             "bo_length_scale_n_step_floor": 2.0,
@@ -5152,11 +5626,14 @@ class MainWindow(QMainWindow):
             "lbo_line_samples": 11,
             "group_bo_passes": 2,
             "group_bo_score_eps": 0.0,
+            "corrector_gp_mode": self.corrector_gp_mode_box.currentData(),
+            "corrector_gp_refit_interval": self.corrector_gp_refit_spin.value(),
+            "gbo_budget_preset": self.group_bo_budget_preset_box.currentData(),
             "gbo_correctors_auto": self.corrector_budget_auto.isChecked(),
             "reuse_initial_eval": True,
             "gun_sol_l0_phase": self.chk_gun_sol_l0_phase.isChecked(),
             "kly_phase": self.chk_kly_phase.isChecked(),
-            "timing": self.chk_timing.isChecked(),
+            "timing": self.chk_timing.isChecked() and not (self.correctors_l8.isChecked() and self.chk_correctors.isChecked()),
             "qa": self.chk_qa.isChecked(),
             "qm": self.chk_qm.isChecked(),
             "correctors": self.chk_correctors.isChecked(),
@@ -5211,6 +5688,7 @@ class MainWindow(QMainWindow):
                            + (f"BPMs: {', '.join(bpms)}\n" if bpms else "")
                            + (f"Source: {config['intensity_source']}; aggregate: {self.dev_intensity_aggregation.currentText()}\n"
                               if objective == DEVELOPER_OBJECTIVE_INTENSITY else "")
+                           + (dr_turn_label(config) + f"; w={config['dr_current_weight']:g}; selector PV will be written and restored.\n" if objective == DEVELOPER_OBJECTIVE_INTENSITY and dr_turn_label(config) and any(n in DR_BPM_NAMES for n in bpms) else "")
                            + "\n".join(summary) + "\n\nStart? Selected machine settings will change.")
                 if QMessageBox.question(self, "Confirm optimization", message,
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
