@@ -2820,8 +2820,6 @@ class MainWindow(QMainWindow):
         refresh_row.addStretch(1)
         self.selection_page.layout().addLayout(refresh_row)
         self.selection_page.layout().addWidget(self.selection_panel, stretch=1)
-        self.objective_row.insertWidget(3, self.dev_intensity_plot)
-        self.dev_intensity_plot.currentTextChanged.connect(lambda: self._refresh_eval_plot(RUN_PROFILE_MAIN))
 
         self.mode_box.currentTextChanged.connect(self._update_mode_ui)
         self.mode_box.currentTextChanged.connect(self._refresh_current_values)
@@ -3221,11 +3219,6 @@ class MainWindow(QMainWindow):
         self.dev_intensity_aggregation.addItem("Mean / initial baseline", "relative_mean")
         self.dev_intensity_aggregation.setToolTip("Maximize the selected BPMs' mean or sum. Relative mode fixes each baseline before the run.")
         bpm_row.addWidget(self.dev_intensity_aggregation)
-        self.dev_intensity_plot = QComboBox()
-        self.dev_intensity_plot.addItem("All selected BPMs")
-        self.dev_intensity_plot.setToolTip("Individual intensity traces (upper plot); latest BPM snapshot is below.")
-        self.dev_intensity_plot.currentTextChanged.connect(lambda: self._refresh_eval_plot(RUN_PROFILE_DEVELOPER))
-        bpm_row.addWidget(self.dev_intensity_plot)
         bpm_row.addStretch(1)
         bpm_layout.addLayout(bpm_row)
         self.intensity_help = QLabel(
@@ -3758,7 +3751,6 @@ class MainWindow(QMainWindow):
         self.dev_bpm_mode_label.setText("Aggregate" if show_intensity else "Plane")
         self.dev_intensity_aggregation.setVisible(show_intensity)
         self.intensity_help.setVisible(show_intensity)
-        self.dev_intensity_plot.setVisible(intensity)
         self.dev_bpm_table.setHorizontalHeaderLabels(
             ["Use", "Name", "Region", "Intensity", "Status"] if show_intensity else
             ["Use", "Name", "Region", "Live X [mm]", "Live Y [mm]"])
@@ -4110,9 +4102,13 @@ class MainWindow(QMainWindow):
         ax_ttot.grid(True, alpha=0.3)
 
         metric_label = str(state.get("metric_label", "Metric") or "Metric")
-        if metric_label.startswith("BPM intensity"):
-            ax_ttot.set_title("BPM intensities vs evaluation")
-            ax_ttot.set_ylabel("Intensity (raw)")
+        is_intensity = metric_label.startswith("BPM intensity")
+        if is_intensity:
+            aggregation = metric_label.removeprefix("BPM intensity").strip()
+            objective_label = {"raw_sum": "Raw sum", "raw_mean": "Raw mean",
+                               "relative_mean": "Mean / initial baseline"}.get(aggregation, "Score")
+            ax_ttot.set_title(f"BPM intensity objective ({objective_label}) vs evaluation")
+            ax_ttot.set_ylabel(objective_label)
         ax_metric.set_title(f"{metric_label} vs evaluation", pad=10)
         ax_metric.set_ylabel(metric_label)
         ax_metric.set_xlabel("Evaluation")
@@ -4126,7 +4122,8 @@ class MainWindow(QMainWindow):
             if measurement_ok.size != eval_index.size:
                 measurement_ok = np.ones_like(eval_index, dtype=bool)
 
-            valid_ttot = np.where(measurement_ok, ttot, np.nan)
+            upper_values = metric if is_intensity else ttot
+            valid_ttot = np.where(measurement_ok, upper_values, np.nan)
             valid_metric = np.where(measurement_ok, metric, np.nan)
             ax_ttot.plot(eval_index, valid_ttot, marker="o", color="#2563eb", linewidth=1.8)
             ax_metric.plot(eval_index, valid_metric, marker="o", color="#0f766e", linewidth=1.8)
@@ -4135,7 +4132,7 @@ class MainWindow(QMainWindow):
             if np.any(invalid_mask):
                 ax_ttot.plot(
                     eval_index[invalid_mask],
-                    ttot[invalid_mask],
+                    upper_values[invalid_mask],
                     linestyle="None",
                     marker="x",
                     color="#dc2626",
@@ -4158,7 +4155,7 @@ class MainWindow(QMainWindow):
         if discarded_eval.size > 0:
             ax_ttot.plot(
                 discarded_eval,
-                discarded_ttot,
+                discarded_metric if is_intensity else discarded_ttot,
                 linestyle="None",
                 marker="x",
                 color="#dc2626",
@@ -4175,19 +4172,7 @@ class MainWindow(QMainWindow):
                 markeredgewidth=2.0,
             )
 
-        if state.get("bpm_intensities"):
-            ax_ttot.clear()
-            ax_ttot.set_title("BPM intensities vs evaluation")
-            ax_ttot.set_ylabel("Intensity (raw)")
-            selected = self.dev_intensity_plot.currentText()
-            names = list(state["bpm_intensities"][0])
-            for name in names:
-                if selected not in ("All selected BPMs", name):
-                    continue
-                ax_ttot.plot(state["eval_index"], [v.get(name, np.nan) for v in state["bpm_intensities"]], marker="o", markersize=3, label=name)
-            ax_ttot.legend(fontsize="small")
-            ax_ttot.grid(True, alpha=.3)
-        if metric_label.startswith("BPM intensity"):
+        if is_intensity:
             from matplotlib.patches import Patch
             ax_ttot.tick_params(axis="x", labelbottom=True)
             # The title already identifies evaluation count; leave space for
@@ -5053,8 +5038,6 @@ class MainWindow(QMainWindow):
             self.dev_downstream_ict_box.currentText()) if objective_key == DEVELOPER_OBJECTIVE_ICT else f"BPM {self.dev_bpm_plane_box.currentText()} sumsq"
         if objective_key == DEVELOPER_OBJECTIVE_INTENSITY:
             metric_label = "BPM intensity " + config["intensity_aggregation"]
-        self.dev_intensity_plot.clear()
-        self.dev_intensity_plot.addItems(["All selected BPMs"] + bpm_names)
         self._reset_eval_plot(metric_label, profile=RUN_PROFILE_DEVELOPER)
         if resume_path_text:
             self._prime_eval_plot_from_resume(
@@ -5192,8 +5175,6 @@ class MainWindow(QMainWindow):
         self._prepare_target_states_for_run(mode)
         metric_label = ("BPM intensity " + config["intensity_aggregation"] if objective == DEVELOPER_OBJECTIVE_INTENSITY else
                         (f"BPM {config['objective_bpm_plane']} sumsq" if objective == DEVELOPER_OBJECTIVE_BPM else config["downstream_ict"]))
-        self.dev_intensity_plot.clear()
-        self.dev_intensity_plot.addItems(["All selected BPMs"] + bpms)
         self._reset_eval_plot(metric_label, profile=RUN_PROFILE_MAIN)
         if resume_path_text:
             self._prime_eval_plot_from_resume(

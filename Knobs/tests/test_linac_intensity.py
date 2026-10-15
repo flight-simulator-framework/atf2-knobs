@@ -371,10 +371,23 @@ class IntensityTests(unittest.TestCase):
                 self.assertEqual(bars["MB1R"].get_height(), 2.)
                 self.assertNotEqual(bars["MB1R"].get_facecolor(), bars["MB3R"].get_facecolor())
                 self.assertFalse(lower.get_shared_x_axes().joined(lower, upper))
-                self.assertEqual(len(window._plot_widgets[opt.RUN_PROFILE_MAIN]["ax_ttot"].lines), 2)
-                window.dev_intensity_plot.addItem("A")
-                window.dev_intensity_plot.setCurrentText("A")
-                self.assertEqual(len(window._plot_widgets[opt.RUN_PROFILE_MAIN]["ax_ttot"].lines), 1)
+                self.assertEqual(len(upper.lines), 1)
+                np.testing.assert_equal(upper.lines[0].get_ydata(), [11.])
+                for aggregation, score, label in (("raw_sum", 22., "Raw sum"),
+                                                   ("raw_mean", 11., "Raw mean"),
+                                                   ("relative_mean", 1.5, "Mean / initial baseline")):
+                    window._reset_eval_plot("BPM intensity " + aggregation)
+                    for evaluation in (1, 2):
+                        window._on_worker_progress({"kind": "evaluation", "eval_index": evaluation,
+                                                    "ttot": 999.,
+                                                    "bpm_intensities": {"MB1R": 2., "MB2R": 20.},
+                                                    "downstream_value": score * evaluation,
+                                                    "downstream_label": "BPM intensity " + aggregation})
+                    self.assertEqual(len(upper.lines), 1)
+                    np.testing.assert_equal(upper.lines[0].get_xdata(), [1, 2])
+                    np.testing.assert_equal(upper.lines[0].get_ydata(), [score, score * 2])
+                    self.assertEqual(upper.get_ylabel(), label)
+                    self.assertIn(label, upper.get_title())
                 window.dev_objective_box.setCurrentText("BPM sumsq")
                 self.assertEqual(window.dev_bpm_table.horizontalHeaderItem(3).text(), "Live X [mm]")
                 self.assertNotIn("MB1R", window.dev_bpm_row_map)
