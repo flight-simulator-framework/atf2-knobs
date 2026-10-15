@@ -105,8 +105,24 @@ class IntensityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             opt.read_turn_objective(reader, ["MB5L"], config)
         first["intensity"][:, 0] = 0
+        first["status"][:, 0] = 0
+        last["status"][:, 0] = 0
+        result = opt.read_turn_objective(reader, first["names"], config, plot_out=plot)
+        self.assertEqual(result[0], .25)  # lost BPM remains in the mean, contributing zero
+        self.assertEqual(plot["ratios"]["MB1R"], 0.)
+        config["intensity_aggregation"] = "turn_composite"
+        result = opt.read_turn_objective(reader, first["names"], config, baseline, check_status=False)
+        self.assertAlmostEqual(result[0], .25 + 2 * (10 / 7.5))
+        first["intensity"][:] = 0
+        self.assertEqual(opt.read_turn_objective(reader, first["names"], config, baseline)[0], 0.)
+        with self.assertRaisesRegex(ValueError, "Initial meanCurrent"):
+            opt.read_turn_objective(reader, first["names"], config)
+        config["intensity_aggregation"] = "turn_ratio"
+        self.assertEqual(opt.read_turn_objective(reader, first["names"], config)[0], 0.)
+        first["intensity"][:, 0] = np.nan
         with self.assertRaises(ValueError):
             opt.read_turn_objective(reader, first["names"], config, check_status=False)
+        first["intensity"][:, 1] = 20.
         first["intensity"][:, 0] = [1, 10, 20]
         with self.assertRaises(ValueError):
             opt.read_turn_objective(reader, first["names"], config, check_status=False)

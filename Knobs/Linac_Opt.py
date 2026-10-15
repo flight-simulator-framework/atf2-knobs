@@ -247,25 +247,42 @@ def read_turn_objective(reader, names, config, baseline=None, check_status=True,
     finally:
         reader.nsamples = previous
     first_data, last_data = data["turn_data"][1], data["turn_data"][target]
-    first = bpm_intensity_values(first_data, names, min_samples=3, check_status=check_status)
-    last = bpm_intensity_values(last_data, names, min_samples=3, check_status=check_status)
+    # Finite low intensity is a measured loss, not a missing measurement.
+    first = bpm_intensity_values(first_data, names, min_samples=3, check_status=False)
+    last = bpm_intensity_values(last_data, names, min_samples=3, check_status=False)
+    lost = {name for name in names if first[name] <= floor}
+    valid_names = [name for name in names if name not in lost]
+    if check_status and valid_names:
+        bpm_intensity_values(first_data, valid_names, min_samples=3, check_status=True)
+        bpm_intensity_values(last_data, valid_names, min_samples=3, check_status=True)
     for name in names:
+        if name in lost:
+            first[name] = 0.
+            continue
         samples = np.asarray(first_data["intensity"])[:, list(first_data["names"]).index(name)]
         if first[name] <= max(floor, 5 * float(np.std(samples))):
             raise ValueError(f"Turn 1 intensity too small/noisy for transmission: {name}")
-    transmission = float(np.mean([last[name] / first[name] for name in names]))
+    transmission = float(np.mean([0. if name in lost else last[name] / first[name] for name in names]))
     initial = first if baseline is None else baseline
-    if any(n not in initial or not np.isfinite(initial[n]) or initial[n] <= floor for n in names):
+    if any(n not in initial or not np.isfinite(initial[n]) or initial[n] < 0 for n in names):
         raise ValueError("Invalid fixed turn 1 baseline; start a fresh run.")
-    normalized = float(np.mean(list(first.values())) / np.mean([initial[n] for n in names]))
+    initial_mean = float(np.mean([initial[n] for n in names]))
+    if initial_mean <= floor and config["intensity_aggregation"] == "turn_composite":
+        raise ValueError("Initial meanCurrent is zero/too small; cannot normalize. Establish beam or use transmission-only mode.")
+    normalized = float(np.mean(list(first.values())) / initial_mean) if initial_mean > floor else float("nan")
     score = transmission + weight * normalized if config["intensity_aggregation"] == "turn_composite" else transmission
     if not np.isfinite(score):
         raise ValueError("Non-finite turn transmission score")
     if plot_out is not None:
         first_snapshot = bpm_intensity_snapshot(first_data, check_status=check_status)
         last_snapshot = bpm_intensity_snapshot(last_data, check_status=check_status)
+        raw_first_snapshot = bpm_intensity_snapshot(first_data, check_status=False)
+        raw_last_snapshot = bpm_intensity_snapshot(last_data, check_status=False)
         ratios = {}
         for name, value in first_snapshot.items():
+            if np.isfinite(raw_first_snapshot.get(name, np.nan)) and raw_first_snapshot[name] <= floor and np.isfinite(raw_last_snapshot.get(name, np.nan)):
+                ratios[name] = 0.
+                continue
             samples = np.asarray(first_data["intensity"])[:, list(first_data["names"]).index(name)]
             limit = max(floor, 5 * float(np.std(samples)))
             ratios[name] = (last_snapshot.get(name, np.nan) / value
@@ -3463,7 +3480,8 @@ class MainWindow(QMainWindow):
         bpm_layout.addLayout(ratio_row)
         ratio_help = QLabel("Transmission modes: DR BPMs only; read turns 1 and N (0.5 s settle each). "
                             "Overrides the turn-range scan above. Score = mean(I_N / I_1), optionally + w × "
-                            "mean(I_1) / initial mean(I_1). Fixed baseline; reject weak/noisy denominators. "
+                            "mean(I_1) / initial mean(I_1). Fixed baseline; finite turn 1 intensity at/below the minimum "
+                            "counts as loss (0 transmission, retained in the BPM mean). Missing data and noisy positive denominators stop the run. "
                             "These modes write and restore the turn selector PV.")
         ratio_help.setWordWrap(True)
         bpm_layout.addWidget(ratio_help)
