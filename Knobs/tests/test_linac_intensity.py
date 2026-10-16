@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import threading
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -17,6 +18,96 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_save_and_end_applies_full_best_recorded_state(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control, patch("epics.PV") as pv:
+            pv.return_value.put.return_value = 1
+            worker = opt.OptimizationWorker({"mode": "GROUP_BO", "settle_sec": 0.}, directory)
+            paused, progress = threading.Event(), []
+            def initial():
+                worker._current_pv_values = {"CM7L:phaseWrite": 0., "CM8L:phaseWrite": 0.}
+                worker._remember_best(1., True)
+            worker._dump_initial_snapshot = initial
+            measurements = iter([10., 2.])
+            def measure():
+                score = next(measurements)
+                if score == 2.:
+                    worker.request_pause()
+                return {}, score, score, "ICT", score, True, ""
+            worker._measure_objective = Mock(side_effect=measure)
+            def emit(payload):
+                progress.append(payload)
+                if payload.get("kind") == "pause_state" and payload["paused"]:
+                    paused.set()
+            worker._emit_progress = emit
+            def optimize():
+                worker._evaluate_point("L7", "CM7L:phaseWrite", 1., "GROUP_BO", "first")
+                worker._evaluate_point("L8", "CM8L:phaseWrite", 2., "GROUP_BO", "second")
+                self.fail("Save and End must unwind the search")
+            worker._run_group_bo = optimize
+            thread = threading.Thread(target=worker.run)
+            thread.start()
+            try:
+                self.assertTrue(paused.wait(2))
+                worker.save_and_end()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual([call.args[0] for call in pv.call_args_list], ["CM7L:phaseWrite", "CM8L:phaseWrite"])
+                self.assertEqual([call.args[0] for call in pv.return_value.put.call_args_list], [1., 0.])
+                pv.return_value.put.assert_called_with(0., wait=True, timeout=5.)
+                self.assertEqual(worker._measure_objective.call_count, 2)
+                self.assertFalse(any(p["kind"] == "run_error" for p in progress))
+                with open(worker.run_dir / f"SaveAndEnd_{worker.run_tag}.json") as stream:
+                    saved = json.load(stream)
+                self.assertEqual(saved["score"], 10.)
+                self.assertTrue(saved["write_completed"])
+            finally:
+                worker.stop()
+                thread.join(3)
+
+    def test_save_and_end_refuses_missing_state_and_records_write_failure(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control:
+            worker = opt.OptimizationWorker({}, directory)
+            with self.assertRaises(ValueError):
+                worker._finish_at_best()
+            worker._current_pv_values = {"CM8L:phaseWrite": 1.}
+            worker._remember_best(5., True)
+            worker._touched_pvs = {"CM7L:phaseWrite"}
+            with self.assertRaises(ValueError):
+                worker._finish_at_best()
+            control.return_value.pv_put.assert_not_called()
+            worker._touched_pvs = {"CM8L:phaseWrite"}
+            with patch("epics.PV") as pv:
+                pv.return_value.put.return_value = -1
+                with self.assertRaises(RuntimeError):
+                    worker._finish_at_best()
+            with open(worker.run_dir / f"SaveAndEnd_{worker.run_tag}.json") as stream:
+                saved = json.load(stream)
+            self.assertFalse(saved["write_completed"])
+            self.assertIn("did not complete", saved["error"])
+
+    def test_pause_dialog_resume_end_and_escape(self):
+        app = QApplication.instance() or QApplication([])
+        with patch.object(opt.MainWindow, "_refresh_current_values"):
+            window = opt.MainWindow()
+            window._current_value_timer.stop()
+            try:
+                for choice in (0, 1, 2):
+                    worker = SimpleNamespace(is_paused=True, is_running=True,
+                        _best_recorded={"score": 10.}, resume=Mock(), save_and_end=Mock())
+                    window.worker = worker
+                    buttons = [Mock(), Mock()]
+                    with patch.object(opt, "QMessageBox") as dialog:
+                        dialog.return_value.addButton.side_effect = buttons
+                        dialog.return_value.clickedButton.return_value = buttons[choice] if choice < 2 else None
+                        window._show_pause_choices()
+                        dialog.return_value.setEscapeButton.assert_called_once_with(buttons[0])
+                        self.assertEqual(dialog.return_value.addButton.call_count, 2)
+                    self.assertEqual(worker.resume.call_count, int(choice != 1))
+                    self.assertEqual(worker.save_and_end.call_count, int(choice == 1))
+            finally:
+                window.worker = None
+                window.close()
+
     def test_transmission_clips_each_bpm_but_not_normalized_current(self):
         first, last = data(), data()
         first["names"] = last["names"] = ["MB1R", "MB2R"]
@@ -49,7 +140,7 @@ class IntensityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             opt.read_turn_objective(reader, first["names"], config)
 
-    def test_gui_pause_resume_and_stop_controls(self):
+    def test_gui_pause_resume_without_standalone_stop(self):
         app = QApplication.instance() or QApplication([])
         with patch.object(opt.MainWindow, "_refresh_current_values"):
             window = opt.MainWindow()
@@ -63,18 +154,21 @@ class IntensityTests(unittest.TestCase):
                 fake.stop.assert_not_called()
                 self.assertFalse(window.btn_stop.isEnabled())
                 fake.is_paused = True
-                window._on_worker_progress({"kind": "pause_state", "paused": True})
+                with patch.object(window, "_show_pause_choices") as choices:
+                    window._on_worker_progress({"kind": "pause_state", "paused": True})
+                    choices.assert_called_once()
                 self.assertEqual(window.btn_stop.text(), "RESUME")
                 self.assertTrue(window.btn_stop.isEnabled())
-                window.stop_optimization()
-                fake.resume.assert_called_once()
+                with patch.object(window, "_show_pause_choices") as choices:
+                    window.stop_optimization()
+                    choices.assert_called_once()
                 self.assertIs(window.worker, fake)
                 fake.is_paused = False
                 window._on_worker_progress({"kind": "pause_state", "paused": False})
                 self.assertEqual(window.btn_stop.text(), "PAUSE")
-                window.cancel_optimization()
-                fake.stop.assert_called_once()
-                self.assertFalse(window.btn_stop.isEnabled())
+                self.assertFalse(hasattr(window, "btn_end"))
+                self.assertFalse(hasattr(window, "cancel_optimization"))
+                fake.stop.assert_not_called()
             finally:
                 window.worker = None
                 window.close()
@@ -120,7 +214,8 @@ class IntensityTests(unittest.TestCase):
                     worker.resume()
                     thread.join(3)
                     self.assertFalse(thread.is_alive())
-                    self.assertEqual(worker._eval_counter, 2)
+                    self.assertEqual(worker._eval_counter, 3)  # paused point is re-measured on Resume
+                    self.assertEqual([call.args[1] for call in control.return_value.pv_put.call_args_list], [1., 1., 2.])
                     self.assertEqual(len(results), 2)
                     self.assertEqual(worker.run_dir, run_dir)
                     self.assertEqual(worker.intensity_baseline, {"MB1R": 10.})
@@ -237,8 +332,9 @@ class IntensityTests(unittest.TestCase):
     def test_initial_bo_background_phases_and_restarts(self):
         from matplotlib.figure import Figure
         from matplotlib.colors import to_rgba
-        notes = ["GBO_INIT_CUR|REUSE_INIT", "GBO_INIT_RAND", "GBO_EI", "OPTIMIZED_SET",
-                 "BO_INIT", "BO_EI", "BO_REFINE", "TERNARY_EVAL"]
+        notes = ["GBO_INIT_CUR|REUSE_INIT", 'GBO_INIT_RAND | {"CM8L:phaseWrite": 1}',
+                 'GBO_EI | {"CM8L:phaseWrite": 2}', "OPTIMIZED_SET",
+                 " BO_INIT | PAUSE_REMEASURE ", " BO_EI ", "BO_REFINE", "TERNARY_EVAL"]
         phases = [opt.evaluation_phase(note) for note in notes]
         self.assertEqual(phases, ["Initial", "Initial", "BO", "", "Initial", "BO", "BO", ""])
         axis = Figure().add_subplot()

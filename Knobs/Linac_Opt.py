@@ -106,8 +106,12 @@ DEVELOPER_OBJECTIVE_BPM = "BPM_SQSUM"
 DEVELOPER_OBJECTIVE_INTENSITY = "BPM_INTENSITY"
 
 
+class SaveAndEndRequested(Exception):
+    """Unwind the active search, then apply its best recorded machine state."""
+
+
 def evaluation_phase(note):
-    tags = str(note or "").split("|")
+    tags = [tag.strip() for tag in str(note or "").split("|")]
     if any(tag in ("GBO_INIT_CUR", "GBO_INIT_RAND", "BO_INIT", "REUSE_INIT") for tag in tags):
         return "Initial"
     if any(tag in ("GBO_EI", "BO_EI", "BO_REFINE") for tag in tags):
@@ -770,6 +774,11 @@ class OptimizationWorker(QThread):
         self._pause_condition = threading.Condition()
         self.pause_requested = False
         self.is_paused = False
+        self._save_and_end = False
+        self._remeasure_after_pause = False
+        self._pause_can_remeasure = False
+        self._best_recorded = None
+        self._touched_pvs = set()
         self.run_profile = str(config.get("run_profile", RUN_PROFILE_MAIN)).upper()
 
         self.settle_sec = float(config.get("settle_sec", SETTLE_SEC_DEFAULT))
@@ -947,6 +956,7 @@ class OptimizationWorker(QThread):
             for pv_name, value in pv_updates.items():
                 self._current_pv_values[str(pv_name)] = float(value)
         self._eval_counter += 1
+        self._remember_best(r.score, r.measurement_ok)
         self._emit_progress({
             "kind": "evaluation",
             "evaluation_phase": evaluation_phase(r.note),
@@ -970,7 +980,7 @@ class OptimizationWorker(QThread):
             "measurement_reason": str(r.measurement_reason),
             "display_values": build_display_value_texts(self._current_pv_values),
         })
-        self._pause_checkpoint()
+        self._pause_checkpoint(remeasure=True)
 
     def _resume_seq_key(self, mode: str, group: str, pv_name: str) -> Tuple[str, str, str]:
         return (str(mode), str(group), str(pv_name))
@@ -1195,6 +1205,7 @@ class OptimizationWorker(QThread):
             json.dump(data, f, indent=2)
         self._initial_snapshot = data
         self._current_pv_values = {str(k): float(v) for k, v in setpoints.items()}
+        self._remember_best(initial_score, initial_measurement_ok)
         self._emit_display_values()
         self.log_signal.emit(f"[INIT] Snapshot dumped: {snapshot_path}")
         self._pause_checkpoint()
@@ -1241,6 +1252,9 @@ class OptimizationWorker(QThread):
         self._append_csv(r)
         self._record_evaluation(r, {pv_name: float(set_value)})
         self.log_signal.emit(f"[INIT-REUSE] Reused initial eval for {device_label} ({pv_name}) at x={set_value:.6g}")
+        if self._remeasure_after_pause:
+            self._remeasure_after_pause = False
+            return self._evaluate_point(device_label, pv_name, set_value, mode, group, note + "|PAUSE_REMEASURE")
         return r
 
     def _try_reuse_initial_vector(self, labels: List[str], pvs: List[str], x_vec: np.ndarray,
@@ -1287,6 +1301,10 @@ class OptimizationWorker(QThread):
         self._append_csv(r)
         self._record_evaluation(r, {pv: float(x) for pv, x in zip(pvs, x_vec)})
         self.log_signal.emit(f"[INIT-REUSE] Reused initial vector eval for group {group}")
+        if self._remeasure_after_pause:
+            self._remeasure_after_pause = False
+            return self._evaluate_point_multi(
+                ",".join(labels), dict(zip(pvs, map(float, x_vec))), mode, group, note + "|PAUSE_REMEASURE")
         return r
 
     # ----------------------------
@@ -1305,15 +1323,53 @@ class OptimizationWorker(QThread):
                 self.pause_requested = True
         self.log_signal.emit("[PAUSE] Requested; finish the current evaluation before waiting.")
 
-    def resume(self):
+    def resume(self, remeasure_current_point=True):
         with self._pause_condition:
+            self._remeasure_after_pause = bool(remeasure_current_point and self._pause_can_remeasure)
             self.pause_requested = False
             self._pause_condition.notify_all()
 
-    def _pause_checkpoint(self):
+    def save_and_end(self):
+        with self._pause_condition:
+            if not self.is_paused or not self.is_running:
+                return
+            self._save_and_end = True
+            self.pause_requested = False
+            self._pause_condition.notify_all()
+
+    def _remember_best(self, score, measurement_ok):
+        if measurement_ok and np.isfinite(score) and self._current_pv_values:
+            if self._best_recorded is None or score > self._best_recorded["score"]:
+                self._best_recorded = {"score": float(score), "eval_index": self._eval_counter,
+                                       "setpoints": dict(self._current_pv_values)}
+
+    def _finish_at_best(self):
+        if self._best_recorded is None:
+            raise ValueError("No valid recorded measurement; cannot apply best settings.")
+        best = self._best_recorded
+        if any(pv not in best["setpoints"] for pv in self._touched_pvs):
+            raise ValueError("Best measurement lacks a complete machine state; refusing partial restoration.")
+        target = {pv: best["setpoints"][pv] for pv in sorted(self._touched_pvs)}
+        report = {**best, "requested_setpoints": target, "write_completed": False}
+        try:
+            if target:
+                self._write_setpoints(target, wait=True)
+                self._current_pv_values.update(target)
+            report["write_completed"] = True
+            self._emit_display_values()
+            self.log_signal.emit(f"[SAVE AND END] Applied best recorded score={best['score']:.6g}; {len(target)} PVs. No new evaluation.")
+        except Exception as exc:
+            report["error"] = str(exc)
+            raise
+        finally:
+            with open(self.run_dir / f"SaveAndEnd_{self.run_tag}.json", "w") as stream:
+                json.dump(report, stream, indent=2)
+
+    def _pause_checkpoint(self, remeasure=False):
         with self._pause_condition:
             if self.pause_requested and self.is_running:
                 self.is_paused = True
+                self._pause_can_remeasure = remeasure
                 self.log_signal.emit("[PAUSE] Paused; history, baseline and machine settings retained.")
                 self._emit_progress({"kind": "pause_state", "paused": True})
                 try:
@@ -1321,6 +1377,9 @@ class OptimizationWorker(QThread):
                         self._pause_condition.wait()
                 finally:
                     self.is_paused = False
+                if self._save_and_end and self.is_running:
+                    self._save_and_end = False
+                    raise SaveAndEndRequested()
                 if self.is_running:
                     self.log_signal.emit("[RESUME] Continuing the same run.")
                     self._emit_progress({"kind": "pause_state", "paused": False})
@@ -1480,6 +1539,9 @@ class OptimizationWorker(QThread):
         )
         self._append_csv(r)
         self._record_evaluation(r, {pv_name: float(set_value)})
+        if self._remeasure_after_pause:
+            self._remeasure_after_pause = False
+            return self._evaluate_point(device_label, pv_name, set_value, mode, group, note + "|PAUSE_REMEASURE")
         return r
 
     def _evaluate_point_multi(self, device_label: str, pv_to_value: Dict[str, float],
@@ -1526,6 +1588,9 @@ class OptimizationWorker(QThread):
         )
         self._append_csv(r)
         self._record_evaluation(r, {k: float(v) for k, v in pv_to_value.items()})
+        if self._remeasure_after_pause:
+            self._remeasure_after_pause = False
+            return self._evaluate_point_multi(device_label, pv_to_value, mode, group, note + "|PAUSE_REMEASURE")
         return r
 
     # ----------------------------
@@ -2563,6 +2628,12 @@ class OptimizationWorker(QThread):
                 self._run_correctors()
                 if self.is_running:
                     self._emit_group_state("correctors", "done")
+        except SaveAndEndRequested:
+            try:
+                self._finish_at_best()
+            except Exception as e:
+                self._emit_progress({"kind": "run_error", "message": str(e)})
+                self.log_signal.emit(f"[SAVE AND END] Failed: {e}")
         except InterruptedError as e:
             if self.is_running:
                 self._emit_progress({"kind": "run_error", "message": str(e)})
@@ -2575,7 +2646,7 @@ class OptimizationWorker(QThread):
             self.log_signal.emit("=== Optimization Finished ===")
             self.finished_signal.emit()
 
-    def _write_setpoints(self, values):
+    def _write_setpoints(self, values, wait=False):
         self._pause_checkpoint()
         if self.run_profile == RUN_PROFILE_DEVELOPER or self.config.get("correctors"):
             selected = {spec["pv_write"] for spec in self.developer_actuators}
@@ -2589,11 +2660,25 @@ class OptimizationWorker(QThread):
                 lo, hi = limits[pv]
                 if not np.isfinite(value) or not lo <= value <= hi:
                     raise ValueError(f"Corrector command outside verified range: {pv}={value}")
-        if len(values) == 1:
+        if wait:
+            from epics import PV
+            for pv_name, value in values.items():
+                if not self.is_running:
+                    raise InterruptedError("Best-setting application stopped")
+                pv = PV(pv_name)
+                if not pv.wait_for_connection(timeout=2.):
+                    raise RuntimeError(f"Cannot connect while applying best: {pv_name}")
+                if pv.put(float(value), wait=True, timeout=5.) != 1:
+                    raise RuntimeError(f"Best-setting put did not complete: {pv_name}")
+                # Track partial completion if a later PV fails.
+                self._current_pv_values[pv_name] = float(value)
+                self._touched_pvs.add(pv_name)
+        elif len(values) == 1:
             pv, value = next(iter(values.items()))
             self.interface.pv_put(pv, value)
         else:
             self.interface.pv_put_many(values)
+        self._touched_pvs.update(values)
 
     def _run_correctors(self):
         if not self.developer_actuators:
@@ -3159,10 +3244,6 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_start = QPushButton("START")
         self.btn_stop = QPushButton("PAUSE")
-        self.btn_end = QPushButton("STOP")
-        self.btn_end.setToolTip("End this run (cannot resume in memory). Does not restore initial settings.")
-        self.btn_end.setEnabled(False)
-        self.btn_end.clicked.connect(self.cancel_optimization)
         self.reset_initial_btn = QPushButton("Reset To Initial")
         self.btn_stop.setEnabled(False)
         self.btn_start.clicked.connect(self.start_optimization)
@@ -3178,7 +3259,6 @@ class MainWindow(QMainWindow):
         )
         btn_row.addWidget(self.btn_start)
         btn_row.addWidget(self.btn_stop)
-        btn_row.addWidget(self.btn_end)
         btn_row.addWidget(self.reset_initial_btn)
         ctrl.addLayout(btn_row)
 
@@ -4903,6 +4983,8 @@ class MainWindow(QMainWindow):
                 button.setEnabled(True)
             self._set_status("Status: PAUSED — settings retained" if paused else "Status: RUNNING",
                              state="paused" if paused else "running", profile=context)
+            if paused:
+                self._show_pause_choices()
             return
 
         if kind == "bo1d_trace":
@@ -5689,7 +5771,6 @@ class MainWindow(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self._on_worker_progress)
         self.worker.finished_signal.connect(self.optimization_finished)
-        self.btn_end.setEnabled(True)
         self.worker.start()
 
     def start_optimization(self):
@@ -5846,28 +5927,51 @@ class MainWindow(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self._on_worker_progress)
         self.worker.finished_signal.connect(self.optimization_finished)
-        self.btn_end.setEnabled(True)
         self.worker.start()
+
+    def _show_pause_choices(self):
+        worker = self.worker
+        if worker is None or not worker.is_paused or not worker.is_running:
+            return
+        best = worker._best_recorded
+        box = QMessageBox(self)
+        box.setWindowTitle("Pause Requested")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Current evaluation finished.\n"
+                    + (f"Best recorded score: {best['score']:.6g}\n" if best else "No valid best measurement yet.\n")
+                    + "Resume: re-measure the paused point and continue.\n"
+                      "Save and End: apply the best recorded settings and end this run.\n"
+                      "Closing this dialog or pressing Esc resumes the run.")
+        resume_button = box.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
+        end_button = box.addButton("Save and End", QMessageBox.ButtonRole.ActionRole)
+        box.setEscapeButton(resume_button)
+        end_button.setEnabled(best is not None)
+        box.setDefaultButton(resume_button)
+        box.exec()
+        if self.worker is not worker or not worker.is_running:
+            return
+        clicked = box.clickedButton()
+        if clicked is end_button:
+            worker.save_and_end()
+        else:
+            worker.resume()
+        self.btn_stop.setEnabled(False)
+        self.dev_btn_stop.setEnabled(False)
+        self._set_status("Status: applying best settings and saving" if clicked is end_button else "Status: re-measuring paused point",
+                         state="info", profile=self._run_profile)
 
     def stop_optimization(self):
         if self.worker and self.worker.isRunning():
             was_paused = self.worker.is_paused
             if was_paused:
-                self.worker.resume()
+                self._show_pause_choices()
+                return
             else:
                 self.worker.request_pause()
             self.btn_stop.setEnabled(False)
             self.dev_btn_stop.setEnabled(False)
             self._set_status("Status: resuming" if was_paused else "Status: pause requested — completing evaluation",
                              state="paused", profile=self._run_profile)
-
-    def cancel_optimization(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
-            self.btn_stop.setEnabled(False)
-            self.dev_btn_stop.setEnabled(False)
-            self.btn_end.setEnabled(False)
-            self._set_status("Status: stopping", state="paused", profile=self._run_profile)
 
     def closeEvent(self, event):  # type: ignore[override]
         timer_was_active = self._current_value_timer.isActive()
@@ -5898,7 +6002,6 @@ class MainWindow(QMainWindow):
                 for pv, value in dict(getattr(self.worker, "_current_pv_values", {}) or {}).items()
             }
         self.worker = None
-        self.btn_end.setEnabled(False)
         self.btn_stop.setText("PAUSE")
         self.dev_btn_stop.setText("PAUSE")
         self.btn_start.setEnabled(True)
