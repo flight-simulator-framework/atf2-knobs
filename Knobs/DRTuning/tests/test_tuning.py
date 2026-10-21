@@ -326,18 +326,98 @@ class ReadbackAcquisitionTests(unittest.TestCase):
                 evidence['y']=dict(timestamp=1.,sha256='1')
                 if not partial:evidence['x']=dict(timestamp=1.,sha256='1')
                 return wave,evidence
-            with self.assertRaises(TimeoutError):self.controller().acquire(snapshot)
+            with self.assertRaisesRegex(TimeoutError,r'stale/missing PVs=.*y'):self.controller().acquire(snapshot)
             self.assertEqual(self.values['shot'],0)
     def test_processing_timestamp_alone_not_accepted(self):
         def snapshot():
             wave,evidence=self.snapshot()
             for v in evidence.values():v['sha256']='unchanged'
             return wave,evidence
-        with self.assertRaises(TimeoutError):self.controller().acquire(snapshot)
+        with self.assertRaisesRegex(TimeoutError,'content_changed=False'):self.controller().acquire(snapshot)
     def test_cancellation_restores_legacy_modes(self):
         cancel=threading.Event();cancel.set()
         with self.assertRaisesRegex(RuntimeError,'cancelled'):self.controller().acquire(self.snapshot,cancel=cancel)
         self.assertEqual(self.values['mode'],'Repetitive 3Hz')
+
+
+class OrbitModeAcquisitionTests(unittest.TestCase):
+    def setup_live(self,original=2):
+        from Knobs.DRTuning.epics import LiveBackend
+        b=LiveBackend.__new__(LiveBackend)
+        config=dict(mode='readback_checks',mode_pv='crate-mode',shot_mode_pv='shot',
+                    turn_pv='turn',snap_pv='snap',event_pv='event',timeout_s=.03,
+                    arm_settle_s=0.,readout_settle_s=0.,stable_read_interval_s=0.,
+                    orbit_mode_pv='orbit-mode',orbit_mode_settle_s=0.,orbit_mode_timeout_s=.03)
+        b.profile={'tbt':dict(mapping_confirmed=True,acquisition=config)}
+        values={'orbit-mode':original,'crate-mode':'Repetitive 3Hz','shot':0,'turn':99,'event':1.}
+        commands=[]
+        def put(pv,value):
+            commands.append((pv,value));values[pv]=value
+            if pv=='snap':values['event']+=1
+        b.get=values.__getitem__;b.put=put;b.metadata=lambda pv:dict(timestamp=values[pv])
+        def snapshot(turns,**kwargs):
+            self.assertEqual(values['orbit-mode'],0)
+            n=values['event']
+            return dict(turns=list(range(1,turns+1))),{'bpm01.WPSH':dict(timestamp=n,sha256=str(n))}
+        b.tbt_snapshot=snapshot
+        return b,values,commands
+    def test_new_shot_restores_each_original_mode(self):
+        for original in (0,1,2,3):
+            with self.subTest(original=original):
+                b,values,commands=self.setup_live(original)
+                r=b.tbt_acquire(16,start_turn=21)
+                self.assertEqual(values['orbit-mode'],original)
+                self.assertEqual((values['crate-mode'],values['shot'],values['turn']),('Repetitive 3Hz',0,99))
+                self.assertEqual(r['turns'][0],21);self.assertTrue(r['orbit_mode_control']['restored'])
+                if original:
+                    self.assertEqual(commands[0],('orbit-mode',0));self.assertEqual(commands[-1],('orbit-mode',original))
+                else:self.assertNotIn('orbit-mode',[pv for pv,_ in commands])
+    def test_waveform_timeout_restores_orbit_and_crate_modes(self):
+        b,values,commands=self.setup_live()
+        b.tbt_snapshot=lambda turns,**kwargs:(dict(turns=list(range(1,turns+1))),{'bpm02.WPSV':dict(timestamp=1.,sha256='old')})
+        with self.assertRaisesRegex(TimeoutError,'bpm02.WPSV'):b.tbt_acquire(16)
+        self.assertEqual(values['orbit-mode'],2);self.assertEqual(values['shot'],0);self.assertEqual(values['turn'],99)
+        self.assertEqual(commands[-1],('orbit-mode',2))
+    def test_mode_readback_mismatch_never_triggers_shot(self):
+        b,values,commands=self.setup_live()
+        original_put=b.put
+        def put(pv,value):
+            if pv=='orbit-mode' and value==0:commands.append((pv,value))
+            else:original_put(pv,value)
+        b.put=put
+        with self.assertRaisesRegex(TimeoutError,'orbit-mode: expected 0, read 2'):b.tbt_acquire(16)
+        self.assertEqual(commands,[('orbit-mode',0),('orbit-mode',2)])
+    def test_cancellation_after_mode_write_still_restores(self):
+        b,values,commands=self.setup_live(3);cancel=threading.Event();original_put=b.put
+        def put(pv,value):
+            original_put(pv,value)
+            if pv=='orbit-mode' and value==0:cancel.set()
+        b.put=put
+        with self.assertRaisesRegex(RuntimeError,'cancelled'):b.tbt_acquire(16,cancel=cancel)
+        self.assertEqual(values['orbit-mode'],3);self.assertNotIn('snap',[pv for pv,_ in commands])
+    def test_failed_write_may_have_applied_and_is_restored(self):
+        b,values,commands=self.setup_live();original_put=b.put
+        def put(pv,value):
+            original_put(pv,value)
+            if pv=='orbit-mode' and value==0:raise RuntimeError('write reply lost')
+        b.put=put
+        with self.assertRaisesRegex(RuntimeError,'write reply lost'):b.tbt_acquire(16)
+        self.assertEqual(values['orbit-mode'],2);self.assertNotIn('snap',[pv for pv,_ in commands])
+    def test_restoration_failure_is_not_reported_as_success(self):
+        b,values,commands=self.setup_live();original_put=b.put
+        def put(pv,value):
+            if pv=='orbit-mode' and value==2:return  # simulate accepted but ineffective restore
+            original_put(pv,value)
+        b.put=put
+        with self.assertRaisesRegex(RuntimeError,'ORBIT_MODE restoration failed'):b.tbt_acquire(16)
+        self.assertEqual(values['orbit-mode'],0)
+    def test_completion_counter_path_also_selects_and_restores_orbit_mode(self):
+        b,values,commands=self.setup_live(1);a=b.profile['tbt']['acquisition']
+        a.update(mode='completion',completion_confirmed=True,generation_pv='event')
+        def read(turns,**kwargs):
+            self.assertEqual(values['orbit-mode'],0);return dict(turns=list(range(1,turns+1)))
+        b.read_tbt=read;r=b.tbt_acquire(16)
+        self.assertTrue(r['orbit_mode_control']['restored']);self.assertEqual(values['orbit-mode'],1)
 
 
 class LiveQuadTests(unittest.TestCase):

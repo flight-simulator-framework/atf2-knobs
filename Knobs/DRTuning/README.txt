@@ -131,6 +131,21 @@ Regenerate the public design calibration using:
 
 Live acquisition without a completion PV
 ---------------------------------------
+New-shot acquisition first reads DRBPM:ORBIT_MODE, temporarily sets it to TBT
+(0), waits for matching readback (5 s deadline), then settles for 0.5 s and
+checks the readback again. Only then does it execute the crate sequence below.
+After restoring crate mode / shot mode / first turn, it restores the ORIGINAL
+ORBIT_MODE and verifies it, also on acquisition failure or cancellation.
+The original mode may be TBT=0, COD=1, Injection=2 or Extraction=3; it does not
+unconditionally select COD on exit. No ORBIT_MODE write is made if already in
+TBT. A restoration failure is reported explicitly, never as successful capture.
+Successful results record orbit_mode_control with the original/acquisition mode
+and restoration status. This guard applies to both acquisition strategies.
+The profile fields orbit_mode_pv, orbit_mode_timeout_s and orbit_mode_settle_s
+configure the PV and timing; omitted fields use the defaults above.
+Read waveform with Acquire a new shot OFF remains read-only and does not change
+ORBIT_MODE. COD / Injection controls in other tools are not changed by this.
+
 The user confirmed that there is no dedicated all-BPM completion PV. Default
 readback_checks therefore ports the Turn1024 one-shot / shot-mode / TURN / SNAP
 sequence and uses TBT:TUNE:H timestamp updates as the old event source. It then
@@ -138,6 +153,11 @@ processes the BPM records, requires every waveform timestamp to advance, checks
 that waveform content changed, and requires two stable reads while the event
 timestamp remains unchanged. Stale, partial and torn reads time out. All original
 mode/turn values are restored, also on failure or cancellation.
+Waveform-check timeouts now report counts and names (first eight per category)
+of stale/missing or unstable PVs, unexpected PVs, whether waveform content
+changed, and whether the tune event changed during the read. These diagnostics
+help distinguish missing updates from a continuously changing acquisition;
+the acceptance checks are not relaxed to suppress a timeout.
 
 These are SOFTWARE readback checks, not proof of a common hardware shot ID.
 Every resulting measurement has same_shot_verified=false and records the IOC

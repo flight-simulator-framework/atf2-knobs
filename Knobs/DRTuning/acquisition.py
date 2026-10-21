@@ -5,7 +5,60 @@ The deployment profile must identify a completion generation after ALL data is
 ready. No elapsed delay is accepted as evidence of a completed acquisition.
 """
 import time
+from contextlib import contextmanager
 import numpy as np
+
+
+@contextmanager
+def tbt_orbit_mode(get,put,config,*,cancel=None,progress=lambda *_:None):
+    """Temporarily select TBT (0), verify readback, then restore the original mode.
+
+    This is separate from crate MODE and drbpm:shot:mode. Restoration deliberately
+    ignores cancellation, and a failed write is treated as possibly applied.
+    """
+    pv=config.get('orbit_mode_pv','DRBPM:ORBIT_MODE')
+    timeout=float(config.get('orbit_mode_timeout_s',5.))
+    settle=float(config.get('orbit_mode_settle_s',.5))
+    if not pv or not np.isfinite([timeout,settle]).all() or timeout<=0 or settle<0:
+        raise ValueError('Invalid TBT ORBIT_MODE timing / PV configuration')
+    def check_cancel():
+        if cancel is not None and cancel.is_set():raise RuntimeError('TBT cancelled')
+    def read():
+        value=get(pv)
+        if not np.isscalar(value) or value not in (0,1,2,3):
+            raise ValueError(f'{pv}: invalid mode readback {value!r}')
+        return int(value)
+    def wait(target,restoring=False):
+        deadline=time.monotonic()+timeout
+        while True:
+            if not restoring:check_cancel()
+            actual=read()
+            if actual==target:break
+            if time.monotonic()>=deadline:
+                raise TimeoutError(f'{pv}: expected {target}, read {actual}')
+            time.sleep(.02)
+        until=time.monotonic()+settle
+        while time.monotonic()<until:
+            if not restoring:check_cancel()
+            time.sleep(min(.02,max(0.,until-time.monotonic())))
+        if read()!=target:raise RuntimeError(f'{pv}: mode changed during settling; expected {target}')
+    check_cancel();original=read();touched=False
+    evidence=dict(pv=pv,original=original,acquisition=0,restored=False)
+    try:
+        progress(0,f'{pv}: selecting TBT (0), original mode {original}')
+        if original!=0:
+            touched=True;put(pv,0)
+        wait(0)
+        yield evidence
+        if read()!=0:raise RuntimeError(f'{pv}: changed during TBT acquisition')
+    finally:
+        if touched:
+            progress(100,f'{pv}: restoring mode {original}')
+            try:put(pv,original);wait(original,restoring=True)
+            except Exception as exc:raise RuntimeError(f'ORBIT_MODE restoration failed: {pv} -> {original}: {exc}') from exc
+        elif read()!=original:
+            raise RuntimeError(f'{pv}: original mode {original} is no longer active')
+        evidence['restored']=True
 
 
 class TBTController:
@@ -96,7 +149,15 @@ class ReadbackTBTController:
                         acquisition_quality='legacy event + updated stable waveforms; common shot ID unavailable',
                         event_timestamp=end_event,waveform_evidence=first)
                     return data
-                if time.monotonic()>deadline:raise TimeoutError('TBT waveform update/stability checks failed')
+                if time.monotonic()>deadline:
+                    stale=sorted(n for n in previous if n not in first or first[n]['timestamp']<=previous[n]['timestamp'])
+                    unstable=sorted(n for n in set(first)|set(second) if first.get(n)!=second.get(n))
+                    unexpected=sorted(set(first)-set(previous))
+                    def describe(names):return f'{len(names)} ['+', '.join(names[:8])+(', ...' if len(names)>8 else '')+']'
+                    raise TimeoutError('TBT waveform update/stability checks failed; '
+                        f'stale/missing PVs={describe(stale)}; unstable PVs={describe(unstable)}; '
+                        f'unexpected PVs={describe(unexpected)}; content_changed={changed}; '
+                        f'tune_event_changed_during_read={start_event!=end_event}')
                 pause(.02)
         finally:
             errors=[]

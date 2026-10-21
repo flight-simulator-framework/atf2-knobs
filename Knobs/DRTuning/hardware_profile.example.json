@@ -800,7 +800,10 @@
       "mode": "readback_checks",
       "event_pv": "TBT:TUNE:H",
       "readout_settle_s": 1.0,
-      "stable_read_interval_s": 0.05
+      "stable_read_interval_s": 0.05,
+      "orbit_mode_pv": "DRBPM:ORBIT_MODE",
+      "orbit_mode_settle_s": 0.5,
+      "orbit_mode_timeout_s": 5.0
     },
     "extraction_turn": null
   },

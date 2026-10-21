@@ -4,7 +4,7 @@ import hashlib
 import numpy as np
 from Knobs.DRCorrection.backends import EpicsBackend
 from Knobs.DRCorrection.tbt import analyze_tbt
-from .acquisition import TBTController,ReadbackTBTController
+from .acquisition import TBTController,ReadbackTBTController,tbt_orbit_mode
 from .calibration import coil_k1l
 
 
@@ -81,11 +81,15 @@ class LiveBackend(EpicsBackend):
         self.validate_tbt_acquisition()
         progress(0,'New shot: checking acquisition mode and waveform updates')
         a=self.profile['tbt']['acquisition']
-        if a.get('mode')=='readback_checks':
-            controller=ReadbackTBTController(self.get,self.put,lambda:self.metadata(a['event_pv'])['timestamp'],a)
-            return controller.acquire(lambda:self.tbt_snapshot(turns,cancel=cancel,progress=progress),start_turn=start_turn,cancel=cancel)
-        controller=TBTController(self.get,self.put,a)
-        return controller.acquire(lambda:self.read_tbt(turns,cancel=cancel,progress=progress),start_turn=start_turn,cancel=cancel)
+        with tbt_orbit_mode(self.get,self.put,a,cancel=cancel,progress=progress) as mode:
+            if a.get('mode')=='readback_checks':
+                controller=ReadbackTBTController(self.get,self.put,lambda:self.metadata(a['event_pv'])['timestamp'],a)
+                result=controller.acquire(lambda:self.tbt_snapshot(turns,cancel=cancel,progress=progress),start_turn=start_turn,cancel=cancel)
+            else:
+                controller=TBTController(self.get,self.put,a)
+                result=controller.acquire(lambda:self.read_tbt(turns,cancel=cancel,progress=progress),start_turn=start_turn,cancel=cancel)
+        result['orbit_mode_control']=mode
+        return result
     def read_tbt(self,turns=1024,*,cancel=None,progress=lambda *_:None):
         """Read existing waveforms only; no trigger, PROC or machine write."""
         p=self.profile.get('tbt',{})

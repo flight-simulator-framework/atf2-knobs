@@ -27,6 +27,7 @@ class TuningTBTPanel(TBTPanel):
         controls=QWidget();left=QVBoxLayout(controls)
         box,v=group('1. Waveform acquisition');left.addWidget(box)
         self.fresh=QCheckBox('Acquire a new shot')
+        self.fresh.setToolTip('Temporarily selects DRBPM:ORBIT_MODE = 0 (TBT), verifies the readback, and restores the original mode after acquisition, failure or cancellation.')
         self.fresh.setChecked(False)
         self.fresh.setEnabled(hasattr(window.backend,'tbt_acquire'));v.addWidget(self.fresh)
         form=QFormLayout();form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows);v.addLayout(form)
