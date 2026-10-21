@@ -9,7 +9,7 @@ Improvements (2026-01):
 - Log additional ICTs (GUN/LNE/BTM/BTE) at every evaluation point.
 - Always wait settle_sec (default 5s) after changing any PV before reading ICTs.
 - Timing scan after klystron phase scan:
-    PV: EVE_LINAC:OT8D [count], integer step=1, range=±10 around current
+    PV: EVE_LINAC.OT8D [count], integer step=1, range=±10 around current
 - Add Group-LBO mode (discrete / quantized to the same step sizes as sequential scans).
   Groups: L1–L4, L5–L8, Timing, QA, QM (only checked groups run, in this order).
 """
@@ -87,7 +87,7 @@ QA_STEP_A = 0.05
 QM_HALF_RANGE_A = 2.0
 QM_STEP_A = 0.2
 
-TIMING_PV = "EVE_LINAC:OT8D"
+TIMING_PV = "EVE_LINAC.OT8D"
 TIMING_STEP = 1
 TIMING_HALF_STEPS = 10  # ±10 counts by default
 
@@ -3887,7 +3887,7 @@ class MainWindow(QMainWindow):
         lay_seq.addLayout(lay_timing)
 
         self.correctors_l8 = QCheckBox("Correctors & L8: include L8 phase + Timing in one Group BO")
-        self.correctors_l8.setToolTip("Timing = EVE_LINAC:OT8D (integer counts, default current ±10). Uses Timing range/step above. L8 is excluded from the separate L5–L8 group.")
+        self.correctors_l8.setToolTip("Timing = EVE_LINAC.OT8D (integer counts, default current ±10). Uses Timing range/step above. L8 is excluded from the separate L5–L8 group.")
         lay_seq.addWidget(self.correctors_l8)
         self.l8_phase_half = QDoubleSpinBox()
         self.l8_phase_half.setRange(0.001, 180.)
