@@ -122,8 +122,10 @@ Their invocation exists in op-base, but the called model/code is not bundled.
 
 Verification
 ------------
-Offline suite: 26 tests passed, including five added tests for live-limit PV
-ordering/dynamic changes, RAMP routing, unsupported step rejection, scan-state
-restoration and failed-preset rollback. All EPICS access used fake clients.
+Offline full suite: 26 tests passed. After adding explicit frequency-record
+processing, the focused control suite passed all 6 tests (27 distinct tests
+covered across both runs). They cover live-limit PV ordering/dynamic changes,
+RAMP routing, unsupported step rejection, scan-state restoration, failed-preset
+rollback and read-record processing. All EPICS access used fake clients.
 Existing demo/GUI correction tests also passed with per-magnet limit arrays.
 No expensive particle tracking or new emittance campaign was run for this audit.

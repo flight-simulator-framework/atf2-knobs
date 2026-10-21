@@ -63,6 +63,11 @@ class RecoveredControlTests(unittest.TestCase):
         backend.restore(before)
         self.assertTrue(backend.same_settings(before,backend.snapshot()))
         self.assertEqual(client.values['RAMP:STATUS_READ'],0)
+    def test_frequency_record_processing_and_fresh_get(self):
+        client=RampClient();p=ramp_profile();p['rf']['read_process_pv']='FREQUENCY:DR_read.PROC'
+        backend=EpicsBackend(p,client);backend.set_frequency(1000.)
+        self.assertIn(('FREQUENCY:DR_read.PROC',1),client.calls)
+        self.assertFalse(any(pv.endswith('_write') for pv,value in client.calls))
     def test_sub_khz_is_rejected_before_any_write(self):
         client=RampClient();backend=EpicsBackend(ramp_profile(),client)
         with self.assertRaisesRegex(ValueError,'integer kHz'):backend.set_frequency(500.)

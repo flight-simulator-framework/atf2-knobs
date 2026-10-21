@@ -154,7 +154,8 @@ Validation
     /home/motokisato/rftrack-env/bin/python -m unittest discover \
     -s atf2-knobs/Knobs/DRCorrection/tests -v
 
-2026-10-21: 26 tests passed after the source-audit updates. Includes ported-solver correction, limits, stale and
+2026-10-21: full suite 26 tests passed; final focused controls suite 6 passed
+(27 distinct tests covered). Includes ported-solver correction, limits, stale and
 duplicate SET, cancellation and failed-scan restoration, failed-SET rollback,
 file re-solving, numeric SAD parsing, TBT fits, SR response fit, fake EPICS packed
 COD/per-BPM TBT mapping, failed writes, and offscreen Qt button/save workflows.
