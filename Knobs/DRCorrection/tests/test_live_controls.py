@@ -2,7 +2,7 @@
 import unittest
 import numpy as np
 from Knobs.DRCorrection.backends import EpicsBackend,profile_issues
-from Knobs.DRCorrection.core import CorrectionService,Options
+from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
 from Knobs.DRCorrection.ramp import DeltaRamp
 from test_corrections import fake_profile,FakeEpics
 
@@ -79,6 +79,40 @@ class RecoveredControlTests(unittest.TestCase):
         CorrectionService(backend)._signal('dispersion',Options(frequency_change_khz=2.))
         self.assertEqual(backend.frequency_state(),before)
         self.assertIn(('RAMP:MI1:ONOFF_SW',1),client.calls);self.assertIn(('RAMP:PL1:ONOFF_SW',1),client.calls)
+    def test_dispersion_calc_only_restores_probed_magnets(self):
+        # One corrector entails nine orbit reads: nominal and +/- RF, repeated
+        # at the two corrector probe settings. Fail/cancel at every read.
+        cases=[('success',None)]+[(mode,i) for mode in ('failure','cancel') for i in range(1,10)]
+        for mode,at in cases:
+            with self.subTest(mode=mode,read=at):
+                client=RampClient();backend=EpicsBackend(ramp_profile(),client)
+                client.values.update(h=.4,v=.7,s=.2)
+                service=CorrectionService(backend);before=backend.snapshot()
+                original=backend.orbit
+                def orbit():
+                    result=original()
+                    # An unrelated setting changed elsewhere must not be
+                    # overwritten by this scan's cleanup.
+                    client.values['h']=1.3
+                    if backend.acquisitions==at:
+                        if mode=='failure':raise RuntimeError('Injected orbit failure')
+                        service.cancel.set()
+                    return result
+                backend.orbit=orbit
+                options=Options(frequency_change_khz=2.,corrector_probe_A=.01)
+                if mode=='success':
+                    data=service.calculate('dispersion',options)
+                    self.assertEqual(data['actuators'],['V'])
+                    self.assertEqual(backend.acquisitions,9)
+                else:
+                    with self.assertRaises(RuntimeError if mode=='failure' else Cancelled):
+                        service.calculate('dispersion',options)
+                expected=before
+                expected['correctors']['H']=1.3
+                self.assertTrue(backend.same_settings(expected,backend.snapshot()))
+                writes=[(pv,value) for pv,value in client.calls if not pv.startswith('RAMP:')]
+                self.assertTrue(all(pv=='v' for pv,value in writes),writes)
+                self.assertTrue(all(abs(value-.7)<=.010001 for pv,value in writes),writes)
     def test_failed_ramp_preset_restores_active_previous_preset(self):
         client=RampClient();backend=EpicsBackend(ramp_profile(),client)
         backend.set_frequency(-2000.);before=backend.frequency_state()

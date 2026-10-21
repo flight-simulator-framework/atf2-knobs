@@ -11,6 +11,12 @@ Select Interface, then Initialize. Nothing connects to EPICS or writes
 machine settings merely by opening DRTuning. The selection is locked while a
 session is connected. Disconnect before choosing another interface.
 
+Mouse wheel / trackpad scrolling over numeric inputs and closed dropdowns
+scrolls the surrounding panel without changing the setting, even if the input
+has focus. Edit numbers with the keyboard or the spinbox arrow buttons; open
+dropdowns explicitly to choose an item. This applies to the launcher, all DR
+tuning panels, and their settings dialogs, including dialogs opened later.
+
 RFTrack: native RF-Track transverse DR, reference 20111111b lattice, no radiation
 or 200-ms equilibrium assertion. BPM positions come from tracked probes, with
 1 um RMS simulated read noise. Quadrupole main coils hold design strengths;

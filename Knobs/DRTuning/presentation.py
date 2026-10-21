@@ -57,7 +57,10 @@ def reflow_correction(panel):
     plane.currentIndexChanged.connect(lambda i:panel.set_option('plane','x' if i==0 else 'y'))
     if panel.mode!='skew':form.addRow('Plane',plane)
     keys=[('corrector_probe_A','Probe ± [A]'),('step_A','Max correction [A]')]
-    if panel.mode=='dispersion':keys += [('frequency_change_khz','RF full span [kHz]'),('momentum_compaction','Momentum compaction')]
+    if panel.mode=='dispersion':
+        keys += [('frequency_change_khz','RF full span [kHz]')]
+        panel.compaction_label=QLabel();panel.compaction_label.setWordWrap(True)
+        form.addRow('Momentum compaction',panel.compaction_label)
     if panel.mode=='skew':
         keys=[('skew_probe','Skew probe ± [A]'),('skew_step','Max correction [A]'),('change1_A','H probe 1 span [A]'),('change2_A','H probe 2 span [A]')]
         from PyQt6.QtWidgets import QCheckBox
@@ -72,6 +75,7 @@ def reflow_correction(panel):
         spin.valueChanged.connect(lambda v,k=key:panel.set_option(k,v));form.addRow(label,spin)
         panel.modern_fields[key]=spin
     layout.addWidget(button('Select BPMs / magnets',panel.window.selection))
+    panel.selection_label=QLabel();panel.selection_label.setWordWrap(True);layout.addWidget(panel.selection_label)
     layout.addWidget(button('SVD / advanced settings',panel.advanced))
     box,layout=group('2. Measure and correct');left.addWidget(box)
     note=QLabel('Response acquisition moves magnets / RF.\nApply the proposed correction separately.');note.setWordWrap(True);layout.addWidget(note)
@@ -91,3 +95,4 @@ def reflow_correction(panel):
     table_style(panel.table)
     split=QSplitter();area=scroll(controls);area.setMinimumWidth(290);split.addWidget(area);split.addWidget(result)
     split.setSizes([310,800]);split.setStretchFactor(1,1);panel.layout().addWidget(split)
+    panel.refresh()

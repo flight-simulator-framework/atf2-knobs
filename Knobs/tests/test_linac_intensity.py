@@ -18,6 +18,57 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_gui_wheel_scrolls_without_changing_settings(self):
+        from PyQt6.QtCore import Qt, QPoint, QPointF
+        from PyQt6.QtGui import QWheelEvent
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox
+        app = QApplication.instance() or QApplication([])
+        with patch.object(opt.MainWindow, "_refresh_current_values"), patch.object(
+                opt.MainWindow, "_refresh_developer_live_values"), patch(
+                "epics.PV", side_effect=AssertionError("No live PV access in wheel test")):
+            window = opt.MainWindow()
+            window._current_value_timer.stop()
+            try:
+                window.show()
+                window.tabs.setCurrentWidget(window.config_tab)
+                app.processEvents()
+                def wheel(control, delta):
+                    pos = QPointF(control.rect().center())
+                    event = QWheelEvent(pos, QPointF(control.mapToGlobal(pos.toPoint())),
+                        QPoint(), QPoint(0, delta), Qt.MouseButton.NoButton,
+                        Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+                    QApplication.sendEvent(control, event)
+                controls = window.findChildren(QAbstractSpinBox) + window.findChildren(QComboBox)
+                self.assertGreater(len(controls), 20)
+                for control in controls:
+                    getter = control.currentIndex if isinstance(control, QComboBox) else control.value
+                    before = getter()
+                    control.setFocus()
+                    for delta in (-120, 120):
+                        wheel(control, delta)
+                        self.assertEqual(getter(), before, type(control).__name__)
+                area = window.config_sections.widget(0)
+                window.tabs.setCurrentWidget(window.config_tab)
+                window.config_sections.setCurrentIndex(0)
+                window.resize(1100, 700)
+                app.processEvents()
+                # Offscreen Qt expands this window to its large size hint;
+                # force overflow to exercise scrolling on smaller displays.
+                area.widget().setMinimumHeight(area.viewport().height() + 600)
+                app.processEvents()
+                area.verticalScrollBar().setValue(0)
+                self.assertGreater(area.verticalScrollBar().maximum(), 0)
+                wheel(window.sp_phase_half, -120)
+                self.assertGreater(area.verticalScrollBar().value(), 0)
+                area.ensureWidgetVisible(window.sp_phase_half)
+                window.sp_phase_half.setFocus(); window.sp_phase_half.selectAll()
+                QTest.keyClicks(window.sp_phase_half, '7')
+                QTest.keyClick(window.sp_phase_half, Qt.Key.Key_Return)
+                self.assertEqual(window.sp_phase_half.value(), 7.)
+            finally:
+                window.close(); app.processEvents()
+
     def test_timing_scan_reads_ot8d_and_centers_integer_grid(self):
         for runner in ("_run_sequential", "_run_group_bo"):
             with self.subTest(runner=runner), tempfile.TemporaryDirectory() as directory, patch.object(

@@ -303,6 +303,8 @@ class TuningSession(DRCorrectionWindow):
 class DRTuningWindow(QMainWindow):
     def __init__(self):
         super().__init__();self.session=None;self.task=None;self.setWindowTitle('DRTuning');self.resize(860,760)
+        from Knobs.DRCorrection.input_guard import protect_settings_from_wheel
+        protect_settings_from_wheel(self)
         from .presentation import STYLE,button,group,scroll
         from PyQt6.QtWidgets import QFormLayout
         self.setStyleSheet(STYLE)

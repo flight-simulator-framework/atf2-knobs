@@ -4,6 +4,10 @@ Liniac_Opt.py
 
 Linac auto tuning GUI + worker.
 
+Mouse wheel / trackpad scrolling over numeric inputs and closed dropdowns
+scrolls the surrounding panel without editing settings. Use typing, arrow
+keys/buttons, or explicitly open a dropdown to change its value.
+
 Improvements (2026-01):
 - Use BIM:L0_nparticles as upstream and selectable downstream ICT (LN0/DR/GUN/LNE/BTM/BTE) for transmission.
 - Log additional ICTs (GUN/LNE/BTM/BTE) at every evaluation point.
@@ -3045,6 +3049,8 @@ class ClickOpenComboBox(QComboBox):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        from Knobs.DRCorrection.input_guard import protect_settings_from_wheel
+        protect_settings_from_wheel(self)
         self.setWindowTitle("Linac Optimization GUI")
         self.resize(1180, 900)
 

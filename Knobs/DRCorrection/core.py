@@ -147,21 +147,21 @@ class CorrectionService:
         low,high=self.backend.limits(kind,names)
         measured,valid=self._signal(mode,opt)
         full_measured=self.full_signal.copy();columns=[];full_columns=[]
-        try:
-            for j,name in enumerate(names):
-                self.check_cancel();values=[];full_values=[]
-                lo=max(low[j],centers[j]-probe);hi=min(high[j],centers[j]+probe)
-                if hi<=lo:raise ValueError('No available probe range')
-                try:
-                    for setting in (lo,hi):
-                        self.backend.write(kind,[name],[setting])
-                        value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
-                finally:self.backend.write(kind,[name],[centers[j]])
-                columns.append(((values[1]-values[0])/(hi-lo)).reshape(-1))
-                full_columns.append(((full_values[1]-full_values[0])/(hi-lo)).reshape(-1))
-                progress(int(100*(j+1)/len(names)),f'{name}: response {j+1}/{len(names)}')
-        finally:
-            self.backend.restore(baseline)
+        # Each probe owns its restoration, including failures/cancellation.
+        # _signal likewise restores RF and skew-excitation correctors. Do not
+        # replay the full snapshot: it includes magnets this scan never touched.
+        for j,name in enumerate(names):
+            self.check_cancel();values=[];full_values=[]
+            lo=max(low[j],centers[j]-probe);hi=min(high[j],centers[j]+probe)
+            if hi<=lo:raise ValueError('No available probe range')
+            try:
+                for setting in (lo,hi):
+                    self.backend.write(kind,[name],[setting])
+                    value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
+            finally:self.backend.write(kind,[name],[centers[j]])
+            columns.append(((values[1]-values[0])/(hi-lo)).reshape(-1))
+            full_columns.append(((full_values[1]-full_values[0])/(hi-lo)).reshape(-1))
+            progress(int(100*(j+1)/len(names)),f'{name}: response {j+1}/{len(names)}')
         target=np.zeros_like(measured)
         if mode=='dispersion':target[0]=nominal
         return dict(schema='dr-correction-1',mode=mode,options=asdict(opt),

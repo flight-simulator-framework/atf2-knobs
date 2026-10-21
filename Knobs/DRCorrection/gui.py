@@ -153,6 +153,17 @@ class CorrectionPanel(QWidget):
         if ok:self.set_option(name,value)
 
     def refresh(self):
+        if hasattr(self,'compaction_label'):
+            self.compaction_label.setText(f'{self.options.momentum_compaction:g} (fixed for these optics)')
+        if hasattr(self,'selection_label'):
+            b=self.window.backend;o=self.options
+            if self.mode=='skew':names=[n for n in b.skews if (o.sd and n.startswith('SD')) or (o.sf and n.startswith('SF'))]
+            else:names=b.hcorrectors if o.plane=='x' else b.vcorrectors
+            count=sum(n not in o.fixed_actuators for n in names)
+            bpms=sum(n not in o.excluded_bpms for n in b.bpm_names)
+            self.selection_label.setText(f'CALC will scan {count} magnets; {bpms} BPMs enabled for fitting.'+
+                (f' RF scan pairs: {1+2*count}.' if self.mode=='dispersion' and count else '')+
+                '\nMaximum correctors limits SET selection, not the CALC scan count.')
         for key,widget in getattr(self,'modern_fields',{}).items():
             widget.blockSignals(True);widget.setValue(getattr(self.options,key));widget.blockSignals(False)
         for entry in self.inventory:
@@ -181,6 +192,10 @@ class CorrectionPanel(QWidget):
             spin=QSpinBox();spin.setRange(1,500);spin.setValue(getattr(self.options,key));form.addRow(label,spin);fields[key]=spin
         for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','dispersion_weight','orbit_weight'):
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(0.,1000.);spin.setValue(getattr(self.options,key));form.addRow(key,spin);fields[key]=spin
+        if self.mode=='dispersion':
+            spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(.0000001,1.)
+            spin.setValue(self.options.momentum_compaction)
+            form.addRow('Momentum compaction (optics setting)',spin);fields['momentum_compaction']=spin
         tolerance=QDoubleSpinBox();tolerance.setDecimals(7);tolerance.setRange(.0000001,1.);tolerance.setValue(self.options.tolerance_m)
         form.addRow('COD tolerance [m]',tolerance);fields['tolerance_m']=tolerance
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
@@ -363,6 +378,8 @@ class TBTPanel(QWidget):
 class DRCorrectionWindow(QMainWindow):
     def __init__(self,backend=None):
         super().__init__();self.backend=backend or DemoBackend();self.service=CorrectionService(self.backend);self.task=None;self.orbit_buffers={}
+        from .input_guard import protect_settings_from_wheel
+        protect_settings_from_wheel(self)
         self.setWindowTitle('DR Corrections — Python op-base');self.resize(1320,880)
         body=QWidget();self.setCentralWidget(body);layout=QVBoxLayout(body)
         self.banner=QLabel(self.backend.label);self.banner.setStyleSheet('font-weight:bold;padding:8px;background:#dbeafe;color:#12243b;');layout.addWidget(self.banner)
@@ -388,17 +405,9 @@ class DRCorrectionWindow(QMainWindow):
         self.tabs.setEnabled(True)
         for panel in self.panels.values():panel.refresh()
     def selection(self):
-        dialog=QDialog(self);dialog.setWindowTitle('BPM selection / FIX DR STEER');layout=QHBoxLayout(dialog)
-        lists=[]
-        for title,names,excluded in [('BPMs (checked = used)',self.backend.bpm_names,self.panels['orbit'].options.excluded_bpms),('Magnets (checked = free)',self.backend.hcorrectors+self.backend.vcorrectors+self.backend.skews,self.panels['orbit'].options.fixed_actuators)]:
-            box=QWidget();v=QVBoxLayout(box);v.addWidget(QLabel(title));widget=QListWidget()
-            for name in names:
-                item=QListWidgetItem(name);item.setFlags(item.flags()|Qt.ItemFlag.ItemIsUserCheckable);item.setCheckState(Qt.CheckState.Unchecked if name in excluded else Qt.CheckState.Checked);widget.addItem(item)
-            v.addWidget(widget);layout.addWidget(box);lists.append(widget)
-        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);layout.addWidget(buttons)
-        if dialog.exec():
-            excluded=[[w.item(i).text() for i in range(w.count()) if w.item(i).checkState()==Qt.CheckState.Unchecked] for w in lists]
-            for panel in self.panels.values():panel.options.excluded_bpms=tuple(excluded[0]);panel.options.fixed_actuators=tuple(excluded[1]);panel.invalidate()
+        from .selection import SelectionDialog
+        dialog=SelectionDialog(self)
+        if dialog.exec():dialog.apply_to(self)
     def buffers(self):
         from .dialogs import BufferDialog
         self.buffer_dialog=BufferDialog(self);self.buffer_dialog.show()
