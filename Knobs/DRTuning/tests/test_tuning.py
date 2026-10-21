@@ -334,6 +334,53 @@ class ReadbackAcquisitionTests(unittest.TestCase):
             for v in evidence.values():v['sha256']='unchanged'
             return wave,evidence
         with self.assertRaisesRegex(TimeoutError,'content_changed=False'):self.controller().acquire(snapshot)
+    def test_stable_new_payload_with_advancing_record_timestamps(self):
+        calls=0
+        def snapshot():
+            nonlocal calls
+            calls+=1;wave,evidence=self.snapshot()
+            for v in evidence.values():v['timestamp']=float(calls)
+            return wave,evidence
+        r=self.controller().acquire(snapshot)
+        self.assertEqual(r['timestamp_only_updates'],['x','y'])
+        self.assertTrue(r['readback_update_verified']);self.assertFalse(r['same_shot_verified'])
+        self.assertFalse(r['fresh_acquisition'])
+    def test_advancing_timestamps_with_old_payload_reports_no_new_shot(self):
+        calls=0
+        def snapshot():
+            nonlocal calls
+            calls+=1;wave,evidence=self.snapshot()
+            for v in evidence.values():v.update(timestamp=float(calls),sha256='old')
+            return wave,evidence
+        with self.assertRaises(TimeoutError) as caught:self.controller().acquire(snapshot)
+        self.assertIn('unstable PVs=0',str(caught.exception))
+        self.assertIn('timestamp-only updates=2',str(caught.exception))
+        self.assertIn('New shot NOT verified',str(caught.exception))
+        self.assertEqual(self.values['shot'],0)
+    def test_changing_payload_is_still_rejected(self):
+        calls=0
+        def snapshot():
+            nonlocal calls
+            calls+=1;wave,evidence=self.snapshot()
+            evidence['y']['sha256']=str(calls)
+            return wave,evidence
+        with self.assertRaisesRegex(TimeoutError,r'unstable PVs=1 \[y\]'):self.controller().acquire(snapshot)
+    def test_timestamp_regression_is_still_rejected(self):
+        calls=0
+        def snapshot():
+            nonlocal calls
+            calls+=1;wave,evidence=self.snapshot()
+            for v in evidence.values():v['timestamp']=1. if calls==1 else 3. if calls%2==0 else 2.
+            return wave,evidence
+        with self.assertRaisesRegex(TimeoutError,'timestamp regressions=2'):self.controller().acquire(snapshot)
+    def test_external_turn_or_shot_mode_change_is_reported_and_restored(self):
+        for pv in ('turn','shot'):
+            self.setUp()
+            def snapshot():
+                if self.updated:self.values[pv]=777
+                return self.snapshot()
+            with self.assertRaisesRegex(RuntimeError,'TBT control changed: '+pv):self.controller().acquire(snapshot)
+            self.assertEqual(self.values['turn'],1);self.assertEqual(self.values['shot'],0)
     def test_cancellation_restores_legacy_modes(self):
         cancel=threading.Event();cancel.set()
         with self.assertRaisesRegex(RuntimeError,'cancelled'):self.controller().acquire(self.snapshot,cancel=cancel)

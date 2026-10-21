@@ -122,12 +122,18 @@ class ReadbackTBTController:
         previous=snapshot()[1]
         def check():
             if cancel is not None and cancel.is_set():raise RuntimeError('TBT cancelled')
+        def check_controls():
+            for pv,expected in ((p['turn_pv'],start_turn),(p['shot_mode_pv'],1)):
+                actual=self.get(pv)
+                if actual!=expected:
+                    raise RuntimeError(f'TBT control changed: {pv}, expected {expected}, read {actual}; check other acquisition clients')
         def pause(seconds):
             until=time.monotonic()+seconds
             while time.monotonic()<until:check();time.sleep(min(.02,max(0,until-time.monotonic())))
         try:
             for (pv,value),(_,old) in zip(controls,originals):touched.append((pv,old));self.put(pv,value)
             pause(float(p.get('arm_settle_s',1.)))
+            check_controls()
             event0=self.event_timestamp();self.put(p['snap_pv'],1);deadline=time.monotonic()+timeout
             while True:
                 check();event=self.event_timestamp()
@@ -137,27 +143,39 @@ class ReadbackTBTController:
             pause(settle)
             for pv in p.get('process_pvs',[]):check();self.put(pv,1)
             while True:
-                check();start_event=self.event_timestamp()
+                check();check_controls();start_event=self.event_timestamp()
                 data,first=snapshot();pause(float(p.get('stable_read_interval_s',.05)));_,second=snapshot()
-                end_event=self.event_timestamp()
+                end_event=self.event_timestamp();check_controls()
                 updated=(set(first)==set(previous) and all(first[n]['timestamp']>previous[n]['timestamp'] for n in first))
-                stable=(first==second)
+                # A record timestamp may advance without a new waveform. Compare
+                # the payload for stability, while still rejecting timestamp
+                # regression and requiring post-baseline update evidence.
+                unstable=sorted(n for n in set(first)|set(second)
+                    if n not in first or n not in second or first[n]['sha256']!=second[n]['sha256'])
+                regressed=sorted(n for n in set(first)&set(second) if second[n]['timestamp']<first[n]['timestamp'])
+                timestamp_only=sorted(n for n in set(first)&set(second)
+                    if first[n]['sha256']==second[n]['sha256'] and second[n]['timestamp']>first[n]['timestamp'])
+                stable=(set(first)==set(second) and not unstable and not regressed)
                 changed=any(first[n]['sha256']!=previous[n]['sha256'] for n in set(first)&set(previous))
                 if updated and stable and changed and start_event==end_event:
                     data.update(turns=list(range(start_turn,start_turn+len(data['turns']))),fresh_acquisition=False,
                         readback_update_verified=True,same_shot_verified=False,
-                        acquisition_quality='legacy event + updated stable waveforms; common shot ID unavailable',
-                        event_timestamp=end_event,waveform_evidence=first)
+                        acquisition_quality='legacy event + updated timestamps + stable waveform content; common shot ID unavailable',
+                        event_timestamp=end_event,waveform_evidence=first,repeat_waveform_evidence=second,
+                        timestamp_only_updates=timestamp_only)
                     return data
                 if time.monotonic()>deadline:
                     stale=sorted(n for n in previous if n not in first or first[n]['timestamp']<=previous[n]['timestamp'])
-                    unstable=sorted(n for n in set(first)|set(second) if first.get(n)!=second.get(n))
                     unexpected=sorted(set(first)-set(previous))
                     def describe(names):return f'{len(names)} ['+', '.join(names[:8])+(', ...' if len(names)>8 else '')+']'
+                    reason=('No waveform content changed since before SNAP. New shot NOT verified. '
+                            'Compare with acquisition in the existing Turn1024 tool and inspect the TBT trigger/reader.'
+                            if not changed else 'Waveform content or acquisition event did not remain stable.')
                     raise TimeoutError('TBT waveform update/stability checks failed; '
                         f'stale/missing PVs={describe(stale)}; unstable PVs={describe(unstable)}; '
+                        f'timestamp-only updates={describe(timestamp_only)}; timestamp regressions={describe(regressed)}; '
                         f'unexpected PVs={describe(unexpected)}; content_changed={changed}; '
-                        f'tune_event_changed_during_read={start_event!=end_event}')
+                        f'tune_event_changed_during_read={start_event!=end_event}; {reason}')
                 pause(.02)
         finally:
             errors=[]

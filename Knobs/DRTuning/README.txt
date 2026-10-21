@@ -150,14 +150,29 @@ The user confirmed that there is no dedicated all-BPM completion PV. Default
 readback_checks therefore ports the Turn1024 one-shot / shot-mode / TURN / SNAP
 sequence and uses TBT:TUNE:H timestamp updates as the old event source. It then
 processes the BPM records, requires every waveform timestamp to advance, checks
-that waveform content changed, and requires two stable reads while the event
+that waveform content changed since the pre-SNAP baseline, and requires two
+reads with identical waveform content while the event
 timestamp remains unchanged. Stale, partial and torn reads time out. All original
 mode/turn values are restored, also on failure or cancellation.
 Waveform-check timeouts now report counts and names (first eight per category)
-of stale/missing or unstable PVs, unexpected PVs, whether waveform content
-changed, and whether the tune event changed during the read. These diagnostics
-help distinguish missing updates from a continuously changing acquisition;
-the acceptance checks are not relaxed to suppress a timeout.
+of stale/missing or payload-unstable PVs, timestamp-only updates, timestamp
+regressions, unexpected PVs, whether waveform content changed, and whether the
+tune event changed during the read. Repeated record processing may advance a
+timestamp without changing a waveform: this alone is no longer classified as
+payload instability. Timestamp regression is still rejected. New data must still
+differ from the pre-SNAP payload; processing an old waveform is not accepted as
+a new shot. Successful provisional results save both passes of timestamp/hash
+evidence and the list of timestamp-only updates. This does not establish a
+common shot ID. First-turn and shot-mode readbacks are also checked before SNAP
+and around waveform reads to detect interference from another acquisition client.
+
+For content_changed=False, first compare with a working acquisition in the
+existing Turn1024 tool. Then read those buffers in DRTuning with New shot OFF.
+For a subsequent DRTuning new-shot test, use the SAME first turn as the working
+tool and avoid simultaneous trigger/turn control by another client. The archived
+Turn1024 initializes m_turn=369350 (2024-06-28); DRTuning starts at 1. The old
+constant is not automatically a valid current operating setting. A tune update
+alone cannot demonstrate that the requested waveform has been acquired.
 
 These are SOFTWARE readback checks, not proof of a common hardware shot ID.
 Every resulting measurement has same_shot_verified=false and records the IOC
