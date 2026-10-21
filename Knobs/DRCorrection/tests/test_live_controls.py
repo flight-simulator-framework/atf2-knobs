@@ -37,6 +37,38 @@ def ramp_profile():
 
 
 class RecoveredControlTests(unittest.TestCase):
+    def test_selected_preset_with_wrong_frequency_is_rejected_with_numeric_evidence(self):
+        class HalfStepClient(RampClient):
+            def caput(self,pv,value,**kwargs):
+                result=super().caput(pv,value,**kwargs)
+                self.values['rf']=714.+(self.selected*.5/1e6 if self.values['RAMP:STATUS_READ'] else 0.)
+                return result
+        client=HalfStepClient();backend=EpicsBackend(ramp_profile(),client)
+        before=backend.frequency_state()
+        with self.assertRaisesRegex(RuntimeError,'timeout: RF frequency') as caught:
+            backend.set_frequency(-1000.)
+        message=str(caught.exception)
+        for text in ('initial_hz=714000000.000000','expected_hz=713999000.000000',
+                     'observed_hz=713999500.000000','error_hz=+500.000000',
+                     'target_offset_hz=-1000.',"'offset_hz': -1000.0"):
+            self.assertIn(text,message)
+        self.assertEqual(backend.frequency_state(),before)
+
+    def test_frequency_target_is_relative_to_measured_start_not_nominal_714mhz(self):
+        class ShiftedBaseClient(RampClient):
+            def __init__(self):
+                super().__init__();self.values['rf']=714.016
+            def caput(self,pv,value,**kwargs):
+                result=super().caput(pv,value,**kwargs)
+                self.values['rf']=714.016+(self.selected/1e6 if self.values['RAMP:STATUS_READ'] else 0.)
+                return result
+        client=ShiftedBaseClient();backend=EpicsBackend(ramp_profile(),client)
+        before=backend.frequency_state()
+        backend.set_frequency(-1000.)
+        self.assertAlmostEqual(client.values['rf'],714.015)
+        backend.restore_frequency(before)
+        self.assertEqual(backend.frequency_state(),before)
+
     def test_enable_delay_handles_controller_not_ready_at_on_status(self):
         for delay in (0.,1.):
             with self.subTest(delay=delay):

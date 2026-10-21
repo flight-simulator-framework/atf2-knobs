@@ -51,6 +51,19 @@ class DeltaRamp:
             if time.monotonic()>deadline:
                 raise RuntimeError('DeltaFRamp timeout: '+description+'; before restoration: '+self.diagnostics(diagnostic_pvs))
             time.sleep(.05)
+    def wait_frequency(self,expected,description,context=''):
+        last=None
+        def matched():
+            nonlocal last
+            last=self.read_hz()
+            return abs(last-expected)<=self.config['tolerance_hz']
+        try:self.wait(matched,description)
+        except RuntimeError as error:
+            # Keep the last checked value, not a new read after restoration.
+            details=f'expected_hz={expected:.6f}; tolerance_hz={self.config["tolerance_hz"]}'
+            if last is not None:details+=f'; observed_hz={last:.6f}; error_hz={last-expected:+.6f}'
+            if context:details+='; '+context
+            raise RuntimeError(str(error)+'; '+details) from error
     def _apply(self,state):
         if not state['enabled']:
             # SysID reset_energy uses value 0 on CONTROL_OFF_SW.
@@ -70,7 +83,7 @@ class DeltaRamp:
                       ('RAMP:'+label+':ONOFF_SW','RAMP:'+label+':STATUS_READ'))
     def restore(self,state):
         self._apply(state)
-        if 'read_hz' in state:self.wait(lambda:abs(self.read_hz()-state['read_hz'])<=self.config['tolerance_hz'],'restored RF frequency')
+        if 'read_hz' in state:self.wait_frequency(state['read_hz'],'restored RF frequency')
         time.sleep(self.config['settle_s'])
         if 'read_hz' in state and abs(self.read_hz()-state['read_hz'])>self.config['tolerance_hz']:raise RuntimeError('Restored RF frequency did not remain settled')
     def set(self,offset):
@@ -80,7 +93,9 @@ class DeltaRamp:
         expected=before+offset-old['offset_hz']
         try:
             self._apply(target)
-            self.wait(lambda:abs(self.read_hz()-expected)<=self.config['tolerance_hz'],'RF frequency')
+            self.wait_frequency(expected,'RF frequency',
+                                f'initial_hz={before:.6f}; initial_enabled={old["enabled"]}; '
+                                f'initial_offset_hz={old["offset_hz"]}; target_offset_hz={offset}')
             time.sleep(self.config['settle_s'])
             if abs(self.read_hz()-expected)>self.config['tolerance_hz']:raise RuntimeError('RF frequency did not remain settled')
         except Exception as error:
