@@ -203,6 +203,14 @@ configuration has not been commissioned against live hardware here.
 The default RF/quad settling delays are 5 s; RF tolerance is 100 Hz and timeout
 30 s. These are configurable software defaults, not measured machine response
 times. RF uses the linked DeltaFRamp controller and MHz readback conversion.
+Corrector/skew operations check current convergence without an extra fixed wait
+(magnet_settle_s defaults to 0). As in SysID, correction measurements use repeated
+BPM acquisition: the live GUI defaults to BPM samples per setting = 3 and BPM
+interval [s] = 1, both editable. Waits occur before each read, including the first;
+the total per setting is about 3 s plus communication time. Means, population
+standard deviations and raw samples are saved. A BPM must be valid in every
+sample to be fitted. Samples are not certified independent/fresh shots: COD
+does not yet verify waveform timestamps/shot IDs. RF/quad waits remain separate.
 Missing horizontal dispersion targets or live phase/SR optics are requested by
 their respective analyses; they do not block startup or unrelated tools.
 

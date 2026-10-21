@@ -1587,6 +1587,7 @@
   },
   "skew_limits_A": null,
   "readback_timeout_s": 10.0,
+  "magnet_settle_s": 0.0,
   "current_tolerance_A": 0.001,
   "tbt": {
     "x": [

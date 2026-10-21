@@ -183,6 +183,8 @@ class EpicsBackend(DemoBackend):
         return values
     def write(self,kind,names,values):
         values=np.asarray(values,float);lo,hi=self.limits(kind,names)
+        settle=float(self.profile.get('magnet_settle_s',0.))
+        if not np.isfinite(settle) or settle<0:raise ValueError('Invalid magnet_settle_s')
         available=self.skews if kind=='skews' else self.hcorrectors+self.vcorrectors
         if len(names)!=len(values) or len(set(names))!=len(names) or set(names)-set(available) or not np.isfinite(values).all() or np.any(values<lo) or np.any(values>hi):
             raise ValueError('Command outside current limits')
@@ -196,6 +198,11 @@ class EpicsBackend(DemoBackend):
                 if np.isfinite(readings).all() and np.max(abs(readings-values))<=self.profile['current_tolerance_A']:break
                 if time.monotonic()>deadline:raise RuntimeError('Magnet readback did not settle')
                 time.sleep(.05)
+            # Supply readback convergence is not BPM acquisition completion.
+            # Allow the beam/monitor chain to settle before the caller reads it.
+            if settle:time.sleep(settle)
+            if np.max(abs(self.read(kind,names)-values))>self.profile['current_tolerance_A']:
+                raise RuntimeError('Magnet readback changed during settling wait')
         except Exception:
             for n,v in zip(names,old):self.put(self.mapping[n]['set'],float(v))
             raise
@@ -309,6 +316,7 @@ def profile_issues(p):
         except (TypeError,ValueError):ok=False
         if not ok:issues.append('Invalid '+label)
     for key in ('nominal_frequency_hz','readback_timeout_s','current_tolerance_A'):positive(key,p.get(key))
+    positive('magnet_settle_s',p.get('magnet_settle_s',0.),True)
     for section,key,zero in [('orbit','mm_per_unit',False),('rf','hz_per_unit',False),('rf','settle_s',True),('rf','tolerance_hz',False)]:positive(section+'.'+key,p.get(section,{}).get(key),zero)
     if p.get('rf',{}).get('mode')=='delta_ramp':positive('rf.timeout_s',p['rf'].get('timeout_s'))
     for key in ('bpm_names','hcorrectors','vcorrectors','skews'):

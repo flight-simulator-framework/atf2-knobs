@@ -71,6 +71,30 @@ exceptions restore probes; failed remeasurement rolls back SET. Readback errors
 remain visible in the log; successful software restoration is not a guarantee
 against a hardware fault. CALC itself moves magnets/RF temporarily on live mode.
 
+Live corrector/skew writes verify current readback, without an extra fixed wait
+(magnet_settle_s defaults to 0, including profiles omitting it). This follows
+SysID's separation of current convergence and repeated BPM acquisition.
+SysID's InterfaceATF2_DR.get_bpms uses configurable nsamples and a default 1 s
+interval; State.get_orbit forms means and population standard deviations.
+DRTuning's live correction panels default to 3 samples at 1 s, adjustable in
+the main panel or advanced settings. Three is a DRTuning initial setting, not
+a claim about the current SysID GUI's selected nsamples. Simulation/API Options
+retain one sample with zero delay unless explicitly configured otherwise.
+DRTuning waits BEFORE each read (including the first), unlike SysID's sleep
+after each read. Both schedule N * interval seconds. This avoids taking the
+first sample immediately after a current change. Cancellation interrupts these
+sample waits and still restores the probes. Correction datasets save raw X/Y/
+intensity samples, validity, means, standard deviations, and N/interval for each
+orbit measurement, including SET remeasurements. All samples must be valid for
+a BPM to be fitted; a bad sample is not silently averaged into a valid BPM.
+Repeated samples are not proof of fresh independent shots: COD acquisition
+does not yet verify waveform timestamps/shot IDs (freshness_verified=false).
+If an IOC stops updating, averaging alone cannot make its waveform fresh.
+CALC progress states the requested current and settling interval. A zero
+response now gives an explicit diagnostic with plane, valid BPM count and
+per-magnet response RMS; nonzero responses with no useful correction have a
+separate diagnostic. Neither case applies a correction or enlarges the probe.
+
 First live dispersion response test (DRTuning GUI):
 - Use the updated code and restart the GUI. Select COD mode in the existing
   machine controls first; the dispersion reader checks but does not select it.
@@ -82,8 +106,11 @@ First live dispersion response test (DRTuning GUI):
   0.0021. Ensure the RF endpoints are in the allowed offset range (+/-5 kHz).
 - Record the corrector current and DeltaFRamp state/readback. Measure response
   (CALC) performs three RF pairs: original current, current-0.01 A, and
-  current+0.01 A. With 5 s RF settling this includes at least 45 s of settling,
-  plus ramp/readback time. No correction is applied by CALC.
+  current+0.01 A. With the unchanged 5 s RF settling and 3 BPM samples at 1 s,
+  this includes 45 s RF settling + 27 s BPM sampling, plus ramp/readback time.
+  COD-only CALC with one corrector schedules 9 s BPM sampling (3 settings *
+  3 samples * 1 s), without additional magnet settling. No correction is
+  applied by CALC.
 - Check restoration and save data/plots. Stop this first test before SET/RESET.
   Failure: retain the detailed log and verify the current/RF restoration.
 

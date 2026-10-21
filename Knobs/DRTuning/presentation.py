@@ -2,7 +2,7 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QGroupBox,
     QScrollArea,QSplitter,QPushButton,QLabel,QComboBox,QDoubleSpinBox,QHeaderView,
-    QAbstractItemView)
+    QAbstractItemView,QSpinBox)
 
 
 STYLE = '''
@@ -56,6 +56,13 @@ def reflow_correction(panel):
     plane=QComboBox();plane.addItems(['Horizontal (X)','Vertical (Y)']);plane.setCurrentIndex(0 if panel.options.plane=='x' else 1)
     plane.currentIndexChanged.connect(lambda i:panel.set_option('plane','x' if i==0 else 'y'))
     if panel.mode!='skew':form.addRow('Plane',plane)
+    samples=QSpinBox();samples.setRange(1,1000);samples.setValue(panel.options.bpm_samples)
+    samples.valueChanged.connect(lambda value:panel.set_option('bpm_samples',value))
+    form.addRow('BPM samples per setting',samples);panel.modern_fields['bpm_samples']=samples
+    interval=QDoubleSpinBox();interval.setRange(0.,60.);interval.setDecimals(2);interval.setValue(panel.options.bpm_interval_s)
+    interval.setToolTip('Wait before every BPM read, including the first. Average samples; save their spread.')
+    interval.valueChanged.connect(lambda value:panel.set_option('bpm_interval_s',value))
+    form.addRow('BPM interval [s]',interval);panel.modern_fields['bpm_interval_s']=interval
     keys=[('corrector_probe_A','Probe ± [A]'),('step_A','Max correction [A]')]
     if panel.mode=='dispersion':
         keys += [('frequency_change_khz','RF full span [kHz]')]

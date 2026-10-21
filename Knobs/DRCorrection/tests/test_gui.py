@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt
 from Knobs.DRCorrection.gui import DRCorrectionWindow
 from Knobs.DRCorrection.dialogs import BufferDialog,SRFitDialog
 from Knobs.DRCorrection.selection import SelectionDialog
+from Knobs.DRCorrection.backends import DemoBackend
 
 
 class GuiTests(unittest.TestCase):
@@ -23,6 +24,21 @@ class GuiTests(unittest.TestCase):
             self.app.processEvents();time.sleep(.01)
             if time.monotonic()>deadline:raise AssertionError('Qt task timed out')
         self.app.processEvents()
+    def test_live_sampling_defaults_and_editable_controls(self):
+        from Knobs.DRTuning.presentation import reflow_correction
+        backend=DemoBackend();backend.identity='epics:offline-ui-test'
+        window=DRCorrectionWindow(backend)
+        try:
+            for panel in window.panels.values():
+                reflow_correction(panel)
+                self.assertEqual(panel.options.bpm_samples,3)
+                self.assertEqual(panel.options.bpm_interval_s,1.)
+                panel.modern_fields['bpm_samples'].setValue(5)
+                panel.modern_fields['bpm_interval_s'].setValue(.5)
+                self.assertEqual(panel.options.bpm_samples,5)
+                self.assertEqual(panel.options.bpm_interval_s,.5)
+            self.assertEqual(backend.acquisitions,0)
+        finally:window.close()
     def test_calc_set_save_reset_all_panels(self):
         with tempfile.TemporaryDirectory() as root:
             baseline=self.window.backend.snapshot()

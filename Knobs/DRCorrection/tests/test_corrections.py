@@ -125,7 +125,7 @@ def fake_profile():
         hcorrectors=['H'],vcorrectors=['V'],skews=['SD'],nominal_frequency_hz=714e6,
         actuators={n:dict(set=p,read=p) for n,p in [('H','h'),('V','v'),('SD','s')]},
         orbit=dict(x='x',y='y',tmit='q',mm_per_unit=1.),rf=dict(set='rf',read='rf',hz_per_unit=1.,settle_s=0.,tolerance_hz=1.),
-        target_dispersion_mm=dict(x=[100.,100.],y=[0.,0.]),skew_limits_A=[-1.,1.],readback_timeout_s=.01,current_tolerance_A=.001)
+        target_dispersion_mm=dict(x=[100.,100.],y=[0.,0.]),skew_limits_A=[-1.,1.],readback_timeout_s=.01,current_tolerance_A=.001,magnet_settle_s=0.)
 
 
 class EpicsTests(unittest.TestCase):

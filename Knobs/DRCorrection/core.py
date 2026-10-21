@@ -37,6 +37,8 @@ class Options:
     tolerance_m: float = .0001
     frequency_change_khz: float = 1.
     momentum_compaction: float = .0021
+    bpm_samples: int = 1
+    bpm_interval_s: float = 0.
     sd: bool = True
     sf: bool = False
     sd_calibration: float = 0.
@@ -68,25 +70,50 @@ def checked_orbit(value,names):
     return x,y,valid & np.isfinite(x) & np.isfinite(y) & np.isfinite(q) & (q>0)
 
 
+def validate_bpm_sampling(opt):
+    if not np.isfinite(opt.bpm_samples) or int(opt.bpm_samples)!=opt.bpm_samples or not 1<=opt.bpm_samples<=1000:
+        raise ValueError('BPM samples must be an integer in 1..1000')
+    if not np.isfinite(opt.bpm_interval_s) or opt.bpm_interval_s<0:
+        raise ValueError('BPM interval must be nonnegative')
+
+
 class CorrectionService:
     def __init__(self,backend):
         self.backend=backend
         self.cancel=threading.Event()
         self.undo=[]
+        self.orbit_measurements=[]
 
     def check_cancel(self):
         if self.cancel.is_set():raise Cancelled('Cancelled; temporary scan settings restored')
 
-    def _orbit(self):
-        self.check_cancel()
-        result=self.backend.orbit()
-        self.check_cancel()
-        return checked_orbit(result,self.backend.bpm_names)
+    def _orbit(self,opt):
+        count=opt.bpm_samples;interval=opt.bpm_interval_s
+        validate_bpm_sampling(opt)
+        samples=[]
+        for _ in range(int(count)):
+            self.check_cancel()
+            # Same sampling cadence as SysID, but wait BEFORE each sample
+            # (including the first) instead of after it, to avoid an immediate
+            # pre-change read. Total scheduled wait remains count * interval.
+            if interval and self.cancel.wait(interval):self.check_cancel()
+            result=self.backend.orbit()
+            self.check_cancel()
+            x,y,valid=checked_orbit(result,self.backend.bpm_names)
+            samples.append(dict(x=x.copy(),y=y.copy(),tmit=np.asarray(result['tmit'],float).copy(),valid=valid.copy()))
+        arrays={key:np.stack([s[key] for s in samples]) for key in ('x','y','tmit','valid')}
+        means={key:np.mean(arrays[key],axis=0) for key in ('x','y','tmit')}
+        valid=np.all(arrays['valid'],axis=0)
+        self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**means,valid=valid,
+            stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0),
+            nshots=int(count),sample_interval_s=float(interval),samples=arrays,
+            position_unit='mm',freshness_verified=False))
+        return means['x'],means['y'],valid
 
     def _signal(self,mode,opt):
         n=len(self.backend.bpm_names)
         if mode=='orbit':
-            x,y,mask=self._orbit()
+            x,y,mask=self._orbit(opt)
             self.full_signal=np.array([x,y])
             return np.array([x if opt.plane=='x' else y]),mask
         if mode=='dispersion':
@@ -96,12 +123,12 @@ class CorrectionService:
             if not np.isfinite(span) or span<=0 or not np.isfinite(opt.momentum_compaction) or opt.momentum_compaction<=0:
                 raise ValueError('Positive frequency span and momentum compaction required')
             self.backend.validate_frequency_targets([origin-span/2,origin+span/2])
-            baseline=self._orbit()
+            baseline=self._orbit(opt)
             try:
                 frames=[]
                 for sign in (-1,1):
                     self.backend.set_frequency(origin+sign*span/2)
-                    frames.append(self._orbit())
+                    frames.append(self._orbit(opt))
             finally:self.backend.restore_frequency(frequency_state)
             index=0 if opt.plane=='x' else 1
             delta=-span/(self.backend.nominal_frequency_hz*opt.momentum_compaction)
@@ -117,7 +144,7 @@ class CorrectionService:
                     frames=[]
                     for sign in (-1,1):
                         self.backend.write('correctors',[name],[origin+sign*span/2])
-                        frames.append(self._orbit())
+                        frames.append(self._orbit(opt))
                 finally:self.backend.write('correctors',[name],[origin])
                 # Native op-base plots show the vertical orbit difference for
                 # each horizontal excitation, not a hidden coupling coefficient.
@@ -127,6 +154,8 @@ class CorrectionService:
         raise ValueError('Unknown correction mode')
 
     def acquire(self,mode,opt,progress=lambda *_:None):
+        validate_bpm_sampling(opt)
+        self.orbit_measurements=[]
         self.backend.validate_mode(mode)
         if opt.plane not in ('x','y'):raise ValueError('Select x or y')
         # Validate the nominal target before moving any magnet or RF setting.
@@ -156,6 +185,8 @@ class CorrectionService:
             if hi<=lo:raise ValueError('No available probe range')
             try:
                 for setting in (lo,hi):
+                    delay=float(getattr(self.backend,'profile',{}).get('magnet_settle_s',0.))
+                    progress(int(100*j/len(names)),f'{name}: set {setting:.6g} {self.backend.unit(kind)}; current readback + {delay:g} s extra wait; BPM {opt.bpm_samples} samples, {opt.bpm_interval_s:g} s interval (first read delayed)')
                     self.backend.write(kind,[name],[setting])
                     value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
             finally:self.backend.write(kind,[name],[centers[j]])
@@ -169,6 +200,7 @@ class CorrectionService:
             positions_m=list(self.backend.positions_m),actuators=names,kind=kind,
             actuator_unit=self.backend.unit(kind),baseline=baseline,centers=centers,
             measured=measured,target=target,response=np.column_stack(columns),valid=valid,
+            orbit_measurements=self.orbit_measurements,
             full_measured=full_measured,full_response=np.column_stack(full_columns),
             full_signal_labels=['COD X','COD Y'] if mode=='orbit' else (['Dispersion X','Dispersion Y','COD X','COD Y'] if mode=='dispersion' else [opt.probe1,opt.probe2]),
             limits=[low,high],source='measured symmetric response',
@@ -186,7 +218,7 @@ class CorrectionService:
             raise ValueError('File is not a matching correction dataset')
         if data['options']['plane']!=opt.plane and mode!='skew':
             raise ValueError('Select the same H/V plane as the file before CALC (FILE)')
-        for key in ('after','full_after','after_valid'):data.pop(key,None)
+        for key in ('after','full_after','after_valid','after_orbit_measurements'):data.pop(key,None)
         names=data['names'];actuators=data['actuators']
         measured=np.asarray(data['measured'],float);target=np.asarray(data['target'],float)
         response=np.asarray(data['response'],float)
@@ -227,9 +259,19 @@ class CorrectionService:
             if not fit.success:raise RuntimeError('Bounded solve failed')
             return fit.x,s,int(keep.sum())
         symmetric=np.all(lower[available]==-step_limit) and np.all(upper[available]==step_limit)
+        response_rms=np.sqrt(np.mean(a[:,available]**2,axis=0))
+        diagnostic=', '.join(f'{name}: {value:.6g}' for name,value in zip(np.asarray(actuators)[available],response_rms))
+        diagnostic=f'plane={opt.plane}; valid BPMs={int(valid.sum())}; weighted response RMS per {data["actuator_unit"]}: [{diagnostic}]'
+        if np.linalg.norm(residual)>1e-14 and not np.any(a[:,available]):
+            raise ValueError('No measured response: all enabled response columns are zero. '+diagnostic+
+                '. Check magnet readbacks, BPM updates and settling; no correction was applied.')
         if symmetric and np.linalg.norm(residual)>1e-14:
-            from .ported_solver import propose
-            delta,selected_names,singular_values,rank=propose(data,opt,valid,available,maximum,step_limit)
+            from .ported_solver import propose,ClosedOrbitError
+            try:delta,selected_names,singular_values,rank=propose(data,opt,valid,available,maximum,step_limit)
+            except ClosedOrbitError as exc:
+                if str(exc)!='No useful corrector columns were selected':raise
+                raise ValueError('Measured response could not reduce the selected COD/dispersion residual within the correction limits. '+diagnostic+
+                    '. Check selected magnets/plane and BPM updates; no correction was applied.') from exc
             selected=[actuators.index(n) for n in selected_names]
             solver='ATFDRRingCorrection.propose_'+{'orbit':'orbit_correction','dispersion':'dispersion_correction','skew':'coupling_correction'}[mode]
         elif np.linalg.norm(residual)<=1e-14:
@@ -259,11 +301,13 @@ class CorrectionService:
 
     def apply(self,data):
         self.check_cancel()
+        validate_bpm_sampling(Options(**data['options']))
         if data.get('backend_id')!=self.backend.identity:raise ValueError('Proposal belongs to another backend')
         if data.get('applied'):raise ValueError('Already applied; CALC again before another SET')
         if not self.backend.same_settings(self.backend.snapshot(),data['baseline']):raise ValueError('Settings changed since CALC; recalculate')
         self.backend.validate_mode(data['mode'])
         before=self.backend.snapshot()
+        self.orbit_measurements=[]
         try:
             values=np.asarray(data['centers'])+np.asarray(data['delta'])
             self.backend.write(data['kind'],data['actuators'],values)
@@ -273,6 +317,7 @@ class CorrectionService:
         self.undo.append(before)
         data['after']=measured;data['after_valid']=valid;data['applied']=True
         data['full_after']=self.full_signal.copy()
+        data['after_orbit_measurements']=self.orbit_measurements
         return data
 
     def reset(self):

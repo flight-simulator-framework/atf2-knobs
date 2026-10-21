@@ -83,6 +83,8 @@ class CorrectionPanel(QWidget):
         super().__init__();self.window=window;self.mode=mode;self.data=None
         backend=window.backend
         self.options=Options(probe1=backend.hcorrectors[0],probe2=backend.hcorrectors[len(backend.hcorrectors)//2])
+        if backend.identity.startswith('epics:'):
+            self.options.bpm_samples=3;self.options.bpm_interval_s=1.
         if backend.unit('skews')=='A':self.options.skew_probe=.05;self.options.skew_step=.1
         if getattr(backend,'ramp',None):self.options.frequency_change_khz=2.
         self.form=uic.loadUi(str(HERE/'forms'/f'{mode}.ui'))
@@ -188,9 +190,9 @@ class CorrectionPanel(QWidget):
     def advanced(self):
         dialog=QDialog(self);dialog.setWindowTitle('Response acquisition and correction limits')
         form=QFormLayout(dialog);fields={}
-        for key,label in [('count_h','Maximum H correctors'),('count_v','Maximum V correctors')]:
+        for key,label in [('count_h','Maximum H correctors'),('count_v','Maximum V correctors'),('bpm_samples','BPM samples per setting')]:
             spin=QSpinBox();spin.setRange(1,500);spin.setValue(getattr(self.options,key));form.addRow(label,spin);fields[key]=spin
-        for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','dispersion_weight','orbit_weight'):
+        for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','dispersion_weight','orbit_weight','bpm_interval_s'):
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(0.,1000.);spin.setValue(getattr(self.options,key));form.addRow(key,spin);fields[key]=spin
         if self.mode=='dispersion':
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(.0000001,1.)

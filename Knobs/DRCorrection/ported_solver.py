@@ -5,7 +5,7 @@ queried; A and K1L units are carried by the measured response matrix columns.
 """
 from types import SimpleNamespace
 import numpy as np
-from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_correction import ATFDRRingCorrection
+from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_correction import ATFDRRingCorrection,ClosedOrbitError
 
 
 class MeasuredProposal(ATFDRRingCorrection):
