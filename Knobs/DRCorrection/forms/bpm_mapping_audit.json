@@ -1,0 +1,788 @@
+{
+  "schema": "dr-bpm-source-audit-1",
+  "twiss_source": "machine-interfaces/backends/atf2/machine_interfaces_atf2/DR_ATF2/ATF_DR_twiss_file.tws",
+  "twiss_sha256": "ee13bff323628f380a7ff878dd1cae63749426274db571cbb5c93e556b33e1b2",
+  "cod_names": [
+    "MB1R",
+    "MB2R",
+    "MB3R",
+    "MB4R",
+    "MB5R",
+    "MB6R",
+    "MB7R",
+    "MB8R",
+    "MB9R",
+    "MB10R",
+    "MB11R",
+    "MB12R",
+    "MB13R",
+    "MB14R",
+    "MB15R",
+    "MB16R",
+    "MB17R",
+    "MB18R",
+    "MB19R",
+    "MB21R",
+    "MB22R",
+    "MB23R",
+    "MB24R",
+    "MB25R",
+    "MB26R",
+    "MB27R",
+    "MB28R",
+    "MB29R",
+    "MB30R",
+    "MB31R",
+    "MB32R",
+    "MB33R",
+    "MB34R",
+    "MB35R",
+    "MB36R",
+    "MB37R",
+    "MB38R",
+    "MB39R",
+    "MB40R",
+    "MB41R",
+    "MB42R",
+    "MB43R",
+    "MB44R",
+    "MB45R",
+    "MB46R",
+    "MB47R",
+    "MB48R",
+    "MB49R",
+    "MB50R",
+    "MB51R",
+    "MB52R",
+    "MB53R",
+    "MB54R",
+    "MB55R",
+    "MB56R",
+    "MB57R",
+    "MB58R",
+    "MB59R",
+    "MB60R",
+    "MB61R",
+    "MB62R",
+    "MB63R",
+    "MB64R",
+    "MB65R",
+    "MB66R",
+    "MB67R",
+    "MB68R",
+    "MB69R",
+    "MB70R",
+    "MB71R",
+    "MB72R",
+    "MB73R",
+    "MB74R",
+    "MB76R",
+    "MB77R",
+    "MB78R",
+    "MB79R",
+    "MB80R",
+    "MB81R",
+    "MB82R",
+    "MB83R",
+    "MB84R",
+    "MB85R",
+    "MB86R",
+    "MB87R",
+    "MB88R",
+    "MB89R",
+    "MB90R",
+    "MB91R",
+    "MB92R",
+    "MB93R",
+    "MB94R",
+    "MB95R",
+    "MB96R",
+    "MB97R",
+    "MB98R"
+  ],
+  "cod_names_missing_from_twiss": [
+    "MB97R",
+    "MB98R"
+  ],
+  "lattice_names_absent_from_cod": [
+    "MB20R",
+    "MB75R"
+  ],
+  "tbt_mapping_is_inferred_from_geometry": true,
+  "live_mapping_confirmed": false,
+  "maximum_s_difference_m": 0.0010075133634472877,
+  "records": [
+    {
+      "tbt_channel": 1,
+      "legacy_s_m": 0.2463,
+      "nearest_lattice_bpm": "MB1R",
+      "lattice_s_m": 0.2463,
+      "difference_m": 0.0
+    },
+    {
+      "tbt_channel": 2,
+      "legacy_s_m": 0.7574228208547056,
+      "nearest_lattice_bpm": "MB2R",
+      "lattice_s_m": 0.7573,
+      "difference_m": -0.00012282085470560755
+    },
+    {
+      "tbt_channel": 3,
+      "legacy_s_m": 2.6664228208547054,
+      "nearest_lattice_bpm": "MB3R",
+      "lattice_s_m": 2.6663,
+      "difference_m": -0.00012282085470527448
+    },
+    {
+      "tbt_channel": 4,
+      "legacy_s_m": 3.1775456417094112,
+      "nearest_lattice_bpm": "MB4R",
+      "lattice_s_m": 3.1773,
+      "difference_m": -0.00024564170941143715
+    },
+    {
+      "tbt_channel": 5,
+      "legacy_s_m": 5.08654564170941,
+      "nearest_lattice_bpm": "MB5R",
+      "lattice_s_m": 5.0863,
+      "difference_m": -0.00024564170941054897
+    },
+    {
+      "tbt_channel": 6,
+      "legacy_s_m": 5.597668462564115,
+      "nearest_lattice_bpm": "MB6R",
+      "lattice_s_m": 5.5973,
+      "difference_m": -0.0003684625641149353
+    },
+    {
+      "tbt_channel": 7,
+      "legacy_s_m": 7.5066684625641145,
+      "nearest_lattice_bpm": "MB7R",
+      "lattice_s_m": 7.5063,
+      "difference_m": -0.0003684625641140471
+    },
+    {
+      "tbt_channel": 8,
+      "legacy_s_m": 8.017791283418818,
+      "nearest_lattice_bpm": "MB8R",
+      "lattice_s_m": 8.0173,
+      "difference_m": -0.0004912834188175452
+    },
+    {
+      "tbt_channel": 9,
+      "legacy_s_m": 9.926791283418819,
+      "nearest_lattice_bpm": "MB9R",
+      "lattice_s_m": 9.9263,
+      "difference_m": -0.0004912834188193216
+    },
+    {
+      "tbt_channel": 10,
+      "legacy_s_m": 10.437914104273524,
+      "nearest_lattice_bpm": "MB10R",
+      "lattice_s_m": 10.4373,
+      "difference_m": -0.0006141042735237079
+    },
+    {
+      "tbt_channel": 11,
+      "legacy_s_m": 12.346914104273525,
+      "nearest_lattice_bpm": "MB11R",
+      "lattice_s_m": 12.3463,
+      "difference_m": -0.0006141042735254842
+    },
+    {
+      "tbt_channel": 12,
+      "legacy_s_m": 12.85803692512823,
+      "nearest_lattice_bpm": "MB12R",
+      "lattice_s_m": 12.8573,
+      "difference_m": -0.0007369251282298706
+    },
+    {
+      "tbt_channel": 13,
+      "legacy_s_m": 14.767036925128231,
+      "nearest_lattice_bpm": "MB13R",
+      "lattice_s_m": 14.7663,
+      "difference_m": -0.0007369251282316469
+    },
+    {
+      "tbt_channel": 14,
+      "legacy_s_m": 15.278159745982936,
+      "nearest_lattice_bpm": "MB14R",
+      "lattice_s_m": 15.2773,
+      "difference_m": -0.0008597459829360332
+    },
+    {
+      "tbt_channel": 15,
+      "legacy_s_m": 17.18715974598293,
+      "nearest_lattice_bpm": "MB15R",
+      "lattice_s_m": 17.1863,
+      "difference_m": -0.0008597459829324805
+    },
+    {
+      "tbt_channel": 16,
+      "legacy_s_m": 17.698159745982927,
+      "nearest_lattice_bpm": "MB16R",
+      "lattice_s_m": 17.6973,
+      "difference_m": -0.0008597459829289278
+    },
+    {
+      "tbt_channel": 17,
+      "legacy_s_m": 19.27315974598292,
+      "nearest_lattice_bpm": "MB17R",
+      "lattice_s_m": 19.2723,
+      "difference_m": -0.0008597459829182696
+    },
+    {
+      "tbt_channel": 18,
+      "legacy_s_m": 19.878159745982916,
+      "nearest_lattice_bpm": "MB18R",
+      "lattice_s_m": 19.8773,
+      "difference_m": -0.0008597459829147169
+    },
+    {
+      "tbt_channel": 19,
+      "legacy_s_m": 21.422293763368472,
+      "nearest_lattice_bpm": "MB19R",
+      "lattice_s_m": 21.4223,
+      "difference_m": 6.2366315276563e-06
+    },
+    {
+      "tbt_channel": 20,
+      "legacy_s_m": 25.08429376336847,
+      "nearest_lattice_bpm": "MB20R",
+      "lattice_s_m": 25.0843,
+      "difference_m": 6.2366315276563e-06
+    },
+    {
+      "tbt_channel": 21,
+      "legacy_s_m": 28.574293763368477,
+      "nearest_lattice_bpm": "MB21R",
+      "lattice_s_m": 28.5743,
+      "difference_m": 6.236631524103586e-06
+    },
+    {
+      "tbt_channel": 22,
+      "legacy_s_m": 32.299293763368475,
+      "nearest_lattice_bpm": "MB22R",
+      "lattice_s_m": 32.2993,
+      "difference_m": 6.2366315276563e-06
+    },
+    {
+      "tbt_channel": 23,
+      "legacy_s_m": 32.91929376336848,
+      "nearest_lattice_bpm": "MB23R",
+      "lattice_s_m": 32.9193,
+      "difference_m": 6.236631520550873e-06
+    },
+    {
+      "tbt_channel": 24,
+      "legacy_s_m": 35.56929376336848,
+      "nearest_lattice_bpm": "MB24R",
+      "lattice_s_m": 35.5693,
+      "difference_m": 6.236631520550873e-06
+    },
+    {
+      "tbt_channel": 25,
+      "legacy_s_m": 38.55929376336849,
+      "nearest_lattice_bpm": "MB25R",
+      "lattice_s_m": 38.5593,
+      "difference_m": 6.236631513445445e-06
+    },
+    {
+      "tbt_channel": 26,
+      "legacy_s_m": 40.89929376336849,
+      "nearest_lattice_bpm": "MB26R",
+      "lattice_s_m": 40.8993,
+      "difference_m": 6.236631506340018e-06
+    },
+    {
+      "tbt_channel": 27,
+      "legacy_s_m": 43.59929376336849,
+      "nearest_lattice_bpm": "MB27R",
+      "lattice_s_m": 43.5993,
+      "difference_m": 6.236631506340018e-06
+    },
+    {
+      "tbt_channel": 28,
+      "legacy_s_m": 45.24919876336849,
+      "nearest_lattice_bpm": "MB28R",
+      "lattice_s_m": 45.249205,
+      "difference_m": 6.236631513445445e-06
+    },
+    {
+      "tbt_channel": 29,
+      "legacy_s_m": 45.949198763368486,
+      "nearest_lattice_bpm": "MB29R",
+      "lattice_s_m": 45.949205,
+      "difference_m": 6.236631513445445e-06
+    },
+    {
+      "tbt_channel": 30,
+      "legacy_s_m": 46.949198763368486,
+      "nearest_lattice_bpm": "MB30R",
+      "lattice_s_m": 46.949205,
+      "difference_m": 6.236631513445445e-06
+    },
+    {
+      "tbt_channel": 31,
+      "legacy_s_m": 48.49633278075405,
+      "nearest_lattice_bpm": "MB31R",
+      "lattice_s_m": 48.497205,
+      "difference_m": 0.0008722192459487133
+    },
+    {
+      "tbt_channel": 32,
+      "legacy_s_m": 50.20533278075406,
+      "nearest_lattice_bpm": "MB32R",
+      "lattice_s_m": 50.206205,
+      "difference_m": 0.0008722192459345024
+    },
+    {
+      "tbt_channel": 33,
+      "legacy_s_m": 50.676332780754066,
+      "nearest_lattice_bpm": "MB33R",
+      "lattice_s_m": 50.677205,
+      "difference_m": 0.0008722192459345024
+    },
+    {
+      "tbt_channel": 34,
+      "legacy_s_m": 52.58533278075408,
+      "nearest_lattice_bpm": "MB34R",
+      "lattice_s_m": 52.586205,
+      "difference_m": 0.0008722192459202915
+    },
+    {
+      "tbt_channel": 35,
+      "legacy_s_m": 53.09633278075409,
+      "nearest_lattice_bpm": "MB35R",
+      "lattice_s_m": 53.097205,
+      "difference_m": 0.0008722192459131861
+    },
+    {
+      "tbt_channel": 36,
+      "legacy_s_m": 55.005332780754095,
+      "nearest_lattice_bpm": "MB36R",
+      "lattice_s_m": 55.006205,
+      "difference_m": 0.0008722192459060807
+    },
+    {
+      "tbt_channel": 37,
+      "legacy_s_m": 55.516455601608804,
+      "nearest_lattice_bpm": "MB37R",
+      "lattice_s_m": 55.517205,
+      "difference_m": 0.0007493983911928126
+    },
+    {
+      "tbt_channel": 38,
+      "legacy_s_m": 57.42545560160881,
+      "nearest_lattice_bpm": "MB38R",
+      "lattice_s_m": 57.426205,
+      "difference_m": 0.0007493983911928126
+    },
+    {
+      "tbt_channel": 39,
+      "legacy_s_m": 57.93657842246352,
+      "nearest_lattice_bpm": "MB39R",
+      "lattice_s_m": 57.937205,
+      "difference_m": 0.0006265775364795445
+    },
+    {
+      "tbt_channel": 40,
+      "legacy_s_m": 59.845578422463525,
+      "nearest_lattice_bpm": "MB40R",
+      "lattice_s_m": 59.846205,
+      "difference_m": 0.0006265775364724391
+    },
+    {
+      "tbt_channel": 41,
+      "legacy_s_m": 60.356701243318234,
+      "nearest_lattice_bpm": "MB41R",
+      "lattice_s_m": 60.357205,
+      "difference_m": 0.0005037566817662764
+    },
+    {
+      "tbt_channel": 42,
+      "legacy_s_m": 62.26570124331824,
+      "nearest_lattice_bpm": "MB42R",
+      "lattice_s_m": 62.266205,
+      "difference_m": 0.000503756681759171
+    },
+    {
+      "tbt_channel": 43,
+      "legacy_s_m": 62.77682406417295,
+      "nearest_lattice_bpm": "MB43R",
+      "lattice_s_m": 62.777205,
+      "difference_m": 0.0003809358270530083
+    },
+    {
+      "tbt_channel": 44,
+      "legacy_s_m": 64.68582406417296,
+      "nearest_lattice_bpm": "MB44R",
+      "lattice_s_m": 64.686205,
+      "difference_m": 0.00038093582703879747
+    },
+    {
+      "tbt_channel": 45,
+      "legacy_s_m": 65.19694688502769,
+      "nearest_lattice_bpm": "MB45R",
+      "lattice_s_m": 65.197205,
+      "difference_m": 0.0002581149723113185
+    },
+    {
+      "tbt_channel": 46,
+      "legacy_s_m": 67.10594688502768,
+      "nearest_lattice_bpm": "MB46R",
+      "lattice_s_m": 67.106205,
+      "difference_m": 0.0002581149723255294
+    },
+    {
+      "tbt_channel": 47,
+      "legacy_s_m": 67.6170697058824,
+      "nearest_lattice_bpm": "MB47R",
+      "lattice_s_m": 67.617205,
+      "difference_m": 0.00013529411759805043
+    },
+    {
+      "tbt_channel": 48,
+      "legacy_s_m": 69.52606970588239,
+      "nearest_lattice_bpm": "MB48R",
+      "lattice_s_m": 69.526205,
+      "difference_m": 0.0001352941176122613
+    },
+    {
+      "tbt_channel": 49,
+      "legacy_s_m": 70.03719252673712,
+      "nearest_lattice_bpm": "MB49R",
+      "lattice_s_m": 70.037205,
+      "difference_m": 1.2473262884782343e-05
+    },
+    {
+      "tbt_channel": 50,
+      "legacy_s_m": 71.94619252673711,
+      "nearest_lattice_bpm": "MB50R",
+      "lattice_s_m": 71.946205,
+      "difference_m": 1.2473262898993198e-05
+    },
+    {
+      "tbt_channel": 51,
+      "legacy_s_m": 72.45731534759183,
+      "nearest_lattice_bpm": "MB51R",
+      "lattice_s_m": 72.457205,
+      "difference_m": -0.00011034759182848575
+    },
+    {
+      "tbt_channel": 52,
+      "legacy_s_m": 74.36631534759182,
+      "nearest_lattice_bpm": "MB52R",
+      "lattice_s_m": 74.366205,
+      "difference_m": -0.00011034759182848575
+    },
+    {
+      "tbt_channel": 53,
+      "legacy_s_m": 74.87743816844655,
+      "nearest_lattice_bpm": "MB53R",
+      "lattice_s_m": 74.877205,
+      "difference_m": -0.00023316844654175384
+    },
+    {
+      "tbt_channel": 54,
+      "legacy_s_m": 76.78643816844654,
+      "nearest_lattice_bpm": "MB54R",
+      "lattice_s_m": 76.786205,
+      "difference_m": -0.00023316844654175384
+    },
+    {
+      "tbt_channel": 55,
+      "legacy_s_m": 77.29756098930126,
+      "nearest_lattice_bpm": "MB55R",
+      "lattice_s_m": 77.297205,
+      "difference_m": -0.00035598930125502193
+    },
+    {
+      "tbt_channel": 56,
+      "legacy_s_m": 79.20656098930125,
+      "nearest_lattice_bpm": "MB56R",
+      "lattice_s_m": 79.206205,
+      "difference_m": -0.00035598930125502193
+    },
+    {
+      "tbt_channel": 57,
+      "legacy_s_m": 79.71768381015598,
+      "nearest_lattice_bpm": "MB57R",
+      "lattice_s_m": 79.717205,
+      "difference_m": -0.00047881015596829
+    },
+    {
+      "tbt_channel": 58,
+      "legacy_s_m": 81.62668381015597,
+      "nearest_lattice_bpm": "MB58R",
+      "lattice_s_m": 81.626205,
+      "difference_m": -0.00047881015596829
+    },
+    {
+      "tbt_channel": 59,
+      "legacy_s_m": 82.13780663101069,
+      "nearest_lattice_bpm": "MB59R",
+      "lattice_s_m": 82.137205,
+      "difference_m": -0.000601631010695769
+    },
+    {
+      "tbt_channel": 60,
+      "legacy_s_m": 84.04680663101068,
+      "nearest_lattice_bpm": "MB60R",
+      "lattice_s_m": 84.046205,
+      "difference_m": -0.0006016310106815581
+    },
+    {
+      "tbt_channel": 61,
+      "legacy_s_m": 84.5579294518654,
+      "nearest_lattice_bpm": "MB61R",
+      "lattice_s_m": 84.557205,
+      "difference_m": -0.0007244518654090371
+    },
+    {
+      "tbt_channel": 62,
+      "legacy_s_m": 86.46692945186538,
+      "nearest_lattice_bpm": "MB62R",
+      "lattice_s_m": 86.466205,
+      "difference_m": -0.0007244518653806153
+    },
+    {
+      "tbt_channel": 63,
+      "legacy_s_m": 86.97792945186539,
+      "nearest_lattice_bpm": "MB63R",
+      "lattice_s_m": 86.977205,
+      "difference_m": -0.0007244518653948262
+    },
+    {
+      "tbt_channel": 64,
+      "legacy_s_m": 88.5529294518654,
+      "nearest_lattice_bpm": "MB64R",
+      "lattice_s_m": 88.552205,
+      "difference_m": -0.0007244518653948262
+    },
+    {
+      "tbt_channel": 65,
+      "legacy_s_m": 89.15792945186539,
+      "nearest_lattice_bpm": "MB65R",
+      "lattice_s_m": 89.157205,
+      "difference_m": -0.0007244518653806153
+    },
+    {
+      "tbt_channel": 66,
+      "legacy_s_m": 90.70206346925093,
+      "nearest_lattice_bpm": "MB66R",
+      "lattice_s_m": 90.702205,
+      "difference_m": 0.00014153074907596874
+    },
+    {
+      "tbt_channel": 67,
+      "legacy_s_m": 93.01156346925094,
+      "nearest_lattice_bpm": "MB67R",
+      "lattice_s_m": 93.011705,
+      "difference_m": 0.0001415307490617579
+    },
+    {
+      "tbt_channel": 68,
+      "legacy_s_m": 94.69906346925094,
+      "nearest_lattice_bpm": "MB68R",
+      "lattice_s_m": 94.699205,
+      "difference_m": 0.0001415307490617579
+    },
+    {
+      "tbt_channel": 69,
+      "legacy_s_m": 97.87906346925094,
+      "nearest_lattice_bpm": "MB69R",
+      "lattice_s_m": 97.879205,
+      "difference_m": 0.0001415307490617579
+    },
+    {
+      "tbt_channel": 70,
+      "legacy_s_m": 99.56656346925094,
+      "nearest_lattice_bpm": "MB70R",
+      "lattice_s_m": 99.566705,
+      "difference_m": 0.0001415307490617579
+    },
+    {
+      "tbt_channel": 71,
+      "legacy_s_m": 101.57906346925094,
+      "nearest_lattice_bpm": "MB71R",
+      "lattice_s_m": 101.579205,
+      "difference_m": 0.0001415307490617579
+    },
+    {
+      "tbt_channel": 72,
+      "legacy_s_m": 102.19906346925096,
+      "nearest_lattice_bpm": "MB72R",
+      "lattice_s_m": 102.199205,
+      "difference_m": 0.00014153074904754703
+    },
+    {
+      "tbt_channel": 73,
+      "legacy_s_m": 104.84906346925098,
+      "nearest_lattice_bpm": "MB73R",
+      "lattice_s_m": 104.849205,
+      "difference_m": 0.00014153074901912532
+    },
+    {
+      "tbt_channel": 74,
+      "legacy_s_m": 107.83906346925097,
+      "nearest_lattice_bpm": "MB74R",
+      "lattice_s_m": 107.839205,
+      "difference_m": 0.00014153074903333618
+    },
+    {
+      "tbt_channel": 75,
+      "legacy_s_m": 110.17906346925098,
+      "nearest_lattice_bpm": "MB75R",
+      "lattice_s_m": 110.179205,
+      "difference_m": 0.00014153074901912532
+    },
+    {
+      "tbt_channel": 76,
+      "legacy_s_m": 112.87906346925098,
+      "nearest_lattice_bpm": "MB76R",
+      "lattice_s_m": 112.879205,
+      "difference_m": 0.00014153074901912532
+    },
+    {
+      "tbt_channel": 77,
+      "legacy_s_m": 114.528968469251,
+      "nearest_lattice_bpm": "MB77R",
+      "lattice_s_m": 114.52911,
+      "difference_m": 0.00014153074900491447
+    },
+    {
+      "tbt_channel": 78,
+      "legacy_s_m": 115.22896846925101,
+      "nearest_lattice_bpm": "MB78R",
+      "lattice_s_m": 115.22911,
+      "difference_m": 0.00014153074899070361
+    },
+    {
+      "tbt_channel": 79,
+      "legacy_s_m": 116.22896846925103,
+      "nearest_lattice_bpm": "MB79R",
+      "lattice_s_m": 116.22911,
+      "difference_m": 0.00014153074897649276
+    },
+    {
+      "tbt_channel": 80,
+      "legacy_s_m": 117.77610248663659,
+      "nearest_lattice_bpm": "MB80R",
+      "lattice_s_m": 117.77711,
+      "difference_m": 0.0010075133634046551
+    },
+    {
+      "tbt_channel": 81,
+      "legacy_s_m": 119.48510248663656,
+      "nearest_lattice_bpm": "MB81R",
+      "lattice_s_m": 119.48611,
+      "difference_m": 0.0010075133634330768
+    },
+    {
+      "tbt_channel": 82,
+      "legacy_s_m": 119.95610248663658,
+      "nearest_lattice_bpm": "MB82R",
+      "lattice_s_m": 119.95711,
+      "difference_m": 0.001007513363418866
+    },
+    {
+      "tbt_channel": 83,
+      "legacy_s_m": 121.86510248663656,
+      "nearest_lattice_bpm": "MB83R",
+      "lattice_s_m": 121.86611,
+      "difference_m": 0.0010075133634472877
+    },
+    {
+      "tbt_channel": 84,
+      "legacy_s_m": 122.37610248663657,
+      "nearest_lattice_bpm": "MB84R",
+      "lattice_s_m": 122.37711,
+      "difference_m": 0.0010075133634330768
+    },
+    {
+      "tbt_channel": 85,
+      "legacy_s_m": 124.28510248663656,
+      "nearest_lattice_bpm": "MB85R",
+      "lattice_s_m": 124.28611,
+      "difference_m": 0.0010075133634330768
+    },
+    {
+      "tbt_channel": 86,
+      "legacy_s_m": 124.79622530749128,
+      "nearest_lattice_bpm": "MB86R",
+      "lattice_s_m": 124.79711,
+      "difference_m": 0.0008846925087198088
+    },
+    {
+      "tbt_channel": 87,
+      "legacy_s_m": 126.70522530749128,
+      "nearest_lattice_bpm": "MB87R",
+      "lattice_s_m": 126.70611,
+      "difference_m": 0.0008846925087198088
+    },
+    {
+      "tbt_channel": 88,
+      "legacy_s_m": 127.216348128346,
+      "nearest_lattice_bpm": "MB88R",
+      "lattice_s_m": 127.21711,
+      "difference_m": 0.0007618716540065407
+    },
+    {
+      "tbt_channel": 89,
+      "legacy_s_m": 129.12534812834596,
+      "nearest_lattice_bpm": "MB89R",
+      "lattice_s_m": 129.12611,
+      "difference_m": 0.0007618716540491732
+    },
+    {
+      "tbt_channel": 90,
+      "legacy_s_m": 129.63647094920069,
+      "nearest_lattice_bpm": "MB90R",
+      "lattice_s_m": 129.63711,
+      "difference_m": 0.0006390507993216943
+    },
+    {
+      "tbt_channel": 91,
+      "legacy_s_m": 131.54547094920065,
+      "nearest_lattice_bpm": "MB91R",
+      "lattice_s_m": 131.54611,
+      "difference_m": 0.000639050799350116
+    },
+    {
+      "tbt_channel": 92,
+      "legacy_s_m": 132.05659377005537,
+      "nearest_lattice_bpm": "MB92R",
+      "lattice_s_m": 132.05711,
+      "difference_m": 0.000516229944622637
+    },
+    {
+      "tbt_channel": 93,
+      "legacy_s_m": 133.96559377005534,
+      "nearest_lattice_bpm": "MB93R",
+      "lattice_s_m": 133.96611,
+      "difference_m": 0.0005162299446510588
+    },
+    {
+      "tbt_channel": 94,
+      "legacy_s_m": 134.47671659091006,
+      "nearest_lattice_bpm": "MB94R",
+      "lattice_s_m": 134.47711,
+      "difference_m": 0.0003934090899520015
+    },
+    {
+      "tbt_channel": 95,
+      "legacy_s_m": 136.38571659091002,
+      "nearest_lattice_bpm": "MB95R",
+      "lattice_s_m": 136.38611,
+      "difference_m": 0.00039340908998042323
+    },
+    {
+      "tbt_channel": 96,
+      "legacy_s_m": 136.89683941176474,
+      "nearest_lattice_bpm": "MB96R",
+      "lattice_s_m": 136.89711,
+      "difference_m": 0.0002705882352529443
+    }
+  ]
+}

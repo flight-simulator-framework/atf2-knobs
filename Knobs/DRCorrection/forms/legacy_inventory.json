@@ -1,0 +1,848 @@
+{
+  "orbit": {
+    "source": "/home/motokisato/Projects/op-base261019/sad/Qt/DR_ORBIT_CORRECTION/drorbitcorrection.ui",
+    "sha256": "17ab465d2e5fc79bf6229b498e67acfd7a7cf8c4e4aa5226191502be2e9124b8",
+    "widgets": [
+      {
+        "name": "DROrbitCorrection",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "label",
+        "qt_class": "QLabel",
+        "text": "BEAM ENERGY",
+        "pv": null
+      },
+      {
+        "name": "label_2",
+        "qt_class": "QLabel",
+        "text": "Tolerance",
+        "pv": null
+      },
+      {
+        "name": "qeanalogprogressbar",
+        "qt_class": "QEAnalogProgressBar",
+        "text": null,
+        "pv": "SAD:DR_TOLERANCE"
+      },
+      {
+        "name": "label_3",
+        "qt_class": "QLabel",
+        "text": "Steering (H)",
+        "pv": null
+      },
+      {
+        "name": "label_4",
+        "qt_class": "QLabel",
+        "text": "Tune (H)",
+        "pv": null
+      },
+      {
+        "name": "qelabel_1",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:COD:DR:SW_H"
+      },
+      {
+        "name": "qelabel_2",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:COD:DR:SW_V"
+      },
+      {
+        "name": "label_5",
+        "qt_class": "QLabel",
+        "text": "(V)",
+        "pv": null
+      },
+      {
+        "name": "label_6",
+        "qt_class": "QLabel",
+        "text": "(V)",
+        "pv": null
+      },
+      {
+        "name": "label_7",
+        "qt_class": "QLabel",
+        "text": "DR COD Correction",
+        "pv": null
+      },
+      {
+        "name": "pushButtonCalc",
+        "qt_class": "QPushButton",
+        "text": "CALC",
+        "pv": null
+      },
+      {
+        "name": "pushButtonCalcFile",
+        "qt_class": "QPushButton",
+        "text": "CALC (FILE)",
+        "pv": null
+      },
+      {
+        "name": "pushButtonSet",
+        "qt_class": "QPushButton",
+        "text": "SET",
+        "pv": null
+      },
+      {
+        "name": "pushButtonReset",
+        "qt_class": "QPushButton",
+        "text": "RESET",
+        "pv": null
+      },
+      {
+        "name": "qelabel_3",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:COD:DR:MESSAGE"
+      },
+      {
+        "name": "pushButton_DataToSad",
+        "qt_class": "QPushButton",
+        "text": "OPEN MENU\nBPM DATA to SAD",
+        "pv": null
+      },
+      {
+        "name": "pushButton_DRSTEER",
+        "qt_class": "QPushButton",
+        "text": "OPEN MENU\nFIX DR STEER",
+        "pv": null
+      },
+      {
+        "name": "qelabel_4",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TOLERANCE"
+      },
+      {
+        "name": "qepushbuttonDR_SWH",
+        "qt_class": "QEPushButton",
+        "text": "",
+        "pv": "SAD:COD:DR:SW_H_CONT"
+      },
+      {
+        "name": "qepushbuttonDR_SWV",
+        "qt_class": "QEPushButton",
+        "text": "",
+        "pv": "SAD:COD:DR:SW_V_CONT"
+      },
+      {
+        "name": "label_8",
+        "qt_class": "QLabel",
+        "text": "GeV",
+        "pv": null
+      },
+      {
+        "name": "pushButtonHelp",
+        "qt_class": "QPushButton",
+        "text": "HELP",
+        "pv": null
+      },
+      {
+        "name": "widget_16",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRTuneY",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TUNE_Y"
+      },
+      {
+        "name": "pushButton_DRTuneY",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_17",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRTuneX",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TUNE_X"
+      },
+      {
+        "name": "pushButton_DRTuneX",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_18",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRSteeringH",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:COD:DR:N_STH"
+      },
+      {
+        "name": "pushButton_DRSteeringH",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_19",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRSteeringV",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:COD:DR:N_STV"
+      },
+      {
+        "name": "pushButton_DRSteeringV",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_20",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRBeamEnergy",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR:BEAM_ENERGY"
+      },
+      {
+        "name": "pushButton_DRBeamEnergy",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      }
+    ]
+  },
+  "dispersion": {
+    "source": "/home/motokisato/Projects/op-base261019/sad/Qt/DR_DISPERSION_CORRECTION/drdispersioncorrection.ui",
+    "sha256": "c898d4f21c9e46874ef75d77b9e48e8cba3f3d56a84bf0976ffdbbd8de4cec24",
+    "widgets": [
+      {
+        "name": "DRDispersionCorrection",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "label",
+        "qt_class": "QLabel",
+        "text": "DR Dispersion Correction",
+        "pv": null
+      },
+      {
+        "name": "label_2",
+        "qt_class": "QLabel",
+        "text": "BEAM ENERGY",
+        "pv": null
+      },
+      {
+        "name": "label_3",
+        "qt_class": "QLabel",
+        "text": "GeV",
+        "pv": null
+      },
+      {
+        "name": "label_4",
+        "qt_class": "QLabel",
+        "text": "Frequency Change",
+        "pv": null
+      },
+      {
+        "name": "label_5",
+        "qt_class": "QLabel",
+        "text": "kHz",
+        "pv": null
+      },
+      {
+        "name": "label_6",
+        "qt_class": "QLabel",
+        "text": "Momentum Compaction",
+        "pv": null
+      },
+      {
+        "name": "label_7",
+        "qt_class": "QLabel",
+        "text": "Tolerance",
+        "pv": null
+      },
+      {
+        "name": "qelabel_4",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TOLERANCE"
+      },
+      {
+        "name": "qeanalogprogressbar",
+        "qt_class": "QEAnalogProgressBar",
+        "text": null,
+        "pv": "SAD:DR_TOLERANCE"
+      },
+      {
+        "name": "label_8",
+        "qt_class": "QLabel",
+        "text": "Steering (H)",
+        "pv": null
+      },
+      {
+        "name": "qelabel",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DISPERSION:DR:ZH_SW"
+      },
+      {
+        "name": "qepushbuttonDR_ZHSW",
+        "qt_class": "QEPushButton",
+        "text": "",
+        "pv": "SAD:DISPERSION:DR:ZH_SW_CONT"
+      },
+      {
+        "name": "label_9",
+        "qt_class": "QLabel",
+        "text": "(V)",
+        "pv": null
+      },
+      {
+        "name": "qelabel_2",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DISPERSION:DR:ZV_SW"
+      },
+      {
+        "name": "qepushbuttonDR_ZVSW",
+        "qt_class": "QEPushButton",
+        "text": "",
+        "pv": "SAD:DISPERSION:DR:ZV_SW_CONT"
+      },
+      {
+        "name": "label_10",
+        "qt_class": "QLabel",
+        "text": "Tune (H)",
+        "pv": null
+      },
+      {
+        "name": "label_11",
+        "qt_class": "QLabel",
+        "text": "(V)",
+        "pv": null
+      },
+      {
+        "name": "pushButtonDeltaF",
+        "qt_class": "QPushButton",
+        "text": "Delta-f Ramp",
+        "pv": null
+      },
+      {
+        "name": "label_12",
+        "qt_class": "QLabel",
+        "text": "DR Dispersion Correction",
+        "pv": null
+      },
+      {
+        "name": "pushButtonDispersionCalcFile",
+        "qt_class": "QPushButton",
+        "text": "CALC (FILE)",
+        "pv": null
+      },
+      {
+        "name": "pushButton_DRSTEER",
+        "qt_class": "QPushButton",
+        "text": "OPEN MENU\nFIX DR STEER",
+        "pv": null
+      },
+      {
+        "name": "pushButtonDispersionSet",
+        "qt_class": "QPushButton",
+        "text": "SET",
+        "pv": null
+      },
+      {
+        "name": "pushButtonDispersionReset",
+        "qt_class": "QPushButton",
+        "text": "RESET",
+        "pv": null
+      },
+      {
+        "name": "pushButtonDispersionCalc",
+        "qt_class": "QPushButton",
+        "text": "CALC",
+        "pv": null
+      },
+      {
+        "name": "qelabel_3",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DISPERSION:DR:MESSAGE"
+      },
+      {
+        "name": "label_13",
+        "qt_class": "QLabel",
+        "text": "SRMON Dispersion Correction",
+        "pv": null
+      },
+      {
+        "name": "pushButtonSRCalcFile",
+        "qt_class": "QPushButton",
+        "text": "CALC (FILE)",
+        "pv": null
+      },
+      {
+        "name": "pushButtonSRCalc",
+        "qt_class": "QPushButton",
+        "text": "CALC",
+        "pv": null
+      },
+      {
+        "name": "qelabel_5",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SRMON:DR:MESSAGE"
+      },
+      {
+        "name": "pushButton_DataToSad",
+        "qt_class": "QPushButton",
+        "text": "OPEN MENU\nBPM DATA to SAD",
+        "pv": null
+      },
+      {
+        "name": "pushButtonHelp",
+        "qt_class": "QPushButton",
+        "text": "HELP",
+        "pv": null
+      },
+      {
+        "name": "widget_20",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRBeamEnergy",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR:BEAM_ENERGY"
+      },
+      {
+        "name": "pushButton_DRBeamEnergy",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_21",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_FreqChange",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DISPERSION:FREQ_CHANGE"
+      },
+      {
+        "name": "pushButton_FreqChange",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_22",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_MomentumCompaction",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DISPERSION:ALPHA"
+      },
+      {
+        "name": "pushButton_MomentumCompaction",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_23",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_SteeringH",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DISPERSION:DR:ZH_N"
+      },
+      {
+        "name": "pushButton_SteeringH",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_24",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_SteeringV",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DISPERSION:DR:ZV_N"
+      },
+      {
+        "name": "pushButton_SteeringV",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_25",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRTuneX",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TUNE_X"
+      },
+      {
+        "name": "pushButton_DRTuneX",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_26",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRTuneY",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TUNE_Y"
+      },
+      {
+        "name": "pushButton_DRTuneY",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      }
+    ]
+  },
+  "skew": {
+    "source": "/home/motokisato/Projects/op-base261019/sad/Qt/SKEW_CORRECTION/skewcorrection.ui",
+    "sha256": "1ea2b9742873cd9b58e3546beaba11e61529ba836c62f8447ea1daa2220687a2",
+    "widgets": [
+      {
+        "name": "SkewCorrection",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "label",
+        "qt_class": "QLabel",
+        "text": "BEAM ENERGY",
+        "pv": null
+      },
+      {
+        "name": "label_2",
+        "qt_class": "QLabel",
+        "text": "GeV",
+        "pv": null
+      },
+      {
+        "name": "label_3",
+        "qt_class": "QLabel",
+        "text": "H-Steering Name and Changed current",
+        "pv": null
+      },
+      {
+        "name": "label_4",
+        "qt_class": "QLabel",
+        "text": "Tune (H)",
+        "pv": null
+      },
+      {
+        "name": "label_5",
+        "qt_class": "QLabel",
+        "text": "(V)",
+        "pv": null
+      },
+      {
+        "name": "qelabel",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_SWSD"
+      },
+      {
+        "name": "qelabel_2",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_SWSF"
+      },
+      {
+        "name": "label_6",
+        "qt_class": "QLabel",
+        "text": "SD1R.* SK1/I",
+        "pv": null
+      },
+      {
+        "name": "label_7",
+        "qt_class": "QLabel",
+        "text": "SF1R.* SK1/I",
+        "pv": null
+      },
+      {
+        "name": "label_8",
+        "qt_class": "QLabel",
+        "text": "DR Skew Correction",
+        "pv": null
+      },
+      {
+        "name": "pushButtonCalc",
+        "qt_class": "QPushButton",
+        "text": "CALC",
+        "pv": null
+      },
+      {
+        "name": "pushButtonCalcFile",
+        "qt_class": "QPushButton",
+        "text": "CALC (FILE)",
+        "pv": null
+      },
+      {
+        "name": "pushButtonSet",
+        "qt_class": "QPushButton",
+        "text": "SET",
+        "pv": null
+      },
+      {
+        "name": "pushButtonReset",
+        "qt_class": "QPushButton",
+        "text": "RESET",
+        "pv": null
+      },
+      {
+        "name": "qelabel_3",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR:DR:MESSAGE"
+      },
+      {
+        "name": "pushButtonHelp",
+        "qt_class": "QPushButton",
+        "text": "HELP",
+        "pv": null
+      },
+      {
+        "name": "pushButtonOpenMenu",
+        "qt_class": "QPushButton",
+        "text": "OPEN MENU\nBPM DATA to SAD",
+        "pv": null
+      },
+      {
+        "name": "qepushbuttonSkewCor_SWSD",
+        "qt_class": "QEPushButton",
+        "text": "",
+        "pv": "SAD:SKEWCOR_SWSD_CONT"
+      },
+      {
+        "name": "qepushbuttonSkewCor_SWSF",
+        "qt_class": "QEPushButton",
+        "text": "",
+        "pv": "SAD:SKEWCOR_SWSF_CONT"
+      },
+      {
+        "name": "widget_20",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRBeamEnergy",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR:BEAM_ENERGY"
+      },
+      {
+        "name": "pushButton_DRBeamEnergy",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_17",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRTuneX",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TUNE_X"
+      },
+      {
+        "name": "pushButton_DRTuneX",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_16",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRTuneY",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:DR_TUNE_Y"
+      },
+      {
+        "name": "pushButton_DRTuneY",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_18",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRSkewCorSD",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_SDCALIB"
+      },
+      {
+        "name": "pushButton_DRSkewCorSD",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_19",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabel_DRSkewCorSF",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_SFCALIB"
+      },
+      {
+        "name": "pushButton_DRSkewCorSF",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_21",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabelSkewCor_SteerName1",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_STEERNAME1"
+      },
+      {
+        "name": "pushButtonSkewCor_SteerName1",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_22",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabelSkewCor_SteerName2",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_STEERNAME2"
+      },
+      {
+        "name": "pushButtonSkewCor_SteerName2",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_23",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabelSkewCor_SteerChange1",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_STEERCHANGE1"
+      },
+      {
+        "name": "pushButtonSkewCor_SteerChange1",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      },
+      {
+        "name": "widget_24",
+        "qt_class": "QWidget",
+        "text": null,
+        "pv": null
+      },
+      {
+        "name": "qelabelSkewCor_SteerChange2",
+        "qt_class": "QELabel",
+        "text": null,
+        "pv": "SAD:SKEWCOR_STEERCHANGE2"
+      },
+      {
+        "name": "pushButtonSkewCor_SteerChange2",
+        "qt_class": "QPushButton",
+        "text": "",
+        "pv": null
+      }
+    ]
+  }
+}

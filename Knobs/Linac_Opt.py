@@ -766,7 +766,7 @@ class OptimizationWorker(QThread):
     progress_signal = pyqtSignal(dict)
     finished_signal = pyqtSignal()
 
-    def __init__(self, config: dict, save_dir: str | Path):
+    def __init__(self, config: dict, save_dir: str | Path, *, interface=None, dr_bpm_reader=None):
         super().__init__()
         self.config = config
         self.save_dir = Path(save_dir)
@@ -826,8 +826,13 @@ class OptimizationWorker(QThread):
         self._resume_discarded_row: Optional[Dict[str, Any]] = None
 
         # Fixed machine interface for Linac operations
-        self.interface = InterfaceATF2_LinacBT(nsamples=1)
-        self.dr_bpm_reader = DRBPMReader(nsamples=3) if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY else None
+        self._interface_injected = interface is not None
+        self.interface = interface if interface is not None else InterfaceATF2_LinacBT(nsamples=1)
+        if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY and dr_bpm_reader is None and interface is not None:
+            raise ValueError("An injected interface requires an explicit DR reader for intensity objectives")
+        self.dr_bpm_reader = dr_bpm_reader
+        if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY and self.dr_bpm_reader is None:
+            self.dr_bpm_reader = DRBPMReader(nsamples=3)
         if self.dr_bpm_reader is not None:
             configure_dr_turns(self.dr_bpm_reader, config, cancelled=lambda: not self.is_running)
 
@@ -2660,7 +2665,13 @@ class OptimizationWorker(QThread):
                 lo, hi = limits[pv]
                 if not np.isfinite(value) or not lo <= value <= hi:
                     raise ValueError(f"Corrector command outside verified range: {pv}={value}")
-        if wait:
+        if wait and self._interface_injected:
+            writer = getattr(self.interface, "write_setpoints_and_wait", None)
+            if writer is None:
+                raise RuntimeError("Injected interface must implement write_setpoints_and_wait; hardware fallback is disabled")
+            writer(dict(values))
+            self._current_pv_values.update({k: float(v) for k, v in values.items()})
+        elif wait:
             from epics import PV
             for pv_name, value in values.items():
                 if not self.is_running:

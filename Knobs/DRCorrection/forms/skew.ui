@@ -1,0 +1,554 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>SkewCorrection</class>
+  <widget class="QWidget" name="SkewCorrection">
+    <property name="geometry">
+      <rect>
+        <x>0</x>
+        <y>0</y>
+        <width>400</width>
+        <height>293</height>
+      </rect>
+    </property>
+    <property name="windowTitle">
+      <string>SkewCorrection</string>
+    </property>
+    <widget class="QLabel" name="label">
+      <property name="geometry">
+        <rect>
+          <x>10</x>
+          <y>20</y>
+          <width>91</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>BEAM ENERGY</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label_2">
+      <property name="geometry">
+        <rect>
+          <x>175</x>
+          <y>20</y>
+          <width>41</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>GeV</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label_3">
+      <property name="geometry">
+        <rect>
+          <x>10</x>
+          <y>50</y>
+          <width>251</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>H-Steering Name and Changed current</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label_4">
+      <property name="geometry">
+        <rect>
+          <x>10</x>
+          <y>150</y>
+          <width>66</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>Tune (H)</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label_5">
+      <property name="geometry">
+        <rect>
+          <x>170</x>
+          <y>145</y>
+          <width>26</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>(V)</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="qelabel">
+      <property name="geometry">
+        <rect>
+          <x>160</x>
+          <y>180</y>
+          <width>46</width>
+          <height>18</height>
+        </rect>
+      </property>
+    </widget>
+    <widget class="QLabel" name="qelabel_2">
+      <property name="geometry">
+        <rect>
+          <x>160</x>
+          <y>205</y>
+          <width>46</width>
+          <height>18</height>
+        </rect>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label_6">
+      <property name="geometry">
+        <rect>
+          <x>210</x>
+          <y>180</y>
+          <width>86</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>SD1R.* SK1/I</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label_7">
+      <property name="geometry">
+        <rect>
+          <x>210</x>
+          <y>205</y>
+          <width>91</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>SF1R.* SK1/I</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label_8">
+      <property name="geometry">
+        <rect>
+          <x>5</x>
+          <y>200</y>
+          <width>151</width>
+          <height>18</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>DR Skew Correction</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButtonCalc">
+      <property name="geometry">
+        <rect>
+          <x>15</x>
+          <y>235</y>
+          <width>61</width>
+          <height>22</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>CALC</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButtonCalcFile">
+      <property name="geometry">
+        <rect>
+          <x>85</x>
+          <y>235</y>
+          <width>81</width>
+          <height>22</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>CALC (FILE)</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButtonSet">
+      <property name="geometry">
+        <rect>
+          <x>175</x>
+          <y>235</y>
+          <width>56</width>
+          <height>22</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>SET</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButtonReset">
+      <property name="geometry">
+        <rect>
+          <x>240</x>
+          <y>235</y>
+          <width>81</width>
+          <height>22</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>RESET</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="qelabel_3">
+      <property name="geometry">
+        <rect>
+          <x>15</x>
+          <y>265</y>
+          <width>366</width>
+          <height>20</height>
+        </rect>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButtonHelp">
+      <property name="geometry">
+        <rect>
+          <x>260</x>
+          <y>20</y>
+          <width>66</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>HELP</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButtonOpenMenu">
+      <property name="geometry">
+        <rect>
+          <x>255</x>
+          <y>90</y>
+          <width>126</width>
+          <height>41</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string>OPEN MENU
+BPM DATA to SAD</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="qepushbuttonSkewCor_SWSD">
+      <property name="geometry">
+        <rect>
+          <x>160</x>
+          <y>180</y>
+          <width>46</width>
+          <height>16</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string />
+      </property>
+    </widget>
+    <widget class="QPushButton" name="qepushbuttonSkewCor_SWSF">
+      <property name="geometry">
+        <rect>
+          <x>160</x>
+          <y>205</y>
+          <width>46</width>
+          <height>16</height>
+        </rect>
+      </property>
+      <property name="text">
+        <string />
+      </property>
+    </widget>
+    <widget class="QWidget" name="widget_20" native="true">
+      <property name="geometry">
+        <rect>
+          <x>105</x>
+          <y>15</y>
+          <width>61</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabel_DRBeamEnergy">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>61</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButton_DRBeamEnergy">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>61</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_17" native="true">
+      <property name="geometry">
+        <rect>
+          <x>75</x>
+          <y>145</y>
+          <width>76</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabel_DRTuneX">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButton_DRTuneX">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_16" native="true">
+      <property name="geometry">
+        <rect>
+          <x>200</x>
+          <y>145</y>
+          <width>76</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabel_DRTuneY">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButton_DRTuneY">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_18" native="true">
+      <property name="geometry">
+        <rect>
+          <x>310</x>
+          <y>175</y>
+          <width>76</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabel_DRSkewCorSD">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButton_DRSkewCorSD">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_19" native="true">
+      <property name="geometry">
+        <rect>
+          <x>310</x>
+          <y>200</y>
+          <width>76</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabel_DRSkewCorSF">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButton_DRSkewCorSF">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>76</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_21" native="true">
+      <property name="geometry">
+        <rect>
+          <x>75</x>
+          <y>80</y>
+          <width>56</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabelSkewCor_SteerName1">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButtonSkewCor_SteerName1">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_22" native="true">
+      <property name="geometry">
+        <rect>
+          <x>75</x>
+          <y>110</y>
+          <width>56</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabelSkewCor_SteerName2">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButtonSkewCor_SteerName2">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_23" native="true">
+      <property name="geometry">
+        <rect>
+          <x>155</x>
+          <y>80</y>
+          <width>56</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabelSkewCor_SteerChange1">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButtonSkewCor_SteerChange1">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+    <widget class="QWidget" name="widget_24" native="true">
+      <property name="geometry">
+        <rect>
+          <x>155</x>
+          <y>110</y>
+          <width>56</width>
+          <height>21</height>
+        </rect>
+      </property>
+      <widget class="QLabel" name="qelabelSkewCor_SteerChange2">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+      </widget>
+      <widget class="QPushButton" name="pushButtonSkewCor_SteerChange2">
+        <property name="geometry">
+          <rect>
+            <x>0</x>
+            <y>0</y>
+            <width>56</width>
+            <height>21</height>
+          </rect>
+        </property>
+        <property name="text">
+          <string />
+        </property>
+      </widget>
+    </widget>
+  </widget>
+  <layoutdefault spacing="6" margin="11" />
+</ui>

@@ -1,0 +1,129 @@
+op-base / SysID follow-up source audit — 2026-10-21
+=================================================
+This records source findings and offline implementation changes. No EPICS
+connection or real-machine write was performed. Local copies do not establish
+which external optics snapshot or IOC configuration is currently deployed.
+
+RF / DeltaFRamp
+--------------
+SysID_GUI.py:622 calls interface.change_energy for dispersion measurements.
+machine-interfaces/backends/atf2/machine_interfaces_atf2/InterfaceATF2_DR.py:352:
+  RAMP:CONTROL_ON_SW <- 1; RAMP:PL4:ONOFF_SW <- 1.
+  energy_frequency_offset_khz = 4.0 (line 269).
+  dp/p = -4 / (714e3 * 2.1e-3) for that preset.
+reset_energy (line 367) writes RAMP:CONTROL_OFF_SW <- 0.
+
+/home/motokisato/Projects/op-base261019/ramp/Qt/DeltaFRamp/widget.ui:
+  PM0, PL1..PL10, MI1..MI10 ONOFF_SW buttons are labelled 0,+/-1..10 kHz.
+  RAMP:STATUS_READ: 0 OFF, 1 ON. RAMP:HOLD:STATUS_READ is separate.
+  FREQUENCY:LN_read / DR_read are displayed in MHz (labels at lines 1336/1354).
+The manual frequency-with-cooling-water path in widget.cpp changes LN_write,
+processes DR_write_CALC, writes DR_write, and changes water temperature.
+This is separate code from the RAMP preset buttons. The preset controller's
+internal linked actions were not found in these local sources.
+
+Implemented ramp.py and EpicsBackend rf.mode='delta_ramp': controller presets,
+control/status readback, MHz->Hz conversion, frequency verification, restoration
+of active frequency/control state on scan exit and failed preset. The linked
+LN/DR/water action remains owned by the existing ramp controller. Only controller
+commands and optional DR_read.PROC are issued, never FREQUENCY:*_write or water
+setpoints. The GUI's span is total B-A: default 2 kHz yields -1,+1 kHz. Unsupported
+half-kHz presets are rejected before writes. +/-5 kHz GUI offset bounds remain.
+When restoring OFF, the selected inactive preset button is not overwritten;
+active frequency and control state are restored and checked.
+
+SysID verifies switch readback, but the inspected code does not establish a
+physical frequency/beam settling time. timeout_s=10 is a software deadline;
+settle_s and tolerance_hz remain unset in the hardware profile pending an
+operational value. They are not inferred from ca_pend_io timeout values.
+
+Magnet current limits
+--------------------
+/home/motokisato/Projects/op-base261019/magnet/Qt/Library/MagnetLibrary/
+  magnet.cpp:157-160 and magnet.h:129-130:
+    <EPICS device>:parameter.A = LOWER current limit
+    <EPICS device>:parameter.B = UPPER current limit
+This is the exact spelling/order; neither '.paraemterA' nor A=upper is correct.
+Device bases are taken from configured PVs (e.g. SD1R_1, not guessed from the
+lattice label). Profile entries now carry lower_limit_pv/upper_limit_pv.
+Limits are read per device before response acquisition and again before writes.
+Corrector range is their intersection with [-5,+5] A. Skew uses its own supply
+limits. NaN, reversed limits or missing members of a configured pair are errors.
+The response solver now accepts per-actuator asymmetric bounds.
+
+TBT positions, acquisition and beta calibration
+---------------------------------------------
+/home/motokisato/Projects/op-base/monitor/TBT/Turn1024/turn1024.cpp:
+  lines 44-58: bpmNN.PROC, WPSH, WPSV, WINT (NN=01..96).
+  lines 129-140: bpm:crate1.MODE='One-shot', one-second wait,
+                drbpm:shot:mode set to 1 if needed.
+  lines 205-212: bpm:crate1.TURN=start turn; bpm:crate1.SNAP=1.
+  lines 294-305: process each BPM, read 1024 WINT/WPSH/WPSV samples,
+                ca_pend_io(1.0) after requests.
+  destructor: Repetitive 3 Hz, shot mode 0, turn 1, external COD reset script.
+  line 63 says 'Need to add Hand shake func'. No robust acquisition-generation
+  or all-BPM completion handshake was established from this implementation.
+triggerthread.cpp subscribes to TBT:TUNE:H updates; this does not by itself prove
+that all 96 waveforms belong to the same new shot.
+The new GUI continues to consume acquired live waveforms/file inputs; it does
+not claim to have reproduced a validated fresh-shot trigger handshake.
+
+TBTtoBETA_calc_JFY2024.py (also same coefficients in Turn1024_64bit copy):
+  line 119: 96-element BPM_s_list, in m.
+  lines 366-385: PyNAFF result amplitude is multiplied by 2.
+  lines 474, 523, 526:
+    beta_x [m] = 0.00010108 * amplitude_x [um]^2
+    beta_y [m] = 0.00021257 * amplitude_y [um]^2
+  lines 590/613/640: position and amplitude axes labelled um.
+calc_facBETAmemo.txt fits amplitude-squared [um^2] to reference beta [m] and
+compares against quadrupole-modulation measurements.
+These are historical excitation-dependent calibration constants, not universal
+beta normalization. Profile records them and converts raw um to mm by 0.001,
+but does not automatically apply them to different excitation/amplitude fits.
+The GUI retains relative beta or explicitly supplied independent calibration.
+
+BPM name/position cross-check
+----------------------------
+The existing Python live interface selects MB1R..MB98R except MB20R/MB75R.
+op-base261019/beam/OperationLibrary/bpm_array_no.h defines numerical slots
+MB1R=0 through MB98R=97; that header alone does not define which are operational.
+The local ATF_DR_twiss_file.tws contains MB1R..MB96R (plus other monitors) and
+does not contain MB97R/MB98R. TBT's old s list matches MB1R..MB96R in order to
+within 1.008 mm. This is evidence for a nominal geometric mapping, not proof of
+the current live channel wiring. The two live names cannot be assigned invented
+s coordinates. forms/bpm_mapping_audit.json records all 96 comparisons and the
+four-name discrepancy. Existing live mapping is unchanged; profile confirmation
+and longitudinal positions remain incomplete.
+
+SR/SR2 optics sources and missing external files
+----------------------------------------------
+Found locally:
+  /home/motokisato/Projects/sad/operation/lib/dispersion.n:173
+    FitDispersionAtSr fits measured dispersion around SR; SR and SR2 are at
+    LINE[Position,"BH1R.27"]+0.27 and +0.9 (SAD fractional element positions,
+    not unconditional 0.27/0.9 metre offsets).
+  /home/motokisato/Projects/sad/operation/atfdrex.sad:577
+    bpmaroundsr={"M.64","M.65","M.66"}; calls FitDispersionAtSr.
+  /home/motokisato/Projects/sad/operation/sr_betafit.sad:6,62-64
+    reads ringdaihonnew.sad and LoadRingOpticsNew["SR_Betafit"].
+  /home/motokisato/Projects/sad/operation/lib/atfringlib-new.n:390
+    loads ./ringoptics/<name> and its qfv/qmv/sxtv/sthv/stvv/bendv/cavv settings.
+  /home/motokisato/Projects/sad/operation/ringoptics/
+    SR_Betafit_20241022, _20241101, _20241112, _20251120 are present.
+    The unversioned SR_Betafit named by sr_betafit.sad is absent in this copy;
+    the dated files are candidates, not automatically the active optics.
+
+The Turn1024 GUI also refers to external paths:
+  /userhome/abe/SAD/ATF/ATF-DR/SRfit_Okugi/
+    sr_betafit_deriveXSRbeta_OP.sad
+    calc-beta-nbpm_OP.sad / calc-beta-nbpm.sad
+These specific files were not found under local op-base, op-base261019 or sad.
+Their invocation exists in op-base, but the called model/code is not bundled.
+
+Verification
+------------
+Offline suite: 26 tests passed, including five added tests for live-limit PV
+ordering/dynamic changes, RAMP routing, unsupported step rejection, scan-state
+restoration and failed-preset rollback. All EPICS access used fake clients.
+Existing demo/GUI correction tests also passed with per-magnet limit arrays.
+No expensive particle tracking or new emittance campaign was run for this audit.

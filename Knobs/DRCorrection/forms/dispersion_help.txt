@@ -1,0 +1,37 @@
+8. In SAD - ORBIT/DISPERSION CORRECTION window, put numbers in
+   'Frequency Change' and 'Momentum Compaction', 'Tune (H)' and 'Tune (V)'.
+   (To measure tunes everytime you change magnet setting is reccomended.)
+   Select H or V (to select both is not recomended, may cause error)
+   Put number if steers to be used.(60, if you use all steers.)
+3. Increase RF freq. and take another Orbit data using BPM window.
+7. Select 'FILE B' and '-FILE A' and click 'To SAD Buffer1'
+5. Open SAD - DISPERSION CORRECTION - OPEN MENU BPM DATA to SAD
+1. Take orbit data using BPM window.
+   (EXEC. Average Store Orbit into Memory)
+2. Store the data in a file. (SAVE TO FILE) Let's call this file_1.
+9. Click 'CALC'
+   The calculation may take a few min.
+   The measured dispersion (plot) and fitted dispersion will be seen on a display.
+Followinf is an old comment. 'Tolerance' will be ignored now.
+What is 'Torerance' in OnlineDispersion Correction
+11. 'Reset' will make the steers as before the last 'SET' click.
+   (NOTE: If you click 'SET' twice, the original setting is lost.)
+7.2. Select 'STANDARD' and 'copy' and click 'To SAD Buffer2'
+6. Chose file_1 as STANDARD, file_2 as 'FILE A' and file_3 as 'FILE_B'
+Online Dispersion Correction
+                                1998.10.30 2005.10.18 changed K.KUBO
+3b. 4b. Decreas RF freq. and take another orbit data. Save to file_3.
+10. Click 'SET' to set the result of the steering.
+Recomended:
+  'Tolerance' should be resolution of BPMs /Change of energy ration.
+  (2e-3 ~ 1e-2 ???)
+In Dispersion correction, SAD try to fit dispersion to the BPM data using steers.
+SAD will stop the fitting when the difference between the calculation and
+the BPM data become less than the 'Tolerance' for all BPMs.
+Unit of 'Tolerance' is meter.
+If you give too small Tolerance, SAD may not be able to find solution
+and may give a strange answer.
+ ( You can see the data in the SAD Buffer in BPM window.)
+ ( You can select BPMs to be used from SAD - DISPERSION CORRECTION -
+    OPEN MENU BPM DATA to SAD - OPEN MENU BPM SELECTION before the click)
+4. Store the data in a file. (SAVE TO FILE) Let's call this file_2.

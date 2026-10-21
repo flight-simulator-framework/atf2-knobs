@@ -1,0 +1,25 @@
+Online skew Correction
+                              2001.1.28, 200510.18 changed K.KUBO
+1. Select two Horizontal steers. Phase advance between should be about pi/2 + 2 pi.
+2. Reduce one of the steers as much as it does not affect the beam stored current,
+    then take Orbit data using BPM window.
+3. Store the data in a file. (SAVE TO FILE) Let's call this file_1.
+4. Increase the current of the steer as much as it does not affect the stored current,
+    then take orbit data.
+5. Store data in a file. (file_2)
+7. Same thing (from 2 to 6) for the othre steer. Save data as file_3 and file_4.
+5.. Open SAD Calc - skew CORRECTION - OPEN MENU BPM DATA to SAD
+6. Chose file_1 as 'STANDERD', file_2 'FILEA'
+7. Select '-FILE A' and 'STANDERD' and click 'To SAD1 Buffer'
+8. Chose file_3 as 'STANDERD', file_4 'FILEB'
+9. Select '-FILEB' and 'STANDERD' and click 'To SAD2 Buffer'
+   (You can see the data int the SAD Buffer in BPM window.)
+   (You can select BPMs to be used or unused from SAD - skew CORRECTION -
+   OPEN MENU BPM DATA to SAD - OPEN MENU BPM SELECTION before the click)
+8. Input names of steers and changed current of them in DR SKEW CORRECTIOn window
+9. Select SD1R.* or SF1R.* to be used. (to select both in not recomended, may cause error)
+9. Click 'CALC'
+   The calculation may take a few min.
+10. Click 'SET' to set the result of the steering.
+11. 'Reset' will make the steers as before the lase 'SET' click.
+   (NOTE: If you click 'SET' twice, the original setting is lost.)
