@@ -3,7 +3,7 @@ DRTuning — RFTrack / machine interface launcher
 
 Start from flight-simulator-framework:
 
-  PYTHONPATH=atf2-knobs /home/motokisato/rftrack-env/bin/python -m Knobs.DRTuning
+  PYTHONPATH=atf2-knobs python -m Knobs.DRTuning
 
 Or launch Knobs/GUIs/DRTuning_GUI.py directly with the same Python interpreter.
 After package installation, the DRTuning GUI entry point is also available.
@@ -18,8 +18,12 @@ individual trims use the existing mag_ki_main calibration and simulated +/-2 A
 limits. Correctors retain the existing calibration and +/-5 A current bounds.
 This is a diagnostics port validation environment, not a new emittance result.
 
-Machine (EPICS): load a completed hardware_profile JSON. Only explicitly mapped
-quadrupoles are enabled. Existing COD/dispersion/skew profile checks still apply.
+Machine (EPICS): select 実機 (EPICS), then Connect / initialize. With the profile
+field empty, hardware_profile.default.json is loaded automatically from this
+package. No JSON selection or user-specific path is needed. Initialization loads
+configuration only; individual measurements check their PV connections.
+The optional profile picker REPLACES the defaults with a complete site JSON.
+An invalid override is reported, never silently replaced by the defaults.
 Stored DR (200 ms): retains the previous fast stored-beam corrections/TBT adapter;
 this optional backend does not yet expose quadrupole trims. It is NOT RFTrack.
 DEMO: synthetic correction/TBT data for UI checks, not quadrupole commissioning.
@@ -125,12 +129,33 @@ unchecking Acquire new shot.
 
 Calibration files and remaining site configuration
 -------------------------------------------------
+hardware_profile.default.json bundles the existing interface/op-base convention:
+96 COD BPMs (MB1R..MB98R except 20/75), the interface's 47 horizontal and 50
+vertical correctors, 34 SD and 34 SF supplies, 100 quadrupole trims, TuneDR and
+Turn1024 PVs. Current limits are read from parameter.A/B at use time, with the
+additional +/-5 A corrector limit. Q modulation uses prog_beta_calc's main-coil
+internalCurrentWrite reference, including QM7R.1 -> QM7AR. This source-based
+configuration has not been commissioned against live hardware here.
+
+The default RF/quad settling delays are 5 s; RF tolerance is 100 Hz and timeout
+30 s. These are configurable software defaults, not measured machine response
+times. RF uses the linked DeltaFRamp controller and MHz readback conversion.
+Missing horizontal dispersion targets or live phase/SR optics are requested by
+their respective analyses; they do not block startup or unrelated tools.
+
+MB97R/MB98R longitudinal positions are not present in the bundled nominal
+lattice. They stay null (allow_missing_positions=true); COD plots then use a
+labelled BPM-index axis. Measured response corrections do not need s positions.
+TBT keeps its separate legacy 96-channel nominal geometry. No physical position
+is invented and no COD/TBT channel is silently relabelled.
+
 hardware_profile.example.json provides candidate device names but deliberately
 keeps operational mapping/settling values unconfirmed. Confirm only the supplies
 you use; unconfigured quads do not prevent unrelated correction tools from use.
-DR:monitors is acknowledged to include slots through 98. The old COD enabled
-list (20/75 omitted) and TBT-96 mapping remain separate; waveform capacity alone
-does not identify physical channels. No automatic rewriting of real mappings.
+DR:monitors includes slots through 98. The existing COD enabled list (20/75
+omitted) and TBT-96 mapping remain separate in both profiles; waveform capacity
+alone does not identify physical channels. The source conventions above are
+used as defaults, without inventing a correspondence between these two lists.
 
 Live phase beta needs a current public transport model in dr-phase-optics-1
 format: source string, planes.x/y lists of {names:[i,j,k], m11_m12:[a,b],

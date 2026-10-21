@@ -318,7 +318,12 @@ def profile_issues(p):
     if len(set(all_magnets))!=len(all_magnets):issues.append('Overlapping actuator families')
     for label,value in [('positions_m',p.get('positions_m'))]+[(f'target_dispersion_mm.{axis}',p.get('target_dispersion_mm',{}).get(axis)) for axis in ('x','y')]:
         if label.endswith('.x') and value is None:continue  # can be loaded before horizontal CALC
-        try:ok=np.shape(value)==(n,) and np.isfinite(np.asarray(value,float)).all()
+        try:
+            if label=='positions_m' and p.get('allow_missing_positions'):
+                # Missing geometry does not invalidate a measured BPM response.
+                # Keep missing s as null/NaN; plotting uses an explicit index axis.
+                ok=np.shape(value)==(n,) and all(v is None or np.isfinite(float(v)) for v in value)
+            else:ok=np.shape(value)==(n,) and np.isfinite(np.asarray(value,float)).all()
         except (TypeError,ValueError):ok=False
         if not ok:issues.append('Invalid '+label+' array')
     if any(not all(p.get('actuators',{}).get(n,{}).get(k) for k in ('lower_limit_pv','upper_limit_pv')) for n in p.get('skews',[])):

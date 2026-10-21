@@ -10,6 +10,7 @@ from Knobs.DRCorrection.backends import DemoBackend,StoredBackend
 from Knobs.DRCorrection.core import serial
 from .qmod_gui import QModPanel,HERE,FAMILIES
 from .optics import phase_beta
+from .hardware import load_hardware_profile
 
 
 class TuningTBTPanel(TBTPanel):
@@ -209,8 +210,8 @@ class DRTuningWindow(QMainWindow):
         self.interface=QComboBox();self.interface.addItems(['RFTrack','実機 (EPICS)','Stored DR (200 ms)','DEMO']);form.addWidget(self.interface)
         self.connect_button=QPushButton('Connect / initialize');self.connect_button.clicked.connect(self.connect_backend);form.addWidget(self.connect_button)
         self.disconnect_button=QPushButton('Disconnect');self.disconnect_button.clicked.connect(self.disconnect);form.addWidget(self.disconnect_button)
-        self.profile=QLineEdit();self.profile.setPlaceholderText('実機用 hardware profile JSON');layout.addWidget(self.profile)
-        browse=QPushButton('Select hardware profile');browse.clicked.connect(self.browse);layout.addWidget(browse)
+        self.profile=QLineEdit();self.profile.setPlaceholderText('空欄：ATF実機の標準設定を使用');layout.addWidget(self.profile)
+        browse=QPushButton('別の実機設定を選択（任意）');browse.clicked.connect(self.browse);layout.addWidget(browse)
         self.directory=QLineEdit('/tmp/drtuning-session');layout.addWidget(self.directory)
         self.status=QLabel('Interfaceを選択して初期化してください。');self.status.setWordWrap(True);layout.addWidget(self.status)
         self.buttons=QWidget();grid=QGridLayout(self.buttons);layout.addWidget(self.buttons);self.buttons.setEnabled(False)
@@ -234,8 +235,7 @@ class DRTuningWindow(QMainWindow):
                 return RFTrackBackend()
             if selection.startswith('実機'):
                 from .epics import LiveBackend
-                if not profile:raise ValueError('Select the confirmed hardware profile JSON')
-                return LiveBackend(json.loads(Path(profile).read_text()))
+                return LiveBackend(load_hardware_profile(profile))
             if selection.startswith('Stored'):return StoredBackend(Path(directory))
             return DemoBackend()
         self.task=Task(initialize);self.task.result.connect(self.connected);self.task.failure.connect(self.failed);self.task.start()
@@ -244,6 +244,9 @@ class DRTuningWindow(QMainWindow):
         except Exception as e:
             backend.close();self.failed(str(e));return
         self.session.owned_by_launcher=True;self.buttons.setEnabled(True);self.status.setText(backend.label)
+        if self.interface.currentText().startswith('実機'):
+            source=self.profile.text().strip() or 'ATF実機の標準設定'
+            self.status.setText('初期化済み：'+source+'（PV接続は各測定時に確認）')
     def failed(self,error):
         self.status.setText(error);self.connect_button.setEnabled(True);self.interface.setEnabled(True)
     def open_tool(self,key):

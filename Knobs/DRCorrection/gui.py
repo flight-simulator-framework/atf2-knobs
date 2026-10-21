@@ -44,7 +44,10 @@ class Plot(QWidget):
         # Keep the original X-above-Y convention, adding the joint COD fit
         # beside the dispersion panels instead of squeezing four rows.
         axes=self.figure.subplots(2,2).T.ravel() if count==4 else self.figure.subplots(count,1,squeeze=False).ravel()
-        s=np.asarray(data['positions_m']);order=np.argsort(s)
+        s=np.asarray(data['positions_m'],float)
+        known=np.isfinite(s).all()
+        if not known:s=np.arange(1,len(data['names'])+1)
+        order=np.argsort(s)
         valid=np.asarray(data['valid'],bool)
         for row,(ax,label) in enumerate(zip(axes,labels)):
             y=np.asarray(data[prefix+'measured'])[row];ax.scatter(s[valid],y[valid],s=14,c='black',label='Measured')
@@ -53,7 +56,7 @@ class Plot(QWidget):
                 if prefix+key in data:ax.plot(s[order],np.asarray(data[prefix+key])[row][order],style,color=color,label=title)
             unit='mm / (dp/p)' if label.startswith('Dispersion') else 'mm'
             ylabel={'Dispersion X':'ηx [mm]','Dispersion Y':'ηy [mm]'}.get(label,f'{label} [{unit}]')
-            ax.set(xlabel='s [m]',ylabel=ylabel)
+            ax.set(xlabel='s [m]' if known else 'BPM index (measurement order)',ylabel=ylabel)
             ax.grid(alpha=.2);ax.tick_params(labelsize=8);ax.xaxis.label.set_size(9);ax.yaxis.label.set_size(9)
         handles,titles=axes[0].get_legend_handles_labels()
         self.figure.legend(handles,titles,loc='upper center',bbox_to_anchor=(.55,.95),ncol=2,fontsize=8)
@@ -320,7 +323,9 @@ class TBTPanel(QWidget):
         axes[0,1].plot(np.fft.rfftfreq(len(values)),spectrum);axes[0,1].set(xlabel='Fractional tune',ylabel='FFT amplitude')
         if self.estimate:
             nominal=dict(zip(self.window.backend.bpm_names,self.window.backend.positions_m))
-            known=all(n in nominal for n in self.wave['names'])
+            tbt_profile=getattr(self.window.backend,'profile',{}).get('tbt',{})
+            nominal.update(zip(tbt_profile.get('names') or [],tbt_profile.get('positions_m') or []))
+            known=all(n in nominal and nominal[n] is not None and np.isfinite(nominal[n]) for n in self.wave['names'])
             positions=[nominal[n] for n in self.wave['names']] if known else list(range(len(self.wave['names'])))
             absolute=False
             for plane,color in [('x','black'),('y','red')]:

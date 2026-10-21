@@ -140,6 +140,94 @@ class GuiTests(unittest.TestCase):
             self.assertTrue(window.interface.isEnabled())
         finally:window.close()
 
+    def test_live_launcher_uses_default_without_file_picker_or_pv_access(self):
+        from unittest.mock import patch
+        from Knobs.DRTuning.gui import DRTuningWindow
+        from Knobs.DRTuning.epics import LiveBackend
+        from Knobs.DRTuning.hardware import load_hardware_profile
+        class NoIO:
+            def __getattr__(self,name):raise AssertionError('Unexpected EPICS access: '+name)
+        captured=[]
+        def offline_backend(profile):
+            captured.append(profile)
+            return LiveBackend(profile,client=NoIO())
+        window=DRTuningWindow();window.interface.setCurrentText('実機 (EPICS)')
+        try:
+            with patch('Knobs.DRTuning.epics.LiveBackend',side_effect=offline_backend):
+                window.connect_backend();self.wait(window)
+                self.assertIsNotNone(window.session,window.status.text())
+                self.assertEqual(captured[-1],load_hardware_profile())
+                self.assertIn('標準設定',window.status.text())
+                self.assertEqual(len(window.session.backend.quadrupoles),100)
+                self.assertTrue(window.disconnect())
+                with tempfile.TemporaryDirectory() as temp:
+                    custom=load_hardware_profile();custom['machine_id']='custom-test'
+                    path=Path(temp)/'site.json';path.write_text(json.dumps(custom))
+                    window.profile.setText(str(path));window.connect_backend();self.wait(window)
+                    self.assertIsNotNone(window.session,window.status.text())
+                    self.assertEqual(window.session.backend.identity,'epics:custom-test')
+        finally:window.close()
+
+    def test_correction_plot_labels_missing_geometry_as_index(self):
+        from Knobs.DRCorrection.gui import Plot
+        plot=Plot()
+        data=dict(mode='orbit',source='test',names=['MB96R','MB98R'],positions_m=[137.,None],
+                  valid=[True,True],signal_labels=['COD'],measured=[[.1,.2]],target=[[0.,0.]])
+        try:
+            plot.correction(data)
+            self.assertEqual(plot.figure.axes[0].get_xlabel(),'BPM index (measurement order)')
+            np.testing.assert_equal(plot.figure.axes[0].collections[0].get_offsets()[:,0],[1,2])
+            self.assertIsNone(data['positions_m'][1])
+        finally:plot.close()
+
+
+class HardwareDefaultsTests(unittest.TestCase):
+    def test_default_reads_full_98_slot_waveform_and_uses_live_limits(self):
+        from Knobs.DRTuning.hardware import load_hardware_profile
+        from Knobs.DRTuning.epics import LiveBackend
+        p=load_hardware_profile();raw=np.zeros((98,10));columns=p['orbit']['columns']
+        raw[:,columns['x']]=np.arange(1,99)*1000.
+        raw[:,columns['status']]=p['orbit']['valid_status'];raw[:,columns['tmit']]=1.
+        values={p['orbit']['packed_pv']:raw.ravel(),p['orbit']['mode_read']:p['orbit']['required_mode']}
+        for n in ['ZH1R','SD1R.1']:
+            values[p['actuators'][n]['lower_limit_pv']]=-8.
+            values[p['actuators'][n]['upper_limit_pv']]=7.
+        class ReadOnly:
+            def caget(self,pv,**kwargs):return values[pv]
+            def caput(self,*args,**kwargs):raise AssertionError('Unexpected write')
+        b=LiveBackend(p,client=ReadOnly());r=b.orbit()
+        self.assertEqual(r['names'][-2:],['MB97R','MB98R'])
+        np.testing.assert_equal(r['x'][-2:],[97.,98.])
+        np.testing.assert_equal(b.limits('correctors',['ZH1R']),[[-5.],[5.]])
+        np.testing.assert_equal(b.limits('skews',['SD1R.1']),[[-8.],[7.]])
+
+    def test_default_mapping_limits_and_missing_geometry(self):
+        from Knobs.DRTuning.hardware import load_hardware_profile
+        from Knobs.DRCorrection.backends import profile_issues
+        p=load_hardware_profile()
+        self.assertEqual(profile_issues(p),[])
+        self.assertEqual(p['bpm_names'][-2:],['MB97R','MB98R'])
+        self.assertEqual(p['orbit']['row_indices'][-2:],[96,97])
+        self.assertEqual(p['positions_m'][-2:],[None,None])
+        self.assertEqual(p['tbt']['names'][19],'MB20R')
+        self.assertEqual(p['tbt']['names'][-1],'MB96R')
+        self.assertEqual(p['rf']['mode'],'delta_ramp')
+        self.assertEqual(p['rf']['hz_per_unit'],1e6)
+        self.assertEqual(p['quadrupoles']['QM7R.1']['calibration']['main_current_pv'],'QM7AR:internalCurrentWrite')
+        for n,a in p['actuators'].items():
+            self.assertEqual(a['lower_limit_pv'],n.replace('.','_')+':parameter.A')
+            self.assertEqual(a['upper_limit_pv'],n.replace('.','_')+':parameter.B')
+        # Opting into missing geometry must not permit infinity or bad arrays.
+        p['positions_m'][0]=float('inf')
+        self.assertIn('Invalid positions_m array',profile_issues(p))
+
+    def test_missing_override_is_not_replaced_and_defaults_are_independent(self):
+        from Knobs.DRTuning.hardware import load_hardware_profile
+        p=load_hardware_profile();p['rf']['settle_s']=0.
+        self.assertEqual(load_hardware_profile()['rf']['settle_s'],5.)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(FileNotFoundError):load_hardware_profile(Path(temp)/'missing.json')
+
 
 class ReadbackAcquisitionTests(unittest.TestCase):
     def setUp(self):
