@@ -318,7 +318,9 @@ def profile_issues(p):
     for key in ('nominal_frequency_hz','readback_timeout_s','current_tolerance_A'):positive(key,p.get(key))
     positive('magnet_settle_s',p.get('magnet_settle_s',0.),True)
     for section,key,zero in [('orbit','mm_per_unit',False),('rf','hz_per_unit',False),('rf','settle_s',True),('rf','tolerance_hz',False)]:positive(section+'.'+key,p.get(section,{}).get(key),zero)
-    if p.get('rf',{}).get('mode')=='delta_ramp':positive('rf.timeout_s',p['rf'].get('timeout_s'))
+    if p.get('rf',{}).get('mode')=='delta_ramp':
+        positive('rf.timeout_s',p['rf'].get('timeout_s'))
+        positive('rf.enable_settle_s',p['rf'].get('enable_settle_s',1.),True)
     for key in ('bpm_names','hcorrectors','vcorrectors','skews'):
         names=p.get(key,[])
         if len(set(names))!=len(names) or any(not isinstance(v,str) or not v for v in names):issues.append('Invalid names in '+key)

@@ -203,6 +203,13 @@ configuration has not been commissioned against live hardware here.
 The default RF/quad settling delays are 5 s; RF tolerance is 100 Hz and timeout
 30 s. These are configurable software defaults, not measured machine response
 times. RF uses the linked DeltaFRamp controller and MHz readback conversion.
+On an OFF-to-ON transition, RF scans wait an additional 1 s before selecting a
+preset (rf.enable_settle_s), following op-base mOTRScanner. Already-ON scans do
+not resend CONTROL_ON_SW. Preset and physical RF readback checks still apply;
+timeouts include read-only PV diagnostics captured before restoration. This
+sequence is tested offline; it does not establish the cause of a live MI1
+timeout. OFF retains SysID's CONTROL_OFF_SW=0 convention; the recovered Qt/mOTR
+code instead writes 1, so that discrepancy still needs site verification.
 Corrector/skew operations check current convergence without an extra fixed wait
 (magnet_settle_s defaults to 0). As in SysID, correction measurements use repeated
 BPM acquisition: the live GUI defaults to BPM samples per setting = 3 and BPM

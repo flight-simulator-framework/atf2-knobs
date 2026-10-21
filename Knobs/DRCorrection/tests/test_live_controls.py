@@ -31,12 +31,67 @@ class RampClient(FakeEpics):
 
 def ramp_profile():
     p=fake_profile()
-    p['rf'].update(mode='delta_ramp',hz_per_unit=1e6,timeout_s=.1,settle_s=0.,tolerance_hz=1.,control_scheme_confirmed=True)
+    p['rf'].update(mode='delta_ramp',hz_per_unit=1e6,timeout_s=.1,settle_s=0.,enable_settle_s=0.,tolerance_hz=1.,control_scheme_confirmed=True)
     p['rf'].pop('set')
     return p
 
 
 class RecoveredControlTests(unittest.TestCase):
+    def test_enable_delay_handles_controller_not_ready_at_on_status(self):
+        for delay in (0.,1.):
+            with self.subTest(delay=delay):
+                now=[0.]
+                class ArmingClient(RampClient):
+                    ready_at=float('inf')
+                    def caput(self,pv,value,**kwargs):
+                        if pv=='RAMP:CONTROL_ON_SW':self.ready_at=now[0]+1.
+                        if pv.endswith(':ONOFF_SW') and now[0]<self.ready_at:
+                            self.calls.append((pv,value))
+                            self.values[pv]=value  # CA put succeeds, action is ignored.
+                            return 1
+                        return super().caput(pv,value,**kwargs)
+                client=ArmingClient();profile=ramp_profile()
+                if delay:profile['rf'].pop('enable_settle_s')  # Default is 1 s.
+                backend=EpicsBackend(profile,client)
+                def sleep(seconds):now[0]+=seconds
+                with patch('Knobs.DRCorrection.ramp.time.monotonic',side_effect=lambda:now[0]),patch('Knobs.DRCorrection.ramp.time.sleep',side_effect=sleep):
+                    if delay:
+                        backend.set_frequency(-1000.)
+                        self.assertAlmostEqual(client.values['rf'],713.999)
+                        backend.set_frequency(1000.)
+                        self.assertAlmostEqual(client.values['rf'],714.001)
+                        self.assertEqual(client.calls.count(('RAMP:CONTROL_ON_SW',1)),1)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError,'timeout: preset MI1') as caught:
+                            backend.set_frequency(-1000.)
+                        message=str(caught.exception)
+                        self.assertIn('before restoration:',message)
+                        self.assertIn('RAMP:MI1:ONOFF_SW=1',message)
+                        self.assertIn('RAMP:MI1:STATUS_READ=0',message)
+                        self.assertIn('RAMP:STATUS_READ=1',message)
+                        self.assertIn('rf=714.',message)
+                        self.assertEqual(client.values['RAMP:STATUS_READ'],0)
+
+    def test_rf_enable_delay_configuration_is_validated_before_writes(self):
+        for value in (-1.,float('nan'),float('inf'),'invalid'):
+            client=RampClient();profile=ramp_profile();profile['rf']['enable_settle_s']=value
+            with self.assertRaisesRegex(ValueError,'rf.enable_settle_s'):EpicsBackend(profile,client)
+            self.assertEqual(client.calls,[])
+
+    def test_failed_restoration_preserves_original_error(self):
+        client=RampClient();backend=EpicsBackend(ramp_profile(),client)
+        client.fail_once='RAMP:MI1:ONOFF_SW'
+        with patch.object(backend.ramp,'restore',side_effect=RuntimeError('restore failed')):
+            with self.assertRaisesRegex(RuntimeError,'PV write failed: RAMP:MI1:ONOFF_SW; restoration also failed: restore failed'):
+                backend.set_frequency(-1000.)
+
+    def test_diagnostics_read_failure_does_not_write_or_mask_error(self):
+        client=RampClient();backend=EpicsBackend(ramp_profile(),client)
+        with patch.object(backend.ramp,'get',side_effect=RuntimeError('disconnected')):
+            message=backend.ramp.diagnostics(('RAMP:MI1:ONOFF_SW',))
+        self.assertIn('RAMP:MI1:ONOFF_SW=unavailable (disconnected)',message)
+        self.assertEqual(client.calls,[])
+
     def test_bpm_sampling_waits_first_and_preserves_mean_spread_and_raw_data(self):
         client=FakeEpics();backend=EpicsBackend(fake_profile(),client);service=CorrectionService(backend)
         original=backend.orbit;reads=[]

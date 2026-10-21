@@ -1480,6 +1480,7 @@
     "tolerance_hz": 100.0,
     "control_scheme_confirmed": true,
     "mode": "delta_ramp",
+    "enable_settle_s": 1.0,
     "timeout_s": 30.0,
     "default_total_span_khz": 2.0,
     "read_process_pv": "FREQUENCY:DR_read.PROC"
