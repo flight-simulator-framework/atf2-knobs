@@ -124,6 +124,7 @@ class GuiTests(unittest.TestCase):
                     p.form.pushButtonCALC.click();p.save(temp)
                     self.assertTrue((Path(temp)/f'qmod_{key}.json').exists())
                     self.assertEqual(float(p.form.qelabelQMagBx_1.text()),8.)
+                    self.assertEqual(float(p.form.pushButtonQMagBx_1.text()),8.)
                 window.tbt.turns.setValue(64);window.tbt.legacy.pushButtonUpdate.click();self.wait(window)
                 window.tbt.legacy.pushButtonFFTcalc.click();window.tbt.save(temp)
                 self.assertTrue((Path(temp)/'tbt.json').exists());self.assertNotIn('ERROR:',window.messages.toPlainText())

@@ -32,10 +32,7 @@ class LiveBackend(EpicsBackend):
             from machine_interfaces_atf2.MagKi import MagKiWrapper
             library=cal.get('library')
             if library is None:
-                import sys
-                from pathlib import Path
-                sys.path.insert(0,str(Path(__file__).resolve().parents[3]/'simulation-agent'))
-                from observable.calibration import build_library
+                from .calibration import build_library
                 library=str(build_library())
             if library not in self._calibration:self._calibration[library]=MagKiWrapper(library)
             trim=cal.get('coil','main')=='trim'

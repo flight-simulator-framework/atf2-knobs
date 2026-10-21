@@ -5,7 +5,8 @@ Start from flight-simulator-framework:
 
   PYTHONPATH=atf2-knobs /home/motokisato/rftrack-env/bin/python -m Knobs.DRTuning
 
-Or launch Knobs/GUIs/DRTuning.py directly with the same Python interpreter.
+Or launch Knobs/GUIs/DRTuning_GUI.py directly with the same Python interpreter.
+After package installation, the DRTuning GUI entry point is also available.
 Select Interface, then Connect / initialize. Nothing connects to EPICS or writes
 machine settings merely by opening DRTuning. The selection is locked while a
 session is connected. Disconnect before choosing another interface.
@@ -66,7 +67,7 @@ The user accepted existing mag_ki_main calibration provisionally. library=null
 builds workspace libmagnet C sources into a content-addressed /tmp library;
 a site library can be selected explicitly. Main current and trim current are
 passed separately, including the QM7R.1 -> QM7AR special case. Optional
-field_check reads site blWrite/blWriteCalc-related values and records/comparers
+field_check reads site blWrite/blWriteCalc-related values and records/compares
 against K1L. Supply actual PV names and explicit k1l_per_unit conversion: a BL
 PV's units and main-versus-trim meaning are not guessed. A check disagreement
 aborts a scan and restores the original current.
@@ -154,7 +155,8 @@ Verification (2026-10-21)
 New offline tests cover Q-modulation physics, limits/restoration/cancellation,
 phase beta, SR beta fit, acquisition failure/staleness/torn data, live quad
 readback/field checks, original GUI controls and a shared launcher session.
-The existing DRCorrection suite is also run. No real EPICS IOC was connected.
+22 new tests and all 27 existing DRCorrection tests passed (49 total). No real
+EPICS IOC was connected.
 
   QT_QPA_PLATFORM=offscreen MPLCONFIGDIR=/tmp/mpl-dr-gui \
   OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=atf2-knobs \
@@ -173,7 +175,7 @@ QF2R.1 trim +/-0.02 A, five points, then H/V phase-beta measurements:
   relative difference              = -0.826% / -0.983%
   phase beta accepted triplets     = 91 / 91
   phase beta vs public TFS RMS     = 0.774% / 1.041%
-  all settings restored; native run wall time 31.75 s.
+  all settings restored; native run wall time 32.46 s.
 The offline reference audit uses optics solely to assess measurements. Neither
 Q-modulation nor phase-beta analysis is fed the perturbed simulator's true beta.
 This qualification covers one nominal lattice, not arbitrary coupling/errors.

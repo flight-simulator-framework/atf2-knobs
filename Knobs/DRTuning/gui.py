@@ -30,7 +30,7 @@ class TuningTBTPanel(TBTPanel):
         self.layout().insertLayout(1,row)
         actions={'pushButtonUpdate':self.acquire,'pushButtonSaveAllBPMDATA':self.save,'pushButtonCALCAveStv':self.statistics,
             'pushButtonFFTcalc':self.analyze,'pushButtonShowDRbetaPlot':self.show_plot,'pushButtonUpdateDRbetaPlot':self.draw,
-            'pushButtonShowDRTBTplot':self.show_plot,'pushButtonBetaCalcFILE':self.load,'pushButtonShowDRTBTstatusMonitor':self.status}
+            'pushButtonShowDRTBTplot':self.show_plot,'pushButtonBetaCalcFILE':self.load_and_calculate,'pushButtonShowDRTBTstatusMonitor':self.status}
         for name,action in actions.items():getattr(self.legacy,name).clicked.connect(lambda _,action=action:action())
         for name in ('pushButtoncalcFITBETA','pushButtonBETAcalcFit','pushButtoncalcFITBETA_Kubo','pushButtonBetaCalcFILE_Kubo'):
             getattr(self.legacy,name).clicked.connect(self.sr_beta)
@@ -167,6 +167,17 @@ class TuningTBTPanel(TBTPanel):
         if self.estimate is None:self.analyze()
         if self.estimate is None:return
         self.sr_dialog=SRBetaDialog(self.window,self.estimate,self.phase_result);self.sr_dialog.show()
+    def load_and_calculate(self):
+        path=self.legacy.lineEdit_Betacalc_fname.text().strip()
+        if path and Path(path).is_file():
+            try:
+                from Knobs.DRCorrection.tbt import waveform_arrays
+                data=json.loads(Path(path).read_text());wave=data.get('waveform',data.get('measurement',data));waveform_arrays(wave)
+                self.received(wave);self.analyze()
+            except Exception as e:self.window.error(str(e))
+        else:
+            previous=self.wave;self.load()
+            if self.wave is not previous:self.analyze()
     def save(self,path=None):
         if not path:path=QFileDialog.getExistingDirectory(self,'Save TBT data and figures')
         if not path:return
@@ -206,7 +217,8 @@ class DRTuningWindow(QMainWindow):
         tools=[('DR COD Correction','orbit'),('DR Dispersion Correction','dispersion'),('DR Skew Correction','skew'),
             ('Turn1024 / TBT beta','tbt'),('Beta: QF1R.1–28','qf1'),('Beta: QF2R.1–26','qf2'),
             ('Beta: QM1R–23R.1','qm1'),('Beta: QM1R–23R.2','qm2'),('BPM DATA TO SAD','buffers'),
-            ('FIX DR STEER','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr')]
+            ('FIX DR STEER','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr'),
+            ('SR / SR2 beta fit','sr_beta')]
         for i,(title,key) in enumerate(tools):
             button=QPushButton(title);button.clicked.connect(lambda _,k=key:self.open_tool(k));grid.addWidget(button,i//2,i%2)
     def browse(self):
@@ -242,6 +254,7 @@ class DRTuningWindow(QMainWindow):
         if key in s.panels:s.tabs.setCurrentWidget(s.panels[key])
         elif key in s.qmod:s.tabs.setCurrentWidget(s.qmod[key])
         elif key=='tbt':s.tabs.setCurrentWidget(s.tbt)
+        elif key=='sr_beta':s.tabs.setCurrentWidget(s.tbt);s.tbt.sr_beta()
         elif key=='sr':
             data=s.panels['dispersion'].data
             if data is None:s.tabs.setCurrentWidget(s.panels['dispersion']);s.error('Measure dispersion with CALC before SR fit')

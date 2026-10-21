@@ -13,6 +13,9 @@ dependencies = [
     "machine-interfaces>=0.2.0,<0.3",
 ]
 
+[project.gui-scripts]
+DRTuning = "Knobs.DRTuning.__main__:main"
+
 [project.optional-dependencies]
 atf2 = [
     "machine-interfaces-atf2>=0.2.0,<0.3",

@@ -3,14 +3,11 @@
 Public reads are BPM signals and magnet currents. Periodic-orbit solving is
 inside the instrument simulation; it is never used as the beta measurement.
 """
-import sys
 from pathlib import Path
 import numpy as np
 from Knobs.DRCorrection.backends import DemoBackend
 from Knobs.DRCorrection.tbt import analyze_tbt
-from .calibration import coil_k1l
-
-ROOT=Path(__file__).resolve().parents[3]
+from .calibration import coil_k1l,MagnetCalibration
 
 
 class RFTrackBackend(DemoBackend):
@@ -21,10 +18,8 @@ class RFTrackBackend(DemoBackend):
         import RF_Track as rft
         from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_lattice import build_atf_dr_lattice
         from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_correction import ATFDRRingCorrection
-        sys.path.insert(0,str(ROOT/'simulation-agent'))
-        from observable.calibration import Calibration
         rft.number_of_threads=1
-        self.cal=Calibration();self.lattice=build_atf_dr_lattice(rf_mode='disabled')
+        self.cal=MagnetCalibration();self.lattice=build_atf_dr_lattice(rf_mode='disabled')
         self.solver=ATFDRRingCorrection(self.lattice,population=1e9)
         self.identity=f'rftrack-native-dr-{seed}';self.rng=np.random.default_rng(seed)
         self.offset=0.;self.acquisitions=0;self.noise_mm=.001

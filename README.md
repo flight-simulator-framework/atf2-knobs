@@ -2,6 +2,11 @@
 
 ATF2 IPBSM optimization, beam tuning, linac optimization and controllers.
 
+DR optics tools are available through `python -m Knobs.DRTuning` (or `DRTuning`
+after installation). Select RFTrack or the configured machine interface, then
+open COD, dispersion, skew, TBT beta or quadrupole-modulation measurements from
+the shared launcher. See [DRTuning usage and validation](Knobs/DRTuning/README.txt).
+
 ## Development
 
 Development, issues and pull requests are hosted on [GitHub](https://github.com/flight-simulator-framework/atf2-knobs). The [CERN GitLab repository](https://gitlab.cern.ch/flight-simulator/atf2-knobs) receives updates from GitHub through a pull mirror.
