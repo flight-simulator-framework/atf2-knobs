@@ -1,8 +1,7 @@
-"""Original op-base five-point Q modulation layouts, with local measured data."""
+"""Resizable five-point Q modulation workspace with a selected-magnet table."""
 import json
 from pathlib import Path
 import numpy as np
-from PyQt6 import uic
 from PyQt6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QScrollArea,QPushButton,QComboBox,QLabel,QDoubleSpinBox,QInputDialog,QFileDialog
 from Knobs.DRCorrection.gui import Plot
 from Knobs.DRCorrection.core import serial
@@ -15,64 +14,81 @@ FAMILIES={'qf1':('QF1R',28),'qf2':('QF2R',26),'qm1':('QMTRIM1',23),'qm2':('QMTRI
 class QModPanel(QWidget):
     def __init__(self,window,family):
         super().__init__();self.window=window;self.family=family;self.sessions={};self.rows={};self.enabled={};self.points={}
-        self.form=uic.loadUi(str(HERE/'forms'/f'{family}.ui'));self.form.setFixedSize(self.form.size())
-        layout=QVBoxLayout(self);row=QHBoxLayout();layout.addLayout(row)
-        self.selected=QComboBox();row.addWidget(self.selected)
-        self.span=QDoubleSpinBox();self.span.setRange(.0001,2.);self.span.setDecimals(4);self.span.setValue(.02);self.span.setSuffix(' A full span');row.addWidget(self.span)
-        self.scan_button=QPushButton('Scan 5 points / restore');self.scan_button.clicked.connect(self.scan);row.addWidget(self.scan_button)
-        load=QPushButton('Load measurement');load.clicked.connect(self.load);row.addWidget(load)
-        for title,action in [('CALC',self.calculate),('SAVE',self.save)]:
-            button=QPushButton(title);button.clicked.connect(lambda _,action=action:action());row.addWidget(button)
-        self.note=QLabel('GET reads current + tune. CALC fits the selected points. Auto scan restores the current.');layout.addWidget(self.note)
-        scroll=QScrollArea();scroll.setWidget(self.form);layout.addWidget(scroll,3)
-        self.plot=Plot();layout.addWidget(self.plot,2)
+        from types import SimpleNamespace
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QTableWidget,QSplitter,QFormLayout,QTabWidget
+        from .presentation import button,group,table_style
+        self.form=SimpleNamespace()
+        layout=QVBoxLayout(self)
+        box,v=group('1. Magnet and scan range');layout.addWidget(box)
+        row=QHBoxLayout();v.addLayout(row)
+        self.selected=QComboBox();self.selected.setMinimumWidth(130);row.addWidget(QLabel('Magnet'));row.addWidget(self.selected)
+        self.span=QDoubleSpinBox();self.span.setRange(.0001,2.);self.span.setDecimals(4);self.span.setValue(.02);self.span.setSuffix(' A');row.addWidget(QLabel('Full span'));row.addWidget(self.span)
+        self.scan_button=button('Scan 5 points / restore',self.scan,True);row.addWidget(self.scan_button);row.addStretch()
+        self.note=QLabel('Scan changes the selected magnet current. Editing table values changes recorded data only.');self.note.setWordWrap(True);v.addWidget(self.note)
+        split=QSplitter();layout.addWidget(split,1)
+        self.summary=QTableWidget(0,4);self.summary.setHorizontalHeaderLabels(['Magnet','Use','βx [m]','βy [m]']);table_style(self.summary);self.summary.verticalHeader().hide()
+        split.addWidget(self.summary)
+        detail=QWidget();right=QVBoxLayout(detail);split.addWidget(detail);split.setSizes([320,750]);split.setStretchFactor(1,1)
+        self.result_tabs=QTabWidget();right.addWidget(self.result_tabs)
+        box,v=group('2. Five-point data');self.result_tabs.addTab(box,'Five-point data')
+        self.point_table=QTableWidget(5,5);self.point_table.setHorizontalHeaderLabels(['Use','Current [A]','Tune X','Tune Y','Read']);table_style(self.point_table)
+        self.point_table.setVerticalHeaderLabels([str(i) for i in range(1,6)]);self.point_table.setMinimumHeight(240);v.addWidget(self.point_table)
+        self.point_table.cellDoubleClicked.connect(self.edit_selected)
+        hint=QLabel('Double-click a value to edit it. Read captures the current and tunes.');hint.setWordWrap(True);v.addWidget(hint)
+        row=QHBoxLayout();v.addLayout(row)
+        self.form.pushButtonCALC=button('Fit beta (CALC)',self.calculate);row.addWidget(self.form.pushButtonCALC)
+        self.form.pushButtonCALC_2=button('Save results',self.save);row.addWidget(self.form.pushButtonCALC_2)
+        row.addWidget(button('Open results',self.load))
+        self.plot=Plot();self.result_tabs.addTab(self.plot,'Tune fits')
         key,count=FAMILIES[family];catalog=getattr(window.backend,'quadrupoles',{})
         names=[n for n,p in catalog.items() if p['family']==key]
-        self.selected.addItems(names)
-        for r in range(1,count+1):
-            name=names[r-1] if r<=len(names) else None;self.rows[r]=name;self.enabled[r]=bool(name)
+        for r,name in enumerate(names,1):
+            self.rows[r]=name;self.enabled[r]=True
             self.points[r]=[dict(used=True,current_A=None,tunes=[None,None]) for _ in range(5)]
-            self.widget(f'qelabelQMagName_{r}').setText(name or 'Not configured')
-            for w in self.form.findChildren(QWidget):
-                if 'QMag' in w.objectName() and w.objectName().endswith('_'+str(r)) and name is None:w.setEnabled(False)
-            self.widget(f'pushButtonQMagUse_{r}').clicked.connect(lambda _,r=r:self.toggle(r))
-            for p in range(1,6):
-                self.widget(f'qepushbuttonQMagReadBeta{p}_{r}').clicked.connect(lambda _,r=r,p=p:self.get_point(r,p-1))
-                self.widget(f'pushButtonQMagCurrUseBeta{p}_{r}').clicked.connect(lambda _,r=r,p=p:self.toggle(r,p-1))
-                for field in ('Curr','NX','NY'):
-                    self.widget(f'pushButtonQMag{field}Beta{p}_{r}').clicked.connect(lambda _,r=r,p=p,f=field:self.edit(r,p-1,f))
-            for plane in ('x','y'):
-                w=self.widget(f'pushButtonQMagB{plane}_{r}')
-                if w:w.setEnabled(False);w.setToolTip('Calculated measurement result')
-        self.form.pushButtonCALC.clicked.connect(self.calculate)
-        self.form.pushButtonCALC_2.clicked.connect(self.save)
+        self.summary.setRowCount(len(names));self.selected.addItems(names)
+        self.selected.currentIndexChanged.connect(self.select_magnet)
+        self.summary.cellClicked.connect(lambda r,c:self.selected.setCurrentIndex(r))
+        self.scan_button.setEnabled(bool(names))
+        if not names:self.note.setText('No quadrupole trims are configured for this interface.')
         self.refresh()
-    def widget(self,name):return self.form.findChild(QWidget,name)
+    def selected_row(self):return self.selected.currentIndex()+1
+    def edit_selected(self,row,column):
+        if self.selected_row() not in self.rows:return
+        field={1:'Curr',2:'NX',3:'NY'}.get(column)
+        if field:self.edit(self.selected_row(),row,field)
+    def select_magnet(self,*_):
+        self.refresh()
+        result=self.sessions.get(self.selected.currentText())
+        if result:self.draw(result)
+        else:self.plot.figure.clear();self.plot.canvas.draw_idle()
     def refresh(self):
+        from PyQt6.QtWidgets import QTableWidgetItem
+        from .presentation import button
         for r,name in self.rows.items():
-            self.widget(f'qelabelQMagUse_{r}').setText('USE' if self.enabled[r] else 'OFF')
-            self.widget(f'pushButtonQMagUse_{r}').setText('USE' if self.enabled[r] else 'OFF')
-            for p,point in enumerate(self.points[r],1):
-                self.widget(f'qelabelQMagCurrUseBeta{p}_{r}').setText('USE' if point['used'] else 'OFF')
-                self.widget(f'pushButtonQMagCurrUseBeta{p}_{r}').setText('USE' if point['used'] else 'OFF')
-                for field,value in [('Curr',point['current_A']),('NX',point['tunes'][0]),('NY',point['tunes'][1])]:
-                    self.widget(f'qelabelQMag{field}Beta{p}_{r}').setText('—' if value is None else f'{value:.7g}')
-                    self.widget(f'pushButtonQMag{field}Beta{p}_{r}').setText('—' if value is None else f'{value:.5g}')
+            self.summary.setItem(r-1,0,QTableWidgetItem(name))
+            self.summary.setCellWidget(r-1,1,button('USE' if self.enabled[r] else 'OFF',lambda r=r:self.toggle(r)))
             result=self.sessions.get(name)
-            for i,plane in enumerate(('x','y')):
-                self.widget(f'qelabelQMagB{plane}_{r}').setText('—' if result is None else f"{result['fit']['beta_m'][i]:.5g}")
-                self.widget(f'pushButtonQMagB{plane}_{r}').setText('—' if result is None else f"{result['fit']['beta_m'][i]:.4g}")
+            for i in range(2):self.summary.setItem(r-1,i+2,QTableWidgetItem('—' if result is None else f"{result['fit']['beta_m'][i]:.5g}"))
+        r=self.selected_row()
+        if r not in self.rows:return
+        self.summary.selectRow(r-1)
+        for i,point in enumerate(self.points[r]):
+            self.point_table.setCellWidget(i,0,button('USE' if point['used'] else 'OFF',lambda r=r,i=i:self.toggle(r,i)))
+            for col,value in enumerate([point['current_A'],*point['tunes']],1):
+                self.point_table.setItem(i,col,QTableWidgetItem('—' if value is None else f'{value:.7g}'))
+            self.point_table.setCellWidget(i,4,button('Read',lambda r=r,i=i:self.get_point(r,i)))
     def toggle(self,r,p=None):
         if p is None:self.enabled[r]=not self.enabled[r]
         else:self.points[r][p]['used']=not self.points[r][p]['used']
-        self.sessions.pop(self.rows[r],None);self.refresh()
+        self.sessions.pop(self.rows[r],None);self.select_magnet()
     def edit(self,r,p,field):
         point=self.points[r][p];old=point['current_A'] if field=='Curr' else point['tunes'][int(field=='NY')]
         value,ok=QInputDialog.getDouble(self,'Edit measured '+field,'Recorded value (does not write magnet)',old or 0.,-10000,10000,8)
         if ok:
             if field=='Curr':point['current_A']=value
             else:point['tunes'][int(field=='NY')]=value
-            point.pop('k1l',None);self.sessions.pop(self.rows[r],None);self.refresh()
+            point.pop('k1l',None);self.sessions.pop(self.rows[r],None);self.select_magnet()
     def get_point(self,r,p):
         name=self.rows[r];b=self.window.backend
         def action(_):
@@ -91,10 +107,12 @@ class QModPanel(QWidget):
     def received(self,result):
         name=result['name'];self.sessions[name]=result
         r=next(r for r,n in self.rows.items() if n==name)
-        self.points[r]=[dict(v,used=True) for v in result['rows']];self.refresh();self.draw(result)
+        self.points[r]=[dict(v,used=True) for v in result['rows']];self.selected.setCurrentText(name);self.refresh();self.draw(result)
         if any(v.get('measurement',{}).get('same_shot_verified') is False for v in result['rows']):
             self.note.setText('Readback updates checked; common hardware shot ID unavailable. This qualification is saved with the result.')
     def calculate(self):
+        if not any(p['current_A'] is not None for points in self.points.values() for p in points):
+            self.window.error('Read, scan or load measurement points before fitting beta');return
         for r,name in self.rows.items():
             if not self.enabled[r] or not name:continue
             points=self.points[r]
@@ -117,6 +135,7 @@ class QModPanel(QWidget):
             ax.set(xlabel='K1L [1/m]',ylabel='Tune '+('X' if i==0 else 'Y'),title=f"β = {fit['beta_m'][i]:.4g} m")
         self.plot.canvas.draw_idle()
     def save(self,path=None):
+        if not self.sessions:self.window.error('Calculate or load beta results before saving');return
         if not path:path=QFileDialog.getExistingDirectory(self,'Save Q modulation data / figures')
         if not path:return
         root=Path(path);root.mkdir(parents=True,exist_ok=True)

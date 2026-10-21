@@ -123,11 +123,67 @@ class GuiTests(unittest.TestCase):
                     self.assertEqual(len(p.sessions),1,window.messages.toPlainText())
                     p.form.pushButtonCALC.click();p.save(temp)
                     self.assertTrue((Path(temp)/f'qmod_{key}.json').exists())
-                    self.assertEqual(float(p.form.qelabelQMagBx_1.text()),8.)
-                    self.assertEqual(float(p.form.pushButtonQMagBx_1.text()),8.)
+                    self.assertEqual(float(p.summary.item(0,2).text()),8.)
+                    self.assertEqual(p.point_table.rowCount(),5)
                 window.tbt.turns.setValue(64);window.tbt.legacy.pushButtonUpdate.click();self.wait(window)
                 window.tbt.legacy.pushButtonFFTcalc.click();window.tbt.save(temp)
                 self.assertTrue((Path(temp)/'tbt.json').exists());self.assertNotIn('ERROR:',window.messages.toPlainText())
+        finally:window.close()
+    def test_update_shows_failure_then_success_and_is_read_only_by_default(self):
+        from Knobs.DRTuning.gui import TuningSession
+        class Backend(DemoBackend):
+            label='EPICS test'
+            fail=True
+            def read_tbt(self,turns,*,cancel=None,progress=lambda *_:None):
+                progress(0,'bpm01.WPSH (1/288)')
+                if self.fail:raise RuntimeError('bpm01.WPSH: disconnected')
+                return self.tbt(turns)
+            def tbt_acquire(self,*args,**kwargs):raise AssertionError('Unexpected fresh trigger')
+        backend=Backend();window=TuningSession(backend);window.show();window.tabs.setCurrentWidget(window.tbt)
+        try:
+            self.assertFalse(window.tbt.fresh.isChecked())
+            window.tbt.update_button.click();self.wait(window)
+            self.assertIn('bpm01.WPSH',window.operation_status.text())
+            self.assertIn('Failed',window.tbt.acquisition_status.text())
+            self.assertTrue(window.log_toggle.isChecked());self.assertFalse(window.cancel_button.isEnabled())
+            backend.fail=False;window.tbt.turns.setValue(64);window.tbt.update_button.click();self.wait(window)
+            self.assertIn('complete',window.operation_status.text());self.assertIn('64 turns',window.tbt.acquisition_status.text())
+            self.assertTrue(window.tabs.isEnabled());self.assertEqual(len(window.tbt.plot.figure.axes),1)
+        finally:window.close()
+
+    def test_update_cancel_is_responsive_and_keeps_previous_waveform(self):
+        from Knobs.DRTuning.gui import TuningSession
+        class Backend(DemoBackend):
+            label='EPICS test'
+            def read_tbt(self,turns,*,cancel=None,progress=lambda *_:None):
+                progress(5,'bpm02.WPSH')
+                if not cancel.wait(5):raise AssertionError('Cancel was not delivered')
+                raise RuntimeError('TBT read cancelled')
+        b=Backend();window=TuningSession(b);window.show();window.tabs.setCurrentWidget(window.tbt)
+        try:
+            wave=b.tbt(32);window.tbt.received(wave);window.tbt.update_button.click()
+            self.app.processEvents();self.assertTrue(window.cancel_button.isEnabled());self.assertFalse(window.tabs.isEnabled())
+            window.cancel_button.click();self.wait(window)
+            self.assertIs(window.tbt.wave,wave);self.assertIn('cancelled',window.operation_status.text())
+            self.assertTrue(window.tabs.isEnabled())
+        finally:
+            window.service.cancel.set();self.wait(window);window.close()
+
+    def test_redesigned_corrections_measure_apply_restore_and_small_window(self):
+        from Knobs.DRTuning.gui import TuningSession
+        window=TuningSession(DemoBackend());window.resize(1024,768);window.show();self.app.processEvents()
+        try:
+            self.assertLessEqual(window.width(),1024);self.assertLessEqual(window.height(),768)
+            baseline=window.backend.snapshot()
+            for mode,panel in window.panels.items():
+                window.tabs.setCurrentWidget(panel)
+                prefix='pushButtonDispersion' if mode=='dispersion' else 'pushButton'
+                getattr(panel.form,prefix+'Calc').click();self.wait(window)
+                self.assertIsNotNone(panel.data,window.messages.toPlainText())
+                getattr(panel.form,prefix+'Set').click();self.wait(window);self.assertTrue(panel.data['applied'])
+                getattr(panel.form,prefix+'Reset').click();self.wait(window)
+                self.assertEqual(window.backend.snapshot(),baseline)
+                self.assertNotIn('Failed',window.operation_status.text())
         finally:window.close()
     def test_launcher_keeps_one_interface_and_switches_tools(self):
         from Knobs.DRTuning.gui import DRTuningWindow
@@ -151,13 +207,13 @@ class GuiTests(unittest.TestCase):
         def offline_backend(profile):
             captured.append(profile)
             return LiveBackend(profile,client=NoIO())
-        window=DRTuningWindow();window.interface.setCurrentText('実機 (EPICS)')
+        window=DRTuningWindow();window.interface.setCurrentText('Machine (EPICS)')
         try:
             with patch('Knobs.DRTuning.epics.LiveBackend',side_effect=offline_backend):
                 window.connect_backend();self.wait(window)
                 self.assertIsNotNone(window.session,window.status.text())
                 self.assertEqual(captured[-1],load_hardware_profile())
-                self.assertIn('標準設定',window.status.text())
+                self.assertIn('ATF machine defaults',window.status.text())
                 self.assertEqual(len(window.session.backend.quadrupoles),100)
                 self.assertTrue(window.disconnect())
                 with tempfile.TemporaryDirectory() as temp:
@@ -182,6 +238,22 @@ class GuiTests(unittest.TestCase):
 
 
 class HardwareDefaultsTests(unittest.TestCase):
+    def test_read_tbt_reports_pv_progress_and_cancel_without_writes(self):
+        from Knobs.DRTuning.hardware import load_hardware_profile
+        from Knobs.DRTuning.epics import LiveBackend
+        class NoIO:
+            def __getattr__(self,name):raise AssertionError('Unexpected EPICS call '+name)
+        b=LiveBackend(load_hardware_profile(),NoIO());calls=[];updates=[]
+        def metadata(pv):calls.append(pv);return dict(value=np.ones(32),timestamp=1.)
+        b.metadata=metadata
+        wave=b.read_tbt(32,progress=lambda n,s:updates.append((n,s)))
+        self.assertEqual(len(calls),288);self.assertEqual(updates[-1][0],100)
+        self.assertFalse(wave['fresh_acquisition']);self.assertFalse(wave['same_shot_verified'])
+        cancel=threading.Event();cancel.set();calls.clear()
+        with self.assertRaisesRegex(RuntimeError,'cancelled'):b.read_tbt(32,cancel=cancel)
+        self.assertEqual(calls,[])
+        b.metadata=lambda pv:dict(value=np.ones(8),timestamp=2.)
+        with self.assertRaisesRegex(ValueError,'bpm01.WPSH'):b.read_tbt(32)
     def test_default_reads_full_98_slot_waveform_and_uses_live_limits(self):
         from Knobs.DRTuning.hardware import load_hardware_profile
         from Knobs.DRTuning.epics import LiveBackend

@@ -7,7 +7,7 @@ Start from flight-simulator-framework:
 
 Or launch Knobs/GUIs/DRTuning_GUI.py directly with the same Python interpreter.
 After package installation, the DRTuning GUI entry point is also available.
-Select Interface, then Connect / initialize. Nothing connects to EPICS or writes
+Select Interface, then Initialize. Nothing connects to EPICS or writes
 machine settings merely by opening DRTuning. The selection is locked while a
 session is connected. Disconnect before choosing another interface.
 
@@ -18,7 +18,7 @@ individual trims use the existing mag_ki_main calibration and simulated +/-2 A
 limits. Correctors retain the existing calibration and +/-5 A current bounds.
 This is a diagnostics port validation environment, not a new emittance result.
 
-Machine (EPICS): select 実機 (EPICS), then Connect / initialize. With the profile
+Machine (EPICS): select Machine (EPICS), then Initialize. With the profile
 field empty, hardware_profile.default.json is loaded automatically from this
 package. No JSON selection or user-specific path is needed. Initialization loads
 configuration only; individual measurements check their PV connections.
@@ -35,14 +35,35 @@ window hides it; Disconnect closes its interface. An active scan must finish
 restoration before disconnecting. Cancellation is available during Q modulation
 and TBT acquisition. Existing response CALC/SET/RESET behavior is retained.
 
+Control-room UI (2026-10-21 redesign)
+-----------------------------------
+Launcher, TBT, Q modulation and correction workspaces use resizable layouts,
+11-point controls and left-hand tool navigation. English operation labels avoid
+missing-glyph boxes on PCs without Japanese fonts. Settings scroll vertically;
+the active plot stays beside them. The window supports 1024 x 768 logical pixels.
+The status strip always shows working/completed/failed state and elapsed time.
+Failures open the detailed log automatically; its text can be selected/copied.
+Cancel remains available while controls are locked during an operation.
+
+First live TBT check: Machine (EPICS) -> Initialize -> TBT waveform / beta ->
+Read waveform (Update). Acquire a new shot is OFF by default: this reads the
+existing WPSH/WPSV/WINT records without SNAP, PROC or mode writes. The progress
+strip shows the current PV and progress through 288 waveform reads. Missing PVs
+and short arrays identify the affected PV. Cancellation is checked between
+reads; it must wait for an in-flight EPICS read timeout. Failed reads preserve
+the previous displayed waveform. Real control-room acquisition is still not
+validated by offline GUI tests.
+
 Q modulation
 ------------
-The original QF1R (28), QF2R (26), QM trim 1 (23), QM trim 2 (23) .ui geometry,
-widget names, five points per magnet, USE/OFF switches, GET/CALC/SAVE are ported.
-QE plugins are replaced by local Qt controls; no old BETA:* result PV is written.
-Original files, widget/PV inventory and SHA256 are in forms/inventory.json.
+QF1R (28), QF2R (26), QM trim 1 (23), QM trim 2 (23) retain five points per
+magnet, USE/OFF and read/fit/save operations. A magnet summary replaces the huge
+legacy grid; select one magnet to inspect/edit its five-point table. The Tune
+fits tab shows its plots at full size. Original source forms and PV inventory
+remain archived in forms/inventory.json; their fixed geometry is no longer used
+for the Q-modulation screen. No old BETA:* result PV is written.
 
-GET captures current and measured H/V tunes. Point-value buttons edit recorded
+Read captures current and measured H/V tunes. Double-clicking a table value edits recorded
 numbers, not hardware. USE/OFF excludes a magnet or individual fit point.
 CALC fits Q vs calibrated K1L and returns |4 pi dQ/dK1L|, as prog_beta_calc.
 The signed slopes, residuals and regression uncertainty are saved as well.
@@ -78,11 +99,12 @@ aborts a scan and restores the original current.
 
 TBT / beta
 ----------
-The Turn1024 .ui layout is also retained, with its plot area replaced by an
-interactive Matplotlib plot. Update, BPM previous/next, X/Y/intensity selection,
-turn/step, plot limits, statistics, automatic saving, beta calculation, plot
-windows and file operations are connected. SCAN(+/-) advances the selected
-first turn on each Update. This port does not subscribe a perpetual background
+The TBT screen replaces the fixed Turn1024 geometry with grouped acquisition,
+display and calibration settings. The large plot selector switches between
+waveform, FFT, beta, phase and a four-panel overview for larger windows. The
+Matplotlib toolbar supplies pan/zoom and plot export. Statistics, automatic
+saving, beta calculation and file operations remain available. Advance/rewind
+first turn operates on each NEW acquisition only. This port does not subscribe a perpetual background
 loop to every beam pulse. The extraction checkbox selects a configured
 extraction_turn; it does not start the old external extraction-shot daemon.
 TESTMODE is represented by the explicit DEMO interface at the launcher.
@@ -91,7 +113,7 @@ RFTrack starts at turn 1; choose Fit start turn to omit the excitation passage.
 It does not track 471150 native turns to emulate the legacy extraction setting.
 The optional stored backend is the separately qualified 200-ms model.
 
-Amplitude beta: Beta at BPM CALC uses the existing sine-fit analyzer. Relative
+Amplitude beta: Calculate tune / relative beta uses the existing sine-fit analyzer. Relative
 beta is the default. Absolute beta from independent reference requires a real
 calibration at the selected BPM; the initial value 8 m is NOT a calibration.
 Historical PyNAFF scale constants are not applied to different excitation.

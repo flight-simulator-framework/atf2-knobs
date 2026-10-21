@@ -77,14 +77,22 @@ class LiveBackend(EpicsBackend):
             time.sleep(delay)
         except Exception:
             self.put(p['set'],original);wait(original);raise
-    def tbt_acquire(self,turns=1024,start_turn=1,cancel=None):
+    def tbt_acquire(self,turns=1024,start_turn=1,cancel=None,progress=lambda *_:None):
         self.validate_tbt_acquisition()
+        progress(0,'New shot: checking acquisition mode and waveform updates')
         a=self.profile['tbt']['acquisition']
         if a.get('mode')=='readback_checks':
             controller=ReadbackTBTController(self.get,self.put,lambda:self.metadata(a['event_pv'])['timestamp'],a)
-            return controller.acquire(lambda:self.tbt_snapshot(turns),start_turn=start_turn,cancel=cancel)
+            return controller.acquire(lambda:self.tbt_snapshot(turns,cancel=cancel,progress=progress),start_turn=start_turn,cancel=cancel)
         controller=TBTController(self.get,self.put,a)
-        return controller.acquire(lambda:self.tbt(turns),start_turn=start_turn,cancel=cancel)
+        return controller.acquire(lambda:self.read_tbt(turns,cancel=cancel,progress=progress),start_turn=start_turn,cancel=cancel)
+    def read_tbt(self,turns=1024,*,cancel=None,progress=lambda *_:None):
+        """Read existing waveforms only; no trigger, PROC or machine write."""
+        p=self.profile.get('tbt',{})
+        if not p.get('mapping_confirmed'):raise ValueError('Confirm TBT channel-to-BPM mapping first')
+        wave,evidence=self.tbt_snapshot(turns,cancel=cancel,progress=progress)
+        wave.update(fresh_acquisition=False,same_shot_verified=False,waveform_evidence=evidence)
+        return wave
     def metadata(self,pv):
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         result=self.client.get_pv(pv,form='time',connect=True).get_with_metadata(use_monitor=False,form='time',timeout=3.)
@@ -92,14 +100,20 @@ class LiveBackend(EpicsBackend):
             raise RuntimeError('PV timestamp/data unavailable: '+pv)
         if result.get('severity',0)>=2:raise RuntimeError('PV alarm: '+pv)
         return result
-    def tbt_snapshot(self,turns):
+    def tbt_snapshot(self,turns,*,cancel=None,progress=lambda *_:None):
         p=self.profile['tbt'];names=p.get('names') or self.bpm_names;arrays={};evidence={}
+        total=sum(len(p[a]) if p.get('layout')=='per_bpm' else 1 for a in ('x','y','tmit'));count=0
         for axis in ('x','y','tmit'):
             pvs=p[axis] if p.get('layout')=='per_bpm' else [p[axis]];columns=[]
             for pv in pvs:
-                sample=self.metadata(pv);v=np.asarray(sample['value'],float)
+                if cancel is not None and cancel.is_set():raise RuntimeError('TBT read cancelled')
+                progress(round(100*count/total),f'{pv} ({count+1}/{total})')
+                try:sample=self.metadata(pv);v=np.asarray(sample['value'],float)
+                except Exception as exc:raise RuntimeError(f'{pv}: {exc}') from exc
+                if p.get('layout')=='per_bpm' and (v.ndim!=1 or len(v)<turns):
+                    raise ValueError(f'{pv}: expected at least {turns} samples; received shape {v.shape}')
                 evidence[pv]=dict(timestamp=float(sample['timestamp']),sha256=hashlib.sha256(v.tobytes()).hexdigest())
-                columns.append(v)
+                columns.append(v);count+=1
             v=np.column_stack(columns) if p.get('layout')=='per_bpm' else columns[0].reshape(p['shape'])
             if p.get('layout')!='per_bpm' and p.get('axes')=='bpm,turn':v=v.T
             if v.shape[0]<turns or v.shape[1]!=len(names):raise ValueError('TBT shape mismatch')
@@ -109,6 +123,7 @@ class LiveBackend(EpicsBackend):
         result=dict(names=names,turns=list(range(1,turns+1)),x=arrays['x']*scale,y=arrays['y']*scale,
             tmit=arrays['tmit'],valid=np.isfinite(arrays['x'])&np.isfinite(arrays['y'])&(arrays['tmit']>0),
             position_unit='mm',bpm_noise_rms_mm=p['noise_mm'],orbit_regime='live waveform',equilibrium_validated=False)
+        progress(100,f'{len(names)} BPM × {turns} turns read complete')
         return result,evidence
     def validate_tune_measurement(self):
         tunes=self.profile.get('qmod_tunes',{})

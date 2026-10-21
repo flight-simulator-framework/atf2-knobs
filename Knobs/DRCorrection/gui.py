@@ -153,6 +153,8 @@ class CorrectionPanel(QWidget):
         if ok:self.set_option(name,value)
 
     def refresh(self):
+        for key,widget in getattr(self,'modern_fields',{}).items():
+            widget.blockSignals(True);widget.setValue(getattr(self.options,key));widget.blockSignals(False)
         for entry in self.inventory:
             widget=getattr(self.form,entry['name'],None);pv=entry['pv']
             if not widget:continue
@@ -175,8 +177,12 @@ class CorrectionPanel(QWidget):
     def advanced(self):
         dialog=QDialog(self);dialog.setWindowTitle('Response acquisition and correction limits')
         form=QFormLayout(dialog);fields={}
+        for key,label in [('count_h','Maximum H correctors'),('count_v','Maximum V correctors')]:
+            spin=QSpinBox();spin.setRange(1,500);spin.setValue(getattr(self.options,key));form.addRow(label,spin);fields[key]=spin
         for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','dispersion_weight','orbit_weight'):
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(0.,1000.);spin.setValue(getattr(self.options,key));form.addRow(key,spin);fields[key]=spin
+        tolerance=QDoubleSpinBox();tolerance.setDecimals(7);tolerance.setRange(.0000001,1.);tolerance.setValue(self.options.tolerance_m)
+        form.addRow('COD tolerance [m]',tolerance);fields['tolerance_m']=tolerance
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);form.addRow(buttons)
         if dialog.exec():
