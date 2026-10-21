@@ -18,6 +18,43 @@ def data(status=1):
 
 
 class IntensityTests(unittest.TestCase):
+    def test_timing_scan_reads_ot8d_and_centers_integer_grid(self):
+        for runner in ("_run_sequential", "_run_group_bo"):
+            with self.subTest(runner=runner), tempfile.TemporaryDirectory() as directory, patch.object(
+                    opt, "InterfaceATF2_LinacBT") as control:
+                # The obsolete ns setting must not become an OT8D step.
+                worker = opt.OptimizationWorker({"timing": True, "timing_step_ns": 11.2}, directory)
+                control.return_value.read_current.return_value = 1234.
+                with patch.object(worker, "perform_1d_scan") as scan:
+                    getattr(worker, runner)()
+                control.return_value.read_current.assert_called_once_with(
+                    pv_write="EVE_LINAC:OT8D", pv_read=None, quantize_phase=True)
+                self.assertEqual(scan.call_args.args[:2], ("Timing", "EVE_LINAC:OT8D"))
+                np.testing.assert_array_equal(scan.call_args.args[2], np.arange(1224, 1245))
+                self.assertTrue(np.issubdtype(scan.call_args.args[2].dtype, np.integer))
+
+    def test_timing_lbo_uses_integer_step_and_ten_count_half_range(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT"):
+            worker = opt.OptimizationWorker({"timing": True}, directory)
+            with patch.object(worker, "_lbo_group") as run:
+                worker._run_group_lbo()
+            run.assert_called_once_with("Timing", [("Timing", "EVE_LINAC:OT8D", 1, 10)])
+
+    def test_timing_rejects_fractional_or_invalid_reads_and_commands(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control:
+            worker = opt.OptimizationWorker({}, directory)
+            for value in (1000.5, float("nan"), float("inf")):
+                with self.subTest(value=value):
+                    control.return_value.read_current.return_value = value
+                    with self.assertRaises(ValueError):
+                        worker._read_current(opt.TIMING_PV)
+                    with self.assertRaises(ValueError):
+                        worker._write_setpoints({opt.TIMING_PV: value})
+            control.return_value.pv_put.assert_not_called()
+            worker._write_setpoints({opt.TIMING_PV: 1000.})
+            control.return_value.pv_put.assert_called_once_with("EVE_LINAC:OT8D", 1000)
+            self.assertIsInstance(control.return_value.pv_put.call_args.args[1], int)
+
     def test_save_and_end_applies_full_best_recorded_state(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control, patch("epics.PV") as pv:
             pv.return_value.put.return_value = 1
@@ -308,11 +345,11 @@ class IntensityTests(unittest.TestCase):
         interface = Mock()
         interface.read_current.return_value = 1000.
         window = SimpleNamespace(_ensure_interface=lambda: interface)
-        spec = {"name": "Timing", "pv_write": "EVE_LINAC:OUT0:SetData", "pv_read": None,
-                "unit": "ns", "step": 11.2, "half_range": 112.}
+        spec = {"name": "Timing", "pv_write": "EVE_LINAC:OT8D", "pv_read": None,
+                "unit": "count", "step": 1, "half_range": 10}
         with patch("epics.PV") as pv:
             limits, _ = opt.MainWindow._checked_corrector_ranges(window, [spec])
-            self.assertEqual(limits, {spec["pv_write"]: [888., 1112.]})
+            self.assertEqual(limits, {spec["pv_write"]: [990., 1010.]})
             for value in (float("nan"), float("inf")):
                 interface.read_current.return_value = value
                 with self.assertRaises(ValueError):
@@ -326,7 +363,7 @@ class IntensityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control:
             worker = opt.OptimizationWorker(config, directory)
             with self.assertRaises(ValueError):
-                worker._write_setpoints({spec["pv_write"]: 1113.})
+                worker._write_setpoints({spec["pv_write"]: 1011.})
             control.return_value.pv_put.assert_not_called()
 
     def test_initial_bo_background_phases_and_restarts(self):
@@ -490,6 +527,9 @@ class IntensityTests(unittest.TestCase):
             window._current_value_timer.stop()
             try:
                 window.correctors_l8.setChecked(True)
+                self.assertEqual(window.sp_timing_step.value(), 1)
+                self.assertEqual(window.sp_timing_half_steps.value(), 10)
+                self.assertEqual(window.sp_timing_step.minimum(), 1)
                 self.assertEqual(window.chk_correctors.text(), "Correctors & L8")
                 self.assertEqual(window.mode_box.currentText(), "GROUP_BO")
                 window.dev_actuator_table.item(0, 0).setCheckState(opt.Qt.CheckState.Checked)
@@ -502,12 +542,16 @@ class IntensityTests(unittest.TestCase):
                         window, "_capture_machine_origin", side_effect=ValueError("offline stop")) as capture, patch.object(QMessageBox, "critical"):
                     window.start_optimization()
                 config = capture.call_args.args[0]
+                self.assertEqual(config["timing_step"], 1)
+                self.assertNotIn("timing_step_ns", config)
+                timing = checked.call_args.args[0][-1]
+                self.assertEqual((timing["step"], timing["half_range"], timing["unit"]), (1, 10, "count"))
                 self.assertTrue(config["correctors_l8"])
                 self.assertFalse(config["timing"])
                 self.assertEqual(config["dr_current_weight"], 1.)
                 self.assertEqual(config["intensity_aggregation"], "turn_composite")
                 self.assertEqual([a["pv_write"] for a in checked.call_args.args[0]][-2:],
-                                 ["CM8L:phaseWrite", "EVE_LINAC:OUT0:SetData"])
+                                 ["CM8L:phaseWrite", "EVE_LINAC:OT8D"])
                 # Reject a mixed-region ratio objective before acquiring any data.
                 window.dev_bpm_table.item(window.dev_bpm_row_map["MB5L"], 0).setCheckState(opt.Qt.CheckState.Checked)
                 with patch.object(QMessageBox, "warning") as warning, patch.object(window, "_checked_corrector_ranges") as checked:
@@ -520,7 +564,7 @@ class IntensityTests(unittest.TestCase):
     def test_combined_group_has_correctors_phase_and_timing_in_one_call(self):
         actuators = [{"name": "ZH1L", "pv_write": "ZH1L:currentWrite", "step": .01, "half_range": .1},
                      {"name": "L8 phase", "pv_write": "CM8L:phaseWrite", "step": 1., "half_range": 5., "unit": "deg"},
-                     {"name": "Timing", "pv_write": "EVE_LINAC:OUT0:SetData", "step": 11.2, "half_range": 112., "unit": "ns"}]
+                     {"name": "Timing", "pv_write": "EVE_LINAC:OT8D", "step": 1, "half_range": 10, "unit": "count"}]
         config = {"mode": "GROUP_BO", "correctors": True, "correctors_l8": True,
                   "developer_actuators": actuators, "actuator_limits": {s["pv_write"]: [-200., 200.] for s in actuators}}
         with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT"):

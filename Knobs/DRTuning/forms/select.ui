@@ -1,0 +1,101 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>BETA_SELECT_WIN</class>
+  <widget class="QWidget" name="BETA_SELECT_WIN">
+    <property name="geometry">
+      <rect>
+        <x>0</x>
+        <y>0</y>
+        <width>230</width>
+        <height>205</height>
+      </rect>
+    </property>
+    <property name="windowTitle">
+      <string>BETA_SELECT_WIN</string>
+    </property>
+    <widget class="QPushButton" name="pushButton">
+      <property name="geometry">
+        <rect>
+          <x>20</x>
+          <y>40</y>
+          <width>131</width>
+          <height>28</height>
+        </rect>
+      </property>
+      <property name="styleSheet">
+        <string notr="true">color: rgb(0, 0, 255);</string>
+      </property>
+      <property name="text">
+        <string>QF1R.1 - 28</string>
+      </property>
+    </widget>
+    <widget class="QLabel" name="label">
+      <property name="geometry">
+        <rect>
+          <x>30</x>
+          <y>10</y>
+          <width>291</width>
+          <height>17</height>
+        </rect>
+      </property>
+      <property name="font">
+        <font>
+          <weight>75</weight>
+          <bold>true</bold>
+        </font>
+      </property>
+      <property name="text">
+        <string>Beta function measurement</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButton_2">
+      <property name="geometry">
+        <rect>
+          <x>20</x>
+          <y>80</y>
+          <width>131</width>
+          <height>28</height>
+        </rect>
+      </property>
+      <property name="styleSheet">
+        <string notr="true">color: rgb(0, 0, 255);</string>
+      </property>
+      <property name="text">
+        <string>QF2R.1 - 26</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButton_3">
+      <property name="geometry">
+        <rect>
+          <x>20</x>
+          <y>120</y>
+          <width>131</width>
+          <height>28</height>
+        </rect>
+      </property>
+      <property name="styleSheet">
+        <string notr="true">color: rgb(0, 0, 255);</string>
+      </property>
+      <property name="text">
+        <string>QM1R - 23R.1</string>
+      </property>
+    </widget>
+    <widget class="QPushButton" name="pushButton_4">
+      <property name="geometry">
+        <rect>
+          <x>20</x>
+          <y>160</y>
+          <width>131</width>
+          <height>28</height>
+        </rect>
+      </property>
+      <property name="styleSheet">
+        <string notr="true">color: rgb(0, 0, 255);</string>
+      </property>
+      <property name="text">
+        <string>QM1R - 23R.2</string>
+      </property>
+    </widget>
+  </widget>
+  <layoutdefault spacing="6" margin="11" />
+</ui>
