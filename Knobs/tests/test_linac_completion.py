@@ -1,4 +1,4 @@
-"""Local scan budgets and optional single-PNG export, without machine/NAS I/O."""
+"""Local scan budgets and automatic single-PNG export, without machine/NAS I/O."""
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
@@ -117,36 +117,36 @@ class CompletionTests(unittest.TestCase):
                     dest.mkdir()
                     self.window.worker = Mock(is_running=not stopped, _current_pv_values={})
                     with patch.object(opt, "LINAC_TEMPFILES_DIR", dest), \
-                         patch.object(opt.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as ask, \
+                         patch.object(opt.QMessageBox, "question") as ask, \
                          patch.object(opt.QMessageBox, "warning") as warn, \
                          patch.object(self.window, "_refresh_current_values"):
                         self.window.optimization_finished()
-                    ask.assert_called_once()
-                    self.assertEqual(ask.call_args.args[2], "Save plots to tempfiles?")
+                    ask.assert_not_called()
                     warn.assert_not_called()
                     self.assertEqual(len(list(run_dir.glob("*.png"))), 2)
                     exported = list(dest.iterdir())
                     self.assertEqual(len(exported), 1)
                     self.assertFalse(QImage(str(exported[0])).isNull())
 
-    def test_no_and_missing_directory_preserve_normal_plots(self):
+    def test_automatic_save_and_missing_directory_preserve_normal_plots(self):
         self.prepare_run(opt.RUN_PROFILE_MAIN)
         plots = self.window._save_live_plot_snapshot(opt.RUN_PROFILE_MAIN)
-        with patch.object(opt.QMessageBox, "question", return_value=QMessageBox.StandardButton.No), \
+        with patch.object(opt, "LINAC_TEMPFILES_DIR", self.root), \
+             patch.object(opt.QMessageBox, "question") as ask, \
              patch.object(opt, "save_plot_montage") as save:
-            self.window._offer_tempfiles_export(plots, opt.RUN_PROFILE_MAIN)
-        save.assert_not_called()
-        with patch.object(opt.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
-             patch.object(opt.QMessageBox, "warning") as warn, \
+            self.window._save_tempfiles_export(plots, opt.RUN_PROFILE_MAIN)
+        ask.assert_not_called()
+        save.assert_called_once()
+        with patch.object(opt.QMessageBox, "warning") as warn, \
              patch.object(opt, "LINAC_TEMPFILES_DIR", self.root / "missing"):
-            self.window._offer_tempfiles_export(plots, opt.RUN_PROFILE_MAIN)
+            self.window._save_tempfiles_export(plots, opt.RUN_PROFILE_MAIN)
         warn.assert_called_once()
         self.assertTrue(all(p.exists() for p in plots))
         self.assertFalse((self.root / "missing").exists())
 
     def test_no_data_produces_no_export_prompt(self):
         with patch.object(opt.QMessageBox, "question") as ask:
-            self.window._offer_tempfiles_export(self.window._save_live_plot_snapshot(opt.RUN_PROFILE_MAIN), opt.RUN_PROFILE_MAIN)
+            self.window._save_tempfiles_export(self.window._save_live_plot_snapshot(opt.RUN_PROFILE_MAIN), opt.RUN_PROFILE_MAIN)
         ask.assert_not_called()
 
 

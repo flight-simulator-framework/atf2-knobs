@@ -5459,15 +5459,8 @@ class MainWindow(QMainWindow):
                 self._append_log_text(f"Plot save failed ({path.name}): {exc}", profile=context)
         return saved
 
-    def _offer_tempfiles_export(self, plots, profile):
+    def _save_tempfiles_export(self, plots, profile):
         if not plots:
-            return
-        answer = QMessageBox.question(
-            self, "Save plots", "Save plots to tempfiles?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
             return
         try:
             if not LINAC_TEMPFILES_DIR.is_dir():
@@ -6295,7 +6288,7 @@ class MainWindow(QMainWindow):
         if self._run_failed:
             QMessageBox.warning(self, "Finished with Error", "Optimization ended with an error. Please check the log.")
         else:
-            self._offer_tempfiles_export(saved_plots, finished_profile)
+            self._save_tempfiles_export(saved_plots, finished_profile)
 
     def _append_log_text(self, text: str, profile: Optional[str] = None):
         context = str(profile or RUN_PROFILE_MAIN).upper()

@@ -40,12 +40,12 @@ budget. Sequential warm starts cannot overrun maxeval while filling initial poin
 
 On normal completion or **Save and End**, plots are saved to the usual run
 directory, including the displayed 1D BO model/acquisition figure when present.
-The GUI then asks **Save plots to tempfiles?** Selecting Yes saves one combined
+The GUI then automatically saves one combined
 PNG to `/mnt/nas1/atf-data/op/tempfiles`, with a run-specific unique name. It
 contains the evaluation plots and the available BO figure arranged together.
-No separate plots or data files are copied to tempfiles. No leaves only the
-normal outputs. NAS errors do not delete them. No export prompt is shown for
-an empty run, a failed run, or while closing the application.
+No separate plots or data files are copied to tempfiles. There is no confirmation
+dialog. NAS errors are reported without deleting the normal outputs. Export
+is skipped for an empty run, a failed run, or while closing the application.
 
 ## Development
 

@@ -51,11 +51,11 @@ Inside:
 - Individual history / 1D / 2D plots and fit parameters.
 
 After normal completion or Save and End, the GUI first saves its usual plots,
-then asks **"Save plots to tempfiles?"**. Yes writes a single PNG to
+then automatically writes a single PNG to
 `/mnt/nas1/atf-data/op/tempfiles`. All final PNG plots are tiled in two columns,
 preserving their aspect ratios. The file name contains the run directory name
 and a unique suffix. No CSV, JSON or separate panels are copied there.
-No skips the additional save. A missing/unwritable NAS directory reports an
+There is no confirmation dialog. A missing/unwritable NAS directory reports an
 error without removing the normal outputs. If there are no valid measurements,
 the run records are saved but no plots or export prompt are produced.
 

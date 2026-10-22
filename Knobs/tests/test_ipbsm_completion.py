@@ -94,24 +94,27 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual(image.pixelColor(x, y), QColor(color))
         self.assertEqual(list(output.iterdir()), [destination])
 
-    def test_declined_export_does_not_touch_destination(self):
-        with patch.object(gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as ask, \
+    def test_export_saves_without_confirmation(self):
+        plots = self._plots()
+        with patch.object(gui, "IPBSM_TEMPFILES_DIR", self.root), \
+             patch.object(gui.QMessageBox, "question") as ask, \
              patch.object(gui, "save_plot_montage") as save:
-            self.window._offer_tempfiles_export(self._plots(), self.root)
-        self.assertEqual(ask.call_args.args[2], "Save plots to tempfiles?")
-        save.assert_not_called()
+            self.window._save_tempfiles_export(plots, self.root)
+        ask.assert_not_called()
+        save.assert_called_once()
+        self.assertEqual(save.call_args.args[0], plots)
+        self.assertEqual(save.call_args.args[1].parent, self.root)
 
     def test_unavailable_export_keeps_original_plots(self):
         plots = self._plots()
         with patch.object(gui, "IPBSM_TEMPFILES_DIR", self.root / "unmounted"), \
-             patch.object(gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
              patch.object(gui.QMessageBox, "warning") as warning:
-            self.window._offer_tempfiles_export(plots, self.root)
+            self.window._save_tempfiles_export(plots, self.root)
         warning.assert_called_once()
         self.assertTrue(all(p.exists() for p in plots))
         self.assertFalse((self.root / "unmounted").exists())
 
-    def test_normal_and_save_end_completion_generate_one_optional_png(self):
+    def test_normal_and_save_end_completion_generate_one_automatic_png(self):
         for manual_stop in (False, True):
             with self.subTest(manual_stop=manual_stop):
                 directory = self.root / str(manual_stop)
@@ -128,10 +131,10 @@ class CompletionTests(unittest.TestCase):
                     self.assertEqual(pause.call_args.args[0]["reason"], "manual_pause")
                 self.window.last_run_cfg = cfg
                 with patch.object(gui, "IPBSM_TEMPFILES_DIR", destination), \
-                     patch.object(gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as ask, \
+                     patch.object(gui.QMessageBox, "question") as ask, \
                      patch.object(gui.QMessageBox, "warning") as warning:
                     self.window._on_finished(result)
-                ask.assert_called_once()
+                ask.assert_not_called()
                 warning.assert_not_called()
                 self.assertGreater(len(list(directory.glob("*.png"))), 1)
                 exported = list(destination.iterdir())

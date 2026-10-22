@@ -2914,17 +2914,10 @@ class MainWindow(QMainWindow):
         self.current_measurements_csv = None
         self._run_controller = None
         self._refresh_zscan_status_label()
-        self._offer_tempfiles_export(png_saved, Path(out_dir))
+        self._save_tempfiles_export(png_saved, Path(out_dir))
 
-    def _offer_tempfiles_export(self, plots: List[Path], out_dir: Path) -> None:
+    def _save_tempfiles_export(self, plots: List[Path], out_dir: Path) -> None:
         if not plots:
-            return
-        answer = QMessageBox.question(
-            self, "Save plots", "Save plots to tempfiles?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
             return
         try:
             if not IPBSM_TEMPFILES_DIR.is_dir():
