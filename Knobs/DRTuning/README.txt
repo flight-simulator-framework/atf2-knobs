@@ -7,9 +7,13 @@ Start from flight-simulator-framework:
 
 Or launch Knobs/GUIs/DRTuning_GUI.py directly with the same Python interpreter.
 After package installation, the DRTuning GUI entry point is also available.
-Select Interface, then Initialize. Nothing connects to EPICS or writes
-machine settings merely by opening DRTuning. The selection is locked while a
-session is connected. Disconnect before choosing another interface.
+First select an interface with the radio buttons and press OK, as in SysID.
+The selector closes and the DRTuning measurement/correction window opens
+directly. Cancel exits without creating an interface. There is no Initialize
+step or profile-file picker. Close DRTuning and relaunch to choose another
+interface; closing during a scan waits for cancellation/restoration first.
+Measurements, Corrections and Utilities menus expose all the former launcher
+tools, including BPM/magnet selection, orbit buffers, Delta-f Ramp and SR fits.
 
 Mouse wheel / trackpad scrolling over numeric inputs and closed dropdowns
 scrolls the surrounding panel without changing the setting, even if the input
@@ -24,12 +28,12 @@ individual trims use the existing mag_ki_main calibration and simulated +/-2 A
 limits. Correctors retain the existing calibration and +/-5 A current bounds.
 This is a diagnostics port validation environment, not a new emittance result.
 
-Machine (EPICS): select Machine (EPICS), then Initialize. With the profile
-field empty, hardware_profile.default.json is loaded automatically from this
-package. No JSON selection or user-specific path is needed. Initialization loads
-configuration only; individual measurements check their PV connections.
-The optional profile picker REPLACES the defaults with a complete site JSON.
-An invalid override is reported, never silently replaced by the defaults.
+Machine (EPICS): select Machine (EPICS), then OK. The bundled machine settings
+are used automatically (internally stored in hardware_profile.default.json).
+No user-selected JSON or user-specific path is needed. Opening the interface
+loads configuration and builds the GUI without reading or writing machine PVs;
+individual measurements check their PV connections. The programmatic
+load_hardware_profile(path) API remains available for site tooling/tests.
 Stored DR (200 ms): retains the previous fast stored-beam corrections/TBT adapter;
 this optional backend does not yet expose quadrupole trims. It is NOT RFTrack.
 DEMO: synthetic correction/TBT data for UI checks, not quadrupole commissioning.
@@ -37,8 +41,8 @@ DEMO: synthetic correction/TBT data for UI checks, not quadrupole commissioning.
 One interface is shared by COD, dispersion, skew, TBT, four Q-modulation panels,
 BPM buffers, fixed-steerer selection, Delta-f Ramp and SR/SR2 dispersion fit.
 They open in one session window so scans cannot race each other. Closing that
-window hides it; Disconnect closes its interface. An active scan must finish
-restoration before disconnecting. Cancellation is available during Q modulation
+window closes its interface. An active scan must finish restoration before
+closing. Cancellation is available during Q modulation
 and TBT acquisition. Existing response CALC/SET/RESET behavior is retained.
 
 Control-room UI (2026-10-21 redesign)
@@ -51,7 +55,7 @@ The status strip always shows working/completed/failed state and elapsed time.
 Failures open the detailed log automatically; its text can be selected/copied.
 Cancel remains available while controls are locked during an operation.
 
-First live TBT check: Machine (EPICS) -> Initialize -> TBT waveform / beta ->
+First live TBT check: Machine (EPICS) -> OK -> Measurements / TBT waveform / beta ->
 Read waveform (Update). Acquire a new shot is OFF by default: this reads the
 existing WPSH/WPSV/WINT records without SNAP, PROC or mode writes. The progress
 strip shows the current PV and progress through 288 waveform reads. Missing PVs

@@ -185,19 +185,36 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(window.backend.snapshot(),baseline)
                 self.assertNotIn('Failed',window.operation_status.text())
         finally:window.close()
-    def test_launcher_keeps_one_interface_and_switches_tools(self):
-        from Knobs.DRTuning.gui import DRTuningWindow
-        window=DRTuningWindow();window.interface.setCurrentText('DEMO');window.connect_backend();self.wait(window)
-        try:
-            self.assertIsNotNone(window.session,window.status.text());backend=window.session.backend
-            for key in ('orbit','dispersion','skew','tbt','qf1','qf2','qm1','qm2'):window.open_tool(key);self.app.processEvents()
-            self.assertIs(backend,window.session.backend);self.assertFalse(window.interface.isEnabled())
-            window.session.close();self.assertIsNotNone(window.session);self.assertTrue(window.disconnect())
-            self.assertTrue(window.interface.isEnabled())
-        finally:window.close()
-
-    def test_live_launcher_uses_default_without_file_picker_or_pv_access(self):
+    def test_selector_opens_main_window_and_tools_share_one_interface(self):
         from unittest.mock import patch
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QDialog
+        from Knobs.DRTuning.gui import DRTuningWindow
+        selector=DRTuningWindow();selector.interface_buttons['DEMO'].setChecked(True)
+        QTimer.singleShot(0,selector.connect_button.click)
+        try:
+            self.assertEqual(selector.exec(),QDialog.DialogCode.Accepted)
+            self.wait(selector)
+            window=selector.session;backend=window.backend
+            self.assertTrue(window.isVisible());self.assertFalse(selector.isVisible())
+            for key in ('orbit','dispersion','skew','tbt','qf1','qf2','qm1','qm2'):
+                window.tool_actions[key].trigger();self.app.processEvents()
+                panel=window.panels.get(key) or window.qmod.get(key) or window.tbt
+                self.assertIs(window.tabs.currentWidget(),panel)
+                self.assertIs(backend,window.backend)
+            for key in ('buffers','selection','frequency_dialog'):
+                with patch.object(window,key) as action:
+                    window.tool_actions[key].trigger();action.assert_called_once_with()
+            with patch.object(backend,'close') as close:
+                window.close();close.assert_called_once_with()
+            self.assertFalse(window.isVisible())
+        finally:
+            if selector.session:selector.session.close()
+            selector.close()
+
+    def test_live_selector_uses_defaults_without_file_picker_or_pv_access(self):
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QLabel,QPushButton
         from Knobs.DRTuning.gui import DRTuningWindow
         from Knobs.DRTuning.epics import LiveBackend
         from Knobs.DRTuning.hardware import load_hardware_profile
@@ -207,22 +224,40 @@ class GuiTests(unittest.TestCase):
         def offline_backend(profile):
             captured.append(profile)
             return LiveBackend(profile,client=NoIO())
-        window=DRTuningWindow();window.interface.setCurrentText('Machine (EPICS)')
+        selector=DRTuningWindow();selector.interface_buttons['Machine (EPICS)'].setChecked(True)
         try:
             with patch('Knobs.DRTuning.epics.LiveBackend',side_effect=offline_backend):
-                window.connect_backend();self.wait(window)
-                self.assertIsNotNone(window.session,window.status.text())
+                selector.connect_button.click();self.wait(selector)
+                self.assertIsNotNone(selector.session,selector.status.text())
                 self.assertEqual(captured[-1],load_hardware_profile())
-                self.assertIn('ATF machine defaults',window.status.text())
-                self.assertEqual(len(window.session.backend.quadrupoles),100)
-                self.assertTrue(window.disconnect())
-                with tempfile.TemporaryDirectory() as temp:
-                    custom=load_hardware_profile();custom['machine_id']='custom-test'
-                    path=Path(temp)/'site.json';path.write_text(json.dumps(custom))
-                    window.profile.setText(str(path));window.connect_backend();self.wait(window)
-                    self.assertIsNotNone(window.session,window.status.text())
-                    self.assertEqual(window.session.backend.identity,'epics:custom-test')
-        finally:window.close()
+                self.assertEqual(len(selector.session.backend.quadrupoles),100)
+                self.assertTrue(selector.session.isVisible())
+                self.assertFalse(hasattr(selector,'profile'))
+                texts=[w.text() for cls in (QLabel,QPushButton) for w in selector.findChildren(cls)]
+                self.assertFalse(any('JSON' in t or 'Initialize' in t for t in texts))
+        finally:
+            if selector.session:selector.session.close()
+            selector.close()
+
+    def test_selector_cancel_and_failed_initialization_retry(self):
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QDialogButtonBox
+        from Knobs.DRTuning.gui import DRTuningWindow
+        selector=DRTuningWindow()
+        with patch('Knobs.DRTuning.rftrack.RFTrackBackend') as factory:
+            selector.button_box.button(QDialogButtonBox.StandardButton.Cancel).click()
+            factory.assert_not_called();self.assertIsNone(selector.session)
+        selector=DRTuningWindow();selector.interface_buttons['DEMO'].setChecked(True)
+        try:
+            with patch('Knobs.DRTuning.gui.DemoBackend',side_effect=RuntimeError('Unavailable test backend')):
+                selector.connect_button.click();self.wait(selector)
+            self.assertIsNone(selector.session);self.assertIn('Unavailable test backend',selector.status.text())
+            self.assertTrue(selector.connect_button.isEnabled())
+            selector.connect_button.click();self.wait(selector)
+            self.assertIsNotNone(selector.session,selector.status.text())
+        finally:
+            if selector.session:selector.session.close()
+            selector.close()
 
     def test_correction_plot_labels_missing_geometry_as_index(self):
         from Knobs.DRCorrection.gui import Plot

@@ -4,8 +4,8 @@ import time
 import traceback
 from pathlib import Path
 from PyQt6.QtCore import Qt,QTimer
-from PyQt6.QtWidgets import (QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QGridLayout,QLabel,
-    QComboBox,QLineEdit,QPushButton,QFileDialog,QSpinBox,QCheckBox,QScrollArea,QMessageBox,QDialog,QListWidget,QSplitter)
+from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QLabel,
+    QComboBox,QLineEdit,QPushButton,QFileDialog,QSpinBox,QCheckBox,QMessageBox,QDialog,QListWidget,QSplitter)
 from Knobs.DRCorrection.gui import DRCorrectionWindow,TBTPanel,Task
 from Knobs.DRCorrection.backends import DemoBackend,StoredBackend
 from Knobs.DRCorrection.core import serial
@@ -245,7 +245,27 @@ class TuningSession(DRCorrectionWindow):
         self.progress.setRange(0,100);self.progress.setValue(0)
         self.timer=QTimer(self);self.timer.setInterval(250);self.timer.timeout.connect(self.tick)
         self._failed=False;self._active_label=''
-        self.owned_by_launcher=False
+        self.tool_actions={}
+        for title,tools in (
+            ('Measurements',[('TBT waveform / beta','tbt'),('QF1R beta','qf1'),('QF2R beta','qf2'),('QM trim 1 beta','qm1'),('QM trim 2 beta','qm2')]),
+            ('Corrections',[('COD correction','orbit'),('Dispersion','dispersion'),('Skew correction','skew')]),
+            ('Utilities',[('Orbit buffers','buffers'),('BPM / magnet selection','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr'),('SR / SR2 beta fit','sr_beta')])):
+            menu=self.menuBar().addMenu(title)
+            for label,key in tools:
+                action=menu.addAction(label);action.triggered.connect(lambda checked=False,k=key:self.open_tool(k))
+                self.tool_actions[key]=action
+    def open_tool(self,key):
+        if self.task and self.task.isRunning():
+            self.log('Measurement running. Wait or cancel first.');return
+        if key in self.panels:self.tabs.setCurrentWidget(self.panels[key])
+        elif key in self.qmod:self.tabs.setCurrentWidget(self.qmod[key])
+        elif key=='tbt':self.tabs.setCurrentWidget(self.tbt)
+        elif key=='sr_beta':self.tabs.setCurrentWidget(self.tbt);self.tbt.sr_beta()
+        elif key=='sr':
+            data=self.panels['dispersion'].data
+            if data is None:self.tabs.setCurrentWidget(self.panels['dispersion']);self.error('Measure dispersion with CALC before SR fit')
+            else:self.sr_fit(data)
+        else:getattr(self,key)()
     def tick(self):
         self.elapsed_label.setText(f'{time.monotonic()-self._started:.1f} s')
     def cancel_requested(self):
@@ -296,59 +316,49 @@ class TuningSession(DRCorrectionWindow):
     def closeEvent(self,event):
         if self.task is not None and self.task.isRunning():
             self.service.cancel.set();self.log('Waiting for restoration');event.ignore();return
-        if self.owned_by_launcher:self.hide();event.ignore()
-        else:super().closeEvent(event)
+        super().closeEvent(event)
 
 
-class DRTuningWindow(QMainWindow):
+class DRTuningWindow(QDialog):
+    """Select an interface first, then open the shared tuning window."""
     def __init__(self):
-        super().__init__();self.session=None;self.task=None;self.setWindowTitle('DRTuning');self.resize(860,760)
+        super().__init__();self.session=None;self.task=None
+        self.setWindowTitle('DRTuning — Select an Interface');self.resize(480,300)
         from Knobs.DRCorrection.input_guard import protect_settings_from_wheel
-        protect_settings_from_wheel(self)
-        from .presentation import STYLE,button,group,scroll
-        from PyQt6.QtWidgets import QFormLayout
-        self.setStyleSheet(STYLE)
-        widget=QWidget();self.setCentralWidget(scroll(widget));layout=QVBoxLayout(widget);layout.setSpacing(12)
-        title=QLabel('DR Tuning');title.setStyleSheet('font-size:22pt;font-weight:bold;color:#123b66');layout.addWidget(title)
-        subtitle=QLabel('Initialize an interface, then choose a measurement or correction.');subtitle.setWordWrap(True);layout.addWidget(subtitle)
-        box,v=group('1. Interface');layout.addWidget(box)
-        form=QFormLayout();v.addLayout(form)
-        self.interface=QComboBox();self.interface.addItems(['RFTrack','Machine (EPICS)','Stored DR (200 ms)','DEMO']);form.addRow('Interface',self.interface)
-        row=QHBoxLayout();v.addLayout(row)
-        self.connect_button=button('Initialize',self.connect_backend,True);row.addWidget(self.connect_button)
-        self.disconnect_button=button('Disconnect',self.disconnect);row.addWidget(self.disconnect_button)
-        self.profile=QLineEdit();self.profile.setPlaceholderText('Empty: use bundled ATF machine defaults')
+        from .presentation import STYLE
+        from PyQt6.QtWidgets import QRadioButton,QButtonGroup,QDialogButtonBox,QFormLayout
+        protect_settings_from_wheel(self);self.setStyleSheet(STYLE)
+        layout=QVBoxLayout(self);layout.setSpacing(12)
+        layout.addWidget(QLabel('ATF DR — Choose an interface:'))
+        self.interface_group=QButtonGroup(self);self.interface_buttons={}
+        for name in ('RFTrack','Machine (EPICS)','Stored DR (200 ms)','DEMO'):
+            radio=QRadioButton(name);self.interface_group.addButton(radio)
+            self.interface_buttons[name]=radio;layout.addWidget(radio)
+        self.interface_buttons['RFTrack'].setChecked(True)
         self.directory=QLineEdit('/tmp/drtuning-session')
-        custom=QCheckBox('Show connection options');v.addWidget(custom)
-        detail=QWidget();f=QFormLayout(detail);f.addRow('Machine profile JSON',self.profile)
-        f.addRow('',button('Choose another profile',self.browse));f.addRow('Stored DR directory',self.directory)
-        detail.hide();custom.toggled.connect(detail.setVisible);v.addWidget(detail)
-        self.status=QLabel('Not initialized');self.status.setWordWrap(True);self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);v.addWidget(self.status)
-        self.buttons=QWidget();groups=QVBoxLayout(self.buttons);groups.setContentsMargins(0,0,0,0);layout.addWidget(self.buttons);self.buttons.setEnabled(False)
-        sections=[('2. Measurements',[
-            ('TBT waveform / beta','tbt'),('QF1R beta','qf1'),('QF2R beta','qf2'),('QM trim 1 beta','qm1'),('QM trim 2 beta','qm2')]),
-            ('3. Corrections',[
-            ('COD correction','orbit'),('Dispersion','dispersion'),('Skew correction','skew')]),
-            ('Utilities',[
-            ('Orbit buffers','buffers'),('BPM / magnet selection','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr'),('SR / SR2 beta fit','sr_beta')])]
-        for title,tools in sections:
-            box,v=group(title);grid=QGridLayout();v.addLayout(grid);groups.addWidget(box)
-            for i,(title,key) in enumerate(tools):grid.addWidget(button(title,lambda k=key:self.open_tool(k)),i//3,i%3)
-        layout.addStretch()
-    def browse(self):
-        path,_=QFileDialog.getOpenFileName(self,'Hardware profile','','JSON (*.json)')
-        if path:self.profile.setText(path)
+        self.stored_options=QWidget();form=QFormLayout(self.stored_options)
+        form.addRow('Stored DR directory',self.directory);layout.addWidget(self.stored_options)
+        self.stored_options.hide()
+        self.interface_buttons['Stored DR (200 ms)'].toggled.connect(self.stored_options.setVisible)
+        self.status=QLabel('Select an interface and press OK.');self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);layout.addWidget(self.status)
+        self.button_box=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
+        self.button_box.accepted.connect(self.connect_backend);self.button_box.rejected.connect(self.reject)
+        self.connect_button=self.button_box.button(QDialogButtonBox.StandardButton.Ok)
+        self.connect_button.setDefault(True);layout.addWidget(self.button_box)
     def connect_backend(self):
         if self.session or (self.task and self.task.isRunning()):return
-        selection=self.interface.currentText();profile=self.profile.text();directory=self.directory.text()
-        self.connect_button.setEnabled(False);self.interface.setEnabled(False);self.status.setText('Initializing '+selection)
+        selection=self.interface_group.checkedButton().text();directory=self.directory.text()
+        self.connect_button.setEnabled(False)
+        for radio in self.interface_buttons.values():radio.setEnabled(False)
+        self.directory.setEnabled(False);self.status.setText('Preparing '+selection+'…')
         def initialize(_):
             if selection=='RFTrack':
                 from .rftrack import RFTrackBackend
                 return RFTrackBackend()
             if selection.startswith('Machine'):
                 from .epics import LiveBackend
-                return LiveBackend(load_hardware_profile(profile))
+                return LiveBackend(load_hardware_profile())
             if selection.startswith('Stored'):return StoredBackend(Path(directory))
             return DemoBackend()
         self.task=Task(initialize);self.task.result.connect(self.connected);self.task.failure.connect(self.failed);self.task.start()
@@ -356,33 +366,17 @@ class DRTuningWindow(QMainWindow):
         try:self.session=TuningSession(backend)
         except Exception as e:
             backend.close();self.failed(str(e));return
-        self.session.owned_by_launcher=True;self.buttons.setEnabled(True);self.status.setText(backend.label)
-        if self.interface.currentText().startswith('Machine'):
-            source=self.profile.text().strip() or 'ATF machine defaults'
-            self.status.setText('Initialized: '+source+' (PVs checked when measuring)')
+        # Show the main window before closing the selector, so Qt always has
+        # a visible window and closing the main window exits normally.
+        self.session.show();self.accept()
     def failed(self,error):
-        self.status.setText(error);self.connect_button.setEnabled(True);self.interface.setEnabled(True)
-    def open_tool(self,key):
-        if self.session is None:return
-        s=self.session
-        if s.task and s.task.isRunning():self.status.setText('Measurement running. Wait or cancel first.');return
-        s.show();s.raise_()
-        if key in s.panels:s.tabs.setCurrentWidget(s.panels[key])
-        elif key in s.qmod:s.tabs.setCurrentWidget(s.qmod[key])
-        elif key=='tbt':s.tabs.setCurrentWidget(s.tbt)
-        elif key=='sr_beta':s.tabs.setCurrentWidget(s.tbt);s.tbt.sr_beta()
-        elif key=='sr':
-            data=s.panels['dispersion'].data
-            if data is None:s.tabs.setCurrentWidget(s.panels['dispersion']);s.error('Measure dispersion with CALC before SR fit')
-            else:s.sr_fit(data)
-        else:getattr(s,key)()
-    def disconnect(self):
-        if self.task and self.task.isRunning():return False
-        if self.session:
-            if self.session.task and self.session.task.isRunning():
-                self.session.service.cancel.set();self.status.setText('Waiting for cancellation and restoration.');return False
-            self.session.owned_by_launcher=False;self.session.close();self.session.deleteLater();self.session=None
-        self.buttons.setEnabled(False);self.interface.setEnabled(True);self.connect_button.setEnabled(True);return True
+        self.status.setText(error);self.connect_button.setEnabled(True);self.directory.setEnabled(True)
+        for radio in self.interface_buttons.values():radio.setEnabled(True)
+    def reject(self):
+        if self.task and self.task.isRunning():
+            self.status.setText('Preparing the interface. Wait for completion before closing.');return
+        super().reject()
     def closeEvent(self,event):
-        if self.disconnect():event.accept()
-        else:event.ignore()
+        if self.task and self.task.isRunning():
+            self.status.setText('Preparing the interface. Wait for completion before closing.');event.ignore()
+        else:super().closeEvent(event)

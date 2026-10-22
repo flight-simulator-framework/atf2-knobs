@@ -14,6 +14,9 @@ Improvements (2026-01):
 - Always wait settle_sec (default 5s) after changing any PV before reading ICTs.
 - Timing scan after klystron phase scan:
     PV: EVE_LINAC.OT8D [count], integer step=1, range=±10 around current
+- Optional standalone Timing fine tuning, after other selected targets:
+    OT8D (11.2 ns/count) + RFDLY0 (0.56 ns/count, 0–19),
+    scan current ±11.2 ns in 2.8 ns steps with base-20 carry/borrow.
 - Add Group-LBO mode (discrete / quantized to the same step sizes as sequential scans).
   Groups: L1–L4, L5–L8, Timing, QA, QM (only checked groups run, in this order).
 """
@@ -94,6 +97,11 @@ QM_STEP_A = 0.2
 TIMING_PV = "EVE_LINAC.OT8D"
 TIMING_STEP = 1
 TIMING_HALF_STEPS = 10  # ±10 counts by default
+TIMING_FINE_PV = "EVE_LINAC.RFDLY0"
+TIMING_FINE_RADIX = 20
+TIMING_FINE_TICK_NS = 0.56
+TIMING_FINE_STEP = 5  # 2.8 ns
+TIMING_FINE_HALF_RANGE = 20  # ±11.2 ns
 
 SETTLE_SEC_DEFAULT = 5.0
 ICT_SAMPLES_DEFAULT = 3
@@ -349,7 +357,9 @@ TARGET_LABELS = {
     "kly_phase": "Klystron phase",
     "kly_group_1": "Group 1 (L1-L4)",
     "kly_group_2": "Group 2 (L5-L8)",
+    "timing_group": "Timing",
     "timing": "Timing",
+    "timing_fine": "Timing fine tuning",
     "qa": "QA",
     "qm": "QM",
     "correctors": "Correctors",
@@ -385,6 +395,8 @@ TARGET_VALUE_SPECS = {
     "kly_group_1": KLY_GROUP_1_SPECS,
     "kly_group_2": KLY_GROUP_2_SPECS,
     "timing": [("Timing", TIMING_PV, None, "count")],
+    "timing_fine": [("OT8D", TIMING_PV, None, "count"),
+                    ("RFDLY0", TIMING_FINE_PV, None, "count")],
     "qa": [(f"QA{i}L", f"QA{i}L:currentWrite", f"QA{i}L:currentRead", "A") for i in range(1, 6)],
     "qm": [(f"QM{i}L", f"QM{i}L:currentWrite", f"QM{i}L:currentRead", "A") for i in range(1, 4)],
 }
@@ -442,12 +454,35 @@ def resolve_linac_length_scale(
     return max(float(learned), floor), LINAC_LEARNED_PRESET_VERSION
 
 
-def _timing_count(value: float) -> int:
-    """OT8D is an integer setting; reject invalid reads or fractional commands."""
+def _timing_count(value: float, pv: str = TIMING_PV) -> int:
+    """Validate integer timing registers, including the RFDLY0 digit range."""
     number = float(value)
     if not np.isfinite(number) or not number.is_integer():
-        raise ValueError(f"{TIMING_PV} requires a finite integer count: {value}")
+        raise ValueError(f"{pv} requires a finite integer count: {value}")
+    if pv == TIMING_FINE_PV and not 0 <= number < TIMING_FINE_RADIX:
+        raise ValueError(f"{pv} must be an integer from 0 to 19: {value}")
     return int(number)
+
+
+def timing_fine_scan(coarse: float, fine: float) -> List[Tuple[int, Dict[str, int]]]:
+    """Nine absolute settings at five-tick offsets from the current timing.
+
+    Preserve the current RFDLY0 residue modulo five; only the changes are
+    multiples of five. divmod handles both carry and borrow, including zero.
+    """
+    origin = TIMING_FINE_RADIX * _timing_count(coarse) + _timing_count(fine, TIMING_FINE_PV)
+    points = []
+    for offset in range(-TIMING_FINE_HALF_RANGE, TIMING_FINE_HALF_RANGE + 1, TIMING_FINE_STEP):
+        coarse_value, fine_value = divmod(origin + offset, TIMING_FINE_RADIX)
+        points.append((offset, {TIMING_PV: coarse_value, TIMING_FINE_PV: fine_value}))
+    return points
+
+
+def _restore_pvs_for_config(config: Dict[str, Any]) -> List[str]:
+    pvs = [str(pv) for pv in config.get("restore_pvs", RESTORE_PVS)]
+    if config.get("timing_fine", False):
+        pvs.extend((TIMING_PV, TIMING_FINE_PV))
+    return list(dict.fromkeys(pvs))
 
 
 def _format_machine_value(value: float, unit: str) -> str:
@@ -565,6 +600,8 @@ def _main_run_delta_specs(config: Dict[str, Any]) -> List[Tuple[str, str, Option
             specs.extend(KLY_GROUP_2_SPECS)
     if bool(config.get("timing", False)):
         specs.extend(TARGET_VALUE_SPECS["timing"])
+    if bool(config.get("timing_fine", False)):
+        specs.extend(TARGET_VALUE_SPECS["timing_fine"])
     if bool(config.get("qa", False)):
         specs.extend(TARGET_VALUE_SPECS["qa"])
     if bool(config.get("qm", False)):
@@ -796,6 +833,7 @@ class OptimizationWorker(QThread):
         self._pause_can_remeasure = False
         self._best_recorded = None
         self._touched_pvs = set()
+        self._timing_fine_pairs = set()
         self.run_profile = str(config.get("run_profile", RUN_PROFILE_MAIN)).upper()
 
         self.settle_sec = float(config.get("settle_sec", SETTLE_SEC_DEFAULT))
@@ -1195,7 +1233,7 @@ class OptimizationWorker(QThread):
         self._pause_checkpoint()
         snapshot_path = self.run_dir / f"InitialSnapshot_{self.run_tag}.json"
         setpoints: Dict[str, float] = {}
-        restore_pvs = [str(pv) for pv in list(self.config.get("restore_pvs", RESTORE_PVS))]
+        restore_pvs = _restore_pvs_for_config(self.config)
         for pv in restore_pvs:
             setpoints[pv] = float(self._read_current(pv, _default_readback_pv(pv)))
 
@@ -2461,7 +2499,7 @@ class OptimizationWorker(QThread):
         if pv_read is None:
             pv_read = _default_readback_pv(pv_write)
         value = self.interface.read_current(pv_write=pv_write, pv_read=pv_read, quantize_phase=True)
-        return _timing_count(value) if pv_write == TIMING_PV else value
+        return _timing_count(value, pv_write) if pv_write in (TIMING_PV, TIMING_FINE_PV) else value
 
     def _lbo_group(self, group_name: str, params: List[tuple]):
         """
@@ -2651,6 +2689,8 @@ class OptimizationWorker(QThread):
                 self._run_correctors()
                 if self.is_running:
                     self._emit_group_state("correctors", "done")
+            if self.run_profile == RUN_PROFILE_MAIN and self.config.get("timing_fine") and self.is_running:
+                self._run_timing_fine()
         except SaveAndEndRequested:
             try:
                 self._finish_at_best()
@@ -2671,13 +2711,19 @@ class OptimizationWorker(QThread):
 
     def _write_setpoints(self, values, wait=False):
         self._pause_checkpoint()
-        values = {pv: _timing_count(value) if pv == TIMING_PV else value
+        values = {pv: _timing_count(value, pv) if pv in (TIMING_PV, TIMING_FINE_PV) else value
                   for pv, value in values.items()}
         if self.run_profile == RUN_PROFILE_DEVELOPER or self.config.get("correctors"):
             selected = {spec["pv_write"] for spec in self.developer_actuators}
             limits = self.config.get("actuator_limits", {})
             corrector_pvs = {f"{name}:currentWrite" for name in BT_SEQUENCE if str(name).lower().startswith("z")}
+            fine_pair = (self.run_profile == RUN_PROFILE_MAIN
+                         and (values.get(TIMING_PV), values.get(TIMING_FINE_PV)) in self._timing_fine_pairs)
             for pv, value in values.items():
+                if fine_pair and pv in (TIMING_PV, TIMING_FINE_PV):
+                    # Fine tuning has its own nine verified pairs, centered on
+                    # the timing after the corrector/L8 optimization finishes.
+                    continue
                 if self.run_profile == RUN_PROFILE_MAIN and pv not in corrector_pvs and pv not in selected:
                     continue  # Existing Main groups (RF phases, solenoid, QA/QM).
                 if pv not in selected or pv not in limits:
@@ -2778,6 +2824,48 @@ class OptimizationWorker(QThread):
             self.perform_1d_scan(label, pv_write, scan, group=DEVELOPER_GROUP_NAME, mode="SEQUENTIAL")
             if self.is_running:
                 self._emit_developer_actuator_state(label, "done")
+
+    def _run_timing_fine(self):
+        """Exhaustive relative timing scan, independent of the coarse search mode."""
+        if not self.is_running:
+            return
+        self._emit_group_state("timing_fine", "running")
+        coarse = self._read_current(TIMING_PV)
+        fine = self._read_current(TIMING_FINE_PV)
+        points = timing_fine_scan(coarse, fine)
+        self._timing_fine_pairs = {
+            (values[TIMING_PV], values[TIMING_FINE_PV]) for _, values in points
+        }
+        group = TARGET_LABELS["timing_fine"]
+        self._emit_progress({"kind": "bo1d_trace", "trace": {}})
+        self.log_signal.emit(
+            f"--- {group}: OT8D={coarse}, RFDLY0={fine}; "
+            "9 points, current ±11.2 ns, step 2.8 ns ---")
+        best = None
+        # Measure the center first, then the remaining offsets. Ties prefer
+        # the smallest change from the current setting.
+        for offset, values in sorted(points, key=lambda point: (abs(point[0]), point[0])):
+            if not self.is_running:
+                return
+            result = self._evaluate_point_multi(
+                group, values, mode=self.mode, group=group,
+                note=f"TIMING_FINE offset_ns={offset * TIMING_FINE_TICK_NS:+.2f}")
+            self.log_signal.emit(
+                f"[Timing fine] Δt={offset * TIMING_FINE_TICK_NS:+.2f} ns: "
+                f"OT8D={values[TIMING_PV]}, RFDLY0={values[TIMING_FINE_PV]}, "
+                f"score={result.score:.6g}, valid={result.measurement_ok}")
+            if result.measurement_ok and np.isfinite(result.score):
+                rank = (result.score, -abs(offset))
+                if best is None or rank > best[0]:
+                    best = (rank, values)
+        if not self.is_running:
+            return
+        if best is None:
+            self._write_setpoints({TIMING_PV: coarse, TIMING_FINE_PV: fine})
+            raise ValueError("Timing fine tuning: no valid measurements; restored the starting timing")
+        self._evaluate_point_multi(group, best[1], mode=self.mode, group=group, note="OPTIMIZED_SET")
+        if self.is_running:
+            self._emit_group_state("timing_fine", "done")
 
     def _run_sequential(self):
         # Scan settings (GUI-configurable)
@@ -3179,6 +3267,7 @@ class MainWindow(QMainWindow):
         self.mode_box.currentTextChanged.connect(self._update_mode_ui)
         self.mode_box.currentTextChanged.connect(self._refresh_current_values)
         self.chk_kly_phase.toggled.connect(self._update_mode_ui)
+        self.chk_timing_group.toggled.connect(self._update_mode_ui)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         for cb in (
                 self.chk_gun_sol_l0_phase,
@@ -3186,6 +3275,7 @@ class MainWindow(QMainWindow):
                 self.chk_kly_group1,
                 self.chk_kly_group2,
                 self.chk_timing,
+                self.chk_timing_fine,
                 self.chk_qa,
                 self.chk_qm,
         ):
@@ -3223,7 +3313,19 @@ class MainWindow(QMainWindow):
         self.chk_kly_group2 = self._add_target_row(
             lay_t, "kly_group_2", TARGET_LABELS["kly_group_2"], checked=True, prominent=False, indent=34
         )
-        self.chk_timing = self._add_target_row(lay_t, "timing", TARGET_LABELS["timing"], checked=True, prominent=True)
+        self.chk_timing_group = self._add_target_row(
+            lay_t, "timing_group", TARGET_LABELS["timing_group"],
+            checked=True, prominent=True, show_value=False)
+        self.chk_timing = self._add_target_row(
+            lay_t, "timing", "Coarse (OT8D, 11.2 ns/count)",
+            checked=True, prominent=False, indent=34)
+        self.chk_timing_fine = self._add_target_row(
+            lay_t, "timing_fine", "Fine tuning (±11.2 ns, step 2.8 ns)",
+            checked=False, prominent=False, indent=34)
+        self.chk_timing_fine.setToolTip(
+            "Scan 9 points around the current timing: ±11.2 ns in 2.8 ns steps. "
+            "RFDLY0 changes by 5 counts, with carry/borrow into OT8D (RFDLY0 = 0–19). "
+            "Runs after the other selected targets; can run on its own.")
         self.chk_qa = self._add_target_row(lay_t, "qa", TARGET_LABELS["qa"], checked=True, prominent=True)
         self.chk_qm = self._add_target_row(lay_t, "qm", TARGET_LABELS["qm"], checked=True, prominent=True)
         self.chk_correctors = self._add_target_row(lay_t, "correctors", "Correctors", checked=False,
@@ -4562,6 +4664,22 @@ class MainWindow(QMainWindow):
             "border-radius: 9px; padding: 5px 8px; }"
         )
         self.target_states[key] = str(state).lower()
+        if key in ("timing", "timing_fine") and hasattr(self, "chk_timing_fine"):
+            children = [child for child, box in (("timing", self.chk_timing),
+                                                 ("timing_fine", self.chk_timing_fine))
+                        if self.chk_timing_group.isChecked() and box.isChecked()]
+            states = [self.target_states.get(child, "idle") for child in children]
+            if "error" in states:
+                parent_state = "error"
+            elif "running" in states or ("done" in states and "waiting" in states):
+                parent_state = "running"
+            elif states and all(value == "done" for value in states):
+                parent_state = "done"
+            elif "waiting" in states:
+                parent_state = "waiting"
+            else:
+                parent_state = "idle"
+            self._set_target_state("timing_group", parent_state)
 
     def _reset_target_states(self):
         for key in list(self.target_status_labels.keys()):
@@ -4579,8 +4697,13 @@ class MainWindow(QMainWindow):
                     keys.append("kly_group_1")
                 if self.chk_kly_group2.isChecked():
                     keys.append("kly_group_2")
-        if self.chk_timing.isChecked():
-            keys.append("timing")
+        if self.chk_timing_group.isChecked():
+            if self.chk_timing.isChecked() or self.chk_timing_fine.isChecked():
+                keys.append("timing_group")
+            if self.chk_timing.isChecked():
+                keys.append("timing")
+            if self.chk_timing_fine.isChecked():
+                keys.append("timing_fine")
         if self.chk_qa.isChecked():
             keys.append("qa")
         if self.chk_qm.isChecked():
@@ -5116,10 +5239,12 @@ class MainWindow(QMainWindow):
         enable_kly_subgroups = (self.mode_box.currentText() == "GROUP_BO") and self.chk_kly_phase.isChecked()
         self.chk_kly_group1.setEnabled(enable_kly_subgroups)
         self.chk_kly_group2.setEnabled(enable_kly_subgroups)
+        self.chk_timing.setEnabled(self.chk_timing_group.isChecked())
+        self.chk_timing_fine.setEnabled(self.chk_timing_group.isChecked())
 
     def _capture_machine_origin(self, config: Dict[str, Any]) -> Dict[str, Any]:
         interface = self._ensure_interface()
-        restore_pvs = [str(pv) for pv in list(config.get("restore_pvs", RESTORE_PVS))]
+        restore_pvs = _restore_pvs_for_config(config)
         setpoints = {
             pv: float(interface.read_current(pv, _default_readback_pv(pv)))
             for pv in restore_pvs
@@ -5414,7 +5539,10 @@ class MainWindow(QMainWindow):
         self.chk_kly_phase.setChecked(bool(payload.get("kly_phase", self.chk_kly_phase.isChecked())))
         self.chk_kly_group1.setChecked(bool(payload.get("grp_L1_4", self.chk_kly_group1.isChecked())))
         self.chk_kly_group2.setChecked(bool(payload.get("grp_L5_8", self.chk_kly_group2.isChecked())))
+        self.chk_timing_group.setChecked(bool(payload.get(
+            "timing_group", payload.get("timing", self.chk_timing.isChecked()) or payload.get("timing_fine", False))))
         self.chk_timing.setChecked(bool(payload.get("timing", self.chk_timing.isChecked())))
+        self.chk_timing_fine.setChecked(bool(payload.get("timing_fine", False)))
         self.chk_qa.setChecked(bool(payload.get("qa", self.chk_qa.isChecked())))
         self.chk_qm.setChecked(bool(payload.get("qm", self.chk_qm.isChecked())))
         self.sp_settle_sec.setValue(float(payload.get("settle_sec", self.sp_settle_sec.value())))
@@ -5629,12 +5757,14 @@ class MainWindow(QMainWindow):
     def _set_main_run_controls_enabled(self, enabled: bool):
         for w in [
             self.chk_gun_sol_l0_phase, self.chk_kly_phase, self.chk_kly_group1, self.chk_kly_group2,
-            self.chk_timing, self.chk_qa, self.chk_qm,
+            self.chk_timing_group, self.chk_timing, self.chk_timing_fine, self.chk_qa, self.chk_qm,
             self.chk_correctors, self.objective_box,
             self.mode_box, self.seq_method_box, self.btn_browse, self.config_tab,
             self.resume_file_edit, self.resume_file_browse_btn, self.resume_file_clear_btn
         ]:
             w.setEnabled(enabled)
+        self.chk_timing.setEnabled(enabled and self.chk_timing_group.isChecked())
+        self.chk_timing_fine.setEnabled(enabled and self.chk_timing_group.isChecked())
 
     def _set_developer_run_controls_enabled(self, enabled: bool):
         for w in [
@@ -5861,7 +5991,9 @@ class MainWindow(QMainWindow):
             "reuse_initial_eval": True,
             "gun_sol_l0_phase": self.chk_gun_sol_l0_phase.isChecked(),
             "kly_phase": self.chk_kly_phase.isChecked(),
-            "timing": self.chk_timing.isChecked() and not (self.correctors_l8.isChecked() and self.chk_correctors.isChecked()),
+            "timing_group": self.chk_timing_group.isChecked(),
+            "timing": self.chk_timing_group.isChecked() and self.chk_timing.isChecked() and not (self.correctors_l8.isChecked() and self.chk_correctors.isChecked()),
+            "timing_fine": self.chk_timing_group.isChecked() and self.chk_timing_fine.isChecked(),
             "qa": self.chk_qa.isChecked(),
             "qm": self.chk_qm.isChecked(),
             "correctors": self.chk_correctors.isChecked(),
@@ -5900,7 +6032,9 @@ class MainWindow(QMainWindow):
                 continue
             config[_group_bo_max_evals_config_key(str(spec["config_id"]))] = int(box.value())
 
-        if not (config["gun_sol_l0_phase"] or config["kly_phase"] or config["timing"] or config["qa"] or config["qm"] or config["correctors"]):
+        config["restore_pvs"] = _restore_pvs_for_config(config)
+
+        if not (config["gun_sol_l0_phase"] or config["kly_phase"] or config["timing"] or config["timing_fine"] or config["qa"] or config["qm"] or config["correctors"]):
             QMessageBox.warning(self, "Warning", "Please select at least one target.")
             return
         if config["mode"] == "GROUP_BO" and config["kly_phase"] and not (config["grp_L1_4"] or config["grp_L5_8"]):
@@ -5910,7 +6044,7 @@ class MainWindow(QMainWindow):
             config["actuator_limits"], summary = self._checked_corrector_ranges(actuators)
             if objective != DEVELOPER_OBJECTIVE_ICT or actuators:
                 groups = [label for key, label in [("gun_sol_l0_phase", "GUN / Solenoid / L0"),
-                          ("kly_phase", "Klystron phase"), ("timing", "Timing"), ("qa", "QA"), ("qm", "QM"),
+                          ("kly_phase", "Klystron phase"), ("timing", "Timing"), ("timing_fine", "Timing fine tuning"), ("qa", "QA"), ("qm", "QM"),
                           ("correctors", "Selected LINAC/BT correctors")] if config[key]]
                 message = (f"Objective: {self.objective_box.currentText()}\nTargets: {', '.join(groups)}\n"
                            + (f"BPMs: {', '.join(bpms)}\n" if bpms else "")

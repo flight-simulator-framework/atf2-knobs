@@ -267,3 +267,95 @@ All CALC and RESET settings restored. Wall time ~7.9 s, measurement-time estimat
       no improvement demonstrated by this small/noisy skew trial.
   H-excited TBT: x tune 0.205298 valid; y estimate rejected by the signal gate.
 These GUI integration results do not establish an emittance improvement.
+
+Simulation agent reporting prototype
+-----------------------------------
+  OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/mpl-dr-agent \
+    PYTHONPATH=atf2-knobs python -m Knobs.DRCorrection.agent \
+    --backend stored --output simulation-agent/results/NEW-reporting-run
+
+Use --backend demo for a synthetic control-flow check, or --backend rftrack for
+the native transverse DR. Only these three exact simulation backend types are
+accepted. The runner does not open a GUI or operate EPICS.
+It calls the same CorrectionService as DRTuning: one COD Y, one dispersion Y,
+and one skew stage, using two vertical correctors and one SD from the public
+catalog. The deterministic supervisor is not an LLM or an RL-trained policy.
+
+Each stage measures a response, reports a bounded proposal, applies it, and
+remeasures. Retention requires >=10% improvement of the solver-weighted RMS,
+no loss of the original valid BPM coverage, and all corresponding BPM intensity
+ratios >=0.98. Dispersion also requires non-worsening COD. Noise can trigger
+rejection: these are provisional operational proxy guards, not a significance
+test, an emittance claim, or a validated transmission test of the stored-beam
+envelope model. Rejected settings are restored; accepted earlier stages remain
+in place when a subsequent stage fails/stops. There is no retry/learning loop.
+
+Outputs under <output>/agent:
+  events.jsonl: ordered, flushed dr-agent-event-1 messages with wall time,
+    stage, intended action, proposal, measured assessment, and disposition.
+  orbit/dispersion/skew.json: existing response-session schema plus decision.
+  summary.json: completion/failure, retained/rejected stages, acquisition counts
+    and measurement-time accounting. Completion does not mean all stages improve.
+The stored backend's acquisition clock includes startup's orbit read; elapsed
+agent wall time begins after backend construction. The original plant logs
+remain under <output>/plant. Existing directories are never overwritten.
+
+Future operator integration is intended to subscribe to these same structured
+events and show the active tool, reason, affected magnets and measured result.
+SimulationCorrectionAgent.request_stop() requests a stop at a checked boundary;
+in-flight I/O must finish and temporary settings must restore. Restoration
+failures are reported explicitly. GUI subscription, pause/resume, shared GUI /
+agent command ownership, human takeover and live automatic operation remain
+future work. One serialized executor should own all writes when that is added;
+the GUI and reporting LLM should submit requests through it, not issue competing
+PV writes. No such hardware automation is enabled by this prototype.
+
+Policy decisions use returned measurements and settings only. The common ported
+solver still imports the RF-Track correction module; strict process-level native
+import isolation must be addressed separately before certifying an autonomous
+information-boundary experiment. The CLI run is a service/reporting integration
+test, not the earlier seven-seed emittance benchmark or a Linac-to-IP campaign.
+
+2026-10-21 reporting integration evidence:
+  simulation-agent/results/dr-correction-reporting-v2-20261021/agent/
+  Seed 32, 200 ms stored DR, 34 events; all three stages completed.
+  COD Y RMS 0.112150 -> 0.085085 mm retained. Dispersion's weighted proxy
+  improved but minimum BPM intensity ratio 0.97889 missed the provisional 0.98
+  guard; restored. Skew proxy improved only ~2.7%, below 10%; restored.
+  43 orbit acquisitions = 215 s of measurement time. Agent wall time 3.78 s
+  excludes backend startup. No Multi-OTR/IP measurement or emittance claim.
+  57 correction tests passed, including 8 new reporting/agent tests.
+  The first dr-correction-reporting-20261021 attempt is retained: it stopped
+  because the catalog's first skew was SF while the pilot enabled only SD.
+  The corrected public-name selection and regression test do not alter physics.
+
+Native RFTrack pilot (2026-10-21)
+-------------------------------
+  OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MPLCONFIGDIR=/tmp/mpl-dr-agent \
+    PYTHONPATH=atf2-knobs:machine-interfaces:machine-interfaces/backends/atf2 \
+    /home/motokisato/rftrack-env/bin/python -m Knobs.DRCorrection.agent \
+    --backend rftrack --native-pilot-errors --seed 32 \
+    --output simulation-agent/results/NEW-native-reporting-run
+
+--native-pilot-errors explicitly prepares two V correctors at +0.08/-0.05 A
+and the first SD skew at +0.0005 m^-1. All other magnets have their nominal
+settings; this pilot is NOT the all-magnet Gaussian-error campaign. Seed 32
+controls the 1 um RMS BPM noise. The policy receives BPM readings, intensity
+and actuator settings, not the true orbit/Twiss/emittance. The small stage
+sequence is fixed, and rejection restores settings without retries or learning.
+
+Results: simulation-agent/results/dr-native-reporting-20261021/agent/
+  COD Y: 48.5597 -> 0.8265 um RMS, retained.
+  Dispersion: 1.0950 -> 0.9235 mm/(dp/p); rejected because COD RMS changed
+    1.1122 -> 1.1656 um. This difference is below the per-BPM 1 um noise;
+    the strict non-worsening gate is not a statistical decision.
+  Skew response RMS: 1.4765 -> 1.3971 um; <10% improvement, restored.
+  35 events, 42 orbit acquisitions, 210 s = 3.5 min measurement-time estimate.
+  Agent execution 1.75 s, excluding imports/backend construction. No IPBSM.
+
+The native backend calculates periodic RFTrack transverse orbits. Frequency
+commands emulate a momentum offset using fixed alpha_c=0.0021; the cavity is
+disabled. Intensity is constant in this backend, so its charge guard cannot
+establish loss/transmission performance. There is no radiation equilibrium,
+200 ms storage, or demonstrated emittance improvement in this pilot.
+See simulation-agent/DR_BOUNDARY_AUDIT.txt for the separate full-chain audit.
