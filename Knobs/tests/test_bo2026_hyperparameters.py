@@ -79,6 +79,20 @@ class BO2026HyperparameterTests(unittest.TestCase):
         self.assertEqual(metadata["signal_variance"], 0.15)
         self.assertEqual(metadata["noise_variance"], 1e-4)
 
+    def test_ipbsm_default_and_explicit_legacy_resolve_different_priors(self):
+        cfg = OptimizerConfig(
+            mode_name="custom", method="BO", acquisition="EI", params=["Ay", "Z scan knob"],
+            bounds={"Ay": (-0.5, 0.5), "Z scan knob": (-0.0085, 0.0085)},
+            init_sigma={"Ay": 0.25, "Z scan knob": 0.00425},
+            param_steps={"Ay": 0.01, "Z scan knob": 0.001},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            optimizer = Optimizer(_NoopController(), cfg, Path(directory))
+            self.assertEqual(optimizer._gp_metadata()["mode"], "learned_fixed")
+            self.assertEqual(optimizer._gp_metadata()["length_scales"], {"Ay": 0.08, "Z scan knob": 0.0025})
+            cfg.hyperparameter_mode = "legacy_fixed"
+            self.assertEqual(optimizer._gp_metadata()["length_scales"], cfg.init_sigma)
+
     def test_z_candidates_are_discrete_unique_and_not_repeated(self):
         with tempfile.TemporaryDirectory() as directory:
             optimizer = Optimizer(_NoopController(), self._ay_z_config(), Path(directory))

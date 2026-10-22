@@ -15,11 +15,18 @@ class TestGUIStartup(unittest.TestCase):
         with patch.object(gui, "IPBSMInterface", return_value=object()):
             window = gui.MainWindow()
         try:
-            self.assertEqual(window.hyperparameter_mode_box.currentText(), "legacy_fixed")
+            self.assertEqual(window.hyperparameter_mode_box.currentText(), "learned_fixed")
+            self.assertEqual(window._collect_config().hyperparameter_mode, "learned_fixed")
             self.assertEqual(window.zscan_kernel_box.currentText(), "rbf")
             self.assertEqual(window.zscan_initial_points_box.value(), 3)
-            window.hyperparameter_mode_box.setCurrentText("learned_fixed")
+            window.hyperparameter_mode_box.setCurrentText("legacy_fixed")
+            self.assertEqual(window._collect_config().hyperparameter_mode, "legacy_fixed")
+            # Existing configurations still select the saved mode; files
+            # predating this setting retain the original behavior on load.
+            window._set_config_to_ui({"params": ["Ay"], "hyperparameter_mode": "learned_fixed"})
             self.assertEqual(window.hyperparameter_mode_box.currentText(), "learned_fixed")
+            window._set_config_to_ui({"params": ["Ay"]})
+            self.assertEqual(window.hyperparameter_mode_box.currentText(), "legacy_fixed")
         finally:
             window.close()
             app.processEvents()

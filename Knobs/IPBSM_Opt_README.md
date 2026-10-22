@@ -59,6 +59,27 @@ No skips the additional save. A missing/unwritable NAS directory reports an
 error without removing the normal outputs. If there are no valid measurements,
 the run records are saved but no plots or export prompt are produced.
 
+## GP hyperparameter modes
+
+New GUI runs and new `OptimizerConfig` instances default to `learned_fixed`.
+Loading a GUI config respects its saved mode; older files without the field
+retain `legacy_fixed` for reproducibility.
+
+- `legacy_fixed`: use explicit `gp_ard_length_scales` if present; otherwise
+  use the configured per-knob `init_sigma` (falling back to `gp_length_scale`).
+- `learned_fixed`: use fixed BO2026-derived length scales: Z-only 0.002;
+  when Ay and Z are both selected, Ay 0.08 and Z 0.0025. Z without Ay also
+  uses 0.002. Other axes retain `init_sigma` / `gp_length_scale`. All axes
+  receive a minimum length scale of two configured knob steps. Explicit
+  `gp_ard_length_scales` overrides belong to legacy mode.
+
+Values are in the respective knob's units. In the usual Ay/Ey/Coup2-only
+selection, learned mode normally gives the same widths as legacy, except
+where the step-size floor applies. Switching modes does not change the
+kernel, signal variance (default 0.15), noise variance (default 0.0001),
+initial-point count or search bounds. Both modes update the GP predictions
+as measurements arrive, but neither re-fits hyperparameters during the run.
+
 ## BO progress and EI stopping
 
 The status shows, for example, `step=8/20`. The denominator is the running

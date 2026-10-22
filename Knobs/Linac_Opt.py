@@ -29,6 +29,7 @@ import math
 import json
 import itertools
 import threading
+import uuid
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, Optional
@@ -53,6 +54,7 @@ from matplotlib.figure import Figure
 from machine_interfaces_atf2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT, BT_SEQUENCE
 from machine_interfaces_atf2.InterfaceATF2_DR import DRBPMReader, DR_BPM_NAMES, DRBPMTurnControlError
 from linac_gp import CorrectorGPModel
+from Knobs.ipbsm_opt_plotting import save_plot_montage
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
@@ -65,6 +67,7 @@ INTENSITY_PLOT_BPM_NAMES = (
 )
 
 FLIGHT_SIMULATOR_DATA_ROOT = Path("/atf/data/flight-simulator")
+LINAC_TEMPFILES_DIR = Path("/mnt/nas1/atf-data/op/tempfiles")
 
 
 def default_linacopt_save_dir(year: Optional[str] = None) -> Path:
@@ -873,6 +876,7 @@ class OptimizationWorker(QThread):
         self._initial_snapshot = None
         self._initial_eval_consumed = False
         self._eval_counter = 0
+        self._scan_progress = {}
         self._current_pv_values: Dict[str, float] = {}
         self.resume_csv_path = Path(str(config.get("resume_csv_path", "")).strip()).expanduser() if str(
             config.get("resume_csv_path", "")).strip() else None
@@ -941,6 +945,14 @@ class OptimizationWorker(QThread):
 
     def _emit_progress(self, payload: Dict[str, object]):
         self.progress_signal.emit(dict(payload))
+
+    def _set_scan_progress(self, label, index, max_evals, stage="measuring"):
+        # Local search budget, not the run-wide CSV index (which also counts
+        # final verification measurements and discarded/retried measurements).
+        self._scan_progress = {
+            "label": str(label), "index": index, "max_evals": int(max_evals), "stage": stage,
+        }
+        self._emit_progress({"kind": "scan_progress", "scan_progress": dict(self._scan_progress)})
 
     def _emit_bo1d_trace(
         self,
@@ -1019,6 +1031,7 @@ class OptimizationWorker(QThread):
         self._remember_best(r.score, r.measurement_ok)
         self._emit_progress({
             "kind": "evaluation",
+            "scan_progress": dict(self._scan_progress),
             "evaluation_phase": evaluation_phase(r.note),
             "eval_index": int(self._eval_counter),
             "group": str(r.group),
@@ -1775,6 +1788,7 @@ class OptimizationWorker(QThread):
         auto_budget = _auto_group_bo_budget(len(params), budget_preset)
         min_init = int(self.config.get("gbo_min_init", auto_budget["min_init"]))
         max_evals = _resolve_group_bo_max_evals(self.config, group_name, len(params))
+        self._set_scan_progress(group_name, 0, max_evals, "initializing")
         min_init = max(1, min(min_init, max_evals))
         cand_pool = int(self.config.get("gbo_candidate_pool", auto_budget["candidate_pool"]))
         ei_tol = float(self.config.get("bo_ei_tol", 0.0))
@@ -1853,6 +1867,7 @@ class OptimizationWorker(QThread):
             if cached is not None:
                 self.log_signal.emit(f"[GROUP_BO] Reusing cached lattice point for {group_name}: key={x_key}")
                 return cached
+            self._set_scan_progress(group_name, len(X) + 1, max_evals)
             reused = self._try_reuse_initial_vector(labels=[lab for (lab, *_rest) in params], pvs=pvs, x_vec=xq,
                                                     mode="GROUP_BO_SIMUL", group=group_name, note=note)
             if reused is not None:
@@ -1904,6 +1919,7 @@ class OptimizationWorker(QThread):
                         self._resume_discarded_row = None
                     self.log_signal.emit(
                         f"[RESUME] Group {group_name} already completed previously. Re-applying saved best vector.")
+                    self._set_scan_progress(group_name, None, max_evals, "restoring saved best")
                     _ = self._evaluate_point_multi(
                         device_label=f"Group:{group_name}",
                         pv_to_value=vec_to_dict(quantize_vec(x_best)),
@@ -1949,6 +1965,7 @@ class OptimizationWorker(QThread):
                     self.log_signal.emit(
                         f"[RESUME] Re-measuring discarded last group point for {group_name} before continuing."
                     )
+                    self._set_scan_progress(group_name, len(X) + 1, max_evals, "re-measuring")
                     r_resume = self._evaluate_point_multi(
                         device_label=f"Group:{group_name}",
                         pv_to_value=vec_to_dict(x_resume),
@@ -2072,6 +2089,7 @@ class OptimizationWorker(QThread):
         )
         self.log_signal.emit(f"[GROUP_BO] {group_name}: stop_reason={stop_reason}, evals={len(X)}")
         # Re-apply best settings to be safe (single multi-put)
+        self._set_scan_progress(group_name, len(X), max_evals, "final check")
         _ = self._evaluate_point_multi(
             device_label=f"Group:{group_name}",
             pv_to_value=vec_to_dict(best_x),
@@ -2160,6 +2178,8 @@ class OptimizationWorker(QThread):
             max_evals = _resolve_group_bo_max_evals(self.config, group or device_label, 1)
         else:
             max_evals = int(self.config.get("bo_max_evals", min(17, len(candidates))))
+        scan_limit = max_evals
+        self._set_scan_progress(device_label, 0, scan_limit, "initializing")
         ei_tol = float(self.config.get("bo_ei_tol", 1e-6))
         stall_iters = int(self.config.get("bo_stall_iters", 4))
         refine_enabled = bool(self.config.get("bo_refine", True))
@@ -2202,6 +2222,7 @@ class OptimizationWorker(QThread):
                     self._resume_discarded_row = None
                 self.log_signal.emit(
                     f"[RESUME] {device_label} already completed previously. Re-applying x={best_x:.6g}.")
+                self._set_scan_progress(device_label, None, scan_limit, "restoring saved best")
                 _ = self._evaluate_point(device_label, pv_name, best_x, mode=mode, group=group,
                                          note="RESUME_COMPLETED_SET")
                 return
@@ -2232,6 +2253,7 @@ class OptimizationWorker(QThread):
                 self.log_signal.emit(
                     f"[RESUME] Re-measuring discarded last point for {device_label} before continuing."
                 )
+                self._set_scan_progress(device_label, len(X) + 1, scan_limit, "re-measuring")
                 r_resume = self._evaluate_point(
                     device_label,
                     pv_name,
@@ -2245,6 +2267,7 @@ class OptimizationWorker(QThread):
                 R.append(r_resume)
 
         def eval_at(x: float, note: str = ""):
+            self._set_scan_progress(device_label, len(X) + 1, scan_limit)
             reused = self._try_reuse_initial_point(
                 device_label=device_label,
                 pv_name=pv_name,
@@ -2322,6 +2345,7 @@ class OptimizationWorker(QThread):
                 f"-> Best for {device_label}: {best_x:.6g}  "
                 f"Ttot={best_r.ict.get('Ttot', float('nan')):.6f}  {self._objective_metric_text(best_r.ict, best_r.bpm_metric)}"
             )
+            self._set_scan_progress(device_label, len(X), scan_limit, "final check")
             _ = self._evaluate_point(device_label, pv_name, best_x, mode=mode, group=group, note="OPTIMIZED_SET")
             return
 
@@ -2345,6 +2369,8 @@ class OptimizationWorker(QThread):
         for x in init_x[:max_evals]:
             if not self.is_running:
                 return
+            if len(X) >= max_evals:
+                break
             if x in set(X):
                 continue
             eval_at(x, note="BO_INIT")
@@ -2420,6 +2446,8 @@ class OptimizationWorker(QThread):
                 # allow a few more evals, but keep bounded
                 refine_budget = int(self.config.get("bo_refine_evals", min(10, len(fine))))
                 max_total = max_evals + refine_budget
+                scan_limit = max_total
+                self._set_scan_progress(device_label, len(X), scan_limit, "refinement")
 
                 self.log_signal.emit(
                     f"[BO-1D] Refinement: global step {coarse_step:.6g} -> {fine_step:.6g}, range=[{lo:.6g},{hi:.6g}], budget={refine_budget}"
@@ -2483,6 +2511,7 @@ class OptimizationWorker(QThread):
             f"-> Best for {device_label}: {best_x:.6g}  "
             f"Ttot={best_r.ict.get('Ttot', float('nan')):.6f}  {self._objective_metric_text(best_r.ict, best_r.bpm_metric)}"
         )
+        self._set_scan_progress(device_label, len(X), scan_limit, "final check")
         _ = self._evaluate_point(device_label, pv_name, best_x, mode=mode, group=group, note="OPTIMIZED_SET")
 
         # ----------------------------
@@ -2540,8 +2569,19 @@ class OptimizationWorker(QThread):
 
         x = np.array(x0, dtype=float)
 
+        iters = int(self.config.get("lbo_iters", 4))
+        line_samples = int(self.config.get("lbo_line_samples", 11))
+        search_limit = 1 + max(0, iters) * (len(params) + 1) * max(0, line_samples)
+        search_index = 0
+        self._set_scan_progress(group_name, 0, search_limit, "initializing (upper bound)")
+
         # Evaluation helper
         def eval_vec(x_vec: np.ndarray, note: str = "") -> EvalResult:
+            nonlocal search_index
+            if note != "LBO_FINAL":
+                search_index += 1
+            self._set_scan_progress(group_name, search_index, search_limit,
+                                    "final check" if note == "LBO_FINAL" else "measuring (upper bound)")
             xq = np.asarray(x_vec, dtype=float)
             reused = self._try_reuse_initial_vector(labels=labels, pvs=pvs, x_vec=xq, mode="GROUP_LBO",
                                                     group=group_name, note=note)
@@ -2591,9 +2631,6 @@ class OptimizationWorker(QThread):
         best_x = x.copy()
 
         # iterations (small fixed number to avoid runaway)
-        iters = int(self.config.get("lbo_iters", 4))
-        line_samples = int(self.config.get("lbo_line_samples", 11))
-
         rng = np.random.default_rng()
 
         def clamp_quantize_vec(x_candidate: np.ndarray) -> np.ndarray:
@@ -2844,9 +2881,10 @@ class OptimizationWorker(QThread):
         best = None
         # Measure the center first, then the remaining offsets. Ties prefer
         # the smallest change from the current setting.
-        for offset, values in sorted(points, key=lambda point: (abs(point[0]), point[0])):
+        for index, (offset, values) in enumerate(sorted(points, key=lambda point: (abs(point[0]), point[0])), 1):
             if not self.is_running:
                 return
+            self._set_scan_progress(group, index, len(points))
             result = self._evaluate_point_multi(
                 group, values, mode=self.mode, group=group,
                 note=f"TIMING_FINE offset_ns={offset * TIMING_FINE_TICK_NS:+.2f}")
@@ -2863,6 +2901,7 @@ class OptimizationWorker(QThread):
         if best is None:
             self._write_setpoints({TIMING_PV: coarse, TIMING_FINE_PV: fine})
             raise ValueError("Timing fine tuning: no valid measurements; restored the starting timing")
+        self._set_scan_progress(group, len(points), len(points), "final check")
         self._evaluate_point_multi(group, best[1], mode=self.mode, group=group, note="OPTIMIZED_SET")
         if self.is_running:
             self._emit_group_state("timing_fine", "done")
@@ -3153,6 +3192,7 @@ class MainWindow(QMainWindow):
         self.target_states: Dict[str, str] = {}
         self._run_mode: str = ""
         self._run_failed: bool = False
+        self._scan_progress_by_profile: Dict[str, dict] = {}
         self._shutdown_in_progress: bool = False
         self._current_value_refresh_failed: bool = False
         self.current_machine_origin: Optional[Dict[str, Any]] = None
@@ -4773,6 +4813,7 @@ class MainWindow(QMainWindow):
             },
         )
         state["eval_index"] = []
+        self._scan_progress_by_profile.pop(context, None)
         state["evaluation_phase"] = []
         state["ttot"] = []
         state["metric"] = []
@@ -5094,9 +5135,23 @@ class MainWindow(QMainWindow):
             ax_acq.legend(loc="best")
         canvas.draw_idle()
 
+    def _scan_progress_text(self, profile, *, include_stage=True):
+        progress = self._scan_progress_by_profile.get(profile, {})
+        if not progress:
+            return ""
+        index = progress.get("index")
+        count = f"eval={index}/{progress['max_evals']}" if index is not None else f"maxeval={progress['max_evals']}"
+        return f"{progress['label']} | {count}" + (f" | {progress['stage']}" if include_stage else "")
+
     def _on_worker_progress(self, payload: dict):
         context = self._run_profile
         kind = str(payload.get("kind", ""))
+        if "scan_progress" in payload:
+            self._scan_progress_by_profile[context] = dict(payload["scan_progress"])
+        if kind == "scan_progress":
+            self._set_status(f"Status: RUNNING {self._run_mode} | {self._scan_progress_text(context)}",
+                             state="running", profile=context)
+            return
         if kind == "group_state":
             key = str(payload.get("group_key", ""))
             state = str(payload.get("state", "idle")).lower()
@@ -5136,7 +5191,8 @@ class MainWindow(QMainWindow):
             for button in (self.btn_stop, self.dev_btn_stop):
                 button.setText("RESUME" if paused else "PAUSE")
                 button.setEnabled(True)
-            self._set_status("Status: PAUSED — settings retained" if paused else "Status: RUNNING",
+            self._set_status(("Status: PAUSED — settings retained" if paused else "Status: RUNNING")
+                             + f" | {self._scan_progress_text(context)}",
                              state="paused" if paused else "running", profile=context)
             if paused:
                 self._show_pause_choices()
@@ -5203,7 +5259,7 @@ class MainWindow(QMainWindow):
             self._refresh_eval_plot(context)
             if self._run_mode:
                 self._set_status(
-                    f"Status: RUNNING {self._run_mode} | eval={state['eval_index'][-1]} | " +
+                    f"Status: RUNNING {self._run_mode} | {self._scan_progress_text(context)} | total={state['eval_index'][-1]} | " +
                     (f"Intensity score={state['metric'][-1]:.6g}" if payload.get("bpm_intensities") else f"Ttot={state['ttot'][-1]:.6f}"),
                     state="running",
                     profile=context,
@@ -5376,11 +5432,12 @@ class MainWindow(QMainWindow):
         context = str(profile or RUN_PROFILE_MAIN).upper()
         widgets = self._plot_widgets.get(context)
         csv_path = self.current_measurements_csv_by_profile.get(context)
-        if not widgets or csv_path is None:
-            return
+        state = self._plot_state.get(context, {})
+        if not widgets or csv_path is None or not state.get("eval_index"):
+            return []
         fig = widgets.get("fig")
         if fig is None or not csv_path.exists():
-            return
+            return []
         run_dir = csv_path.parent
         metric_label = str(self._plot_state.get(context, {}).get("metric_label", "Metric") or "Metric")
         safe_metric = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in metric_label).strip(
@@ -5389,11 +5446,38 @@ class MainWindow(QMainWindow):
         run_tag = stem.split("LiniacOptimization_Log_", 1)[-1] if "LiniacOptimization_Log_" in stem else ""
         prefix = f"LivePlot_{run_tag}_{context}" if run_tag else f"LivePlot_{context}"
         out_path = run_dir / f"{prefix}_{safe_metric}.png"
+        figures = [(fig, out_path)]
+        if state.get("bo1d_trace") and widgets.get("bo1d_fig") is not None:
+            figures.append((widgets["bo1d_fig"], run_dir / f"{prefix}_BO1D.png"))
+        saved = []
+        for figure, path in figures:
+            try:
+                figure.savefig(path, dpi=180, bbox_inches="tight")
+                saved.append(path)
+                self._append_log_text(f"Saved plot: {path}", profile=context)
+            except Exception as exc:
+                self._append_log_text(f"Plot save failed ({path.name}): {exc}", profile=context)
+        return saved
+
+    def _offer_tempfiles_export(self, plots, profile):
+        if not plots:
+            return
+        answer = QMessageBox.question(
+            self, "Save plots", "Save plots to tempfiles?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         try:
-            fig.savefig(out_path, dpi=180, bbox_inches="tight")
-            self._append_log_text(f"Saved live plot: {out_path}", profile=context)
+            if not LINAC_TEMPFILES_DIR.is_dir():
+                raise FileNotFoundError(f"Save directory not found: {LINAC_TEMPFILES_DIR}")
+            name = f"{plots[0].parent.name}-{profile}-plots-{uuid.uuid4().hex[:12]}.png"
+            destination = save_plot_montage(plots, LINAC_TEMPFILES_DIR / name)
+            self._append_log_text(f"Combined plot saved: {destination}", profile=profile)
         except Exception as exc:
-            self._append_log_text(f"Live plot save failed: {exc}", profile=context)
+            self._append_log_text(f"tempfiles export failed: {exc}", profile=profile)
+            QMessageBox.warning(self, "Save failed", f"{exc}\n\nPlots are already saved in the normal output directory.")
 
     def _find_resume_snapshot_file(self, csv_path: Path) -> Optional[Path]:
         csv_path = csv_path.expanduser().resolve()
@@ -6194,22 +6278,24 @@ class MainWindow(QMainWindow):
         if finished_profile == RUN_PROFILE_MAIN:
             self._refresh_current_values()
         self._append_final_delta_summary(finished_profile)
-        self._save_live_plot_snapshot(finished_profile)
+        saved_plots = self._save_live_plot_snapshot(finished_profile)
         self._update_result_label(profile=finished_profile)
+        progress = self._scan_progress_text(finished_profile, include_stage=False)
+        suffix = f" | {progress}" if progress else ""
         if self._run_failed:
-            self._set_status("Status: FAILED", state="error", profile=finished_profile)
+            self._set_status("Status: FAILED" + suffix, state="error", profile=finished_profile)
         elif stopped:
-            self._set_status("Status: STOPPED", state="paused", profile=finished_profile)
+            self._set_status("Status: STOPPED" + suffix, state="paused", profile=finished_profile)
         else:
-            self._set_status("Status: DONE", state="success", profile=finished_profile)
+            self._set_status("Status: DONE" + suffix, state="success", profile=finished_profile)
         self._run_mode = ""
         self._run_profile = RUN_PROFILE_MAIN
-        if self._shutdown_in_progress or stopped:
+        if self._shutdown_in_progress:
             return
         if self._run_failed:
             QMessageBox.warning(self, "Finished with Error", "Optimization ended with an error. Please check the log.")
         else:
-            QMessageBox.information(self, "Finished", "Optimization process finished.")
+            self._offer_tempfiles_export(saved_plots, finished_profile)
 
     def _append_log_text(self, text: str, profile: Optional[str] = None):
         context = str(profile or RUN_PROFILE_MAIN).upper()

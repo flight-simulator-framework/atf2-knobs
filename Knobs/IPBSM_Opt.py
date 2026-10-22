@@ -381,7 +381,7 @@ class OptimizerConfig:
     # legacy_fixed retains the former init_sigma-as-ARD behavior.  The learned
     # mode applies conservative BO2026 priors and leaves non-analysed axes at
     # their configured init_sigma values.
-    hyperparameter_mode: str = "legacy_fixed"
+    hyperparameter_mode: str = "learned_fixed"
     zscan_kernel: str = "rbf"
     zscan_initial_points: int = 3
     length_scale_n_step_floor: float = 2.0

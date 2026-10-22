@@ -21,6 +21,32 @@ to the current value: for example, `(OT8D, RFDLY0) = (100, 18)` becomes
 `(101, 3)` at +2.8 ns. If other targets are selected, fine tuning runs last,
 centered on their resulting timing. Both registers are saved for restoration.
 
+## LinacOpt progress and plot export
+
+Main and Developer show the active axis/group's search budget, for example
+`QA1L | eval=8/17`, plus `total` for the run-wide recorded evaluations.
+Initial/reused and warm-start search points count toward the local budget.
+Retries of a paused point keep the same local index. Final remeasurement of
+the best settings is labelled `final check` and does not consume another
+search slot; it does increment `total`. Completed scans restored from a
+resume file show `restoring saved best` and their configured maxeval.
+
+The denominator is an upper limit for the current scan, not a promised number
+of measurements or a whole-run limit. BO can stop early. QA/QM refinement
+extends the displayed limit by its extra budget. Group-LBO displays the upper
+bound from its iterations, directions and line samples; deduplication and
+early stopping can reduce the actual count. Timing fine displays its nine-point
+budget. Sequential warm starts cannot overrun maxeval while filling initial points.
+
+On normal completion or **Save and End**, plots are saved to the usual run
+directory, including the displayed 1D BO model/acquisition figure when present.
+The GUI then asks **Save plots to tempfiles?** Selecting Yes saves one combined
+PNG to `/mnt/nas1/atf-data/op/tempfiles`, with a run-specific unique name. It
+contains the evaluation plots and the available BO figure arranged together.
+No separate plots or data files are copied to tempfiles. No leaves only the
+normal outputs. NAS errors do not delete them. No export prompt is shown for
+an empty run, a failed run, or while closing the application.
+
 ## Development
 
 Development, issues and pull requests are hosted on [GitHub](https://github.com/flight-simulator-framework/atf2-knobs). The [CERN GitLab repository](https://gitlab.cern.ch/flight-simulator/atf2-knobs) receives updates from GitHub through a pull mirror.

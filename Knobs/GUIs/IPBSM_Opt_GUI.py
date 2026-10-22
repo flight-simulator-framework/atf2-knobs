@@ -643,7 +643,12 @@ class MainWindow(QMainWindow):
 
         self.hyperparameter_mode_box = QComboBox()
         self.hyperparameter_mode_box.addItems(["legacy_fixed", "learned_fixed"])
-        self.hyperparameter_mode_box.setCurrentText("legacy_fixed")
+        self.hyperparameter_mode_box.setCurrentText("learned_fixed")
+        self.hyperparameter_mode_box.setToolTip(
+            "learned_fixed: fixed BO2026 length-scale presets for Z and Ay+Z; "
+            "other axes use their configured sigma, with a two-step minimum. "
+            "legacy_fixed: configured ARD length scales or sigma. Neither mode fits hyperparameters during a run."
+        )
         self.zscan_kernel_box = QComboBox()
         self.zscan_kernel_box.addItems(["rbf", "matern52", "matern32"])
         self.zscan_initial_points_box = QSpinBox()
