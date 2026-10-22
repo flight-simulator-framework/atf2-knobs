@@ -23,6 +23,7 @@ import importlib.util
 import sys
 import traceback
 import threading
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -81,11 +82,13 @@ now_tag = _IPBSM_OPT.now_tag
 EPICSIPBSMController = _IPBSM_OPT.EPICSIPBSMController
 DAT_CSV_COLUMNS = _IPBSM_OPT.DAT_CSV_COLUMNS
 IPBSMInterface = _IPBSM_OPT.IPBSMInterface
+from Knobs.ipbsm_opt_plotting import save_plot_montage
 
 
 ZSCAN_DEFAULT_RANGE = 0.0085
 ZSCAN_DEFAULT_STEP = 0.001
 DEFAULT_IPBSM_OUTPUT_BASE_DIR = Path("/atf/data/flight-simulator/IPBSMOpt")
+IPBSM_TEMPFILES_DIR = Path("/mnt/nas1/atf-data/op/tempfiles")
 ZAY_PRESET_INIT_POINTS = 9
 ZAY_PRESET_MAX_STEPS = 20
 ZSCAN_KNOBS = ["Z scan knob"]
@@ -741,11 +744,21 @@ class MainWindow(QMainWindow):
         self.ei_stop_enabled = QCheckBox("Enable")
         self.ei_stop_enabled.setChecked(True)
         self.ei_stop_mode_box = QComboBox()
-        self.ei_stop_mode_box.addItems(list(EI_STOP_MODES.keys()))
+        self.ei_stop_mode_box.addItems([*EI_STOP_MODES, "Custom"])
         self.ei_stop_mode_box.setCurrentText("Standard")
+        self.ei_stop_threshold = QDoubleSpinBox()
+        self.ei_stop_threshold.setDecimals(6)
+        self.ei_stop_threshold.setRange(0.0, 1.0)
+        self.ei_stop_threshold.setSingleStep(0.0001)
+        self.ei_stop_threshold.setValue(EI_STOP_MODES["Standard"][0])
+        self.ei_stop_patience = QSpinBox()
+        self.ei_stop_patience.setRange(1, 1000)
+        self.ei_stop_patience.setValue(EI_STOP_MODES["Standard"][1])
         self.ei_stop_hint_lbl = QLabel(
-            "Aggressive: early stop, Standard: balanced, Careful: keep exploring a bit longer"
+            "Stop when candidate max EI stays below the threshold. "
+            "Absolute modulation units: 0.001 = 0.1 percentage point. Initial points are excluded from EI checks."
         )
+        self.ei_stop_hint_lbl.setWordWrap(True)
         for lbl in (self.n_init_hint_lbl, self.max_steps_hint_lbl, self.candidate_pool_hint_lbl, self.ei_stop_hint_lbl):
             lbl.setStyleSheet("color: #5c6670;")
 
@@ -788,6 +801,14 @@ class MainWindow(QMainWindow):
         ei_stop_layout.addWidget(self.ei_stop_enabled)
         ei_stop_layout.addWidget(self.ei_stop_mode_box)
         form.addRow("EI stop rule", self.ei_stop_row)
+        self.ei_stop_values_row = QWidget()
+        ei_values_layout = QHBoxLayout(self.ei_stop_values_row)
+        ei_values_layout.setContentsMargins(0, 0, 0, 0)
+        ei_values_layout.addWidget(QLabel("Threshold"))
+        ei_values_layout.addWidget(self.ei_stop_threshold)
+        ei_values_layout.addWidget(QLabel("Consecutive checks"))
+        ei_values_layout.addWidget(self.ei_stop_patience)
+        form.addRow("EI stop settings", self.ei_stop_values_row)
         form.addRow("EI stop guide", self.ei_stop_hint_lbl)
 
         sigma_group = QGroupBox("Representative Sigma Per Axis")
@@ -932,7 +953,10 @@ class MainWindow(QMainWindow):
         self.n_init.valueChanged.connect(self._refresh_recommendations)
         self.n_init.valueChanged.connect(self._maybe_apply_recommended_max_steps)
         self.ei_stop_enabled.toggled.connect(self._update_stop_summary)
-        self.ei_stop_mode_box.currentTextChanged.connect(self._update_stop_summary)
+        self.ei_stop_mode_box.currentTextChanged.connect(self._apply_ei_stop_preset)
+        self.ei_stop_threshold.valueChanged.connect(self._sync_ei_stop_preset)
+        self.ei_stop_patience.valueChanged.connect(self._sync_ei_stop_preset)
+        self.ei_stop_enabled.toggled.connect(self.ei_stop_values_row.setEnabled)
 
         self.sigma_mode_box.currentTextChanged.connect(self._apply_sigma_mode)
         self.sigma_mode_box.currentTextChanged.connect(self._sync_main_sigma_mode_box)
@@ -1360,6 +1384,7 @@ class MainWindow(QMainWindow):
         self._set_form_row_visible(self.cfg_form, self.stop_mod_row, False)
         self._set_form_row_visible(self.cfg_form, self.ei_stop_hint_lbl, is_bo)
         self._set_form_row_visible(self.cfg_form, self.ei_stop_row, is_bo)
+        self._set_form_row_visible(self.cfg_form, self.ei_stop_values_row, is_bo)
         if is_bo:
             self._set_zscan_method("BO")
         zscan_method_enabled = is_gf
@@ -1367,6 +1392,23 @@ class MainWindow(QMainWindow):
         self.zscan_method_bo.setEnabled(zscan_method_enabled)
         self.zscan_method_gf.setEnabled(zscan_method_enabled)
         self.main_view_stack.setCurrentIndex(1 if (is_gf or self._should_show_bo_corrector_heatmap()) else 0)
+
+    def _apply_ei_stop_preset(self, mode):
+        if mode in EI_STOP_MODES:
+            threshold, patience = EI_STOP_MODES[mode]
+            for widget, value in ((self.ei_stop_threshold, threshold), (self.ei_stop_patience, patience)):
+                widget.blockSignals(True)
+                widget.setValue(value)
+                widget.blockSignals(False)
+        self._update_stop_summary()
+
+    def _sync_ei_stop_preset(self):
+        pair = (self.ei_stop_threshold.value(), self.ei_stop_patience.value())
+        mode = next((name for name, values in EI_STOP_MODES.items() if pair == values), "Custom")
+        self.ei_stop_mode_box.blockSignals(True)
+        self.ei_stop_mode_box.setCurrentText(mode)
+        self.ei_stop_mode_box.blockSignals(False)
+        self._update_stop_summary()
 
     def _update_stop_summary(self):
         method = self.method_box.currentText().upper()
@@ -1381,16 +1423,16 @@ class MainWindow(QMainWindow):
             ei_stop_line = ""
             if method == "BO":
                 if self.ei_stop_enabled.isChecked():
-                    thr, patience = EI_STOP_MODES[self.ei_stop_mode_box.currentText()]
+                    thr, patience = self.ei_stop_threshold.value(), self.ei_stop_patience.value()
                     ei_stop_line = (
                         f"- or EI stop mode {self.ei_stop_mode_box.currentText()} "
-                        f"(EI max <= {thr:.4g} for {patience} {method} steps)\n"
+                        f"(EI max <= {thr:.4g} for {patience} consecutive checks)\n"
                     )
                 else:
                     ei_stop_line = "- EI-based stop disabled\n"
             txt = (
                 "BO stop rule:\n"
-                f"- total steps >= {int(self.bo_max_steps.value())}\n"
+                f"- total steps >= {int(self.bo_max_steps.value())} (including initial / resumed points)\n"
                 f"- or operator / average warning stop\n"
                 f"{ei_stop_line}"
             )
@@ -1496,8 +1538,8 @@ class MainWindow(QMainWindow):
             ucb_beta=float(self.ucb_beta.value()),
             ei_xi=float(self.ei_xi.value()),
             bo_stop_on_low_acq=bool(self.ei_stop_enabled.isChecked()),
-            bo_low_acq_threshold=float(EI_STOP_MODES[self.ei_stop_mode_box.currentText()][0]),
-            bo_low_acq_patience=int(EI_STOP_MODES[self.ei_stop_mode_box.currentText()][1]),
+            bo_low_acq_threshold=float(self.ei_stop_threshold.value()),
+            bo_low_acq_patience=int(self.ei_stop_patience.value()),
             average_pause_ratio=float(self.avg_pause_ratio.value()),
         )
 
@@ -1569,12 +1611,9 @@ class MainWindow(QMainWindow):
         self.ei_stop_enabled.setChecked(bool(cfg.get("bo_stop_on_low_acq", True)))
         thr = float(cfg.get("bo_low_acq_threshold", 1e-4))
         patience = int(cfg.get("bo_low_acq_patience", 2))
-        matched_mode = "Standard"
-        for mode_name, pair in EI_STOP_MODES.items():
-            if abs(pair[0] - thr) < 1e-12 and int(pair[1]) == patience:
-                matched_mode = mode_name
-                break
-        self.ei_stop_mode_box.setCurrentText(matched_mode)
+        self.ei_stop_threshold.setValue(thr)
+        self.ei_stop_patience.setValue(patience)
+        self._sync_ei_stop_preset()
 
         self._on_knob_selection_changed()
         self._sync_sigma_mode_from_values()
@@ -2364,7 +2403,9 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._set_status(
-            f"Status: RUNNING {cfg.method} | knobs={', '.join(cfg.params)}",
+            f"Status: RUNNING {cfg.method} | "
+            + (f"step={len(opt.X)}/{max(1, cfg.bo_max_steps)} | " if not self._is_sequential_method(cfg.method) else "")
+            + f"knobs={', '.join(cfg.params)}",
             state="running",
         )
         if self._is_sequential_method(cfg.method):
@@ -2416,13 +2457,29 @@ class MainWindow(QMainWindow):
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Warning)
             box.setWindowTitle("Operation Error")
-            box.setText(
+            details = (
                 f"{operation} failed during optimization.\n"
                 f"step={step}\n"
                 f"type={error_type}\n"
                 f"{message}\n\n"
                 f"{x_txt}"
             )
+            remote_prompt = "Please check that the 'Remote' checkbox on the Fringe Scan GUI is ON."
+            if operation == "get_ipbsm" and error_type == "TimeoutError" and remote_prompt in message:
+                box.setTextFormat(Qt.TextFormat.PlainText)
+                box.setText(remote_prompt)
+                box.setInformativeText("Timeout error")
+                box.setDetailedText(details)
+                box.setStyleSheet(
+                    "QLabel#qt_msgbox_label { font-size: 22px; font-weight: 700; min-width: 480px; max-width: 560px; }"
+                    "QLabel#qt_msgbox_informativelabel { font-size: 16px; }"
+                    "QPushButton { font-size: 16px; min-width: 110px; padding: 10px 14px; }"
+                )
+                prompt_label = box.findChild(QLabel, "qt_msgbox_label")
+                if prompt_label is not None:
+                    prompt_label.setWordWrap(True)
+            else:
+                box.setText(details)
             resume_btn = box.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
             stop_btn = box.addButton("Save and End", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(resume_btn)
@@ -2617,7 +2674,7 @@ class MainWindow(QMainWindow):
                             if ch in machine_best:
                                 self._run_final_values[ch] = float(machine_best[ch])
         if y is not None:
-            method_live = str(self.method_box.currentText()).upper()
+            method_live = str(getattr(self.last_run_cfg, "method", self.method_box.currentText())).upper()
             if self._is_sequential_method(method_live):
                 axis_live = str(info.get("axis", "")).strip() or self._axis_from_chosen_by(chosen_by)
                 if axis_live in self.knob_checks:
@@ -2703,9 +2760,25 @@ class MainWindow(QMainWindow):
                 f"warning reason={info.get('reason', '')} message={info.get('message', '')}"
             )
 
-        if y is not None and (not self._is_sequential_method(self.method_box.currentText())):
+        method_live = str(getattr(self.last_run_cfg, "method", self.method_box.currentText())).upper()
+        if not self._is_sequential_method(method_live) and (y is not None or phase in {"model_fit", "acquisition", "measuring", "final_apply", "stop"}):
+            limit = max(1, int(getattr(self.last_run_cfg, "bo_max_steps", self.bo_max_steps.value())))
+            detail = ""
+            if y is not None:
+                detail = f" | modulation={float(y):.6f} | best={float(best_y) if best_y is not None else float(y):.6f}"
+            elif phase == "acquisition":
+                metric = str(getattr(self.last_run_cfg, "acquisition", "EI"))
+                detail = f" | max {metric}={float(info.get('max_acq', float('nan'))):.6g}"
+            elif phase == "model_fit":
+                detail = " | fitting model"
+            elif phase == "measuring":
+                detail = " | measuring"
+            elif phase == "final_apply":
+                detail = " | applying final knobs"
+            if phase == "stop":
+                detail += f" | {info.get('reason', '')}"
             self._set_status(
-                f"Status: RUNNING | step={step} | modulation={float(y):.6f} | best={float(best_y) if best_y is not None else float(y):.6f}",
+                f"Status: {'STOPPING' if phase == 'stop' else 'RUNNING'} {method_live} | step={step}/{limit}{detail}",
                 state="running",
             )
         if self._run_selected_knobs:
@@ -2751,6 +2824,16 @@ class MainWindow(QMainWindow):
         self._run_selected_knobs = list(getattr(cfg, "params", []) or [])
         csv_path = Path(out.get("measurements_csv", "")) if out.get("measurements_csv") else (out_dir / "measurements.csv")
         X, y, yerr, chosen_by, average = self._load_measurements_from_csv(csv_path, cfg)
+
+        if not len(y):
+            self._set_done_scan_knobs([])
+            self._set_status("Status: finished | no valid measurements", state="warning")
+            self.result_lbl.setText(f"No valid measurements; no plots to export.\nSaved folder: {out_dir}")
+            self._append_log(f"Finished without valid measurements. Saved run: {out_dir}")
+            self.current_measurements_csv = None
+            self._run_controller = None
+            self._refresh_zscan_status_label()
+            return
 
         if self._is_sequential_method(cfg.method):
             fit = build_gf_axiswise_fit(cfg, X, y, chosen_by=chosen_by)
@@ -2805,7 +2888,8 @@ class MainWindow(QMainWindow):
                         self._run_current_values[ch] = v
                         self._run_final_values[ch] = v
         self._update_run_knob_state_table()
-        self._set_status("Status: finished", state="success")
+        progress = "" if self._is_sequential_method(cfg.method) else f" | step={len(y)}/{max(1, cfg.bo_max_steps)}"
+        self._set_status(f"Status: finished{progress}", state="success")
         self._append_log(f"Finished: {modulation_label.lower()}={best_y:.6f}")
         self._append_log(f"{knobs_label}: {best_x}")
         self._append_log(f"Measurements CSV: {csv_path}")
@@ -2825,6 +2909,27 @@ class MainWindow(QMainWindow):
         self.current_measurements_csv = None
         self._run_controller = None
         self._refresh_zscan_status_label()
+        self._offer_tempfiles_export(png_saved, Path(out_dir))
+
+    def _offer_tempfiles_export(self, plots: List[Path], out_dir: Path) -> None:
+        if not plots:
+            return
+        answer = QMessageBox.question(
+            self, "Save plots", "Save plots to tempfiles?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if not IPBSM_TEMPFILES_DIR.is_dir():
+                raise FileNotFoundError(f"Save directory not found: {IPBSM_TEMPFILES_DIR}")
+            name = f"{out_dir.name}-plots-{uuid.uuid4().hex[:12]}.png"
+            destination = save_plot_montage(plots, IPBSM_TEMPFILES_DIR / name)
+            self._append_log(f"Combined plot saved: {destination}")
+        except Exception as exc:
+            self._append_log(f"tempfiles export failed: {exc}")
+            QMessageBox.warning(self, "Save failed", f"{exc}\n\nPlots are already saved in the normal output directory.")
 
 def main():
     app = QApplication([])

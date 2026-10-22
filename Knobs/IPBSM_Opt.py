@@ -1656,7 +1656,8 @@ class Optimizer:
 
     def _fit_and_bootstrap(self) -> Dict:
         mode = "diag" if self.cfg.mode_name == "linear" else "full"
-        X = np.asarray(self.X, float)
+        # Save and End may be selected after the very first measurement fails.
+        X = np.asarray(self.X, float).reshape((-1, len(self.cfg.params)))
         y = np.asarray(self.y, float)
 
         fit = fit_gaussian_from_samples(X, y, mode=mode, ridge=self.cfg.ridge_fit, y_cap=self.cfg.expected_y_max)
@@ -2596,7 +2597,8 @@ class Optimizer:
                             "max_acq": float(max_acq),
                             "bo1d_trace": bo1d_trace,
                         })
-                        if bool(getattr(self.cfg, "bo_stop_on_low_acq", True)):
+                        if (str(self.cfg.acquisition).upper() == "EI"
+                                and bool(getattr(self.cfg, "bo_stop_on_low_acq", True))):
                             thr = float(getattr(self.cfg, "bo_low_acq_threshold", 1e-4))
                             if max_acq <= thr:
                                 self._low_acq_streak += 1

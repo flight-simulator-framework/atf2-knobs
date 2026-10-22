@@ -18,6 +18,54 @@ def ensure_dir(p: Path) -> Path:
     return p
 
 
+def save_plot_montage(paths: List[Path], destination: Path, *, panel_width: int = 1600) -> Path:
+    """Tile final plots into one PNG, committing only a complete image.
+
+    Qt is imported only for this GUI export; headless optimizer plotting does
+    not require a QApplication. The destination directory must already exist.
+    """
+    from PyQt6.QtCore import QIODevice, QSaveFile, Qt
+    from PyQt6.QtGui import QImage, QPainter
+
+    if panel_width < 1:
+        raise ValueError("panel_width must be positive")
+    panels = []
+    for path in dict.fromkeys(map(Path, paths)):
+        source = QImage(str(path))
+        if source.isNull():
+            raise ValueError(f"Could not read plot: {path}")
+        panels.append(source.scaledToWidth(min(panel_width, source.width()), Qt.TransformationMode.SmoothTransformation))
+    if not panels:
+        raise ValueError("No plots to export")
+    columns = min(2, len(panels))
+    gap = 24
+    width = max(p.width() for p in panels)
+    heights = [max(p.height() for p in panels[i:i + columns]) for i in range(0, len(panels), columns)]
+    canvas = QImage(columns * width + (columns + 1) * gap,
+                    sum(heights) + (len(heights) + 1) * gap, QImage.Format.Format_RGB32)
+    if canvas.isNull():
+        raise MemoryError("Could not allocate plot montage")
+    canvas.fill(Qt.GlobalColor.white)
+    painter = QPainter(canvas)
+    try:
+        top = gap
+        for row, height in enumerate(heights):
+            for col, panel in enumerate(panels[row * columns:(row + 1) * columns]):
+                painter.drawImage(gap + col * (width + gap) + (width - panel.width()) // 2, top, panel)
+            top += height + gap
+    finally:
+        painter.end()
+    output = QSaveFile(str(destination))
+    if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+        raise OSError(output.errorString())
+    if not canvas.save(output, "PNG"):
+        output.cancelWriting()
+        raise OSError("Could not encode plot montage")
+    if not output.commit():
+        raise OSError(output.errorString())
+    return Path(destination)
+
+
 def _run_file_stamp(out_dir: Path) -> str:
     label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in out_dir.name).strip("_")
     return label or "run"
