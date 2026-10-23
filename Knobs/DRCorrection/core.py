@@ -11,6 +11,7 @@ from pathlib import Path
 import threading
 import numpy as np
 from scipy.optimize import lsq_linear
+from .assessment import changed_indices,assess
 
 
 class Cancelled(RuntimeError):
@@ -28,6 +29,12 @@ def serial(value):
 
 @dataclass
 class Options:
+    response_source: str = 'measured'
+    model_match_tunes: bool = True
+    model_regional_targets: bool = False
+    model_fix_extraction_orbit: bool = False
+    model_fix_extraction_dispersion: bool = False
+    model_extraction_weight: float = 100.
     plane: str = 'y'
     count_h: int = 8
     count_v: int = 8
@@ -83,6 +90,14 @@ class CorrectionService:
         self.cancel=threading.Event()
         self.undo=[]
         self.orbit_measurements=[]
+        self._model_manager=None
+
+    @property
+    def model_manager(self):
+        if self._model_manager is None:
+            from Knobs.DRTuning.model import ModelManager
+            self._model_manager=ModelManager(self.backend)
+        return self._model_manager
 
     def check_cancel(self):
         if self.cancel.is_set():raise Cancelled('Cancelled; temporary scan settings restored')
@@ -155,6 +170,12 @@ class CorrectionService:
 
     def acquire(self,mode,opt,progress=lambda *_:None):
         validate_bpm_sampling(opt)
+        if opt.response_source=='rftrack':
+            try:return self.model_manager.acquire(self,mode,opt,progress)
+            except Exception:
+                self.model_manager.model=None;self.model_manager.optics=None
+                raise
+        if opt.response_source!='measured':raise ValueError('Unknown response source')
         self.orbit_measurements=[]
         self.backend.validate_mode(mode)
         if opt.plane not in ('x','y'):raise ValueError('Select x or y')
@@ -218,7 +239,7 @@ class CorrectionService:
             raise ValueError('File is not a matching correction dataset')
         if data['options']['plane']!=opt.plane and mode!='skew':
             raise ValueError('Select the same H/V plane as the file before CALC (FILE)')
-        for key in ('after','full_after','after_valid','after_orbit_measurements'):data.pop(key,None)
+        for key in ('after','full_after','after_valid','after_orbit_measurements','assessment','applied_actuators'):data.pop(key,None)
         names=data['names'];actuators=data['actuators']
         measured=np.asarray(data['measured'],float);target=np.asarray(data['target'],float)
         response=np.asarray(data['response'],float)
@@ -236,6 +257,12 @@ class CorrectionService:
         if mode=='dispersion':weights[0]*=opt.dispersion_weight;weights[1]*=opt.orbit_weight
         a=(response*weights.reshape(-1,1))[mask]
         residual=((measured-target)*weights).reshape(-1)[mask]
+        constraints=data.get('constraints')
+        if constraints is not None:
+            cm=np.asarray(constraints['matrix'],float);cr=np.asarray(constraints['residual'],float);cw=float(constraints['weight'])
+            if cm.shape!=(len(cr),len(actuators)) or not np.isfinite(cm).all() or not np.isfinite(cr).all() or not np.isfinite(cw) or cw<=0:
+                raise ValueError('Invalid model extraction constraints')
+            a=np.vstack((a,cw*cm));residual=np.concatenate((residual,cw*cr))
         maximum=(opt.count_h if opt.plane=='x' else opt.count_v) if mode!='skew' else len(actuators)
         maximum=min(maximum,int(available.sum()))
         if maximum<1:raise ValueError('At least one steering magnet required')
@@ -265,7 +292,7 @@ class CorrectionService:
         if np.linalg.norm(residual)>1e-14 and not np.any(a[:,available]):
             raise ValueError('No measured response: all enabled response columns are zero. '+diagnostic+
                 '. Check magnet readbacks, BPM updates and settling; no correction was applied.')
-        if symmetric and np.linalg.norm(residual)>1e-14:
+        if symmetric and constraints is None and np.linalg.norm(residual)>1e-14:
             from .ported_solver import propose,ClosedOrbitError
             try:delta,selected_names,singular_values,rank=propose(data,opt,valid,available,maximum,step_limit)
             except ClosedOrbitError as exc:
@@ -287,12 +314,13 @@ class CorrectionService:
                 best=min(candidates,key=lambda item:item[0]);selected.append(best[1]);remaining.remove(best[1])
                 if mode=='orbit' and np.max(abs(a[:,selected]@best[2]+residual))<=opt.tolerance_m*1000:break
             delta=np.zeros(len(actuators));delta[selected]=best[2];singular_values=best[3];rank=best[4]
-            solver='Asymmetric bounded extension at absolute current limit'
+            solver='Bounded response fit with model extraction constraints' if constraints else 'Asymmetric bounded extension at absolute current limit'
         self.check_cancel()
         predicted=measured+(response@delta).reshape(measured.shape)
         data.update(options=asdict(opt),delta=delta,predicted=predicted,
             fitted=target+measured-predicted,valid=valid,selected=[actuators[i] for i in selected],
             singular_values=singular_values,rank=rank,solver=solver,applied=False)
+        if constraints is not None:data['constraints']['predicted_change']=cm@delta
         if 'full_response' in data:
             full=np.asarray(data['full_measured'],float)
             data['full_predicted']=full+(np.asarray(data['full_response'])@delta).reshape(full.shape)
@@ -304,20 +332,28 @@ class CorrectionService:
         validate_bpm_sampling(Options(**data['options']))
         if data.get('backend_id')!=self.backend.identity:raise ValueError('Proposal belongs to another backend')
         if data.get('applied'):raise ValueError('Already applied; CALC again before another SET')
+        changed=changed_indices(data)
+        if not len(changed):raise ValueError('No magnet settings change; CALC already proposes zero correction')
         if not self.backend.same_settings(self.backend.snapshot(),data['baseline']):raise ValueError('Settings changed since CALC; recalculate')
+        if data.get('model_settings'):
+            from Knobs.DRTuning.model import verify_inputs
+            verify_inputs(self.backend,data['model_settings'])
         self.backend.validate_mode(data['mode'])
         before=self.backend.snapshot()
         self.orbit_measurements=[]
         try:
             values=np.asarray(data['centers'])+np.asarray(data['delta'])
-            self.backend.write(data['kind'],data['actuators'],values)
+            self.backend.write(data['kind'],[data['actuators'][i] for i in changed],values[changed])
             measured,valid=self._signal(data['mode'],Options(**data['options']))
         except Exception:
             self.backend.restore(before);raise
         self.undo.append(before)
-        data['after']=measured;data['after_valid']=valid;data['applied']=True
-        data['full_after']=self.full_signal.copy()
+        indices=[self.backend.bpm_names.index(n) for n in data['names']]
+        data['after']=measured[:,indices];data['after_valid']=valid[indices];data['applied']=True
+        data['full_after']=self.full_signal[:,indices].copy()
         data['after_orbit_measurements']=self.orbit_measurements
+        data['applied_actuators']=[data['actuators'][i] for i in changed]
+        data['assessment']=assess(data)
         return data
 
     def reset(self):

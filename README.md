@@ -18,8 +18,11 @@ the best valid point, regardless of the selected BO/ternary method.
 `EVE_LINAC.RFDLY0` changes in increments of five counts (0.56 ns per count);
 carry and borrow adjust OT8D to keep RFDLY0 within 0–19. Changes are relative
 to the current value: for example, `(OT8D, RFDLY0) = (100, 18)` becomes
-`(101, 3)` at +2.8 ns. If other targets are selected, fine tuning runs last,
-centered on their resulting timing. Both registers are saved for restoration.
+`(101, 3)` at +2.8 ns. Fine tuning runs immediately after Coarse, before QA/QM
+and the separate corrector stage, in Sequential, Group BO and Group LBO modes.
+With `Correctors & L8`, the combined group performs the coarse timing search;
+Fine runs immediately after that group instead. Fine-only remains supported.
+Both registers are saved for restoration.
 
 ## LinacOpt progress and plot export
 

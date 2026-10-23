@@ -1,6 +1,200 @@
 DRTuning — RFTrack / machine interface launcher
 ==============================================
 
+XSR emittance estimate (2026-10-23)
+---------------------------------
+Open XSR emittance in the left navigation or Measurements menu. This worksheet
+estimates vertical emittance only; horizontal inputs and PVs are not required.
+1. Measure absolute beta with Q modulation or calibrated TBT / phase beta,
+   then run SR / SR2 beta fit. Use Estimate XSR emittance in that fit dialog,
+   or Use latest SR beta fit / Load SR beta fit in the emittance page.
+   A BPM beta must first be transported to the emission point; relative TBT
+   beta alone cannot give an absolute emittance.
+2. Select the source point matching the actual XSR optical source (SR or SR2).
+   Changing the source clears imported local beta/dispersion. Verify that the
+   optics and size measurement refer to the same source and machine settings.
+3. Read XSR vertical size [um] on the Machine interface, or enter vertical RMS size.
+   Read-only PV: XSR:PROJ_V_SIGMA. The operator confirmed
+   source-plane micrometres and completed resolution correction on 2026-10-23.
+   The legacy reader already applies PROJ_*_SIGMA_FACTOR; never multiply it
+   again. Additional resolution defaults to zero and resets to zero on PV read.
+   This reads existing images; it does not trigger an acquisition or establish
+   exposure freshness. The saved timestamp is the read time.
+   RFTrack has no XSR size monitor attached here; manual/file optics input is
+   supported on every interface, without inventing simulation measurements.
+4. Optional: import the SR dispersion fit, enter RMS dp/p as a fraction, then
+   enable Remove known dispersion contribution for the selected plane.
+   Nonzero eta requires positive dp/p. Eta=0 explicitly represents negligible
+   local dispersion. Without this correction, output is labelled apparent.
+5. Estimate emittance reports geometric pm rad using
+     epsilon = (sigma^2 - (eta*sigma_delta)^2 - extra_resolution^2) / beta.
+   Beta Y and vertical dispersion are used. A nonpositive residual variance is
+   unresolved, not clipped to a zero emittance. Optional independent 1-sigma
+   errors use linear propagation; unknown errors remain unknown. Strong
+   coupling or betatron/energy correlations invalidate the uncoupled formula;
+   this is an effective estimate, not normal-mode emittance separation.
+6. Save result and plot writes xsr_emittance.json plus one PNG. Inputs, units,
+   corrections, source-fit / PV provenance and uncertainties are included.
+   Edits invalidate the displayed result. No magnets are written by this tool.
+
+Offline verification includes a synthetic measured-beta transport followed by
+XSR size inference (12 pm rad recovered), unit conversions, dispersion and
+optional resolution subtraction, uncertainty propagation, invalid signals,
+read-only PV acquisition, GUI navigation, saving and input invalidation.
+This is not a new RFTrack equilibrium-emittance or live-machine validation.
+Physical context: KEK Report 2020-4, emittance measurement section,
+https://cds.cern.ch/record/2742899/files/CERN-ACC-2020-0029.pdf
+
+SET count and outcome verification (2026-10-23)
+----------------------------------------------
+Maximum H / V correctors for SET are visible on the correction pages. The
+current GUI defaults remain 8 / 8. The archived sad/control/db_sad.adb records
+COD H=5,V=5 and dispersion H=10,V=5; these are historical configured maxima,
+not evidence of today's live PV values or actual selected counts. The old
+solver adds useful correctors until the maximum or residual tolerance is met.
+
+After CALC, the result banner and SET button show the actual number of magnet
+settings to change. The Magnet settings tab distinguishes Will change from
+No write. SET now writes only changed settings, using the same definition as
+the display; diagnostic RF / horizontal probe scans still run when required.
+A zero-change proposal disables SET. No additional confirmation popup is added.
+
+After SET, the existing remeasurement and measured/predicted overlay remain.
+The SET verification tab opens automatically and reports, for the selected
+correction plane (or the two skew probe signals):
+- common valid BPM count, before / predicted / after RMS relative to target;
+- improvement = 100 * (1 - after_RMS / before_RMS), positive being better;
+- RMS and maximum absolute measured-minus-predicted difference, and worst BPM.
+Dispersion and COD are evaluated separately, in mm/(dp/p) and mm. Invalid or
+nonfinite readings are excluded from all three RMS values on the same mask.
+No valid BPMs means unavailable, never successful. Ratios with a zero reference
+are unavailable. Improvement is descriptive, not a noise-significance test;
+prediction mismatch can include noise, drift, calibration or model errors.
+No automatic repeat correction or rollback is triggered by this assessment.
+Use RESET to undo a completed correction if required. Existing acquisition
+failure rollback remains in place. Save data and plots includes assessment,
+per-BPM mismatches and applied_actuators in the correction JSON. Re-CALC clears
+old outcome data. The other plane remains visible in the measured/predicted plot.
+
+Settings-driven RFTrack model response (2026-10-23)
+-------------------------------------------------
+The correction pages now offer "Measured magnet response" and "RFTrack model
+response". The existing measured method remains the default. RFTrack model
+response is an added calculation route, NOT a claim that the old SAD programs
+have been reproduced numerically in every detail.
+
+Operator workflow:
+1. Open RFTrack model in the left navigation. Machine input defaults are the
+   old SAD energy/tune target PVs; no user-selected JSON is required. Tune PVs
+   are settings, not asserted fresh TBT measurements. RFTrack simulation uses
+   separately excited measured BPM waveforms to supply its tune targets.
+2. If using the bundled historical lattice with the live channel list, use
+   "Exclude unmapped BPMs / magnets". It explicitly excludes MB97R/MB98R and
+   fixes ZH15R/ZV16R, absent from that lattice. Their settings are recorded as
+   unmodelled fixed actuators. They are never silently mapped to other devices.
+   A current lattice export can instead supply the missing geometry.
+3. Build model / optics captures public settings and matches QF1R/QF2R in the
+   MODEL only. No real magnet is written. The tune fit, beta plots and source
+   settings can be saved with Save model / optics.
+4. Choose RFTrack model response on COD / Dispersion / Skew. CALC recaptures
+   current settings, validates mappings/calibration/stability, matches tunes
+   and computes the response before requesting diagnostic excitation.
+   COD reads the orbit only. Dispersion uses one real symmetric RF pair plus
+   a nominal orbit. Skew uses the two real horizontal probe scans. Corrector
+   or skew RESPONSE columns are computed inside RFTrack, without scanning
+   those supplies on the machine. CALC restores diagnostic excitation.
+5. Inspect measured / predicted curves and proposed currents, then SET.
+   SET retains current-limit, stale-setting, remeasurement and rollback guards.
+   Main-supply, tune-target and calibration PV changes also invalidate a model
+   proposal. RESET restores the pre-SET snapshot as before.
+
+Model-only choices on correction pages:
+- Match model tunes: QF1R/QF2R family scaling, bounded to +/-5%, residual target
+  1e-5. Stable symplectic eigenmodes retain the >0.5 tune branch. Real-waveform
+  aliases are resolved only when the input explicitly identifies alias tunes.
+  Failure to converge aborts before diagnostic writes. Model fit changes never
+  become QF current commands.
+- SAD straight-section targets (H): use nominal horizontal dispersion outside
+  MB19R..MB31R / MB66R..MB80R and zero within; retain model orbit targets in
+  those regions. This is explicit, not applied to measured-response runs.
+- Preserve predicted extraction orbit / dispersion: add weighted zero-change
+  rows at the KIX occurrences and MB19R/MB20R/MB21R. They constrain position AND
+  slope in the selected plane. These are SOFT model constraints, not a guarantee
+  of unchanged extraction on the machine. The weight is in advanced settings;
+  predicted constraint residuals, units and locations are saved. This extends
+  the legacy position constraints; it is not numerically identical to SAD.
+
+Model inputs and calibration:
+- Read SAD:FILE:DR:ENERGY [GeV], SAD:DR_TUNE_X/Y, main quadrupole settings and
+  trim readbacks, SD1R/SF1R main settings, corrector/skew readbacks and limits.
+- Main + trim use mag_ki_main separately. The public hardware QM7R.1 mapping
+  is applied to lattice QM7AR.1. Normal SD1R K2L uses SetRingSext's negative
+  sign convention. Skew K1L/A is read from SAD:SKEWCOR_SDCALIB/SFCALIB.
+- All required quad and sextupole strengths must be supplied. No missing live
+  calibration is replaced with a guessed field. Invalid active mappings fail.
+- Bend geometry/gradients and RF-disabled transverse tracking come from the
+  selected versioned lattice. This does not infer magnet alignment, radiation
+  equilibrium, or a fully identified real-machine lattice from two tunes.
+- Optional model calibration JSON: schema="dr-model-calibration-1", source,
+  quadrupole_factors={physical_name: multiplicative_factor}, and/or
+  bend_k1l={physical_name: integrated_gradient}. Factors act on main+trim K1L.
+  Legacy DR_QUAD_CORRECTION.DAT has different conventions; it is NOT silently
+  multiplied into these factors. Supply an audited conversion for site use.
+- Optional generated lattice JSON can be selected without changing the machine
+  interface. Model inputs, raw PV values, ignored fixed actuators, lattice hash,
+  tune matching and assumptions are saved in every model correction dataset.
+
+SR / phase optics:
+- Build model first, then "Use RFTrack model" in SR beta or dispersion fit.
+  The machine must still be at the captured settings. Independently supplied
+  optics files remain supported. Phase beta also has a model transport button.
+- SR/SR2 are evaluated at fractions .27/.9 INSIDE BH1R.27, including the entrance
+  edge and no premature exit edge. These are fractions, not metre offsets.
+- SR beta uses RFTrack transfer matrices and the existing constrained Twiss
+  fit. Q-modulation panels can pool at least three measured quad betas for this
+  fit; five-point Gaussian quadrature averages transport through each magnet,
+  rather than silently treating a magnet-average beta as its centre beta.
+- SR dispersion uses upstream steerer response modes evaluated at MB64R..66R
+  and the two SR positions. The same two independent modes per plane are fit at
+  BPMs and transported to SR; rank-deficient fits are rejected.
+- The uncoupled beta/phase formulas explicitly reject appreciably coupled
+  model maps. Their outputs can now feed the XSR emittance estimate above.
+  They do not optimize emittance directly.
+
+Reproducibility and independent comparison:
+  OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=atf2-knobs \
+    python -m Knobs.DRTuning.model_validation --native --output /tmp/dr-model-check
+
+This offline check uses a separate RFTrack plant with an unreported 5 um quad
+alignment error and an additional unreported roll error for skew correction.
+It tests measured improvement, restoration, tune matching, SR transport fits
+and extraction constraints. It uses no real EPICS clients. Saved model inputs
+can also be replayed with --settings <model.json> --output <directory>.
+
+Validation on 2026-10-23: 117 DRCorrection / DRTuning unit and integration
+tests passed. The native check completed in 46.1 s; measured residual vector
+norms changed as follows (different units per task; these are NOT emittance):
+  COD:        0.114517 -> 0.00370019   (96.8% reduction)
+  Dispersion: 71.6592  -> 2.07484      (97.1% reduction)
+  Skew:       0.0155995 -> 0.0136015   (12.8% reduction)
+Commanded settings were restored. This is one noise-free fixture, not a
+multi-seed performance claim or a benchmark against SAD.
+
+"Compare reference file" supports dr-optics-reference-1 (source, tunes,
+rows={name:{s_m,beta_m:[x,y]}}, optional settings_sha256) and
+dr-response-reference-1 (source, mode, names, actuators, actuator_unit,
+signal_units, response, optional delta). Signal units are "mm" for orbit/skew
+or "dispersion:mm/delta;orbit:mm" for dispersion. Matrices are name-aligned;
+units and geometry are checked. Independent reference values are not invented
+from the model under test. --reference accepts an optics reference for replay.
+
+The locally archived SAD executable requires a missing 32-bit Linux loader;
+native SAD-vs-RFTrack numerical equality and live commissioning are therefore
+NOT established by the offline tests. Match the deployed lattice/calibration
+and compare independent SAD exports before relying on model accuracy.
+
+The earlier sections below describe the measured-response route unless noted.
+
 Start from flight-simulator-framework:
 
   PYTHONPATH=atf2-knobs python -m Knobs.DRTuning

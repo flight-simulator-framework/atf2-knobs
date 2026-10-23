@@ -56,6 +56,26 @@ def reflow_correction(panel):
     plane=QComboBox();plane.addItems(['Horizontal (X)','Vertical (Y)']);plane.setCurrentIndex(0 if panel.options.plane=='x' else 1)
     plane.currentIndexChanged.connect(lambda i:panel.set_option('plane','x' if i==0 else 'y'))
     if panel.mode!='skew':form.addRow('Plane',plane)
+    if panel.mode!='skew':
+        for key,label in [('count_h','Maximum H correctors for SET'),('count_v','Maximum V correctors for SET')]:
+            spin=QSpinBox();spin.setRange(1,500);spin.setValue(getattr(panel.options,key))
+            spin.valueChanged.connect(lambda value,k=key:panel.set_option(k,value))
+            form.addRow(label,spin);panel.modern_fields[key]=spin
+    source=QComboBox();source.addItem('Measured magnet response','measured');source.addItem('RFTrack model response','rftrack')
+    source.setCurrentIndex(source.findData(panel.options.response_source))
+    source.currentIndexChanged.connect(lambda i:panel.set_option('response_source',source.itemData(i)))
+    form.addRow('Response source',source);panel.response_source_box=source
+    from PyQt6.QtWidgets import QCheckBox
+    for key,label in [('model_match_tunes','Match model tunes to input targets'),
+                      ('model_regional_targets','SAD straight-section targets (H)'),
+                      ('model_fix_extraction_orbit','Preserve predicted extraction orbit'),
+                      ('model_fix_extraction_dispersion','Preserve predicted extraction dispersion')]:
+        if panel.mode=='skew' and key!='model_match_tunes':continue
+        if key=='model_fix_extraction_dispersion' and panel.mode!='dispersion':continue
+        check=QCheckBox(label);check.setChecked(getattr(panel.options,key))
+        check.toggled.connect(lambda v,k=key:panel.set_option(k,v));form.addRow(check)
+        check.setEnabled(source.currentData()=='rftrack')
+        source.currentIndexChanged.connect(lambda _,w=check:w.setEnabled(source.currentData()=='rftrack'))
     samples=QSpinBox();samples.setRange(1,1000);samples.setValue(panel.options.bpm_samples)
     samples.valueChanged.connect(lambda value:panel.set_option('bpm_samples',value))
     form.addRow('BPM samples per setting',samples);panel.modern_fields['bpm_samples']=samples
@@ -85,7 +105,7 @@ def reflow_correction(panel):
     panel.selection_label=QLabel();panel.selection_label.setWordWrap(True);layout.addWidget(panel.selection_label)
     layout.addWidget(button('SVD / advanced settings',panel.advanced))
     box,layout=group('2. Measure and correct');left.addWidget(box)
-    note=QLabel('Response acquisition moves magnets / RF.\nApply the proposed correction separately.');note.setWordWrap(True);layout.addWidget(note)
+    note=QLabel('CALC reads the beam. Measured response also scans correction magnets.\nModel response scans magnets only in RFTrack; dispersion/skew still use real diagnostic excitation.\nSET applies the proposal separately.');note.setWordWrap(True);layout.addWidget(note)
     prefix='pushButtonDispersion' if panel.mode=='dispersion' else 'pushButton'
     for suffix,title in [('Calc','Measure response (CALC)'),('CalcFile','Calculate from file'),('Set','Apply correction (SET)'),('Reset','Undo correction (RESET)')]:
         w=getattr(panel.form,prefix+suffix);w.setMinimumSize(0,0);w.setMaximumSize(16777215,16777215)
@@ -98,7 +118,7 @@ def reflow_correction(panel):
         layout.addWidget(button('SR / SR2 dispersion fit',lambda:panel.window.sr_fit(panel.data)))
         layout.addWidget(button('Delta-f Ramp',panel.window.frequency_dialog))
     left.addStretch()
-    result=QWidget();right=QVBoxLayout(result);right.addWidget(panel.plot,3);right.addWidget(panel.table,1)
+    result=QWidget();right=QVBoxLayout(result);right.addWidget(panel.proposal_summary);right.addWidget(panel.plot,3);right.addWidget(panel.result_tabs,2)
     table_style(panel.table)
     split=QSplitter();area=scroll(controls);area.setMinimumWidth(290);split.addWidget(area);split.addWidget(result)
     split.setSizes([310,800]);split.setStretchFactor(1,1);panel.layout().addWidget(split)

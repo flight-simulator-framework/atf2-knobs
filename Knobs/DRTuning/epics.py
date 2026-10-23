@@ -16,6 +16,9 @@ class LiveBackend(EpicsBackend):
     def get(self,pv):
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         return super().get(pv)
+    def read_xsr_sizes(self):
+        from .emittance import read_xsr_sizes
+        return read_xsr_sizes(self.get)
     def put(self,pv,value):
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         return super().put(pv,value)

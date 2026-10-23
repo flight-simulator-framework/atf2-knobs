@@ -52,6 +52,7 @@ class TuningTBTPanel(TBTPanel):
         self.legacy.pushButtonFFTcalc=self.analysis_button
         v.addWidget(button('Calculate phase beta',self.phase_calculate))
         v.addWidget(button('Load phase optics',self.load_phase))
+        v.addWidget(button('Use RFTrack model phase optics',self.model_phase))
         v.addWidget(button('SR / SR2 beta fit',self.sr_beta))
         box,v=group('Absolute beta calibration');left.addWidget(box)
         self.reference=QCheckBox('Use beta reference');v.addWidget(self.reference)
@@ -205,6 +206,13 @@ class TuningTBTPanel(TBTPanel):
         if self.estimate is None:self.analyze()
         if self.estimate is None:return
         self.sr_dialog=SRBetaDialog(self.window,self.estimate,self.phase_result);self.sr_dialog.show()
+    def model_phase(self):
+        def action(progress):
+            from .model_optics import phase_calibration
+            manager=self.window.service.model_manager
+            return phase_calibration(manager.require_current(),manager.optics)
+        def done(model):self.phase_model=model;self.window.log('Phase optics from independent settings-driven RFTrack model')
+        self.window.start(action,done,label='Calculate reference phase transport')
     def save(self,path=None):
         if self.wave is None:self.window.error('Read or load a waveform before saving');return
         if not path:path=QFileDialog.getExistingDirectory(self,'Save TBT data and figures')
@@ -221,12 +229,16 @@ class TuningSession(DRCorrectionWindow):
         self.qmod={}
         for key,(family,_) in FAMILIES.items():
             panel=QModPanel(self,key);self.qmod[key]=panel;self.tabs.addTab(panel,'Q modulation / '+family)
+        from .model_gui import ModelPanel
+        self.model_panel=ModelPanel(self);self.tabs.addTab(self.model_panel,'RFTrack model / optics')
+        from .emittance_gui import EmittancePanel
+        self.emittance_panel=EmittancePanel(self);self.tabs.addTab(self.emittance_panel,'XSR emittance')
         from .presentation import STYLE,reflow_correction
         self.setStyleSheet(STYLE);self.resize(1280,820)
         for panel in self.panels.values():reflow_correction(panel)
         layout=self.centralWidget().layout();layout.removeWidget(self.tabs)
         self.navigation=QListWidget();self.navigation.setMinimumWidth(160);self.navigation.setMaximumWidth(185)
-        self.navigation.addItems(['COD correction','Dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta'])
+        self.navigation.addItems(['COD correction','Dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance'])
         self.tabs.tabBar().hide();self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
         self.tabs.currentChanged.connect(self.navigation.setCurrentRow);self.navigation.setCurrentRow(0)
         content=QSplitter();content.addWidget(self.navigation);content.addWidget(self.tabs);content.setStretchFactor(1,1)
@@ -247,9 +259,9 @@ class TuningSession(DRCorrectionWindow):
         self._failed=False;self._active_label=''
         self.tool_actions={}
         for title,tools in (
-            ('Measurements',[('TBT waveform / beta','tbt'),('QF1R beta','qf1'),('QF2R beta','qf2'),('QM trim 1 beta','qm1'),('QM trim 2 beta','qm2')]),
+            ('Measurements',[('TBT waveform / beta','tbt'),('QF1R beta','qf1'),('QF2R beta','qf2'),('QM trim 1 beta','qm1'),('QM trim 2 beta','qm2'),('XSR emittance','emittance')]),
             ('Corrections',[('COD correction','orbit'),('Dispersion','dispersion'),('Skew correction','skew')]),
-            ('Utilities',[('Orbit buffers','buffers'),('BPM / magnet selection','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr'),('SR / SR2 beta fit','sr_beta')])):
+            ('Utilities',[('RFTrack model / optics','model'),('Orbit buffers','buffers'),('BPM / magnet selection','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr'),('SR / SR2 beta fit','sr_beta')])):
             menu=self.menuBar().addMenu(title)
             for label,key in tools:
                 action=menu.addAction(label);action.triggered.connect(lambda checked=False,k=key:self.open_tool(k))
@@ -260,6 +272,8 @@ class TuningSession(DRCorrectionWindow):
         if key in self.panels:self.tabs.setCurrentWidget(self.panels[key])
         elif key in self.qmod:self.tabs.setCurrentWidget(self.qmod[key])
         elif key=='tbt':self.tabs.setCurrentWidget(self.tbt)
+        elif key=='model':self.tabs.setCurrentWidget(self.model_panel)
+        elif key=='emittance':self.tabs.setCurrentWidget(self.emittance_panel)
         elif key=='sr_beta':self.tabs.setCurrentWidget(self.tbt);self.tbt.sr_beta()
         elif key=='sr':
             data=self.panels['dispersion'].data

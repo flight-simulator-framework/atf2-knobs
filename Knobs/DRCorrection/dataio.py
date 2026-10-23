@@ -76,9 +76,10 @@ def fit_sr(data,calibration,rcond=.04):
     if calibration.get('schema')!='dr-sr-response-1':raise ValueError('Expected dr-sr-response-1 calibration')
     if len(set(calibration['names']))!=len(calibration['names']):raise ValueError('Duplicate calibration BPMs')
     if not 0<=rcond<1:raise ValueError('Invalid SVD cutoff')
-    index=[calibration['names'].index(n) for n in data['names']]
-    valid=np.asarray(data['valid'],bool);values=np.asarray(data['full_measured'],float)[:2]
-    result=dict(schema='dr-sr-fit-1',names=data['names'],positions_m=data['positions_m'],valid=valid,
+    if set(calibration['names'])-set(data['names']):raise ValueError('SR calibration BPMs missing from measurement')
+    names=list(calibration['names']);selected=[data['names'].index(n) for n in names];index=list(range(len(names)))
+    valid=np.asarray(data['valid'],bool)[selected];values=np.asarray(data['full_measured'],float)[:2,selected]
+    result=dict(schema='dr-sr-fit-1',names=names,positions_m=np.asarray(data['positions_m'])[selected],valid=valid,
         measured=values,monitors=calibration['monitors'],calibration_source=calibration.get('source','unspecified'),planes={})
     for row,plane in enumerate(('x','y')):
         c=calibration['planes'][plane];matrix=np.asarray(c['bpm_response'],float)[index]

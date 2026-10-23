@@ -10,12 +10,13 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,
     QFormLayout,QTabWidget,QPushButton,QLabel,QPlainTextEdit,QTableWidget,QTableWidgetItem,
     QFileDialog,QMessageBox,QInputDialog,QDialog,QDialogButtonBox,QListWidget,QListWidgetItem,
-    QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox,QSplitter,QProgressBar,QScrollArea)
+    QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox,QSplitter,QProgressBar,QScrollArea,QAbstractItemView,QHeaderView)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg,NavigationToolbar2QT
 from matplotlib.figure import Figure
 from .core import Options,CorrectionService,Cancelled,serial,save_session,load_session,export_curves
 from .backends import HERE,DemoBackend,profile_issues
 from .tbt import analyze_tbt
+from .assessment import changed_indices,assess
 
 
 class Task(QThread):
@@ -96,9 +97,21 @@ class CorrectionPanel(QWidget):
         advanced=QPushButton('Response / limits / SVD settings');advanced.clicked.connect(self.advanced);left_layout.addWidget(advanced)
         select=QPushButton('BPM selection / FIX DR STEER');select.clicked.connect(window.selection);left_layout.addWidget(select)
         left_layout.addStretch()
-        self.plot=Plot();self.table=QTableWidget(0,5)
-        self.table.setHorizontalHeaderLabels(['Magnet','Before','Delta','Proposed','Unit'])
-        right=QWidget();right_layout=QVBoxLayout(right);right_layout.addWidget(self.plot,3);right_layout.addWidget(self.table,1)
+        self.plot=Plot();self.table=QTableWidget(0,6)
+        self.table.setHorizontalHeaderLabels(['Magnet','Before','Delta','Proposed','Unit','SET action'])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.proposal_summary=QLabel();self.proposal_summary.setWordWrap(True)
+        self.proposal_summary.setStyleSheet('font-weight: bold; padding: 6px; background: #e8edf3; color: #172b4d;')
+        self.assessment_summary=QLabel('SET has not run.');self.assessment_summary.setWordWrap(True)
+        self.assessment_table=QTableWidget(0,8)
+        self.assessment_table.setHorizontalHeaderLabels(['Signal\n(unit)','BPMs','Before\nRMS','Predicted\nRMS','After\nRMS','Improve\n(%)','Mismatch\nRMS','Max diff\nBPM'])
+        self.assessment_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.assessment_table.verticalHeader().setDefaultSectionSize(52)
+        self.assessment_table.verticalHeader().hide()
+        self.assessment_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        verification=QWidget();v=QVBoxLayout(verification);v.addWidget(self.assessment_summary);v.addWidget(self.assessment_table)
+        self.result_tabs=QTabWidget();self.result_tabs.addTab(self.table,'Magnet settings');self.result_tabs.addTab(verification,'SET verification')
+        right=QWidget();right_layout=QVBoxLayout(right);right_layout.addWidget(self.proposal_summary);right_layout.addWidget(self.plot,3);right_layout.addWidget(self.result_tabs,1)
         row=QHBoxLayout()
         for text,action in [('Save data + figures',self.save_bundle),('Save figure…',self.save_figure),('Load nominal dispersion…',self.load_target)]:
             b=QPushButton(text);b.clicked.connect(action);row.addWidget(b)
@@ -108,7 +121,8 @@ class CorrectionPanel(QWidget):
         self.bind();self.refresh()
 
     def invalidate(self):
-        self.data=None;self.refresh()
+        self.data=None;self.table.setRowCount(0);self.assessment_table.setRowCount(0)
+        self.assessment_summary.setText('No current proposal. Run CALC.');self.refresh()
 
     def bind(self):
         for entry in self.inventory:
@@ -163,7 +177,7 @@ class CorrectionPanel(QWidget):
             else:names=b.hcorrectors if o.plane=='x' else b.vcorrectors
             count=sum(n not in o.fixed_actuators for n in names)
             bpms=sum(n not in o.excluded_bpms for n in b.bpm_names)
-            self.selection_label.setText(f'CALC will scan {count} magnets; {bpms} BPMs enabled for fitting.'+
+            self.selection_label.setText((f'RFTrack will calculate {count} magnet responses; {bpms} BPMs enabled.\nMachine: '+('one RF scan pair.' if self.mode=='dispersion' else 'two horizontal probe scans.' if self.mode=='skew' else 'orbit read only.')) if o.response_source=='rftrack' else f'CALC will scan {count} magnets; {bpms} BPMs enabled for fitting.'+
                 (f' RF scan pairs: {1+2*count}.' if self.mode=='dispersion' and count else '')+
                 '\nMaximum correctors limits SET selection, not the CALC scan count.')
         for key,widget in getattr(self,'modern_fields',{}).items():
@@ -183,16 +197,28 @@ class CorrectionPanel(QWidget):
                 widget.setChecked(state);widget.setText('ON' if state else 'OFF')
             elif pv and ('MESSAGE' in pv):widget.setText('Ready' if self.data is None else 'Calculation ready')
         prefix='pushButtonDispersion' if self.mode=='dispersion' else 'pushButton'
-        getattr(self.form,prefix+'Set').setEnabled(self.data is not None and not self.data.get('applied',False))
+        set_button=getattr(self.form,prefix+'Set')
+        count=len(changed_indices(self.data)) if self.data is not None else 0
+        set_button.setEnabled(bool(count) and not self.data.get('applied',False))
+        set_button.setText(f'Apply {count} magnets (SET)' if self.data is not None else 'Apply correction (SET)')
+        if self.data is None:self.proposal_summary.setText('No current proposal. CALC will show how many magnets SET changes.')
+        else:
+            data=self.data;o=data['options'];plane='H' if o['plane']=='x' else 'V'
+            maximum=o['count_h'] if plane=='H' else o['count_v']
+            scope='skew supplies' if self.mode=='skew' else plane+' correctors'
+            bound='' if self.mode=='skew' else f'; maximum {maximum}'
+            verb='SET changed' if data.get('applied') else 'SET will change'
+            self.proposal_summary.setText(f'{verb} {count} {scope}{bound}; {len(data["actuators"])} response candidates.\n'
+                'Only nonzero setting changes are written. Details: Magnet settings tab.')
         getattr(self.form,prefix+'Reset').setEnabled(bool(self.window.service.undo))
-        self.detail.setText('CALC measures and restores probes. SET is separate.\nCorrector: '+self.window.backend.unit('correctors')+'; skew: '+self.window.backend.unit('skews')+'\nEnergy / tune / SK1/I fields are reference metadata for measured-response mode; no hidden lattice retuning.')
+        self.detail.setText('CALC restores diagnostic probes. SET is separate.\nCorrector: '+self.window.backend.unit('correctors')+'; skew: '+self.window.backend.unit('skews')+ ('\nRFTrack settings/tune source and fit are saved with the proposal.' if self.options.response_source=='rftrack' else '\nEnergy / tune / SK1/I fields are reference metadata for measured-response mode.'))
 
     def advanced(self):
         dialog=QDialog(self);dialog.setWindowTitle('Response acquisition and correction limits')
         form=QFormLayout(dialog);fields={}
         for key,label in [('count_h','Maximum H correctors'),('count_v','Maximum V correctors'),('bpm_samples','BPM samples per setting')]:
             spin=QSpinBox();spin.setRange(1,500);spin.setValue(getattr(self.options,key));form.addRow(label,spin);fields[key]=spin
-        for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','dispersion_weight','orbit_weight','bpm_interval_s'):
+        for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','dispersion_weight','orbit_weight','bpm_interval_s','model_extraction_weight'):
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(0.,1000.);spin.setValue(getattr(self.options,key));form.addRow(key,spin);fields[key]=spin
         if self.mode=='dispersion':
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(.0000001,1.)
@@ -219,12 +245,33 @@ class CorrectionPanel(QWidget):
 
     def display(self,data):
         self.data=data;self.plot.correction(data)
+        changed=set(changed_indices(data))
         self.table.setRowCount(len(data['actuators']))
         for i,name in enumerate(data['actuators']):
-            values=[name,f"{data['centers'][i]:.7g}",f"{data['delta'][i]:+.7g}",f"{data['centers'][i]+data['delta'][i]:.7g}",data['actuator_unit']]
+            values=[name,f"{data['centers'][i]:.7g}",f"{data['delta'][i]:+.7g}",f"{data['centers'][i]+data['delta'][i]:.7g}",data['actuator_unit'],('Changed' if data.get('applied') else 'Will change') if i in changed else 'No write']
             for j,value in enumerate(values):self.table.setItem(i,j,QTableWidgetItem(value))
+        self.show_assessment(data)
         self.table.resizeColumnsToContents();self.refresh()
-        self.window.log(f'{self.mode}: rank {data["rank"]}, {len(data["selected"])} selected; SET has not run' if not data.get('applied') else f'{self.mode}: SET and remeasurement completed')
+        self.window.log(f'{self.mode}: rank {data["rank"]}, {len(changed)} magnets will change; SET has not run' if not data.get('applied') else f'{self.mode}: {len(changed)} magnets changed; SET and remeasurement completed')
+
+    def show_assessment(self,data):
+        self.assessment_table.setRowCount(0)
+        if not data.get('applied'):
+            self.assessment_summary.setText('SET will remeasure and compare against the prediction.');self.result_tabs.setCurrentIndex(0);return
+        report=data.get('assessment') or assess(data);data['assessment']=report
+        self.assessment_table.setRowCount(len(report['rows']));messages=[]
+        fmt=lambda x:'—' if x is None else f'{x:.5g}'
+        for i,r in enumerate(report['rows']):
+            values=[r['signal']+'\n['+r['unit'].replace(' ','')+']',f'{r["valid_bpms"]}/{r["enabled_bpms"]}',
+                    *[fmt(r[k]) for k in ('before_rms','predicted_rms','after_rms','improvement_pct','mismatch_rms')],
+                    fmt(r['mismatch_max'])+('\n'+r['worst_bpm'] if r['worst_bpm'] else '')]
+            for j,value in enumerate(values):
+                item=QTableWidgetItem(value);item.setToolTip(report['note']);self.assessment_table.setItem(i,j,item)
+            message=f'{r["signal"]}: {r["status"]}; improvement {fmt(r["improvement_pct"])}%; prediction mismatch RMS {fmt(r["mismatch_rms"])} {r["unit"]}'
+            if r['excluded_from_comparison']:message+=f'; {r["excluded_from_comparison"]} BPMs unavailable after SET'
+            messages.append(message);self.window.log(message)
+        self.assessment_summary.setText('\n'.join(messages)+'\nRMS is relative to target. Comparison uses common valid BPMs; changes include measurement noise and drift.')
+        self.result_tabs.setCurrentIndex(1)
 
     def apply(self):
         if self.data:self.window.start(lambda _:self.window.service.apply(self.data),self.display)

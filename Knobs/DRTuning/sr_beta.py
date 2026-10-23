@@ -18,8 +18,12 @@ def fit_sr_beta(names,beta,calibration):
     available=dict(zip(names,beta));rows=calibration['bpms']
     chosen=[r for r in rows if r['name'] in available and np.isfinite(available[r['name']]) and available[r['name']]>0]
     if len(chosen)<3:raise ValueError('At least three calibrated absolute beta measurements are required')
-    a=np.array([r['r11'] for r in chosen]);b=np.array([r['r12_m'] for r in chosen]);y=np.array([available[r['name']] for r in chosen])
-    basis=np.column_stack([a*a,-2*a*b,b*b])
+    y=np.array([available[r['name']] for r in chosen])
+    def transport_row(r):
+        if 'beta_transport' in r:return r['beta_transport']
+        a,b=r['r11'],r['r12_m'];return [a*a,-2*a*b,b*b]
+    basis=np.asarray([transport_row(r) for r in chosen],float)
+    if basis.shape!=(len(chosen),3) or not np.isfinite(basis).all():raise ValueError('Invalid beta transport basis')
     if np.linalg.matrix_rank(basis)<3:raise ValueError('Degenerate beta transport basis')
     def twiss(p):
         beta0=np.exp(p[0]);alpha=p[1];return np.array([beta0,alpha,(1+alpha*alpha)/beta0])
@@ -41,9 +45,18 @@ class SRBetaDialog(QDialog):
         layout=QVBoxLayout(self)
         note=QLabel('Measured absolute beta + independently calibrated transport. Local Courant–Snyder fit; legacy external SAD scripts are not bundled.');note.setWordWrap(True);layout.addWidget(note)
         buttons=QHBoxLayout();layout.addLayout(buttons)
-        for text,action in [('Load SR optics',self.load),('CALC',self.calculate),('SAVE',self.save)]:
+        for text,action in [('Load SR optics',self.load),('Use RFTrack model',self.model_calibration),('CALC',self.calculate),('SAVE',self.save)]:
             b=QPushButton(text);b.clicked.connect(action);buttons.addWidget(b)
+        if hasattr(window,'emittance_panel'):
+            b=QPushButton('Estimate XSR emittance');b.clicked.connect(self.emittance);buttons.addWidget(b)
         self.plot=Plot();layout.addWidget(self.plot);self.result_label=QLabel();layout.addWidget(self.result_label)
+    def model_calibration(self):
+        def action(progress):
+            from .model_optics import sr_beta_calibration
+            manager=self.window.service.model_manager
+            return sr_beta_calibration(manager.require_current(),manager.optics)
+        def done(result):self.calibration=result;self.result_label.setText('RFTrack transport ready. Press CALC to fit measured beta.')
+        self.window.start(action,done)
     def load(self):
         path,_=QFileDialog.getOpenFileName(self,'SR beta transport calibration','','JSON (*.json)')
         if path:
@@ -61,10 +74,17 @@ class SRBetaDialog(QDialog):
                 if beta is None:continue
                 self.results[axis]=fit_sr_beta(names,beta,cal)
             if not self.results:raise ValueError('Absolute beta or phase beta is required')
+            self.window.latest_sr_beta=serial(self.results)
             self.plot.figure.clear();axes=self.plot.figure.subplots(len(self.results),1,squeeze=False).ravel()
             for ax,(axis,result) in zip(axes,self.results.items()):
                 ax.plot(result['measured_beta_m'],'o',label='Measured');ax.plot(result['fitted_beta_m'],label='Fit');ax.legend();ax.set(ylabel='Beta '+axis+' [m]',xlabel='Selected BPM index')
             self.plot.canvas.draw_idle();self.result_label.setText('; '.join(f"{axis}: "+', '.join(f"{m['name']} β={m['beta_m']:.4g} m" for m in r['monitors']) for axis,r in self.results.items()))
+        except Exception as e:self.window.error(str(e))
+    def emittance(self):
+        try:
+            if not self.results:raise ValueError('Calculate the SR beta fit first')
+            panel=self.window.emittance_panel;panel.import_beta(self.results)
+            self.window.tabs.setCurrentWidget(panel);self.hide()
         except Exception as e:self.window.error(str(e))
     def save(self,path=None):
         if not self.results:return

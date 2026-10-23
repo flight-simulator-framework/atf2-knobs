@@ -14,7 +14,7 @@ Improvements (2026-01):
 - Always wait settle_sec (default 5s) after changing any PV before reading ICTs.
 - Timing scan after klystron phase scan:
     PV: EVE_LINAC.OT8D [count], integer step=1, range=±10 around current
-- Optional standalone Timing fine tuning, after other selected targets:
+- Optional standalone Timing fine tuning, immediately after Timing coarse:
     OT8D (11.2 ns/count) + RFDLY0 (0.56 ns/count, 0–19),
     scan current ±11.2 ns in 2.8 ns steps with base-20 carry/borrow.
 - Add Group-LBO mode (discrete / quantized to the same step sizes as sequential scans).
@@ -2726,8 +2726,10 @@ class OptimizationWorker(QThread):
                 self._run_correctors()
                 if self.is_running:
                     self._emit_group_state("correctors", "done")
-            if self.run_profile == RUN_PROFILE_MAIN and self.config.get("timing_fine") and self.is_running:
-                self._run_timing_fine()
+            # Combined correctors/L8 includes the coarse timing search itself.
+            # Refine that result immediately after the combined group finishes.
+            if self.config.get("correctors_l8") and self.config.get("correctors"):
+                self._run_timing_fine_stage(combined=True)
         except SaveAndEndRequested:
             try:
                 self._finish_at_best()
@@ -2759,7 +2761,7 @@ class OptimizationWorker(QThread):
             for pv, value in values.items():
                 if fine_pair and pv in (TIMING_PV, TIMING_FINE_PV):
                     # Fine tuning has its own nine verified pairs, centered on
-                    # the timing after the corrector/L8 optimization finishes.
+                    # the timing after the coarse optimization finishes.
                     continue
                 if self.run_profile == RUN_PROFILE_MAIN and pv not in corrector_pvs and pv not in selected:
                     continue  # Existing Main groups (RF phases, solenoid, QA/QM).
@@ -2861,6 +2863,12 @@ class OptimizationWorker(QThread):
             self.perform_1d_scan(label, pv_write, scan, group=DEVELOPER_GROUP_NAME, mode="SEQUENTIAL")
             if self.is_running:
                 self._emit_developer_actuator_state(label, "done")
+
+    def _run_timing_fine_stage(self, combined=False):
+        timing_in_correctors = bool(self.config.get("correctors_l8") and self.config.get("correctors"))
+        if (self.run_profile == RUN_PROFILE_MAIN and self.config.get("timing_fine")
+                and self.is_running and timing_in_correctors == combined):
+            self._run_timing_fine()
 
     def _run_timing_fine(self):
         """Exhaustive relative timing scan, independent of the coarse search mode."""
@@ -2974,6 +2982,8 @@ class OptimizationWorker(QThread):
             if self.is_running:
                 self._emit_group_state("timing", "done")
 
+        self._run_timing_fine_stage()
+
         # 4) QA
         if self.config.get("qa", False) and self.is_running:
             self._emit_group_state("qa", "running")
@@ -3060,6 +3070,8 @@ class OptimizationWorker(QThread):
             self.log_signal.emit("--- GROUP_LBO: Timing ---")
             self._lbo_group("Timing", params)
 
+        self._run_timing_fine_stage()
+
         # QA
         if self.config.get("qa", False) and self.is_running:
             params = [(q, f"{q}:currentWrite", qa_step, qa_half) for q in ["QA1L", "QA2L", "QA3L", "QA4L", "QA5L"]]
@@ -3137,6 +3149,8 @@ class OptimizationWorker(QThread):
             self.perform_1d_scan("Timing", pv, scan, group="Timing", mode="GROUP_BO")
             if self.is_running:
                 self._emit_group_state("timing", "done")
+
+        self._run_timing_fine_stage()
 
         if self.config.get("qa", False) and self.is_running:
             self._emit_group_state("qa", "running")
@@ -3365,7 +3379,8 @@ class MainWindow(QMainWindow):
         self.chk_timing_fine.setToolTip(
             "Scan 9 points around the current timing: ±11.2 ns in 2.8 ns steps. "
             "RFDLY0 changes by 5 counts, with carry/borrow into OT8D (RFDLY0 = 0–19). "
-            "Runs after the other selected targets; can run on its own.")
+            "Runs immediately after Coarse, before QA/QM; can run on its own. "
+            "With Correctors & L8, runs immediately after that combined timing search.")
         self.chk_qa = self._add_target_row(lay_t, "qa", TARGET_LABELS["qa"], checked=True, prominent=True)
         self.chk_qm = self._add_target_row(lay_t, "qm", TARGET_LABELS["qm"], checked=True, prominent=True)
         self.chk_correctors = self._add_target_row(lay_t, "correctors", "Correctors", checked=False,

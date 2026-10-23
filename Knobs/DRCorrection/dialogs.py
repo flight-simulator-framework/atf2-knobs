@@ -69,11 +69,23 @@ class SRFitDialog(QDialog):
         super().__init__(window);self.window=window;self.data=data;self.calibration=None;self.result=None
         self.setWindowTitle('DR SR monitor — dispersion fit');self.resize(960,700)
         layout=QVBoxLayout(self);row=QHBoxLayout();layout.addLayout(row)
-        for title,action in [('Load dispersion file',self.load_data),('Load public response calibration',self.load_calibration),('CALC',self.calculate),('SAVE data/figure',self.save)]:
+        for title,action in [('Load dispersion file',self.load_data),('Load public response calibration',self.load_calibration),('Use RFTrack model',self.model_calibration),('CALC',self.calculate),('SAVE data/figure',self.save)]:
             button=QPushButton(title);button.clicked.connect(action);row.addWidget(button)
+        if hasattr(window,'emittance_panel'):
+            button=QPushButton('XSR emittance');button.clicked.connect(self.emittance);layout.addWidget(button)
         self.note=QLabel('Fit X/Y dispersion to a supplied lattice response basis, then evaluate it at SR/SR2. A calibrated response is required; positions alone do not determine transport.');self.note.setWordWrap(True);layout.addWidget(self.note)
         self.plot=Plot();layout.addWidget(self.plot)
         if callable(getattr(window.backend,'sr_calibration',None)):self.calibration=window.backend.sr_calibration()
+    def model_calibration(self):
+        def action(progress):
+            from Knobs.DRTuning.model_optics import sr_dispersion_calibration
+            manager=self.window.service.model_manager
+            model=manager.require_current()
+            if self.data is not None and not self.window.backend.same_settings(self.data['baseline'],manager.baseline):
+                raise ValueError('Dispersion and model settings differ; acquire / build at the same settings')
+            return sr_dispersion_calibration(model)
+        def done(result):self.calibration=result;self.note.setText('RFTrack SR response basis ready. Press CALC to fit measured dispersion.')
+        self.window.start(action,done)
     def load_data(self):
         path,_=QFileDialog.getOpenFileName(self,'X/Y dispersion session','','JSON (*.json)')
         if path:
@@ -87,7 +99,13 @@ class SRFitDialog(QDialog):
     def calculate(self):
         try:
             if self.data is None or self.calibration is None:raise ValueError('Load dispersion data and SR response calibration first')
-            self.result=fit_sr(self.data,self.calibration);self.draw()
+            self.result=fit_sr(self.data,self.calibration);self.window.latest_sr_dispersion=copy.deepcopy(self.result);self.draw()
+        except Exception as exc:self.window.error(str(exc))
+    def emittance(self):
+        try:
+            if self.result is None:raise ValueError('Calculate the SR dispersion fit first')
+            panel=self.window.emittance_panel;panel.import_dispersion(self.result)
+            self.window.tabs.setCurrentWidget(panel);self.hide()
         except Exception as exc:self.window.error(str(exc))
     def draw(self):
         data=self.result;self.plot.figure.clear();axes=self.plot.figure.subplots(2,1)

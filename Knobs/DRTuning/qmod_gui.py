@@ -40,6 +40,7 @@ class QModPanel(QWidget):
         self.form.pushButtonCALC=button('Fit beta (CALC)',self.calculate);row.addWidget(self.form.pushButtonCALC)
         self.form.pushButtonCALC_2=button('Save results',self.save);row.addWidget(self.form.pushButtonCALC_2)
         row.addWidget(button('Open results',self.load))
+        row.addWidget(button('SR beta fit from Q modulation',self.sr_beta))
         self.plot=Plot();self.result_tabs.addTab(self.plot,'Tune fits')
         key,count=FAMILIES[family];catalog=getattr(window.backend,'quadrupoles',{})
         names=[n for n,p in catalog.items() if p['family']==key]
@@ -53,6 +54,15 @@ class QModPanel(QWidget):
         if not names:self.note.setText('No quadrupole trims are configured for this interface.')
         self.refresh()
     def selected_row(self):return self.selected.currentIndex()+1
+    def sr_beta(self):
+        from .sr_beta import SRBetaDialog
+        sessions={}
+        for panel in self.window.qmod.values():
+            for r,n in panel.rows.items():
+                if panel.enabled[r] and n in panel.sessions:sessions[n]=panel.sessions[n]
+        if len(sessions)<3:self.window.error('At least three measured quadrupole betas are required');return
+        estimate=dict(names=list(sessions),planes={a:dict(beta_m=[s['fit']['beta_m'][i] for s in sessions.values()]) for i,a in enumerate(('x','y'))})
+        self.sr_dialog=SRBetaDialog(self.window,estimate);self.sr_dialog.show()
     def edit_selected(self,row,column):
         if self.selected_row() not in self.rows:return
         field={1:'Curr',2:'NX',3:'NY'}.get(column)

@@ -95,24 +95,43 @@ class TimingFineTests(unittest.TestCase):
                 worker._finish_at_best()
                 self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 101, opt.TIMING_FINE_PV: 3})
 
-    def test_fine_runs_after_coarse_and_correctors_and_reads_their_final_value(self):
+    def test_fine_immediately_follows_coarse_before_qa_qm_and_correctors(self):
+        for mode in ("SEQUENTIAL", "GROUP_BO", "GROUP_LBO"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                worker = opt.OptimizationWorker({"mode": mode, "timing": True,
+                    "correctors": True, "timing_fine": True, "qa": True, "qm": True},
+                    directory, interface=TimingInterface())
+                worker._dump_initial_snapshot = Mock()
+                events = []
+                current = [100]
+                worker._read_current = lambda *args: current[0]
+                def record(group):
+                    events.append(group)
+                    if group == "Timing": current[0] = 110
+                worker.perform_1d_scan = lambda *args, **kw: record(kw["group"])
+                worker._lbo_group = lambda group, params: record(group)
+                worker._group_bo_simultaneous = lambda group, params: record(group)
+                worker._run_correctors = lambda: events.append("correctors")
+                def fine():
+                    events.append("fine")
+                    self.assertEqual(worker._read_current(opt.TIMING_PV), 110)
+                worker._run_timing_fine = fine
+                worker.run()
+                self.assertEqual(events[:2], ["Timing", "fine"])
+                self.assertGreater(events.index("QA"), events.index("fine"))
+                self.assertGreater(events.index("QM"), events.index("fine"))
+                self.assertEqual(events[-1], "correctors")
+                self.assertEqual(events.count("fine"), 1)
+
+    def test_combined_timing_refined_after_correctors_once(self):
         with tempfile.TemporaryDirectory() as directory:
-            interface = TimingInterface()
-            worker = opt.OptimizationWorker({"timing": True, "correctors": True, "timing_fine": True},
-                                            directory, interface=interface)
-            worker._dump_initial_snapshot = Mock()
-            events = []
-            worker._run_sequential = lambda: events.append("coarse")
-            def correctors():
-                events.append("correctors")
-                interface.values[opt.TIMING_PV] = 110
-            worker._run_correctors = correctors
-            def fine():
-                events.append("fine")
-                self.assertEqual(worker._read_current(opt.TIMING_PV), 110)
-            worker._run_timing_fine = fine
+            worker = opt.OptimizationWorker({"correctors_l8": True, "correctors": True,
+                "timing_fine": True}, directory, interface=TimingInterface())
+            worker._dump_initial_snapshot = Mock();events = []
+            worker._run_correctors = lambda: events.append("combined coarse")
+            worker._run_timing_fine = lambda: events.append("fine")
             worker.run()
-            self.assertEqual(events, ["coarse", "correctors", "fine"])
+            self.assertEqual(events, ["combined coarse", "fine"])
 
     def test_fine_pair_may_carry_past_combined_coarse_limit(self):
         with tempfile.TemporaryDirectory() as directory:
