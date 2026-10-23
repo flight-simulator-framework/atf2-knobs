@@ -107,19 +107,25 @@ class ModelMathTests(unittest.TestCase):
         self.assertEqual(manager.last_attempt['optics_failure']['max_modulus_deviation'],1.)
         from Knobs.DRCorrection.core import serial
         json.dumps(serial(manager.last_attempt),allow_nan=False)
-    def test_unstable_tune_trial_reports_scales_and_restores_model(self):
+    def test_unstable_tune_trial_backtracks_and_failed_fit_restores_model(self):
         from types import SimpleNamespace
         class Quadrupole:
             def __init__(self):self.value=2.
             def get_K1(self,p):return self.value
             def set_K1(self,p,value):self.value=value
         elements={'QF1R.1':Quadrupole(),'QF2R.1':Quadrupole()}
-        model=SimpleNamespace(elements=elements,momentum=1300.,check_cancel=lambda:None,
-            tunes=Mock(side_effect=[np.array([.2,.3]),ModelOpticsError('Unstable trial',{'max_modulus_deviation':.2})]))
-        with patch('Knobs.DRTuning.model.least_squares',side_effect=lambda fun,*a,**k:fun([.01,-.02])):
-            with self.assertRaisesRegex(ModelOpticsError,'Tune-match trial') as caught:
-                OpticsModel.match_tunes(model,[.21,.31])
-        np.testing.assert_allclose(caught.exception.diagnostics['tune_match_trial_fractional_changes'],[.01,-.02])
+        def tunes():
+            changes=np.array([e.value/2.-1 for e in elements.values()])
+            if .003<changes[0]<.006:
+                raise ModelOpticsError('Unstable trial',{'max_modulus_deviation':.2})
+            return np.array([.2,.3])+changes
+        model=SimpleNamespace(elements=elements,momentum=1300.,check_cancel=lambda:None,settings={},tunes=tunes)
+        report=OpticsModel.match_tunes(model,[.21,.31])
+        np.testing.assert_allclose(report['final'],[.21,.31],atol=1.e-5)
+        self.assertGreater(len(report['rejected_unstable_trials']),0)
+        for e in elements.values():e.value=2.
+        with self.assertRaisesRegex(ValueError,'Tune match failed'):
+            OpticsModel.match_tunes(model,[.4,.45])
         self.assertEqual([e.value for e in elements.values()],[2.,2.])
     def test_quad_average_beta_fit_uses_integrated_transport(self):
         beta=4.;alpha=.3;gamma=(1+alpha**2)/beta;names=['q1','q2','q3','q4'];rows=[];values=[]
@@ -150,6 +156,20 @@ class ModelGuiTests(unittest.TestCase):
     def setUpClass(cls):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
+    def test_live_defaults_choose_sad_model_and_legacy_counts(self):
+        from Knobs.DRTuning.gui import TuningSession
+        b=CountedBackend();b.identity='epics:offline-fake'
+        window=TuningSession(b)
+        try:
+            self.assertEqual(window.model_panel.preparation.currentData(),'sad_cod')
+            for mode,h in [('orbit',5),('dispersion',10)]:
+                p=window.panels[mode]
+                self.assertEqual(p.options.response_source,'rftrack')
+                self.assertEqual((p.options.count_h,p.options.count_v),(h,5))
+            window.model_panel.preparation.setCurrentIndex(1)
+            self.assertEqual(b.model_config['preparation'],'all_currents')
+            self.assertEqual(b.commands,[]);self.assertEqual(b.acquisitions,0)
+        finally:window.close();window.deleteLater();self.app.processEvents()
     def test_model_navigation_and_response_selection_no_pv_access(self):
         from Knobs.DRTuning.gui import TuningSession
         b=CountedBackend();window=TuningSession(b)

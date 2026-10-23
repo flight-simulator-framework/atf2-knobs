@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 import time
 import numpy as np
-from scipy.optimize import least_squares
 from Knobs.DRCorrection.core import Options, CorrectionService, serial
 
 
@@ -197,6 +196,7 @@ class OpticsModel:
         def set_scales(scales):
             for group,ks,scale in zip(groups,baseline,scales):
                 for e,k in zip(group,ks):e.set_K1(-self.momentum,k*(1+scale))
+        rejected=[]
         def residual(scales):
             self.check_cancel();set_scales(scales)
             try:return (self.tunes()-goals+.5)%1-.5
@@ -204,15 +204,48 @@ class OpticsModel:
                 detail=dict(exc.diagnostics,tune_match_trial_fractional_changes=np.asarray(scales).copy(),resolved_target=goals)
                 raise ModelOpticsError('Tune-match trial failed at QF1R/QF2R changes '
                                        +', '.join(f'{v:+.6%}' for v in scales)+': '+str(exc),detail) from exc
+        def trial(scales):
+            try:return residual(scales)
+            except ModelOpticsError as exc:
+                rejected.append(serial(exc.diagnostics));return None
         try:
-            result=least_squares(residual,[0.,0.],bounds=(-max_scale,max_scale),diff_step=1.e-4,
-                                 xtol=1.e-10,ftol=1.e-10,gtol=1.e-10,max_nfev=40)
-            error=residual(result.x)
-            if not result.success or np.max(abs(error))>tolerance:raise ValueError(f'Tune match failed: residual {error}; no machine correction calculated')
+            scales=np.zeros(2);error=residual(scales)
+            # Absolute family perturbations avoid the tiny relative steps near
+            # zero used by generic optimizers. Reject unstable trials and back
+            # track from the last stable iterate, keeping the stability test.
+            for iteration in range(40):
+                if np.max(abs(error))<=tolerance:break
+                columns=[]
+                for axis in range(2):
+                    column=None
+                    for h in (1.e-4,-1.e-4,1.e-5,-1.e-5):
+                        point=scales.copy();point[axis]+=h
+                        if np.max(abs(point))>max_scale:continue
+                        probe=trial(point)
+                        if probe is not None:
+                            column=((probe-error+.5)%1-.5)/h;break
+                    if column is None:raise ValueError('Tune match could not form a stable local response')
+                    columns.append(column)
+                jacobian=np.column_stack(columns)
+                step=np.linalg.lstsq(jacobian,-error,rcond=1.e-8)[0]
+                largest=np.max(abs(step))
+                if largest>.005:step*=.005/largest
+                accepted=False
+                for power in range(16):
+                    point=np.clip(scales+step*(.5**power),-max_scale,max_scale)
+                    probe=trial(point)
+                    if probe is not None and np.linalg.norm(probe)<np.linalg.norm(error):
+                        scales=point;error=probe;accepted=True;break
+                if not accepted:break
+            error=residual(scales)
+            if np.max(abs(error))>tolerance:
+                raise ValueError(f'Tune match failed: residual {error}; QF changes {scales}; '
+                    f'rejected unstable trials={len(rejected)}; no machine correction calculated')
         except Exception:
             set_scales([0.,0.]);raise
         self.match_report=dict(initial=initial,target=target,resolved_target=goals,final=self.tunes(),
-                               family_fractional_changes=result.x,residual=error,source=self.settings.get('tune_source'),model_only=True)
+                               family_fractional_changes=scales,residual=error,source=self.settings.get('tune_source'),model_only=True,
+                               iterations=iteration+1,rejected_unstable_trials=rejected,method='bounded Newton with stable backtracking')
         return self.match_report
 
 

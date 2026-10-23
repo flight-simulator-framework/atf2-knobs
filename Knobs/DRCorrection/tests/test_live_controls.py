@@ -37,6 +37,21 @@ def ramp_profile():
 
 
 class RecoveredControlTests(unittest.TestCase):
+    def test_operator_current_tolerance_accepts_19ma_but_rejects_21ma(self):
+        for difference,accepted in ((.019,True),(.021,False)):
+            with self.subTest(difference=difference):
+                profile=fake_profile();profile['current_tolerance_A']=.02
+                profile['actuators']['V']['set']='v_set'
+                client=FakeEpics();client.values['v_set']=0.
+                backend=EpicsBackend(profile,client)
+                # The readback stays at zero, within/outside the permitted
+                # deviation from this small requested current.
+                if accepted:backend.write('correctors',['V'],[difference])
+                else:
+                    with self.assertRaisesRegex(RuntimeError,'tolerance 0.02 A'):
+                        backend.write('correctors',['V'],[difference])
+                self.assertEqual(client.values['v_set'],difference if accepted else 0.)
+
     def test_stuck_current_identifies_supply_and_verifies_restoration(self):
         profile=fake_profile();profile['actuators']['V']['set']='v_set'
         client=FakeEpics();client.values['v_set']=0.
@@ -60,6 +75,19 @@ class RecoveredControlTests(unittest.TestCase):
         message=str(caught.exception)
         self.assertIn('target=0.05 A',message);self.assertIn('Restoration FAILED',message)
         self.assertIn('target=0 A',message)
+
+    def test_calc_keeps_probe_error_when_outer_restoration_also_fails(self):
+        profile=fake_profile();profile['actuators']['V']['set']='v_set'
+        client=FakeEpics();client.values['v_set']=0.
+        def put(pv,value,**kw):
+            client.values[pv]=value;client.values['v']=.02;return 1
+        client.caput=put
+        backend=EpicsBackend(profile,client)
+        with self.assertRaises(RuntimeError) as caught:
+            CorrectionService(backend).calculate('orbit',Options())
+        message=str(caught.exception)
+        self.assertIn('target=-0.05 A',message)
+        self.assertIn('Probe restoration also failed for V',message)
 
     def test_selected_preset_with_wrong_frequency_is_rejected_with_numeric_evidence(self):
         class HalfStepClient(RampClient):

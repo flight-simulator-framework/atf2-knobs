@@ -1,6 +1,50 @@
 DRTuning — RFTrack / machine interface launcher
 ==============================================
 
+SAD COD reference preparation and readback diagnostics (2026-10-23)
+----------------------------------------------------------------
+On the Machine interface, correction pages now default to RFTrack model
+response. COD maximum corrector counts default to H=5/V=5, dispersion H=10/V=5,
+following the archived configuration (editable, not live PV values).
+RFTrack model > Model preparation defaults to "SAD COD reference" on Machine;
+simulation retains "All captured currents" unless explicitly changed.
+The SAD preset reproduces the archived CODCorrection preparation:
+- Import main quadrupole strengths; include QM trims except QM7, omit QF trims.
+  Read and record all trims, including ignored ones.
+- Multiply the included main+trim strength by correctQK1[1] factors in the
+  bundled sad_cod_calibration.json (98 entries, source hash and name aliases).
+  No bend-gradient override: setBH1RK1 was commented out in that COD branch.
+- Set corrector/skew excitation to zero ONLY in the reference model. Virtual
+  excitation is relative to the captured current; proposal centers and current
+  bounds still use absolute machine currents. SET is I_captured + delta.
+- Match QF1R/QF2R to configured tune targets, within +/-5%. Unstable trial steps
+  are rejected and shortened. Invalid initial optics still fail read-only;
+  neither the eigenvalue tolerance nor machine current limits are relaxed.
+Model factors are historical calibration, not a claim of today's accuracy.
+This COD reference is also used for dispersion/skew when selected; it does not
+reproduce the old branches' dependence on previously loaded SAD session state.
+It is not a numerical-equivalence claim for the complete SAD optimizer.
+Select All captured currents to return to the previous model preparation.
+An explicit model calibration file overrides the bundled factor table.
+
+For a model test: select RFTrack model, exclude unmapped BPMs / magnets when
+using the bundled lattice, then Build model / optics. No machine writes occur.
+Check the recorded inputs/tune fit before CALC. COD model CALC reads BPMs but
+does not scan real magnets; dispersion/skew still perform their documented
+diagnostic excitations. Save model diagnostics is available even after failure.
+
+"Magnet readback did not settle" is an electrical readback convergence failure,
+not an RFTrack optics failure. Errors now identify the magnet, set/read PVs,
+target, last readback, signed difference, timeout and tolerance. Restoration is
+attempted for every touched supply and checked; restoration failures retain
+the original error. The deadline remains 10 s. At the operator's request the
+bundled current tolerance is now 0.02 A (previously 0.001 A). This shared setting
+also governs skew/quad readback and current snapshot comparisons. Custom site
+profiles retain their explicitly configured value. Restart to reload profiles.
+Do not infer that extending the wait or loosening tolerance fixes a stuck PV.
+The custom measured-response scan remains available; this change does not yet
+connect the SysID worker or import its DATA*.pkl archives.
+
 XSR emittance estimate (2026-10-23)
 ---------------------------------
 Open XSR emittance in the left navigation or Measurements menu. This worksheet
@@ -48,7 +92,8 @@ https://cds.cern.ch/record/2742899/files/CERN-ACC-2020-0029.pdf
 SET count and outcome verification (2026-10-23)
 ----------------------------------------------
 Maximum H / V correctors for SET are visible on the correction pages. The
-current GUI defaults remain 8 / 8. The archived sad/control/db_sad.adb records
+Machine GUI defaults now follow the archived values below; other backends
+retain 8 / 8. The archived sad/control/db_sad.adb records
 COD H=5,V=5 and dispersion H=10,V=5; these are historical configured maxima,
 not evidence of today's live PV values or actual selected counts. The old
 solver adds useful correctors until the maximum or residual tolerance is met.
@@ -137,7 +182,8 @@ Model inputs and calibration:
   equilibrium, or a fully identified real-machine lattice from two tunes.
 - Optional model calibration JSON: schema="dr-model-calibration-1", source,
   quadrupole_factors={physical_name: multiplicative_factor}, and/or
-  bend_k1l={physical_name: integrated_gradient}. Factors act on main+trim K1L.
+  bend_k1l={physical_name: integrated_gradient}. Factors act on the included
+  main/trim K1L according to the selected preparation preset.
   Legacy DR_QUAD_CORRECTION.DAT has different conventions; it is NOT silently
   multiplied into these factors. Supply an audited conversion for site use.
 - Optional generated lattice JSON can be selected without changing the machine

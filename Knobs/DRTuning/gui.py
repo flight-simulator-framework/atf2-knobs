@@ -235,7 +235,13 @@ class TuningSession(DRCorrectionWindow):
         self.emittance_panel=EmittancePanel(self);self.tabs.addTab(self.emittance_panel,'XSR emittance')
         from .presentation import STYLE,reflow_correction
         self.setStyleSheet(STYLE);self.resize(1280,820)
-        for panel in self.panels.values():reflow_correction(panel)
+        for mode,panel in self.panels.items():
+            if backend.identity.startswith('epics:'):
+                panel.options.response_source='rftrack'
+                if mode in ('orbit','dispersion'):
+                    panel.options.count_h=5 if mode=='orbit' else 10
+                    panel.options.count_v=5
+            reflow_correction(panel)
         layout=self.centralWidget().layout();layout.removeWidget(self.tabs)
         self.navigation=QListWidget();self.navigation.setMinimumWidth(160);self.navigation.setMaximumWidth(185)
         self.navigation.addItems(['COD correction','Dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance'])

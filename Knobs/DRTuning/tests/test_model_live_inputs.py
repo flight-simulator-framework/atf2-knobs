@@ -71,8 +71,20 @@ class LiveModelInputTests(unittest.TestCase):
         model.write('correctors',['ZH1R'],[2.01])
         self.assertGreater(np.max(abs(model.orbit()['x'])),1.e-6)
         model.write('correctors',['ZH1R'],[2.])
-        report=model.match_tunes(settings['tunes'])
-        np.testing.assert_allclose(report['final'],settings['tunes'],atol=1.e-5)
+        # These synthetic main currents were inverted from the uncorrected
+        # design, not measured historical operating currents. Do not assert
+        # that archived factors reproduce that design's tunes within 5%.
+        target=model.tunes()+[.005,-.005]
+        report=model.match_tunes(target)
+        np.testing.assert_allclose(report['final'],target,atol=1.e-5)
+        from Knobs.DRCorrection.core import CorrectionService
+        data=CorrectionService(model).acquire('orbit',Options(plane='x',
+            fixed_actuators=tuple(n for n in model.hcorrectors if n!='ZH1R')))
+        self.assertEqual(data['actuators'],['ZH1R'])
+        np.testing.assert_allclose(data['centers'],[2.])
+        np.testing.assert_allclose(data['limits'],[[-5.],[5.]])
+        self.assertGreater(np.linalg.norm(data['response']),1.e-6)
+        np.testing.assert_allclose(model.read('correctors',['ZH1R']),[2.])
         self.assertEqual(self.client.writes,[])
     def test_unknown_active_magnet_fails_without_writing(self):
         from Knobs.DRTuning.model import capture_settings
