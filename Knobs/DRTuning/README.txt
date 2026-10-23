@@ -18,8 +18,19 @@ The SAD preset reproduces the archived CODCorrection preparation:
   excitation is relative to the captured current; proposal centers and current
   bounds still use absolute machine currents. SET is I_captured + delta.
 - Match QF1R/QF2R to configured tune targets, within +/-5%. Unstable trial steps
-  are rejected and shortened. Invalid initial optics still fail read-only;
-  neither the eigenvalue tolerance nor machine current limits are relaxed.
+  are rejected and shortened. If the SAD COD initial reference is unstable and
+  model tune matching is enabled, first search a nearby stable QF1R/QF2R point
+  on an expanding bounded grid (0.01% to 5%). Every trial and the final fit stay
+  within +/-5% of the imported, calibrated family strengths. Final optics must
+  pass the unchanged eigenvalue modulus tolerance 0.0002 and tune residual
+  tolerance 1e-5. Failed search/fit restores model strengths and produces no
+  correction. All captured currents / matching disabled still fail immediately.
+  This is an RFTrack initialization aid, not an exact SAD matching algorithm;
+  it does not establish that imported currents or the lattice are correct.
+  The proposal banner/model status indicates initial recovery; tune_match JSON
+  stores initial_stable_point_search and family_fractional_changes. No machine
+  QF currents are written by the fit. Save model diagnostics retains the initial
+  failure, captured settings and completed matching report.
 Model factors are historical calibration, not a claim of today's accuracy.
 This COD reference is also used for dispersion/skew when selected; it does not
 reproduce the old branches' dependence on previously loaded SAD session state.
@@ -44,6 +55,27 @@ profiles retain their explicitly configured value. Restart to reload profiles.
 Do not infer that extending the wait or loosening tolerance fixes a stuck PV.
 The custom measured-response scan remains available; this change does not yet
 connect the SysID worker or import its DATA*.pkl archives.
+
+Skipping faulty readbacks during Measured magnet response CALC:
+Initial unreadable/nonfinite magnet currents are recorded and omitted, including
+unselected supplies and quadrupoles in the state snapshot. A candidate supply
+whose readback fails, times out, drifts during settling, or has no positive
+adaptive probe span is excluded from the response matrix; scanning continues
+with the next magnet. The scan attempts the original current before continuing.
+If readback disappears after a probe, that restoration command is still sent.
+Inspect "Skipped magnets / errors" and the detailed log for magnet names,
+errors and restoration results. Save data + figures retains scan_errors,
+ignored_readbacks and set_blocked_reason in the session JSON. When all candidate
+magnets fail, no proposal is produced and the detailed error lists the failures.
+An unverified probe restoration permits remaining measurements but blocks SET;
+resolve the fault and run CALC again. Successful SET/RESET only writes the healthy
+supplies involved in that correction (and required diagnostic excitations).
+Known initial unreadable currents are omitted from SET's state comparison;
+other captured currents still undergo the usual stale-setting/readback checks.
+Missing BPM signal, RF failures, write failures and failed required horizontal
+skew probes are not silently skipped. Model-based optics snapshots remain strict.
+The convergence timeout/tolerance are unchanged; skipping occurs after failure
+is detected, not immediately when the target and readback first differ.
 
 No valid enabled BPMs / actuators:
 CALC now reports enabled BPMs, acquisition-valid BPMs, usable BPMs and enabled

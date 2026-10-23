@@ -86,6 +86,24 @@ class LiveModelInputTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(data['response']),1.e-6)
         np.testing.assert_allclose(model.read('correctors',['ZH1R']),[2.])
         self.assertEqual(self.client.writes,[])
+    def test_native_unstable_import_recovers_without_machine_writes(self):
+        from Knobs.DRTuning.model import capture_settings,OpticsModel,ModelOpticsError
+        settings=capture_settings(self.backend,Options(excluded_bpms=('MB97R','MB98R'),
+            fixed_actuators=('ZH15R','ZV16R')),self.baseline)
+        model=OpticsModel(settings);target=model.tunes()
+        # A 1% QF2 error makes this imported reference vertically unstable.
+        # Recovery limits remain relative to this perturbed imported model.
+        for n,e in model.elements.items():
+            if n.startswith('QF2R.') and type(e).__name__=='Quadrupole':
+                e.set_K1(-model.momentum,e.get_K1(-model.momentum)*1.01)
+        with self.assertRaises(ModelOpticsError) as caught:model.tunes()
+        self.assertGreater(caught.exception.diagnostics['max_modulus_deviation'],.1)
+        report=model.match_tunes(target)
+        np.testing.assert_allclose(model.tunes(),target,atol=1.e-5)
+        self.assertLessEqual(np.max(abs(report['family_fractional_changes'])),.05)
+        self.assertGreater(report['initial_stable_point_search']['evaluations'],0)
+        self.assertEqual(self.client.writes,[])
+
     def test_unknown_active_magnet_fails_without_writing(self):
         from Knobs.DRTuning.model import capture_settings
         with self.assertRaisesRegex(ValueError,'Actuator absent'):

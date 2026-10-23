@@ -146,7 +146,7 @@ class AdaptiveProbeTests(unittest.TestCase):
 
     def test_no_current_movement_is_rejected_after_restoring(self):
         b=LinearBeam(readback_gain=0.)
-        with self.assertRaisesRegex(ValueError,'no positive readback span'):
+        with self.assertRaisesRegex(RuntimeError,'no positive readback span'):
             CorrectionService(b).acquire('orbit',options())
         self.assertEqual(b.commands[-1][2],[0.])
 

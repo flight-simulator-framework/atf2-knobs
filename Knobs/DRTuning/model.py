@@ -187,16 +187,46 @@ class OpticsModel:
     def match_tunes(self,target,max_scale=.05,tolerance=1.e-5,alias=False):
         target=np.asarray(target,float)%1
         if target.shape!=(2,) or not np.isfinite(target).all():raise ValueError('Two finite tune targets required')
-        initial=self.tunes();goals=target.copy()
-        if alias:
-            goals=np.array([min((t,1-t),key=lambda v:abs((v-q+.5)%1-.5)) for t,q in zip(target,initial)])
+        if not np.isfinite(max_scale) or max_scale<=0:raise ValueError('Positive finite model matching bound required')
         groups=[[e for n,e in self.elements.items() if n.startswith(family+'.') and type(e).__name__=='Quadrupole'] for family in ('QF1R','QF2R')]
         baseline=[[e.get_K1(-self.momentum) for e in group] for group in groups]
         if not all(groups):raise ValueError('QF1R/QF2R model families missing')
         def set_scales(scales):
             for group,ks,scale in zip(groups,baseline,scales):
                 for e,k in zip(group,ks):e.set_K1(-self.momentum,k*(1+scale))
-        rejected=[]
+        rejected=[];seed_report=None
+        def initial_point():
+            nonlocal seed_report
+            try:return np.zeros(2),self.tunes()
+            except ModelOpticsError as failure:
+                # The SAD COD reference has zero steerers/skews. An imported
+                # working point just outside a stable band cannot provide tune
+                # derivatives. Find a nearby stable MODEL point first, keeping
+                # all family changes bounded relative to the captured inputs.
+                if self.settings.get('preparation')!='sad_cod':raise
+                original=serial(failure.diagnostics);evaluations=0
+                radii=sorted(set(min(max_scale,r) for r in (1.e-4,2.5e-4,5.e-4,.001,.0025,.005,.01,.025,.05,max_scale)))
+                for radius in radii:
+                    candidates=[]
+                    for x,y in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
+                        self.check_cancel();point=radius*np.array([x,y]);set_scales(point);evaluations+=1
+                        try:q=self.tunes()
+                        except ModelOpticsError as exc:
+                            rejected.append(serial(dict(exc.diagnostics,stage='initial stable point search',
+                                tune_match_trial_fractional_changes=point)))
+                            continue
+                        goal=target if not alias else np.array([min((t,1-t),key=lambda v:abs((v-a+.5)%1-.5)) for t,a in zip(target,q)])
+                        candidates.append((np.linalg.norm((q-goal+.5)%1-.5),point,q))
+                    if candidates:
+                        _,point,q=min(candidates,key=lambda entry:entry[0]);set_scales(point)
+                        seed_report=dict(initial_optics_failure=original,evaluations=evaluations,
+                            family_fractional_changes=point.copy(),tunes=q.copy(),max_scale=max_scale,
+                            method='expanding bounded QF1R/QF2R grid; stable point required')
+                        return point,q
+                raise ModelOpticsError('No stable initial RFTrack model found in bounded QF1R/QF2R search '
+                    f'(+/-{max_scale:.1%}, {evaluations} trials); inspect imported currents/calibration/lattice. '+str(failure),
+                    dict(original,stable_point_search_evaluations=evaluations,stable_point_search_max_scale=max_scale,
+                         rejected_unstable_trials=rejected)) from failure
         def residual(scales):
             self.check_cancel();set_scales(scales)
             try:return (self.tunes()-goals+.5)%1-.5
@@ -209,7 +239,10 @@ class OpticsModel:
             except ModelOpticsError as exc:
                 rejected.append(serial(exc.diagnostics));return None
         try:
-            scales=np.zeros(2);error=residual(scales)
+            scales,initial=initial_point();goals=target.copy()
+            if alias:
+                goals=np.array([min((t,1-t),key=lambda v:abs((v-q+.5)%1-.5)) for t,q in zip(target,initial)])
+            error=residual(scales)
             # Absolute family perturbations avoid the tiny relative steps near
             # zero used by generic optimizers. Reject unstable trials and back
             # track from the last stable iterate, keeping the stability test.
@@ -245,7 +278,8 @@ class OpticsModel:
             set_scales([0.,0.]);raise
         self.match_report=dict(initial=initial,target=target,resolved_target=goals,final=self.tunes(),
                                family_fractional_changes=scales,residual=error,source=self.settings.get('tune_source'),model_only=True,
-                               iterations=iteration+1,rejected_unstable_trials=rejected,method='bounded Newton with stable backtracking')
+                               iterations=iteration+1,rejected_unstable_trials=rejected,initial_stable_point_search=seed_report,
+                               method='bounded Newton with stable backtracking')
         return self.match_report
 
 
@@ -360,7 +394,12 @@ class ModelManager:
             attempt['stage']='constructing imported model';model=OpticsModel(settings,cancel)
             attempt['stage']='initial imported optics stability check'
             progress(5,'Checking initial imported model stability (no machine writes)')
-            attempt['initial_tunes']=model.tunes()
+            try:attempt['initial_tunes']=model.tunes()
+            except ModelOpticsError as exc:
+                attempt['initial_optics_failure']=exc.diagnostics
+                if not opt.model_match_tunes or settings.get('preparation')!='sad_cod':raise
+                attempt['initial_tunes']=None
+                progress(7,'Initial SAD COD model unstable; searching model QF1R/QF2R within +/-5% before tune matching (no machine writes)')
             if opt.model_match_tunes:
                 attempt['stage']='QF1R / QF2R tune matching'
                 progress(10,'Matching model QF1R / QF2R to tune targets (no machine writes)')

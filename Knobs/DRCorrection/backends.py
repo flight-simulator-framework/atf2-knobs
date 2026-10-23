@@ -12,6 +12,13 @@ import numpy as np
 HERE=Path(__file__).resolve().parent
 
 
+class MagnetReadbackError(RuntimeError):
+    """A named magnet's current could not be read or did not converge."""
+    def __init__(self,names,message):
+        super().__init__(message)
+        self.names=tuple(names)
+
+
 class DemoBackend:
     label='DEMO — synthetic response model'
     identity='dr-ui-linear-demo-v1'
@@ -177,10 +184,34 @@ class EpicsBackend(DemoBackend):
             lower.append(lo);upper.append(hi)
         if names is None:return max(lower),min(upper)
         return np.asarray(lower),np.asarray(upper)
+    def magnet_readback(self,name,pv):
+        try:
+            value=float(self.get(pv))
+            if not np.isfinite(value):raise ValueError('Nonfinite magnet readback')
+        except (RuntimeError,ValueError,TypeError,TimeoutError) as exc:
+            raise MagnetReadbackError([name],f'{name}: read PV={pv}: {exc}') from exc
+        return value
     def read(self,kind,names):
-        values=np.array([float(self.get(self.mapping[n]['read'])) for n in names])
-        if not np.isfinite(values).all():raise RuntimeError('Nonfinite magnet readback')
-        return values
+        return np.array([self.magnet_readback(n,self.mapping[n]['read']) for n in names])
+    def restore_probe(self,kind,name,value):
+        # The scan knows the original current. Attempt that command even if
+        # readback disappeared; write() normally requires a readable old value.
+        lo,hi=self.limits(kind,[name])
+        if not np.isfinite(value) or not lo[0]<=value<=hi[0]:raise ValueError('Invalid probe restoration current')
+        settle=float(self.profile.get('magnet_settle_s',0.))
+        if not np.isfinite(settle) or settle<0:raise ValueError('Invalid magnet_settle_s')
+        self.put(self.mapping[name]['set'],float(value))
+        deadline=time.monotonic()+float(self.profile['readback_timeout_s'])
+        while True:
+            reading=self.read(kind,[name])[0]
+            if abs(reading-value)<=self.profile['current_tolerance_A']:break
+            if time.monotonic()>=deadline:
+                raise MagnetReadbackError([name],f'{name}: probe restoration did not settle; target={value:g} A, readback={reading:g} A')
+            time.sleep(.05)
+        if settle:time.sleep(settle)
+        reading=self.read(kind,[name])[0]
+        if abs(reading-value)>self.profile['current_tolerance_A']:
+            raise MagnetReadbackError([name],f'{name}: probe restoration readback changed during settling wait; target={value:g} A, readback={reading:g} A')
     def write(self,kind,names,values):
         values=np.asarray(values,float);lo,hi=self.limits(kind,names)
         settle=float(self.profile.get('magnet_settle_s',0.))
@@ -202,7 +233,7 @@ class EpicsBackend(DemoBackend):
                 readings=self.read(kind,names)
                 if np.max(abs(readings-targets))<=tolerance:return
                 if time.monotonic()>=deadline:
-                    raise RuntimeError(f'Magnet readback did not settle after {timeout:g} s '
+                    raise MagnetReadbackError(names,f'Magnet readback did not settle after {timeout:g} s '
                         f'(tolerance {tolerance:g} A): '+details(targets,readings))
                 time.sleep(.05)
         try:
@@ -213,7 +244,7 @@ class EpicsBackend(DemoBackend):
             if settle:time.sleep(settle)
             readings=self.read(kind,names)
             if np.max(abs(readings-values))>tolerance:
-                raise RuntimeError('Magnet readback changed during settling wait: '+details(values,readings))
+                raise MagnetReadbackError(names,'Magnet readback changed during settling wait: '+details(values,readings))
         except Exception as exc:
             # Attempt every restoration, and never hide the original failure.
             failures=[]
@@ -223,10 +254,25 @@ class EpicsBackend(DemoBackend):
             try:wait(old)
             except Exception as restore_error:failures.append(str(restore_error))
             restoration='Restoration FAILED: '+'; '.join(failures) if failures else 'Original readback currents restored and verified.'
+            if isinstance(exc,MagnetReadbackError):
+                raise MagnetReadbackError(exc.names,str(exc)+'\n'+restoration) from exc
             raise RuntimeError(str(exc)+'\n'+restoration) from exc
-    def snapshot(self):
-        result=dict(correctors=dict(zip(self.hcorrectors+self.vcorrectors,self.read('correctors',self.hcorrectors+self.vcorrectors))),
-            skews=dict(zip(self.skews,self.read('skews',self.skews))),frequency=self.frequency())
+    def snapshot_magnets(self,names,read,errors=None,excluded=()):
+        result={}
+        for name in names:
+            if name in excluded:continue
+            try:result[name]=read(name)
+            except MagnetReadbackError as exc:
+                if errors is None:raise
+                errors.append(dict(magnet=name,stage='initial readback',error=str(exc),
+                    restoration='not moved',restored=True))
+        return result
+    def measured_snapshot(self,errors):
+        return self.snapshot(readback_errors=errors)
+    def snapshot(self,readback_errors=None,excluded=()):
+        result={kind:self.snapshot_magnets(names,lambda n:self.read(kind,[n])[0],readback_errors,excluded)
+            for kind,names in [('correctors',self.hcorrectors+self.vcorrectors),('skews',self.skews)]}
+        result['frequency']=self.frequency()
         if self.ramp:result['ramp_state']=self.ramp.snapshot()
         return result
     def restore(self,snapshot):

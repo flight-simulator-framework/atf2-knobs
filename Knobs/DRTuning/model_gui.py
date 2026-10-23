@@ -33,6 +33,7 @@ class ModelPanel(QWidget):
             edit=QLineEdit(defaults[key]);form.addRow(label,edit);self.fields[key]=edit
             edit.editingFinished.connect(self.inputs_changed)
         self.match=QCheckBox('Match QF1R / QF2R in model only');self.match.setChecked(True);v.addWidget(self.match)
+        self.match.setToolTip('SAD COD reference: if initial optics are unstable, search model QF1R/QF2R within +/-5% first. Final stability and tune checks still apply; no machine writes.')
         row=QHBoxLayout();v.addLayout(row)
         row.addWidget(button('Load lattice export',self.load_lattice));row.addWidget(button('Load model factors',self.load_factors))
         row.addWidget(button('Exclude unmapped BPMs / magnets',self.exclude_unmapped))
@@ -98,6 +99,8 @@ class ModelPanel(QWidget):
         self.result=result;t=result['optics'];match=result['tune_match']
         text='Model tunes: '+', '.join(f'{q:.7f}' for q in t['tunes'])
         if match:text+='; QF model changes: '+', '.join(f'{v:+.3%}' for v in match['family_fractional_changes'])
+        if match and match.get('initial_stable_point_search'):
+            text+='; initial unstable model recovered by bounded QF search'
         self.status.setText(text+'\nModel prediction; machine settings unchanged.')
         self.plot.figure.clear();axes=self.plot.figure.subplots(2,1)
         rows=sorted(t['rows'].items(),key=lambda item:item[1]['s_m'])

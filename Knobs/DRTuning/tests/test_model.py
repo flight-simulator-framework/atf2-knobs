@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 import numpy as np
 from Knobs.DRCorrection.backends import DemoBackend
-from Knobs.DRCorrection.core import CorrectionService,Options
+from Knobs.DRCorrection.core import CorrectionService,Options,serial
 from Knobs.DRTuning.model import ModelManager,normal_modes,verify_inputs,digest,ModelOpticsError,OpticsModel
 from Knobs.DRTuning.sr_beta import fit_sr_beta
 from Knobs.DRTuning.model_validation import compare_optics,compare_response
@@ -132,6 +132,68 @@ class ModelMathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Tune match failed'):
             OpticsModel.match_tunes(model,[.4,.45])
         self.assertEqual([e.value for e in elements.values()],[2.,2.])
+    def test_initial_unstable_sad_reference_recovers_with_absolute_bounds(self):
+        from types import SimpleNamespace
+        class Quadrupole:
+            def __init__(self):self.value=2.
+            def get_K1(self,p):return self.value
+            def set_K1(self,p,value):self.value=value
+        for preset,alias in [('sad_cod',False),('sad_cod',True),('all_currents',False)]:
+            with self.subTest(preset=preset,alias=alias):
+                elements={'QF1R.1':Quadrupole(),'QF2R.1':Quadrupole()};trials=[]
+                def tunes():
+                    changes=np.array([e.value/2.-1 for e in elements.values()]);trials.append(changes)
+                    if changes[0]<=0:raise ModelOpticsError('Unstable imported model',{'max_modulus_deviation':.162})
+                    return np.array([.2,.3])+changes
+                model=SimpleNamespace(elements=elements,momentum=1300.,check_cancel=lambda:None,
+                    settings={'preparation':preset},tunes=tunes)
+                if preset=='all_currents':
+                    with self.assertRaises(ModelOpticsError):OpticsModel.match_tunes(model,[.21,.31])
+                    self.assertEqual(len(trials),1)
+                    self.assertEqual([e.value for e in elements.values()],[2.,2.]);continue
+                report=OpticsModel.match_tunes(model,[.79,.69] if alias else [.21,.31],alias=alias)
+                np.testing.assert_allclose(report['final'],[.21,.31],atol=1.e-5)
+                self.assertLessEqual(np.max(np.abs(trials)),.05)
+                self.assertEqual(report['initial_stable_point_search']['initial_optics_failure']['max_modulus_deviation'],.162)
+                json.dumps(serial(report),allow_nan=False)
+
+    def test_unrecoverable_seed_and_cancel_restore_model(self):
+        from types import SimpleNamespace
+        from Knobs.DRCorrection.core import Cancelled
+        class Quadrupole:
+            def __init__(self):self.value=2.
+            def get_K1(self,p):return self.value
+            def set_K1(self,p,value):self.value=value
+        for cancel in (False,True):
+            elements={'QF1R.1':Quadrupole(),'QF2R.1':Quadrupole()};trials=[]
+            def tunes():
+                trials.append([e.value/2.-1 for e in elements.values()])
+                if cancel and len(trials)>3:raise Cancelled('Stopped')
+                raise ModelOpticsError('Always unstable',{'max_modulus_deviation':.162})
+            model=SimpleNamespace(elements=elements,momentum=1300.,check_cancel=lambda:None,
+                settings={'preparation':'sad_cod'},tunes=tunes)
+            with self.assertRaisesRegex(Cancelled if cancel else ModelOpticsError,'Stopped' if cancel else 'No stable initial'):
+                OpticsModel.match_tunes(model,[.21,.31])
+            self.assertEqual([e.value for e in elements.values()],[2.,2.])
+            self.assertLessEqual(np.max(np.abs(trials)),.05+1.e-12)
+
+    def test_manager_allows_sad_seed_recovery_only_when_matching_enabled(self):
+        for preset,match in [('sad_cod',True),('sad_cod',False),('all_currents',True)]:
+            b=CountedBackend();manager=ModelManager(b)
+            settings={'raw_pvs':{},'preparation':preset,'tunes':[.2,.3],'tune_alias':False}
+            fake=Mock();fake.tunes.side_effect=lambda:normal_modes(np.diag([2.,.5,1.,1.]))
+            fake.match_report={'initial_stable_point_search':{'evaluations':8}}
+            with patch('Knobs.DRTuning.model.capture_settings',return_value=settings),patch('Knobs.DRTuning.model.OpticsModel',return_value=fake):
+                if preset=='sad_cod' and match:
+                    self.assertIs(manager.prepare(Options(model_match_tunes=match),lambda:None),fake)
+                    fake.match_tunes.assert_called_once_with(settings['tunes'],alias=False)
+                    self.assertIsNone(manager.last_attempt['initial_tunes'])
+                    self.assertIn('initial_optics_failure',manager.last_attempt)
+                else:
+                    with self.assertRaises(ValueError):manager.prepare(Options(model_match_tunes=match),lambda:None)
+                    fake.match_tunes.assert_not_called()
+            self.assertEqual(b.commands,[])
+
     def test_quad_average_beta_fit_uses_integrated_transport(self):
         beta=4.;alpha=.3;gamma=(1+alpha**2)/beta;names=['q1','q2','q3','q4'];rows=[];values=[]
         for n,s in zip(names,[0.,1.,2.,3.]):

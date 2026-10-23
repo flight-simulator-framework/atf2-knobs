@@ -130,6 +130,11 @@ class CorrectionPanel(QWidget):
         self.assessment_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         verification=QWidget();v=QVBoxLayout(verification);v.addWidget(self.assessment_summary);v.addWidget(self.assessment_table)
         self.result_tabs=QTabWidget();self.result_tabs.addTab(self.table,'Magnet settings');self.result_tabs.addTab(verification,'SET verification')
+        self.scan_error_table=QTableWidget(0,4)
+        self.scan_error_table.setHorizontalHeaderLabels(['Magnet','Stage','Error','Restoration'])
+        self.scan_error_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.scan_error_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.result_tabs.addTab(self.scan_error_table,'Skipped magnets / errors')
         right=QWidget();right_layout=QVBoxLayout(right);right_layout.addWidget(self.proposal_summary);right_layout.addWidget(self.plot,3);right_layout.addWidget(self.result_tabs,1)
         row=QHBoxLayout()
         for text,action in [('Save data + figures',self.save_bundle),('Save figure…',self.save_figure),('Load nominal dispersion…',self.load_target)]:
@@ -140,7 +145,7 @@ class CorrectionPanel(QWidget):
         self.bind();self.refresh()
 
     def invalidate(self):
-        self.data=None;self.table.setRowCount(0);self.assessment_table.setRowCount(0)
+        self.data=None;self.table.setRowCount(0);self.assessment_table.setRowCount(0);self.scan_error_table.setRowCount(0)
         self.assessment_summary.setText('No current proposal. Run CALC.');self.refresh()
 
     def bind(self):
@@ -223,7 +228,7 @@ class CorrectionPanel(QWidget):
         prefix='pushButtonDispersion' if self.mode=='dispersion' else 'pushButton'
         set_button=getattr(self.form,prefix+'Set')
         count=len(changed_indices(self.data)) if self.data is not None else 0
-        set_button.setEnabled(bool(count) and not self.data.get('applied',False))
+        set_button.setEnabled(bool(count) and not self.data.get('applied',False) and not self.data.get('set_blocked_reason'))
         set_button.setText(f'Apply {count} magnets (SET)' if self.data is not None else 'Apply correction (SET)')
         if self.data is None:self.proposal_summary.setText('No current proposal. CALC will show how many magnets SET changes.')
         else:
@@ -240,6 +245,16 @@ class CorrectionPanel(QWidget):
                 self.proposal_summary.setText(self.proposal_summary.text()+
                     f'\nAdaptive probes: {reached}/{len(probes)} within target; '
                     f'{len(probes)-reached} outside target (limits / max pairs). See detailed log and saved probe_history.')
+            match=data.get('tune_match') or {}
+            if match.get('initial_stable_point_search'):
+                changes=match['family_fractional_changes']
+                self.proposal_summary.setText(self.proposal_summary.text()+
+                    f'\nRFTrack initial instability recovered: model QF1R {changes[0]:+.3%}, QF2R {changes[1]:+.3%}. No machine QF changes.')
+            if data.get('scan_errors'):
+                self.proposal_summary.setText(self.proposal_summary.text()+
+                    f"\n{len(data['scan_errors'])} magnet errors: excluded from correction; see Skipped magnets / errors tab.")
+            if data.get('set_blocked_reason'):
+                self.proposal_summary.setText(self.proposal_summary.text()+'\nSET blocked: '+data['set_blocked_reason'])
         getattr(self.form,prefix+'Reset').setEnabled(bool(self.window.service.undo))
         self.detail.setText('CALC restores diagnostic probes. SET is separate.\nCorrector: '+self.window.backend.unit('correctors')+'; skew: '+self.window.backend.unit('skews')+ ('\nRFTrack settings/tune source and fit are saved with the proposal.' if self.options.response_source=='rftrack' else '\nEnergy / tune / SK1/I fields are reference metadata for measured-response mode.'))
 
@@ -281,6 +296,13 @@ class CorrectionPanel(QWidget):
                     self.window.log(f'Probe {probe["magnet"]}: {probe["pair"]} pairs; '
                         f'±{probe["amplitude"]:.6g} {probe["unit"]}; response {probe["observed_mm"]:.6g} / '
                         f'target {probe["target_mm"]:g} mm; {probe["status"]}')
+        errors=data.get('scan_errors',[]);self.scan_error_table.setRowCount(len(errors))
+        for i,error in enumerate(errors):
+            for j,key in enumerate(('magnet','stage','error','restoration')):
+                item=QTableWidgetItem(str(error[key]));item.setToolTip(str(error[key]))
+                self.scan_error_table.setItem(i,j,item)
+            self.window.log(f"SKIP {error['magnet']}: {error['error']}; {error['restoration']}")
+        self.scan_error_table.resizeRowsToContents()
         changed=set(changed_indices(data))
         self.table.setRowCount(len(data['actuators']))
         for i,name in enumerate(data['actuators']):

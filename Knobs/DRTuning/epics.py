@@ -23,9 +23,7 @@ class LiveBackend(EpicsBackend):
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         return super().put(pv,value)
     def quadrupole_current(self,name):
-        value=float(self.get(self.quadrupoles[name]['read']))
-        if not np.isfinite(value):raise RuntimeError('Invalid quadrupole readback')
-        return value
+        return self.magnet_readback(name,self.quadrupoles[name]['read'])
     def quadrupole_k1l(self,name,current):
         p=self.quadrupoles[name];cal=p['calibration']
         if not cal.get('confirmed'):raise ValueError('Confirm current-to-K1L calibration for '+name)
@@ -150,8 +148,10 @@ class LiveBackend(EpicsBackend):
             raise ValueError('Configure TBT completion or select readback_checks mode')
         for key in ('mode_pv','shot_mode_pv','turn_pv','snap_pv','timeout_s'):
             if not a.get(key):raise ValueError('Missing TBT acquisition '+key)
-    def snapshot(self):
-        result=super().snapshot();result['quadrupoles']={n:self.quadrupole_current(n) for n in self.quadrupoles};return result
+    def snapshot(self,readback_errors=None,excluded=()):
+        result=super().snapshot(readback_errors=readback_errors,excluded=excluded)
+        result['quadrupoles']=self.snapshot_magnets(self.quadrupoles,self.quadrupole_current,readback_errors,excluded)
+        return result
     def same_settings(self,left,right):
         a=left.get('quadrupoles',{});b=right.get('quadrupoles',{})
         return (super().same_settings(left,right) and set(a)==set(b) and

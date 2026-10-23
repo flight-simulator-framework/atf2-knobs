@@ -322,6 +322,7 @@ class TuningSession(DRCorrectionWindow):
     def show_progress(self,value,message):
         self.progress.setRange(0,100);self.progress.setValue(value)
         self.operation_status.setText(self._active_label+'：'+message)
+        if message.startswith('SKIP '):self.log(message)
     def task_finished(self):
         self.timer.stop();self.tick();self.tabs.setEnabled(True);self.navigation.setEnabled(True);self.cancel_button.setEnabled(False)
         self.progress.setRange(0,100);self.progress.setValue(0 if self._failed else 100)

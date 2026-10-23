@@ -66,6 +66,22 @@ class GuiTests(unittest.TestCase):
         panel.plot.correction(data)
         after=next(line for line in panel.plot.figure.axes[1].lines if line.get_label()=='Measured after SET')
         self.assertTrue(np.isnan(after.get_ydata()[1]))
+    def test_skipped_magnets_visible_and_unverified_restoration_blocks_set(self):
+        from Knobs.DRCorrection.core import Options
+        panel=self.window.panels['orbit']
+        data=self.window.service.calculate('orbit',Options())
+        data['scan_errors']=[dict(magnet='ZV_BAD',stage='response probe',error='readback timeout',
+            restoration='not verified',restored=False)]
+        data['set_blocked_reason']='Probe restoration unverified; CALC again'
+        panel.display(data)
+        self.assertEqual(panel.scan_error_table.rowCount(),1)
+        self.assertEqual(panel.scan_error_table.item(0,0).text(),'ZV_BAD')
+        self.assertIn('1 magnet errors',panel.proposal_summary.text())
+        self.assertIn('SET blocked',panel.proposal_summary.text())
+        self.assertFalse(panel.form.pushButtonSet.isEnabled())
+        self.assertIn('ZV_BAD',self.window.messages.toPlainText())
+        panel.invalidate();self.assertEqual(panel.scan_error_table.rowCount(),0)
+
     def test_calc_set_save_reset_all_panels(self):
         with tempfile.TemporaryDirectory() as root:
             baseline=self.window.backend.snapshot()
