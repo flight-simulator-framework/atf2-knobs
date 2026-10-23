@@ -50,19 +50,38 @@ class Plot(QWidget):
         if not known:s=np.arange(1,len(data['names'])+1)
         order=np.argsort(s)
         valid=np.asarray(data['valid'],bool)
+        plane=data.get('options',{}).get('plane','y')
+        legends={}
         for row,(ax,label) in enumerate(zip(axes,labels)):
-            y=np.asarray(data[prefix+'measured'])[row];ax.scatter(s[valid],y[valid],s=14,c='black',label='Measured')
-            if (~valid).any():ax.scatter(s[~valid],y[~valid],s=20,c='gray',marker='x',label='Excluded')
-            for key,color,style,title in [('fitted','C0','-','Fitted correction component'),('predicted','C2','--','Predicted after SET'),('target','gray',':','Target'),('after','C3','-','Measured after SET')]:
-                if prefix+key in data:ax.plot(s[order],np.asarray(data[prefix+key])[row][order],style,color=color,label=title)
+            y=np.asarray(data[prefix+'measured'])[row];ax.scatter(s[valid],y[valid],s=14,c='black',label='Measured before SET')
+            # Excluded/invalid BPMs are not constrained by the fit. Never let
+            # their arbitrary response predictions set the orbit plot scale.
+            # NaNs also break lines across excluded BPMs instead of bridging.
+            for key,color,style,title in [('predicted','C2','--','Predicted after SET'),('after','C3','-','Measured after SET')]:
+                if prefix+key in data:
+                    mask=valid.copy()
+                    if key=='after':mask &= np.asarray(data.get('after_valid',mask),bool)
+                    values=np.where(mask,np.asarray(data[prefix+key])[row],np.nan)
+                    ax.plot(s[order],values[order],style,color=color,label=title)
+            target_row=row
+            fitted_plane=True
+            if full and data['mode'] in ('orbit','dispersion'):
+                fitted_plane=(row%2==int(plane=='y'));target_row=row//2
+            if 'target' in data and fitted_plane:
+                target=np.where(valid,np.asarray(data['target'])[target_row],np.nan)
+                ax.plot(s[order],target[order],':',color='gray',label='Target (fit plane)')
             unit='mm / (dp/p)' if label.startswith('Dispersion') else 'mm'
             ylabel={'Dispersion X':'ηx [mm]','Dispersion Y':'ηy [mm]'}.get(label,f'{label} [{unit}]')
             ax.set(xlabel='s [m]' if known else 'BPM index (measurement order)',ylabel=ylabel)
+            ax.set_title(label+(' — fitted plane' if fitted_plane else ' — observation only'),fontsize=9)
+            ax.ticklabel_format(axis='y',style='plain',useOffset=False)
             ax.grid(alpha=.2);ax.tick_params(labelsize=8);ax.xaxis.label.set_size(9);ax.yaxis.label.set_size(9)
-        handles,titles=axes[0].get_legend_handles_labels()
-        self.figure.legend(handles,titles,loc='upper center',bbox_to_anchor=(.55,.95),ncol=2,fontsize=8)
+            handles,titles=ax.get_legend_handles_labels();legends.update(zip(titles,handles))
+        self.figure.legend(list(legends.values()),list(legends),loc='upper center',bbox_to_anchor=(.55,.93),ncol=2,fontsize=8)
         self.figure.subplots_adjust(left=.12,right=.98,bottom=.12,top=.77,hspace=.65,wspace=.45)
-        self.figure.suptitle(f"{data['mode'].upper()} — {data['source']}",fontsize=10,y=.99)
+        state='SET applied; remeasured' if data.get('applied') else 'CALC proposal only; SET not applied'
+        self.figure.suptitle(f"{data['mode'].upper()} — {state}\n"
+            f"{int(valid.sum())}/{len(valid)} BPMs shown; invalid/excluded BPMs hidden",fontsize=10,y=.99)
         self.canvas.draw_idle()
     def save(self,path):self.figure.savefig(path,dpi=160)
 
@@ -178,10 +197,15 @@ class CorrectionPanel(QWidget):
             count=sum(n not in o.fixed_actuators for n in names)
             bpms=sum(n not in o.excluded_bpms for n in b.bpm_names)
             self.selection_label.setText((f'RFTrack will calculate {count} magnet responses; {bpms} BPMs enabled.\nMachine: '+('one RF scan pair.' if self.mode=='dispersion' else 'two horizontal probe scans.' if self.mode=='skew' else 'orbit read only.')) if o.response_source=='rftrack' else f'CALC will scan {count} magnets; {bpms} BPMs enabled for fitting.'+
-                (f' RF scan pairs: {1+2*count}.' if self.mode=='dispersion' and count else '')+
+                ((f' RF scan pairs: up to {1+2*count*int(o.adaptive_max_pairs)}.' if o.adaptive_probe else f' RF scan pairs: {1+2*count}.') if self.mode=='dispersion' and count else '')+
+                (f' Up to {o.adaptive_max_pairs} probe pairs per magnet.' if o.adaptive_probe else '')+
                 '\nMaximum correctors limits SET selection, not the CALC scan count.')
         for key,widget in getattr(self,'modern_fields',{}).items():
-            widget.blockSignals(True);widget.setValue(getattr(self.options,key));widget.blockSignals(False)
+            widget.blockSignals(True)
+            if isinstance(widget,QCheckBox):widget.setChecked(getattr(self.options,key))
+            else:widget.setValue(getattr(self.options,key)*(widget.property('option_scale') or 1))
+            widget.blockSignals(False)
+        if hasattr(self,'refresh_adaptive_controls'):self.refresh_adaptive_controls()
         for entry in self.inventory:
             widget=getattr(self.form,entry['name'],None);pv=entry['pv']
             if not widget:continue
@@ -210,6 +234,12 @@ class CorrectionPanel(QWidget):
             verb='SET changed' if data.get('applied') else 'SET will change'
             self.proposal_summary.setText(f'{verb} {count} {scope}{bound}; {len(data["actuators"])} response candidates.\n'
                 'Only nonzero setting changes are written. Details: Magnet settings tab.')
+            probes=[p for p in data.get('probe_history',[]) if p['used_for_response']]
+            if probes:
+                reached=sum(p['target_reached'] for p in probes)
+                self.proposal_summary.setText(self.proposal_summary.text()+
+                    f'\nAdaptive probes: {reached}/{len(probes)} within target; '
+                    f'{len(probes)-reached} outside target (limits / max pairs). See detailed log and saved probe_history.')
         getattr(self.form,prefix+'Reset').setEnabled(bool(self.window.service.undo))
         self.detail.setText('CALC restores diagnostic probes. SET is separate.\nCorrector: '+self.window.backend.unit('correctors')+'; skew: '+self.window.backend.unit('skews')+ ('\nRFTrack settings/tune source and fit are saved with the proposal.' if self.options.response_source=='rftrack' else '\nEnergy / tune / SK1/I fields are reference metadata for measured-response mode.'))
 
@@ -245,6 +275,12 @@ class CorrectionPanel(QWidget):
 
     def display(self,data):
         self.data=data;self.plot.correction(data)
+        if not data.get('applied'):
+            for probe in data.get('probe_history',[]):
+                if probe['used_for_response']:
+                    self.window.log(f'Probe {probe["magnet"]}: {probe["pair"]} pairs; '
+                        f'±{probe["amplitude"]:.6g} {probe["unit"]}; response {probe["observed_mm"]:.6g} / '
+                        f'target {probe["target_mm"]:g} mm; {probe["status"]}')
         changed=set(changed_indices(data))
         self.table.setRowCount(len(data['actuators']))
         for i,name in enumerate(data['actuators']):

@@ -5,6 +5,7 @@ import tempfile
 import time
 from pathlib import Path
 import unittest
+import numpy as np
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 from Knobs.DRCorrection.gui import DRCorrectionWindow
@@ -39,6 +40,32 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(panel.options.bpm_interval_s,.5)
             self.assertEqual(backend.acquisitions,0)
         finally:window.close()
+    def test_plot_masks_excluded_predictions_but_preserves_large_valid_values(self):
+        from Knobs.DRCorrection.core import Options
+        panel=self.window.panels['orbit']
+        data=self.window.service.calculate('orbit',Options())
+        data['valid'][0]=False
+        data['full_measured'][:,0]=2000.
+        data['full_predicted'][:,0]=3000.
+        panel.plot.correction(data)
+        for ax in panel.plot.figure.axes:
+            self.assertLess(ax.get_ylim()[1],100.)
+            prediction=next(line for line in ax.lines if line.get_label()=='Predicted after SET')
+            self.assertTrue(np.isnan(prediction.get_ydata()[0]))
+        self.assertIn('SET not applied',panel.plot.figure._suptitle.get_text())
+        self.assertIn('95/96',panel.plot.figure._suptitle.get_text())
+        self.assertEqual(panel.plot.figure.axes[1].get_ylabel(),'COD Y [mm]')
+        self.assertTrue(any(line.get_label()=='Target (fit plane)' for line in panel.plot.figure.axes[1].lines))
+        data['full_predicted'][1,1]=3000.
+        panel.plot.correction(data)
+        self.assertGreater(panel.plot.figure.axes[1].get_ylim()[1],3000.)
+        # Stored/exportable arrays are never clipped by plotting.
+        self.assertEqual(data['full_predicted'][1,0],3000.)
+        data['applied']=True;data['full_after']=data['full_measured'].copy()
+        data['after_valid']=data['valid'].copy();data['after_valid'][1]=False
+        panel.plot.correction(data)
+        after=next(line for line in panel.plot.figure.axes[1].lines if line.get_label()=='Measured after SET')
+        self.assertTrue(np.isnan(after.get_ydata()[1]))
     def test_calc_set_save_reset_all_panels(self):
         with tempfile.TemporaryDirectory() as root:
             baseline=self.window.backend.snapshot()

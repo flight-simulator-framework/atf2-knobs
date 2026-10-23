@@ -38,6 +38,11 @@ class ModelRoutingTests(unittest.TestCase):
         self.service.apply(data)
         np.testing.assert_allclose(data['after'],data['predicted'],atol=1.e-10)
         self.service.reset()
+    def test_model_response_does_not_run_adaptive_real_or_virtual_scan(self):
+        self.opt.adaptive_probe=True
+        data=self.service.calculate('orbit',self.opt)
+        self.assertEqual(data['probe_history'],[])
+        self.assertEqual(self.machine.commands,[]);self.assertEqual(self.machine.acquisitions,1)
     def test_dispersion_only_one_real_rf_pair(self):
         data=self.service.calculate('dispersion',self.opt)
         self.assertEqual([c[0] for c in self.machine.commands],['rf','rf','rf'])
@@ -162,6 +167,18 @@ class ModelGuiTests(unittest.TestCase):
         window=TuningSession(b)
         try:
             self.assertEqual(window.model_panel.preparation.currentData(),'sad_cod')
+            panel=window.panels['orbit'];controls=panel.modern_fields
+            self.assertTrue(controls['adaptive_probe'].isChecked())
+            self.assertFalse(controls['adaptive_target_mm'].isEnabled())
+            panel.response_source_box.setCurrentIndex(0)
+            self.assertTrue(controls['adaptive_target_mm'].isEnabled())
+            controls['adaptive_target_mm'].setValue(.15)
+            controls['adaptive_target_tolerance'].setValue(20.)
+            self.assertEqual(panel.options.adaptive_target_mm,.15)
+            self.assertEqual(panel.options.adaptive_target_tolerance,.2)
+            controls['adaptive_probe'].setChecked(False)
+            self.assertFalse(controls['adaptive_target_mm'].isEnabled())
+            panel.response_source_box.setCurrentIndex(1)
             for mode,h in [('orbit',5),('dispersion',10)]:
                 p=window.panels[mode]
                 self.assertEqual(p.options.response_source,'rftrack')

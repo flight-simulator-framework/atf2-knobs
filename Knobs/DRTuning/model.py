@@ -384,6 +384,7 @@ class ModelManager:
         # unstable optics and calibration errors therefore fail read-only.
         virtual=CorrectionService(model);virtual.cancel=service.cancel
         options=copy.deepcopy(opt);options.response_source='measured';options.bpm_samples=1;options.bpm_interval_s=0.
+        options.adaptive_probe=False  # Model finite differences need no beam-driven amplitude search.
         progress(15,'Calculating magnet responses in RFTrack; machine magnets unchanged')
         data=virtual.acquire(mode,options,progress)
         if opt.model_fix_extraction_orbit or (mode=='dispersion' and opt.model_fix_extraction_dispersion):

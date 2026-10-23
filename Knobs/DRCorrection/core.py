@@ -56,6 +56,11 @@ class Options:
     change2_A: float = .2
     corrector_probe_A: float = .05
     skew_probe: float = .0002
+    adaptive_probe: bool = False
+    adaptive_target_mm: float = .1
+    adaptive_target_tolerance: float = .25
+    adaptive_max_pairs: int = 8
+    adaptive_max_probe: float = .5
     step_A: float = .1
     skew_step: float = .0007
     svd_cut: float = .04
@@ -84,6 +89,15 @@ def validate_bpm_sampling(opt):
         raise ValueError('BPM interval must be nonnegative')
 
 
+def validate_adaptive_probe(opt):
+    if not opt.adaptive_probe:return
+    if (not np.isfinite([opt.adaptive_target_mm,opt.adaptive_target_tolerance,opt.adaptive_max_pairs,opt.adaptive_max_probe]).all()
+        or opt.adaptive_target_mm<=0 or not 0<opt.adaptive_target_tolerance<1
+        or int(opt.adaptive_max_pairs)!=opt.adaptive_max_pairs or not 1<=opt.adaptive_max_pairs<=100
+        or opt.adaptive_max_probe<=0):
+        raise ValueError('Invalid adaptive probe target, tolerance, pair count or amplitude limit')
+
+
 class CorrectionService:
     def __init__(self,backend):
         self.backend=backend
@@ -105,7 +119,7 @@ class CorrectionService:
     def _orbit(self,opt):
         count=opt.bpm_samples;interval=opt.bpm_interval_s
         validate_bpm_sampling(opt)
-        samples=[]
+        samples=[];diagnostics=[]
         for _ in range(int(count)):
             self.check_cancel()
             # Same sampling cadence as SysID, but wait BEFORE each sample
@@ -116,14 +130,42 @@ class CorrectionService:
             self.check_cancel()
             x,y,valid=checked_orbit(result,self.backend.bpm_names)
             samples.append(dict(x=x.copy(),y=y.copy(),tmit=np.asarray(result['tmit'],float).copy(),valid=valid.copy()))
+            diagnostics.append(result.get('validity_diagnostics',{}))
         arrays={key:np.stack([s[key] for s in samples]) for key in ('x','y','tmit','valid')}
         means={key:np.mean(arrays[key],axis=0) for key in ('x','y','tmit')}
         valid=np.all(arrays['valid'],axis=0)
         self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**means,valid=valid,
             stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0),
             nshots=int(count),sample_interval_s=float(interval),samples=arrays,
-            position_unit='mm',freshness_verified=False))
+            position_unit='mm',freshness_verified=False,validity_diagnostics=diagnostics))
         return means['x'],means['y'],valid
+
+    def require_usable(self,names,measured,target,acquisition_valid,actuators,opt,measurements=None):
+        enabled=np.array([n not in opt.excluded_bpms for n in names],bool)
+        finite=np.isfinite(measured).all(axis=0)&np.isfinite(target).all(axis=0)
+        valid=np.asarray(acquisition_valid,bool)&enabled&finite
+        available=np.array([n not in opt.fixed_actuators for n in actuators],bool)
+        if valid.any() and available.any():return valid,available
+        message=(f'No valid enabled BPMs or actuators: plane={opt.plane}; '
+            f'BPM total={len(names)}, enabled={int(enabled.sum())}, '
+            f'acquisition-valid={int(np.sum(acquisition_valid))}, usable={int(valid.sum())}; '
+            f'actuators enabled={int(available.sum())}/{len(actuators)}. ')
+        if not enabled.any():message+='Select BPMs / magnets: enable BPMs for the fit. '
+        elif not valid.any():
+            message+='No common valid BPMs across the acquired samples/settings. '
+        if not available.any():message+='Enable magnets for the selected plane/family. '
+        frames=self.orbit_measurements if measurements is None else measurements
+        if frames:
+            counts=[int(np.sum(frame['valid'])) for frame in frames]
+            last=frames[-1];samples=last.get('samples',last)
+            x=np.asarray(samples['x']);y=np.asarray(samples['y']);q=np.asarray(samples['tmit'])
+            message+=(f'Setting valid counts: min={min(counts)}, max={max(counts)} over {len(frames)} settings. '
+                f'Last setting: nonfinite x/y entries={int(np.sum(~np.isfinite(x)|~np.isfinite(y)))}, '
+                f'nonpositive/nonfinite intensity entries={int(np.sum(~np.isfinite(q)|(q<=0)))}. ')
+            diagnostics=last.get('validity_diagnostics',[])
+            if diagnostics:message+='BPM source/status per sample: '+str(diagnostics)+'. '
+        message+='Check COD mode, beam/intensity and BPM selection; no correction applied.'
+        raise ValueError(message)
 
     def _signal(self,mode,opt):
         n=len(self.backend.bpm_names)
@@ -170,6 +212,7 @@ class CorrectionService:
 
     def acquire(self,mode,opt,progress=lambda *_:None):
         validate_bpm_sampling(opt)
+        validate_adaptive_probe(opt)
         if opt.response_source=='rftrack':
             try:return self.model_manager.acquire(self,mode,opt,progress)
             except Exception:
@@ -196,28 +239,73 @@ class CorrectionService:
         centers=np.asarray(self.backend.read(kind,names),float)
         low,high=self.backend.limits(kind,names)
         measured,valid=self._signal(mode,opt)
-        full_measured=self.full_signal.copy();columns=[];full_columns=[]
+        self.require_usable(self.backend.bpm_names,measured,np.zeros_like(measured),valid,names,opt)
+        full_measured=self.full_signal.copy();columns=[];full_columns=[];probe_history=[]
+        self.last_probe_history=probe_history
+        enabled=np.array([n not in opt.excluded_bpms for n in self.backend.bpm_names])
+        if opt.adaptive_probe:
+            from machine_interfaces.Backend.Excitation import finite_abs_max,next_excitation_amplitude
         # Each probe owns its restoration, including failures/cancellation.
         # _signal likewise restores RF and skew-excitation correctors. Do not
         # replay the full snapshot: it includes magnets this scan never touched.
         for j,name in enumerate(names):
-            self.check_cancel();values=[];full_values=[]
-            lo=max(low[j],centers[j]-probe);hi=min(high[j],centers[j]+probe)
-            if hi<=lo:raise ValueError('No available probe range')
-            try:
-                for setting in (lo,hi):
-                    delay=float(getattr(self.backend,'profile',{}).get('magnet_settle_s',0.))
-                    progress(int(100*j/len(names)),f'{name}: set {setting:.6g} {self.backend.unit(kind)}; current readback + {delay:g} s extra wait; BPM {opt.bpm_samples} samples, {opt.bpm_interval_s:g} s interval (first read delayed)')
-                    self.backend.write(kind,[name],[setting])
-                    value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
-            except BaseException as exc:
-                try:self.backend.write(kind,[name],[centers[j]])
-                except Exception as restoration:
-                    raise RuntimeError(f'{exc}\nProbe restoration also failed for {name}: {restoration}') from exc
-                raise
-            else:self.backend.write(kind,[name],[centers[j]])
-            columns.append(((values[1]-values[0])/(hi-lo)).reshape(-1))
-            full_columns.append(((full_values[1]-full_values[0])/(hi-lo)).reshape(-1))
+            self.check_cancel()
+            amplitude=min(probe,opt.adaptive_max_probe) if opt.adaptive_probe else probe
+            pairs=int(opt.adaptive_max_pairs) if opt.adaptive_probe else 1
+            for attempt in range(pairs):
+                self.check_cancel();values=[];full_values=[];readbacks=[]
+                lo=max(low[j],centers[j]-amplitude);hi=min(high[j],centers[j]+amplitude)
+                if hi<=lo:raise ValueError('No available probe range')
+                try:
+                    for setting in (lo,hi):
+                        delay=float(getattr(self.backend,'profile',{}).get('magnet_settle_s',0.))
+                        progress(int(100*j/len(names)),f'{name}: pair {attempt+1}/{pairs}, set {setting:.6g} {self.backend.unit(kind)}; current readback + {delay:g} s extra wait; BPM {opt.bpm_samples} samples, {opt.bpm_interval_s:g} s interval (first read delayed)')
+                        self.backend.write(kind,[name],[setting])
+                        value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
+                        if opt.adaptive_probe:readbacks.append(float(self.backend.read(kind,[name])[0]))
+                        self.require_usable(self.backend.bpm_names,value,np.zeros_like(value),valid,names,opt)
+                except BaseException as exc:
+                    try:self.backend.write(kind,[name],[centers[j]])
+                    except Exception as restoration:
+                        raise RuntimeError(f'{exc}\nProbe restoration also failed for {name}: {restoration}') from exc
+                    raise
+                else:self.backend.write(kind,[name],[centers[j]])
+                span=hi-lo
+                if not opt.adaptive_probe:break
+                # Use physical readback differences, not assumed movement
+                # within the supply's allowed convergence tolerance.
+                span=readbacks[1]-readbacks[0]
+                difference=(values[1]-values[0])/2.
+                # Dispersion acquisition contains eta and nominal COD. Target
+                # a position response in mm, never eta in mm/(dp/p).
+                signal=difference[1] if mode=='dispersion' else difference
+                observed=finite_abs_max(signal[...,valid & enabled])
+                reached=abs(observed/opt.adaptive_target_mm-1)<=opt.adaptive_target_tolerance
+                record=dict(magnet=name,pair=attempt+1,amplitude=amplitude,unit=self.backend.unit(kind),
+                    commanded=[lo,hi],readbacks=readbacks,readback_span=span,observed_mm=observed,
+                    target_mm=opt.adaptive_target_mm,target_reached=bool(reached),used_for_response=False,
+                    valid_bpms=int(np.sum(valid & enabled)),status='retry')
+                probe_history.append(record)
+                if not np.isfinite(readbacks).all() or span<=1.e-12:
+                    record['status']='invalid_current_span'
+                    raise ValueError(f'{name}: adaptive probe has no positive readback span: '
+                        f'commanded {lo:g}/{hi:g}, readbacks {readbacks} {self.backend.unit(kind)}; '
+                        'original current restored; no correction calculated')
+                next_amplitude=min(opt.adaptive_max_probe,
+                    next_excitation_amplitude(amplitude,observed,opt.adaptive_target_mm,opt.adaptive_max_probe))
+                next_lo=max(low[j],centers[j]-next_amplitude);next_hi=min(high[j],centers[j]+next_amplitude)
+                unchanged=np.allclose([next_lo,next_hi],[lo,hi],rtol=1.e-9,atol=1.e-12)
+                if reached:record['status']='target_reached'
+                elif unchanged:record['status']='amplitude_or_supply_limit'
+                elif attempt+1==pairs:record['status']='max_pairs'
+                progress(int(100*(j+(attempt+1)/pairs)/len(names)),
+                    f'{name}: pair {attempt+1}/{pairs}; BPM response {observed:.5g} / target {opt.adaptive_target_mm:g} mm; '
+                    f'{record["status"]}; next probe ±{next_amplitude:.5g} {self.backend.unit(kind)}')
+                if record['status']!='retry':
+                    record['used_for_response']=True;break
+                amplitude=next_amplitude
+            columns.append(((values[1]-values[0])/span).reshape(-1))
+            full_columns.append(((full_values[1]-full_values[0])/span).reshape(-1))
             progress(int(100*(j+1)/len(names)),f'{name}: response {j+1}/{len(names)}')
         target=np.zeros_like(measured)
         if mode=='dispersion':target[0]=nominal
@@ -227,6 +315,7 @@ class CorrectionService:
             actuator_unit=self.backend.unit(kind),baseline=baseline,centers=centers,
             measured=measured,target=target,response=np.column_stack(columns),valid=valid,
             orbit_measurements=self.orbit_measurements,
+            probe_history=probe_history,
             full_measured=full_measured,full_response=np.column_stack(full_columns),
             full_signal_labels=['COD X','COD Y'] if mode=='orbit' else (['Dispersion X','Dispersion Y','COD X','COD Y'] if mode=='dispersion' else [opt.probe1,opt.probe2]),
             limits=[low,high],source='measured symmetric response',
@@ -252,12 +341,11 @@ class CorrectionService:
             raise ValueError('Signal shape mismatch')
         if response.shape!=(measured.size,len(actuators)) or not np.isfinite(response).all():
             raise ValueError('Invalid response matrix')
-        valid=np.asarray(data['valid'],bool)&np.array([n not in opt.excluded_bpms for n in names])
-        valid &= np.isfinite(measured).all(axis=0)&np.isfinite(target).all(axis=0)
+        selected=copy.deepcopy(opt)
+        if mode=='skew':selected.fixed_actuators=tuple(set(opt.fixed_actuators)|{
+            n for n in actuators if not ((opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF')))})
+        valid,available=self.require_usable(names,measured,target,data['valid'],actuators,selected,data.get('orbit_measurements',[]))
         mask=np.tile(valid,measured.shape[0])
-        available=np.array([n not in opt.fixed_actuators for n in actuators])
-        if mode=='skew':available &= np.array([(opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF')) for n in actuators])
-        if not valid.any() or not available.any():raise ValueError('No valid enabled BPMs or actuators')
         weights=np.ones_like(measured)
         if mode=='dispersion':weights[0]*=opt.dispersion_weight;weights[1]*=opt.orbit_weight
         a=(response*weights.reshape(-1,1))[mask]

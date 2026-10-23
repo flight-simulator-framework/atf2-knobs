@@ -83,13 +83,13 @@ def reflow_correction(panel):
     interval.setToolTip('Wait before every BPM read, including the first. Average samples; save their spread.')
     interval.valueChanged.connect(lambda value:panel.set_option('bpm_interval_s',value))
     form.addRow('BPM interval [s]',interval);panel.modern_fields['bpm_interval_s']=interval
-    keys=[('corrector_probe_A','Probe ± [A]'),('step_A','Max correction [A]')]
+    keys=[('corrector_probe_A','Initial probe ± [A]'),('step_A','Max correction [A]')]
     if panel.mode=='dispersion':
         keys += [('frequency_change_khz','RF full span [kHz]')]
         panel.compaction_label=QLabel();panel.compaction_label.setWordWrap(True)
         form.addRow('Momentum compaction',panel.compaction_label)
     if panel.mode=='skew':
-        keys=[('skew_probe','Skew probe ± [A]'),('skew_step','Max correction [A]'),('change1_A','H probe 1 span [A]'),('change2_A','H probe 2 span [A]')]
+        keys=[('skew_probe','Initial skew probe ± [A]'),('skew_step','Max correction [A]'),('change1_A','H probe 1 span [A]'),('change2_A','H probe 2 span [A]')]
         from PyQt6.QtWidgets import QCheckBox
         for key in ('sd','sf'):
             check=QCheckBox(key.upper());check.setChecked(getattr(panel.options,key))
@@ -99,8 +99,39 @@ def reflow_correction(panel):
             combo.currentTextChanged.connect(lambda v,k=key:panel.set_option(k,v));form.addRow(key,combo)
     for key,label in keys:
         spin=QDoubleSpinBox();spin.setDecimals(5);spin.setRange(.00001,1000.);spin.setValue(getattr(panel.options,key))
+        if key in ('corrector_probe_A','skew_probe'):
+            spin.setToolTip('Starting amplitude for adaptive scans; fixed amplitude when adaptation is off. Supply limits always apply.')
         spin.valueChanged.connect(lambda v,k=key:panel.set_option(k,v));form.addRow(label,spin)
         panel.modern_fields[key]=spin
+    adaptive=QCheckBox('Adapt probe to BPM response (SysID rule)')
+    adaptive.setChecked(panel.options.adaptive_probe)
+    adaptive.toggled.connect(lambda v:panel.set_option('adaptive_probe',v))
+    form.addRow(adaptive);panel.modern_fields['adaptive_probe']=adaptive
+    adaptive_widgets=[]
+    unit=panel.window.backend.unit('skews' if panel.mode=='skew' else 'correctors')
+    for key,label,factor,low,high in [
+        ('adaptive_target_mm','Target BPM response [mm]',1.,.00001,10.),
+        ('adaptive_target_tolerance','Target tolerance [%]',100.,1.,99.),
+        ('adaptive_max_probe',f'Max probe ± [{unit}]',1.,.000001,5.)]:
+        spin=QDoubleSpinBox();spin.setDecimals(6 if key=='adaptive_max_probe' else 4)
+        spin.setProperty('option_scale',factor)
+        spin.setRange(low,high);spin.setValue(getattr(panel.options,key)*factor)
+        spin.valueChanged.connect(lambda v,k=key,f=factor:panel.set_option(k,v/f))
+        form.addRow(label,spin);panel.modern_fields[key]=spin;adaptive_widgets.append(spin)
+    pairs=QSpinBox();pairs.setRange(1,100);pairs.setValue(panel.options.adaptive_max_pairs)
+    pairs.valueChanged.connect(lambda v:panel.set_option('adaptive_max_pairs',v))
+    form.addRow('Max pairs per magnet',pairs);panel.modern_fields['adaptive_max_pairs']=pairs;adaptive_widgets.append(pairs)
+    helptext=QLabel('Response = max |BPM(+) − BPM(−)| / 2 on enabled valid BPMs.\n'
+        'Dispersion uses nominal COD; skew uses the vertical probe-response change.\n'
+        'Each pair restores the magnet. Limits / unreached targets are reported.')
+    helptext.setWordWrap(True);form.addRow(helptext)
+    def update_adaptive_controls(*_):
+        measured=source.currentData()=='measured';adaptive.setEnabled(measured)
+        for widget in adaptive_widgets:widget.setEnabled(measured and adaptive.isChecked())
+        helptext.setEnabled(measured)
+    source.currentIndexChanged.connect(update_adaptive_controls)
+    adaptive.toggled.connect(update_adaptive_controls);update_adaptive_controls()
+    panel.refresh_adaptive_controls=update_adaptive_controls
     layout.addWidget(button('Select BPMs / magnets',panel.window.selection))
     panel.selection_label=QLabel();panel.selection_label.setWordWrap(True);layout.addWidget(panel.selection_label)
     layout.addWidget(button('SVD / advanced settings',panel.advanced))

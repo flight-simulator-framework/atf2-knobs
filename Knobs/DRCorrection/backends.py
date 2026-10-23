@@ -276,13 +276,18 @@ class EpicsBackend(DemoBackend):
             raw=raw[np.asarray(p['row_indices'],int)]
             values={axis:raw[:,p['columns'][axis]] for axis in ('x','y','tmit')}
             status=raw[:,p['columns']['status']]==p['valid_status']
+            status_values,status_counts=np.unique(raw[:,p['columns']['status']],return_counts=True)
+            diagnostic=dict(pv=p['packed_pv'],required_status=p['valid_status'],
+                status_counts={str(v):int(c) for v,c in zip(status_values,status_counts)})
         else:
             values={axis:np.asarray(self.get(p[axis]),float) for axis in ('x','y','tmit')}
             status=np.ones(len(self.bpm_names),bool)
+            diagnostic=dict(pv=', '.join(p[k] for k in ('x','y','tmit')))
         if any(v.shape!=(len(self.bpm_names),) for v in values.values()):raise ValueError('BPM waveform length/order differs from profile')
         self.acquisitions+=1
         return dict(names=self.bpm_names,x=values['x']*p['mm_per_unit'],y=values['y']*p['mm_per_unit'],
-                    tmit=values['tmit'],valid=status&np.isfinite(values['x'])&np.isfinite(values['y'])&(values['tmit']>0),position_unit='mm')
+                    tmit=values['tmit'],valid=status&np.isfinite(values['x'])&np.isfinite(values['y'])&(values['tmit']>0),
+                    validity_diagnostics=diagnostic,position_unit='mm')
     def target_dispersion(self,plane):return np.asarray(self.profile['target_dispersion_mm'][plane],float)
     def tbt(self,turns=1024,pulse=None):
         if pulse:raise ValueError('Live exciter is not configured; use an externally acquired waveform')

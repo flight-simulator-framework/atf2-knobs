@@ -45,6 +45,57 @@ Do not infer that extending the wait or loosening tolerance fixes a stuck PV.
 The custom measured-response scan remains available; this change does not yet
 connect the SysID worker or import its DATA*.pkl archives.
 
+No valid enabled BPMs / actuators:
+CALC now reports enabled BPMs, acquisition-valid BPMs, usable BPMs and enabled
+actuators separately. It includes per-setting valid counts, nonfinite position
+and invalid-intensity counts, and packed waveform status histograms (required
+DR:monitors status=1). All samples/settings must share at least one valid,
+enabled BPM. Selection exclusions are distinguished from acquisition failure.
+Measured scans stop before magnet probes if the initial signal has no usable
+BPMs; loss of all common BPMs during a probe aborts and restores that probe.
+This does not weaken status/intensity validation or change waveform mapping.
+
+Correction plot reading:
+Black points = measured before SET; green dashed = predicted after SET;
+red = measured after SET (only when applied); gray dotted = target in the fit
+plane. CALC completion means a proposal exists, not that SET was performed.
+Invalid/excluded BPMs are hidden from every curve and lines break at those
+locations. Their count is displayed; raw data remain in saved sessions. Large
+values at VALID enabled BPMs are not clipped. The fitted correction component
+is retained in the saved data but no longer overlaid as another orbit curve.
+Live COD values use DR:monitors raw / 1000 = mm, as in InterfaceATF2_DR/SysID.
+Measured scans can adapt each magnet's probe amplitude using BPM feedback.
+"Adapt probe to BPM response (SysID rule)" defaults ON in Machine and RFTrack
+simulation DRTuning sessions. It is disabled for RFTrack model-response CALC;
+that path keeps fixed model finite differences and its existing live diagnostics.
+Defaults: initial corrector probe +/-0.05 A, target response 0.1 mm, target band
++/-25%, maximum 8 measurement pairs per magnet, maximum probe +/-0.5 A about
+the captured current. Supply bounds, including the corrector +/-5 A absolute
+limit, always take precedence. All these adaptive controls are on the page.
+Turning adaptation OFF keeps the prior fixed-amplitude measurement behavior.
+
+Response means max(abs(BPM_plus - BPM_minus))/2 over enabled, common-valid BPMs
+in the selected plane. Dispersion uses the nominal COD row, not eta; skew uses
+the change in vertical responses to its horizontal probes. The shared
+machine_interfaces.Backend.Excitation module holds SysID's existing update:
+target/observed clipped to [0.8,2], then 80% new + 20% old; zero response uses
+1.5 before smoothing. SysID_GUI imports the same functions. Its worker and
+archive format are not replaced or invoked by DRTuning.
+
+Every pair restores the original current before retrying. The final pair
+provides the response column, normalized by its actual positive readback
+difference. A zero/reversed/nonfinite current span aborts after restoration.
+Target reached, amplitude/supply limit, and maximum-pair termination are
+recorded distinctly. Unreached targets do not masquerade as convergence: the
+proposal summary and detailed log identify them; a usable last measured column
+is still available for the correction solver. All attempts, measured response,
+commanded/readback currents and the selected final pair are saved in
+probe_history alongside the raw orbit measurements. Cancel/invalid BPM paths
+restore the current and do not proceed to the next pair or SET.
+Programmatic Options defaults adaptation OFF for old scripts/saved sessions;
+set adaptive_probe=True explicitly in an API caller. Deploy the updated
+machine-interfaces package together with atf2-knobs and system-identification.
+
 XSR emittance estimate (2026-10-23)
 ---------------------------------
 Open XSR emittance in the left navigation or Measurements menu. This worksheet

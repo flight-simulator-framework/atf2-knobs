@@ -236,6 +236,8 @@ class TuningSession(DRCorrectionWindow):
         from .presentation import STYLE,reflow_correction
         self.setStyleSheet(STYLE);self.resize(1280,820)
         for mode,panel in self.panels.items():
+            if backend.identity.startswith('epics:') or backend.label.startswith('RFTrack'):
+                panel.options.adaptive_probe=True
             if backend.identity.startswith('epics:'):
                 panel.options.response_source='rftrack'
                 if mode in ('orbit','dispersion'):

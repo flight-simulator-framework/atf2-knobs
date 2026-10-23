@@ -37,6 +37,46 @@ def ramp_profile():
 
 
 class RecoveredControlTests(unittest.TestCase):
+    def test_no_beam_stops_before_magnet_scan_with_intensity_diagnostic(self):
+        client=FakeEpics();client.values['q']=[0.,0.]
+        backend=EpicsBackend(fake_profile(),client)
+        with patch.object(client,'caput',wraps=client.caput) as writes:
+            with self.assertRaisesRegex(ValueError,'acquisition-valid=0, usable=0') as caught:
+                CorrectionService(backend).calculate('orbit',Options())
+            writes.assert_not_called()
+        self.assertIn('intensity entries=2',str(caught.exception))
+        self.assertIn('actuators enabled=1/1',str(caught.exception))
+
+    def test_all_bpms_excluded_is_distinct_from_invalid_measurement(self):
+        client=FakeEpics();backend=EpicsBackend(fake_profile(),client)
+        with patch.object(client,'caput',wraps=client.caput) as writes:
+            with self.assertRaisesRegex(ValueError,'enabled=0, acquisition-valid=2'):
+                CorrectionService(backend).calculate('orbit',Options(excluded_bpms=('b1','b2')))
+            writes.assert_not_called()
+
+    def test_packed_bad_status_is_reported_without_bypassing_validity(self):
+        profile=fake_profile();profile['orbit']=dict(packed_pv='DR:monitors',row_width=10,
+            row_indices=[0,1],columns=dict(status=0,x=1,y=2,tmit=3),valid_status=1,mm_per_unit=1.)
+        client=FakeEpics();raw=np.zeros((2,10));raw[:,3]=1.
+        client.values['DR:monitors']=raw.reshape(-1)
+        backend=EpicsBackend(profile,client)
+        with patch.object(client,'caput',wraps=client.caput) as writes:
+            with self.assertRaises(ValueError) as caught:CorrectionService(backend).calculate('orbit',Options())
+            writes.assert_not_called()
+        self.assertIn("'status_counts': {'0.0': 2}",str(caught.exception))
+        self.assertIn("'required_status': 1",str(caught.exception))
+
+    def test_beam_lost_during_probe_stops_and_restores_current(self):
+        client=FakeEpics();backend=EpicsBackend(fake_profile(),client);original=backend.orbit
+        def read():
+            if backend.acquisitions:client.values['q']=[0.,0.]
+            return original()
+        backend.orbit=read
+        with self.assertRaisesRegex(ValueError,'No common valid BPMs'):
+            CorrectionService(backend).calculate('orbit',Options())
+        self.assertEqual(backend.read('correctors',['V'])[0],0.)
+        self.assertEqual(backend.acquisitions,2)
+
     def test_operator_current_tolerance_accepts_19ma_but_rejects_21ma(self):
         for difference,accepted in ((.019,True),(.021,False)):
             with self.subTest(difference=difference):
