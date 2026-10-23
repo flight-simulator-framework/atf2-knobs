@@ -1,10 +1,13 @@
 """Beam-driven probe adjustment, bounds and restoration; no machine access."""
 import unittest
 import importlib.util
+import builtins
+import sys
+from unittest.mock import patch
 import numpy as np
 from Knobs.DRCorrection.backends import DemoBackend
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
-from machine_interfaces.Backend.Excitation import next_excitation_amplitude
+from Knobs.DRCorrection.core import next_excitation_amplitude
 
 
 class LinearBeam(DemoBackend):
@@ -38,6 +41,41 @@ def options(**changes):
 
 
 class AdaptiveProbeTests(unittest.TestCase):
+    def load_without_shared_module(self,missing_name='machine_interfaces.Backend.Excitation'):
+        from Knobs.DRCorrection import core
+        original=builtins.__import__
+        def blocked(name,*args,**kwargs):
+            if name=='machine_interfaces.Backend.Excitation':
+                raise ModuleNotFoundError('Simulated missing module',name=missing_name)
+            return original(name,*args,**kwargs)
+        spec=importlib.util.spec_from_file_location('Knobs.DRCorrection._compat_core_test',core.__file__)
+        module=importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules,{spec.name:module}),patch('builtins.__import__',side_effect=blocked):
+            spec.loader.exec_module(module)
+        return module
+
+    def test_old_machine_interfaces_runs_adaptive_scan_with_bundled_rule(self):
+        module=self.load_without_shared_module();b=LinearBeam()
+        data=module.CorrectionService(b).acquire('orbit',options())
+        self.assertEqual(data['probe_rule_source'],'bundled SysID compatibility rule')
+        self.assertTrue(data['probe_history'][-1]['target_reached'])
+        self.assertEqual(b.currents['V'],0.)
+
+    def test_bundled_rule_matches_shared_rule_across_edge_cases(self):
+        module=self.load_without_shared_module()
+        for current in (1.e-7,.01,.5):
+            for observed in (0.,float('nan'),.001,1.):
+                for target in (0.,.1):
+                    for limit in (0.,.03,.5):
+                        self.assertEqual(module.next_excitation_amplitude(current,observed,target,limit),
+                                         next_excitation_amplitude(current,observed,target,limit))
+        self.assertEqual(module.finite_abs_max([float('nan'),-.5,.1]),.5)
+
+    def test_missing_dependency_inside_shared_module_is_not_hidden(self):
+        with self.assertRaises(ModuleNotFoundError) as caught:
+            self.load_without_shared_module('some_dependency_inside_excitation')
+        self.assertEqual(caught.exception.name,'some_dependency_inside_excitation')
+
     @unittest.skipUnless(importlib.util.find_spec('RF_Track'),'native RFTrack optional')
     def test_native_rftrack_bpm_feedback_reaches_target_and_restores(self):
         from Knobs.DRTuning.rftrack import RFTrackBackend

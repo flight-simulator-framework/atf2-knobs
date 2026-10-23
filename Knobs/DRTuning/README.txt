@@ -93,8 +93,11 @@ commanded/readback currents and the selected final pair are saved in
 probe_history alongside the raw orbit measurements. Cancel/invalid BPM paths
 restore the current and do not proceed to the next pair or SET.
 Programmatic Options defaults adaptation OFF for old scripts/saved sessions;
-set adaptive_probe=True explicitly in an API caller. Deploy the updated
-machine-interfaces package together with atf2-knobs and system-identification.
+set adaptive_probe=True explicitly in an API caller. The new shared module is
+preferred, but older machine-interfaces packages without Backend.Excitation
+are supported by an identical bundled SysID rule in DRTuning and SysID_GUI.
+The correction session records probe_rule_source. Missing dependencies inside
+an installed shared module are not swallowed as a compatibility fallback.
 
 XSR emittance estimate (2026-10-23)
 ---------------------------------

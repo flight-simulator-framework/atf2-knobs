@@ -14,6 +14,24 @@ from scipy.optimize import lsq_linear
 from .assessment import changed_indices,assess
 
 
+try:
+    from machine_interfaces.Backend.Excitation import finite_abs_max,next_excitation_amplitude
+    EXCITATION_RULE_SOURCE='machine_interfaces.Backend.Excitation'
+except ModuleNotFoundError as exc:
+    if exc.name!='machine_interfaces.Backend.Excitation':raise
+    # Compatibility with installed machine-interfaces 0.2.0 packages which
+    # predate Excitation.py. Keep the established SysID rule unchanged.
+    EXCITATION_RULE_SOURCE='bundled SysID compatibility rule'
+    def finite_abs_max(values):
+        values=np.asarray(values,float).ravel();values=values[np.isfinite(values)]
+        return float(np.max(abs(values))) if values.size else 0.
+    def next_excitation_amplitude(current_amp,observed,target,max_range):
+        if not np.isfinite(observed) or observed<=0:new_amp=current_amp*1.5
+        else:new_amp=current_amp*max(.8,min(target/observed if target>0 else 1.,2.))
+        if max_range>0:new_amp=min(new_amp,max_range)
+        return .8*max(float(new_amp),1.e-6)+.2*current_amp
+
+
 class Cancelled(RuntimeError):
     pass
 
@@ -243,8 +261,6 @@ class CorrectionService:
         full_measured=self.full_signal.copy();columns=[];full_columns=[];probe_history=[]
         self.last_probe_history=probe_history
         enabled=np.array([n not in opt.excluded_bpms for n in self.backend.bpm_names])
-        if opt.adaptive_probe:
-            from machine_interfaces.Backend.Excitation import finite_abs_max,next_excitation_amplitude
         # Each probe owns its restoration, including failures/cancellation.
         # _signal likewise restores RF and skew-excitation correctors. Do not
         # replay the full snapshot: it includes magnets this scan never touched.
@@ -316,6 +332,7 @@ class CorrectionService:
             measured=measured,target=target,response=np.column_stack(columns),valid=valid,
             orbit_measurements=self.orbit_measurements,
             probe_history=probe_history,
+            probe_rule_source=EXCITATION_RULE_SOURCE if opt.adaptive_probe else 'fixed amplitude',
             full_measured=full_measured,full_response=np.column_stack(full_columns),
             full_signal_labels=['COD X','COD Y'] if mode=='orbit' else (['Dispersion X','Dispersion Y','COD X','COD Y'] if mode=='dispersion' else [opt.probe1,opt.probe2]),
             limits=[low,high],source='measured symmetric response',
