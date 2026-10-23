@@ -195,7 +195,7 @@ class ModelMathTests(unittest.TestCase):
             with patch('Knobs.DRTuning.model.capture_settings',return_value=settings),patch('Knobs.DRTuning.model.OpticsModel',return_value=fake):
                 if preset=='sad_cod' and match:
                     self.assertIs(manager.prepare(Options(model_match_tunes=match),lambda:None),fake)
-                    fake.match_tunes.assert_called_once_with(settings['tunes'],alias=False)
+                    fake.match_tunes.assert_called_once_with(settings['tunes'],max_scale=.05,alias=False)
                     self.assertIsNone(manager.last_attempt['initial_tunes'])
                     self.assertIn('initial_optics_failure',manager.last_attempt)
                 else:
@@ -220,6 +220,45 @@ class ModelMathTests(unittest.TestCase):
         self.assertIsNot(attempt['tune_match_attempt'],fake.match_attempt)
         self.assertEqual(b.commands,[]);self.assertIsNone(manager.model)
         json.dumps(serial(attempt),allow_nan=False)
+
+    def test_bound_step_uses_remaining_family_and_larger_limit_is_explicit(self):
+        from types import SimpleNamespace
+        class Quadrupole:
+            def __init__(self):self.value=1.
+            def get_K1(self,p):return self.value
+            def set_K1(self,p,v):self.value=v
+        elements={'QF1R.1':Quadrupole(),'QF2R.1':Quadrupole()}
+        def tunes():
+            x,y=[e.value-1 for e in elements.values()]
+            return np.array([.2+x+y,.3+y])
+        model=SimpleNamespace(elements=elements,momentum=1300.,check_cancel=lambda:None,settings={},tunes=tunes)
+        # Unconstrained Newton points only along QF1. At its bound the
+        # feasible QF2 direction still improves the residual.
+        with self.assertRaisesRegex(ValueError,'Tune match failed'):
+            OpticsModel.match_tunes(model,[.14,.3])
+        attempt=model.match_attempt
+        np.testing.assert_allclose(attempt['family_fractional_changes'],[-.05,-.005],atol=1.e-6)
+        np.testing.assert_allclose(attempt['residual'],[.005,-.005],atol=1.e-6)
+        self.assertTrue(attempt['model_restored'])
+        report=OpticsModel.match_tunes(model,[.14,.3],max_scale=.10)
+        np.testing.assert_allclose(report['final'],[.14,.3],atol=1.e-5)
+        self.assertEqual(report['max_scale'],.10)
+        self.assertLess(report['family_fractional_changes'][0],-.05)
+
+    def test_configured_model_limit_is_captured_and_used_by_manager(self):
+        from Knobs.DRTuning.model import preparation_config
+        b=CountedBackend();b.model_config={'tune_match_max_scale':.10}
+        self.assertEqual(preparation_config(b)['tune_match_max_scale'],.10)
+        manager=ModelManager(b)
+        settings={'raw_pvs':{},'tunes':[.2,.3],'tune_alias':False,'tune_match_max_scale':.10}
+        fake=Mock();fake.tunes.return_value=np.array([.21,.31]);fake.match_report={}
+        with patch('Knobs.DRTuning.model.capture_settings',return_value=settings),patch('Knobs.DRTuning.model.OpticsModel',return_value=fake):
+            manager.prepare(Options(),lambda:None)
+        fake.match_tunes.assert_called_once_with(settings['tunes'],max_scale=.10,alias=False)
+        self.assertEqual(b.commands,[])
+        for bound in (0,-.1,.21,float('nan')):
+            b.model_config={'tune_match_max_scale':bound}
+            with self.assertRaisesRegex(ValueError,'matching limit'):preparation_config(b)
 
     def test_quad_average_beta_fit_uses_integrated_transport(self):
         beta=4.;alpha=.3;gamma=(1+alpha**2)/beta;names=['q1','q2','q3','q4'];rows=[];values=[]
@@ -274,6 +313,10 @@ class ModelGuiTests(unittest.TestCase):
                 self.assertEqual((p.options.count_h,p.options.count_v),(h,5))
             window.model_panel.preparation.setCurrentIndex(1)
             self.assertEqual(b.model_config['preparation'],'all_currents')
+            self.assertEqual(window.model_panel.match_limit.value(),5.)
+            window.model_panel.match_limit.setValue(10.)
+            self.assertEqual(b.model_config['tune_match_max_scale'],.10)
+            self.assertTrue(all(p.data is None for p in window.panels.values()))
             self.assertEqual(b.commands,[]);self.assertEqual(b.acquisitions,0)
         finally:window.close();window.deleteLater();self.app.processEvents()
     def test_model_navigation_and_response_selection_no_pv_access(self):

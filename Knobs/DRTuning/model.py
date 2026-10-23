@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import time
 import numpy as np
+from scipy.optimize import lsq_linear
 from Knobs.DRCorrection.core import Options, CorrectionService, serial
 
 
@@ -26,6 +27,9 @@ def preparation_config(backend):
     preset=config.get('preparation','sad_cod' if backend.identity.startswith('epics:') else 'all_currents')
     if preset not in ('sad_cod','all_currents'):raise ValueError('Unknown model preparation: '+str(preset))
     config['preparation']=preset
+    bound=float(config.get('tune_match_max_scale',.05))
+    if not np.isfinite(bound) or not 0<bound<=.2:raise ValueError('Model QF matching limit must be in (0, 20%]')
+    config['tune_match_max_scale']=bound
     if preset=='sad_cod' and ('quadrupole_factors' not in config or 'bend_k1l' not in config):
         defaults=json.loads(Path(__file__).with_name('sad_cod_calibration.json').read_text())
         for key in ('quadrupole_factors','bend_k1l','source','source_sha256'):
@@ -273,9 +277,14 @@ class OpticsModel:
                     if column is None:raise ValueError('Tune match could not form a stable local response')
                     columns.append(column)
                 jacobian=np.column_stack(columns)
-                step=np.linalg.lstsq(jacobian,-error,rcond=1.e-8)[0]
-                largest=np.max(abs(step))
-                if largest>.005:step*=.005/largest
+                # Solve inside the remaining family bounds. Clipping an
+                # unconstrained Newton step can discard its descent direction
+                # at a bound and miss improvement in the other family.
+                lower=np.maximum(-max_scale-scales,-.005)
+                upper=np.minimum(max_scale-scales,.005)
+                fit=lsq_linear(jacobian,-error,bounds=(lower,upper),tol=1.e-12)
+                if not fit.success:raise ValueError('Bounded local tune step failed: '+fit.message)
+                step=fit.x
                 accepted=False
                 for power in range(16):
                     point=np.clip(scales+step*(.5**power),-max_scale,max_scale)
@@ -292,6 +301,7 @@ class OpticsModel:
             if np.max(abs(error))>tolerance:
                 raise ValueError(f'Tune match failed: residual {error}; QF changes {scales}; '
                     f'target {goals}; model tunes {history[-1]["tunes"]}; '
+                    f'model QF limit +/-{max_scale:.1%}; bound active={self.match_attempt["bound_active"].tolist()}; '
                     f'rejected unstable trials={len(rejected)}; no machine correction calculated')
         except Exception as exc:
             self.match_attempt.update(status='failed',error=str(exc),exception_type=type(exc).__name__)
@@ -301,7 +311,7 @@ class OpticsModel:
         self.match_report=dict(initial=initial,target=target,resolved_target=goals,final=self.tunes(),
                                family_fractional_changes=scales,residual=error,source=self.settings.get('tune_source'),model_only=True,
                                iterations=iteration+1,rejected_unstable_trials=rejected,initial_stable_point_search=seed_report,
-                               method='bounded Newton with stable backtracking')
+                               max_scale=max_scale,method='bounded least-squares Newton with stable backtracking')
         return self.match_report
 
 
@@ -385,7 +395,8 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
         reading=backend.measure_tunes(cancel=event);tunes=reading['tunes']
         tune_source=reading['source'];alias=True
     result=dict(schema='dr-model-settings-1',source=backend.label,captured_unix_s=time.time(),
-        preparation=config['preparation'],calibration_source_sha256=config.get('source_sha256'),
+        preparation=config['preparation'],tune_match_max_scale=config['tune_match_max_scale'],
+        calibration_source_sha256=config.get('source_sha256'),
         reference_excitation='zero correctors and skews in model; absolute machine centers retained' if sad else 'captured corrector and skew currents',
         momentum_mev_c=p,momentum_compaction=opt.momentum_compaction,lattice_path=path,lattice_sha256=digest(load_lattice_data(path)),
         quadrupoles_k1l=quads,sextupoles_k2l=sexts,quadrupole_factors=config.get('quadrupole_factors',{}),
@@ -415,6 +426,7 @@ class ModelManager:
             baseline=self.backend.snapshot();attempt['baseline']=baseline
             settings=capture_settings(self.backend,opt,baseline,cancel);attempt['settings']=settings
             attempt['stage']='constructing imported model';model=OpticsModel(settings,cancel)
+            bound=float(settings.get('tune_match_max_scale',.05))
             attempt['stage']='initial imported optics stability check'
             progress(5,'Checking initial imported model stability (no machine writes)')
             try:attempt['initial_tunes']=model.tunes()
@@ -422,11 +434,11 @@ class ModelManager:
                 attempt['initial_optics_failure']=exc.diagnostics
                 if not opt.model_match_tunes or settings.get('preparation')!='sad_cod':raise
                 attempt['initial_tunes']=None
-                progress(7,'Initial SAD COD model unstable; searching model QF1R/QF2R within +/-5% before tune matching (no machine writes)')
+                progress(7,f'Initial SAD COD model unstable; searching model QF1R/QF2R within +/-{bound:.1%} before tune matching (no machine writes)')
             if opt.model_match_tunes:
                 attempt['stage']='QF1R / QF2R tune matching'
                 progress(10,'Matching model QF1R / QF2R to tune targets (no machine writes)')
-                model.match_tunes(settings['tunes'],alias=settings['tune_alias'])
+                model.match_tunes(settings['tunes'],max_scale=bound,alias=settings['tune_alias'])
             attempt['stage']='checking settings unchanged'
             if not self.backend.same_settings(self.backend.snapshot(),baseline):raise ValueError('Machine settings changed during model preparation')
             verify_inputs(self.backend,settings)

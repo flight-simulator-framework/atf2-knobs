@@ -310,7 +310,8 @@ class TuningSession(DRCorrectionWindow):
         self.operation_status.setText(self._active_label+': working...');self.log(self._active_label+': started')
         self.service.cancel.clear();self.tabs.setEnabled(False);self.navigation.setEnabled(False);self.cancel_button.setEnabled(True)
         self.progress.setRange(0,0);self.timer.start();self.tick()
-        self.task=Task(action)
+        self.task=Task(action,getattr(self.backend,'ramp',None))
+        self.task.message.connect(self.log)
         def done(result):
             try:
                 finished(result)

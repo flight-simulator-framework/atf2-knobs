@@ -23,10 +23,18 @@ class Task(QThread):
     result=pyqtSignal(object)
     failure=pyqtSignal(str)
     progress=pyqtSignal(int,str)
-    def __init__(self,action):
-        super().__init__();self.action=action
+    message=pyqtSignal(str)
+    def __init__(self,action,ramp=None):
+        super().__init__();self.action=action;self.ramp=ramp
     def run(self):
-        try:self.result.emit(self.action(self.progress.emit))
+        try:
+            previous=self.ramp.report if self.ramp is not None else None
+            try:
+                if self.ramp is not None:self.ramp.report=self.message.emit
+                result=self.action(self.progress.emit)
+            finally:
+                if self.ramp is not None:self.ramp.report=previous
+            self.result.emit(result)
         except Exception:self.failure.emit(traceback.format_exc())
 
 
@@ -505,7 +513,8 @@ class DRCorrectionWindow(QMainWindow):
     def start(self,action,finished):
         if self.task is not None and self.task.isRunning():self.error('A task is already running');return
         self.service.cancel.clear();self.tabs.setEnabled(False);self.progress.setValue(0)
-        self.task=Task(action);self.task.result.connect(finished);self.task.failure.connect(self.error)
+        self.task=Task(action,getattr(self.backend,'ramp',None));self.task.result.connect(finished);self.task.failure.connect(self.error)
+        self.task.message.connect(self.log)
         self.task.progress.connect(lambda n,text:(self.progress.setValue(n),self.log(text)))
         self.task.finished.connect(self.task_finished);self.task.start()
     def task_finished(self):

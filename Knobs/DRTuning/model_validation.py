@@ -131,7 +131,7 @@ def main():
         report=native_validation(args.output);print(json.dumps(serial({k:v for k,v in report.items() if k in ('orbit','dispersion','skew','wall_s','restored')}),indent=2));return
     if not args.settings:parser.error('Supply --native or --settings')
     value=json.loads(args.settings.read_text());settings=value.get('settings',value);model=OpticsModel(settings)
-    model.match_tunes(settings['tunes'],alias=settings.get('tune_alias',False))
+    model.match_tunes(settings['tunes'],max_scale=settings.get('tune_match_max_scale',.05),alias=settings.get('tune_alias',False))
     export=dict(schema='dr-model-export-1',settings=settings,tune_match=model.match_report,optics=transport(model))
     if args.reference:export['comparison']=compare_optics(export,json.loads(args.reference.read_text()))
     args.output.mkdir(parents=True,exist_ok=True)

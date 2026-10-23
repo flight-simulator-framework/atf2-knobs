@@ -37,6 +37,85 @@ def ramp_profile():
 
 
 class RecoveredControlTests(unittest.TestCase):
+    def test_minus_to_plus_waits_for_transient_preset_bits(self):
+        for overlap in (False,True):
+            with self.subTest(overlap=overlap):
+                class TransitionClient(RampClient):
+                    pending=False
+                    def caput(self,pv,value,**kwargs):
+                        result=super().caput(pv,value,**kwargs)
+                        if pv=='RAMP:PL1:ONOFF_SW':
+                            self.pending=True
+                            self.values['RAMP:PL1:STATUS_READ']=int(overlap)
+                            self.values['RAMP:MI1:STATUS_READ']=int(overlap)
+                        return result
+                client=TransitionClient();backend=EpicsBackend(ramp_profile(),client)
+                messages=[];backend.ramp.report=messages.append
+                before=backend.frequency_state()
+                backend.set_frequency(-1000.)
+                def settle(seconds):
+                    if client.pending:
+                        client.pending=False
+                        client.values['RAMP:PL1:STATUS_READ']=1
+                        client.values['RAMP:MI1:STATUS_READ']=0
+                with patch('Knobs.DRCorrection.ramp.time.sleep',side_effect=settle):
+                    backend.set_frequency(1000.)
+                self.assertAlmostEqual(client.values['rf'],714.001)
+                backend.restore_frequency(before)
+                self.assertEqual(backend.frequency_state(),before)
+                commands=[m for m in messages if ': command ' in m]
+                self.assertEqual(commands,[f'DeltaFRamp: command {pv}={value}' for pv,value in (
+                    ('RAMP:CONTROL_ON_SW',1),('RAMP:MI1:ONOFF_SW',1),
+                    ('RAMP:PL1:ONOFF_SW',1),('RAMP:CONTROL_OFF_SW',0))])
+                self.assertTrue(any('confirmed preset PL1' in m for m in messages))
+
+    def test_nonunique_initial_preset_is_rejected_without_writes(self):
+        client=RampClient();client.values['RAMP:STATUS_READ']=1
+        client.values['RAMP:MI1:STATUS_READ']=1
+        backend=EpicsBackend(ramp_profile(),client)
+        with self.assertRaisesRegex(RuntimeError,'not uniquely selected'):
+            backend.set_frequency(1000.)
+        self.assertEqual(client.calls,[])
+
+    def test_transition_wait_does_not_hide_hold_bad_status_or_disconnect(self):
+        client=RampClient();backend=EpicsBackend(ramp_profile(),client)
+        backend.set_frequency(-1000.)
+        target=dict(enabled=True,offset_hz=1000.)
+        client.values['RAMP:HOLD:STATUS_READ']=1
+        with self.assertRaisesRegex(RuntimeError,'HOLD'):backend.ramp.preset_matches(target)
+        client.values['RAMP:HOLD:STATUS_READ']=0
+        client.values['RAMP:PL1:STATUS_READ']=2
+        with self.assertRaisesRegex(RuntimeError,'Invalid ramp preset'):backend.ramp.preset_matches(target)
+        with patch.object(backend.ramp,'get',side_effect=RuntimeError('disconnected')):
+            with self.assertRaisesRegex(RuntimeError,'disconnected'):backend.ramp.preset_matches(target)
+
+    def test_failed_plus_transition_times_out_with_trace_and_restores(self):
+        for fault in ('no_selection','off'):
+            with self.subTest(fault=fault):
+                class StuckClient(RampClient):
+                    def caput(self,pv,value,**kwargs):
+                        result=super().caput(pv,value,**kwargs)
+                        if pv=='RAMP:PL1:ONOFF_SW':
+                            if fault=='off':self.values['RAMP:STATUS_READ']=0
+                            else:self.values['RAMP:PL1:STATUS_READ']=0
+                        return result
+                client=StuckClient();backend=EpicsBackend(ramp_profile(),client)
+                messages=[];backend.ramp.report=messages.append
+                before=backend.frequency_state();backend.set_frequency(-1000.)
+                # Match CorrectionService's final restoration even if the
+                # inner restoration cannot identify a unique current preset.
+                try:
+                    with self.assertRaisesRegex(RuntimeError,'timeout: preset PL1'):
+                        backend.set_frequency(1000.)
+                finally:backend.restore_frequency(before)
+                self.assertEqual(backend.frequency_state(),before)
+                failed=next(i for i,m in enumerate(messages) if 'failed before restoration:' in m)
+                restoring=next(i for i,m in enumerate(messages) if 'restoring ' in m)
+                self.assertLess(failed,restoring)
+                plus=messages.index('DeltaFRamp: command RAMP:PL1:ONOFF_SW=1')
+                self.assertFalse(any('CONTROL_ON_SW' in m for m in messages[plus:failed]))
+                self.assertEqual(messages[-1],'DeltaFRamp: restoration complete')
+
     def test_no_beam_stops_before_magnet_scan_with_intensity_diagnostic(self):
         client=FakeEpics();client.values['q']=[0.,0.]
         backend=EpicsBackend(fake_profile(),client)

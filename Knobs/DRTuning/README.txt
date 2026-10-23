@@ -22,11 +22,11 @@ The SAD preset reproduces the archived CODCorrection preparation:
 - Set corrector/skew excitation to zero ONLY in the reference model. Virtual
   excitation is relative to the captured current; proposal centers and current
   bounds still use absolute machine currents. SET is I_captured + delta.
-- Match QF1R/QF2R to configured tune targets, within +/-5%. Unstable trial steps
+- Match QF1R/QF2R to configured tune targets, within +/-5% by default. Unstable trial steps
   are rejected and shortened. If the SAD COD initial reference is unstable and
   model tune matching is enabled, first search a nearby stable QF1R/QF2R point
-  on an expanding bounded grid (0.01% to 5%). Every trial and the final fit stay
-  within +/-5% of the imported, calibrated family strengths. Final optics must
+  on an expanding bounded grid up to the configured limit. Every trial and the
+  final fit stay within that limit of the imported, calibrated family strengths. Final optics must
   pass the unchanged eigenvalue modulus tolerance 0.0002 and tune residual
   tolerance 1e-5. Failed search/fit restores model strengths and produces no
   correction. All captured currents / matching disabled still fail immediately.
@@ -245,7 +245,7 @@ Operator workflow:
    proposal. RESET restores the pre-SET snapshot as before.
 
 Model-only choices on correction pages:
-- Match model tunes: QF1R/QF2R family scaling, bounded to +/-5%, residual target
+- Match model tunes: QF1R/QF2R family scaling, default bound +/-5%, residual target
   1e-5. Stable symplectic eigenmodes retain the >0.5 tune branch. Real-waveform
   aliases are resolved only when the input explicitly identifies alias tunes.
   Failure to converge aborts before diagnostic writes. Model fit changes never
@@ -281,6 +281,23 @@ Model inputs and calibration:
   interface. Model inputs, raw PV values, ignored fixed actuators, lattice hash,
   tune matching and assumptions are saved in every model correction dataset.
 
+Model tune matching at a QF bound:
+The Newton update now solves a bounded linear least-squares problem using the
+remaining family ranges and a 0.5% per-iteration step cap. It no longer merely
+clips an unconstrained Newton direction, which could stall at one QF bound
+while improvement in the other family remained possible. Unstable trials are
+still rejected and backtracked; final stability and tune tolerances are unchanged.
+RFTrack model > Model QF matching limit (±) controls the shared model-only bound
+for Build model and COD/dispersion/skew CALC. Default 5%; editable 0.1..20%.
+Changing it invalidates existing proposals; it does not write real QF currents.
+Start with the default after updating. If the failed fit still reaches a bound,
+10% can be tried explicitly with Build model / optics. Inspect fitted QF changes
+and save diagnostics; reaching the tune targets alone does not validate beta or
+prove that the imported lattice/calibration matches the machine.
+The selected limit is captured as tune_match_max_scale in settings and max_scale
+in the matching report. Offline model_validation --settings uses the recorded
+limit (5% for old files). Limits are never expanded automatically on failure.
+
 Debugging unstable one-turn maps:
 - The error describes the imported RFTrack model, not measured beam stability.
   Initial imported optics are checked even when model tune matching is disabled.
@@ -294,7 +311,7 @@ Debugging unstable one-turn maps:
   current snapshot, tune targets, and matrix/eigenvalue diagnostics when present.
   If tune matching fails, tune_match_attempt also retains the target/resolved
   tune branches, stable seed, evaluated stable points, rejected unstable trials,
-  accepted iterates, final residual and active +/-5% bounds. Model strengths are
+  accepted iterates, final residual and active configured bounds. Model strengths are
   restored after failure; the retained final values describe the failed trial.
   A bound hit does not prove that no solution exists elsewhere inside the bounds.
   Saving does not read or write the machine. A partial capture failure may not
@@ -568,6 +585,14 @@ timeouts include read-only PV diagnostics captured before restoration. This
 sequence is tested offline; it does not establish the cause of a live MI1
 timeout. OFF retains SysID's CONTROL_OFF_SW=0 convention; the recovered Qt/mOTR
 code instead writes 1, so that discrepancy still needs site verification.
+During preset confirmation, a temporary zero/multiple selection is retried
+until the existing timeout; initial snapshots remain strict, and HOLD,
+invalid values and disconnected PVs still fail. Show detailed log records
+DeltaFRamp requests, command PV/value, preset/frequency confirmation and
+restoration through the worker's Qt signal. For a failed -1 -> +1 kHz scan,
+inspect the PL1 command and the failure BEFORE restoration: an OFF display
+afterward can be the scan's restoration to its original OFF state. These
+offline checks do not establish why a live controller failed to switch.
 Corrector/skew operations check current convergence without an extra fixed wait
 (magnet_settle_s defaults to 0). As in SysID, correction measurements use repeated
 BPM acquisition: the live GUI defaults to BPM samples per setting = 3 and BPM

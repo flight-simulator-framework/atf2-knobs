@@ -25,6 +25,21 @@ class GuiTests(unittest.TestCase):
             self.app.processEvents();time.sleep(.01)
             if time.monotonic()>deadline:raise AssertionError('Qt task timed out')
         self.app.processEvents()
+    def test_ramp_worker_messages_reach_log_and_callback_is_restored(self):
+        from Knobs.DRCorrection.ramp import DeltaRamp
+        ramp=DeltaRamp(None,None,{})
+        previous=ramp.report
+        self.window.backend.ramp=ramp
+        for fail in (False,True):
+            def action(progress):
+                ramp.trace('command RAMP:PL1:ONOFF_SW=1')
+                if fail:raise RuntimeError('test failure')
+            self.window.start(action,lambda result:None)
+            self.wait()
+            self.assertIs(ramp.report,previous)
+        text=self.window.messages.toPlainText()
+        self.assertEqual(text.count('DeltaFRamp: command RAMP:PL1:ONOFF_SW=1'),2)
+        self.assertIn('test failure',text)
     def test_live_sampling_defaults_and_editable_controls(self):
         from Knobs.DRTuning.presentation import reflow_correction
         backend=DemoBackend();backend.identity='epics:offline-ui-test'

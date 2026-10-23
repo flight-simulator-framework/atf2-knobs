@@ -113,6 +113,18 @@ class GuiTests(unittest.TestCase):
             self.app.processEvents();time.sleep(.01)
             if time.monotonic()>deadline:raise AssertionError('Qt task timeout')
         self.app.processEvents()
+    def test_ramp_worker_trace_is_available_in_detailed_log(self):
+        from Knobs.DRTuning.gui import TuningSession
+        from Knobs.DRCorrection.ramp import DeltaRamp
+        backend=QuadFixture();backend.ramp=DeltaRamp(None,None,{})
+        window=TuningSession(backend);window.show()
+        try:
+            window.start(lambda progress:backend.ramp.trace('command RAMP:PL1:ONOFF_SW=1'),
+                         lambda result:None,label='Test RF trace')
+            self.wait(window)
+            self.assertIn('DeltaFRamp: command RAMP:PL1:ONOFF_SW=1',window.messages.toPlainText())
+            self.assertFalse(window._failed)
+        finally:window.close()
     def test_original_qmod_buttons_scan_calculate_save(self):
         from Knobs.DRTuning.gui import TuningSession
         window=TuningSession(QuadFixture());window.show()

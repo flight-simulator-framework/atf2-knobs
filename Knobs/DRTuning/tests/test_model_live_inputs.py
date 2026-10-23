@@ -58,6 +58,7 @@ class LiveModelInputTests(unittest.TestCase):
         self.baseline['skews'][self.backend.skews[0]]=.1
         settings=capture_settings(self.backend,Options(excluded_bpms=('MB97R','MB98R'),fixed_actuators=('ZH15R','ZV16R')),self.baseline)
         self.assertEqual(settings['preparation'],'sad_cod')
+        self.assertEqual(settings['tune_match_max_scale'],.05)
         self.assertFalse(settings['coils']['QF1R.1']['trim_included'])
         self.assertFalse(settings['coils']['QM7AR.1']['trim_included'])
         self.assertTrue(settings['coils']['QM8R.1']['trim_included'])

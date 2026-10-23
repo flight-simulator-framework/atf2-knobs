@@ -3,7 +3,7 @@ import copy
 import json
 from pathlib import Path
 import numpy as np
-from PyQt6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QLabel,QFileDialog,QLineEdit,QFormLayout,QCheckBox,QComboBox
+from PyQt6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QLabel,QFileDialog,QLineEdit,QFormLayout,QCheckBox,QComboBox,QDoubleSpinBox
 from Knobs.DRCorrection.gui import Plot
 from Knobs.DRCorrection.core import serial
 from .presentation import button,group,scroll
@@ -33,7 +33,12 @@ class ModelPanel(QWidget):
             edit=QLineEdit(defaults[key]);form.addRow(label,edit);self.fields[key]=edit
             edit.editingFinished.connect(self.inputs_changed)
         self.match=QCheckBox('Match QF1R / QF2R in model only');self.match.setChecked(True);v.addWidget(self.match)
-        self.match.setToolTip('SAD COD reference: if initial optics are unstable, search model QF1R/QF2R within +/-5% first. Final stability and tune checks still apply; no machine writes.')
+        self.match.setToolTip('SAD COD reference: if initial optics are unstable, search model QF1R/QF2R within the selected limit first. Final stability and tune checks still apply; no machine writes.')
+        self.match_limit=QDoubleSpinBox();self.match_limit.setRange(.1,20.);self.match_limit.setDecimals(1)
+        self.match_limit.setSuffix(' %');self.match_limit.setValue(100*preparation_config(window.backend)['tune_match_max_scale'])
+        self.match_limit.setToolTip('Maximum model strength change from imported QF1R/QF2R values. Shared by Build model and correction CALC. No machine QF current writes. Default 5%; changing this invalidates proposals.')
+        form.addRow('Model QF matching limit (±)',self.match_limit)
+        self.match_limit.valueChanged.connect(self.inputs_changed)
         row=QHBoxLayout();v.addLayout(row)
         row.addWidget(button('Load lattice export',self.load_lattice));row.addWidget(button('Load model factors',self.load_factors))
         row.addWidget(button('Exclude unmapped BPMs / magnets',self.exclude_unmapped))
@@ -48,7 +53,7 @@ class ModelPanel(QWidget):
     def manager(self):return self.window.service.model_manager
     def config(self):
         backend=self.window.backend;c=copy.deepcopy(getattr(backend,'model_config',{}))
-        c.update(preparation=self.preparation.currentData(),energy_pv=self.fields['energy_pv'].text().strip(),tune_pvs=[self.fields[k].text().strip() for k in ('tune_x','tune_y')],
+        c.update(preparation=self.preparation.currentData(),tune_match_max_scale=self.match_limit.value()/100.,energy_pv=self.fields['energy_pv'].text().strip(),tune_pvs=[self.fields[k].text().strip() for k in ('tune_x','tune_y')],
                  skew_calibration_pvs={f:self.fields[k].text().strip() for f,k in [('SD','skew_sd'),('SF','skew_sf')]})
         backend.model_config=c
     def inputs_changed(self):
