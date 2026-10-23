@@ -149,6 +149,18 @@ class CompletionTests(unittest.TestCase):
             self.window._save_tempfiles_export(self.window._save_live_plot_snapshot(opt.RUN_PROFILE_MAIN), opt.RUN_PROFILE_MAIN)
         ask.assert_not_called()
 
+    def test_export_ignores_extreme_window_aspect_and_restores_live_size(self):
+        self.prepare_run(opt.RUN_PROFILE_MAIN)
+        self.window.eval_fig.set_size_inches(30, 3, forward=False)
+        self.window.bo1d_fig.set_size_inches(28, 3, forward=False)
+        plots = self.window._save_live_plot_snapshot(opt.RUN_PROFILE_MAIN)
+        self.assertEqual(len(plots), 2)
+        for path in plots:
+            image = QImage(str(path))
+            self.assertLess(image.width() / image.height(), 1.8)
+        np.testing.assert_allclose(self.window.eval_fig.get_size_inches(), [30, 3])
+        np.testing.assert_allclose(self.window.bo1d_fig.get_size_inches(), [28, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

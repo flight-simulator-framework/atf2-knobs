@@ -601,6 +601,11 @@ the total per setting is about 3 s plus communication time. Means, population
 standard deviations and raw samples are saved. A BPM must be valid in every
 sample to be fitted. Samples are not certified independent/fresh shots: COD
 does not yet verify waveform timestamps/shot IDs. RF/quad waits remain separate.
+After Apply correction (SET), COD/dispersion/skew verification waits an additional
+5 s after all correction-current writes/readback checks complete. The status
+shows this wait; cancellation restores the pre-SET settings without measuring.
+Existing BPM sampling/RF settling follows this wait. CALC probe timing is
+unchanged. Saved successful results record after_set_settle_s = 5.
 Missing horizontal dispersion targets or live phase/SR optics are requested by
 their respective analyses; they do not block startup or unrelated tools.
 

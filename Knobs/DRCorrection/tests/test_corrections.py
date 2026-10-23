@@ -3,6 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import numpy as np
 from Knobs.DRCorrection.backends import DemoBackend,EpicsBackend,HERE,profile_issues
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled,save_session,load_session,export_curves
@@ -14,6 +15,34 @@ class CorrectionTests(unittest.TestCase):
     def setUp(self):
         self.b=DemoBackend();self.s=CorrectionService(self.b)
         self.o=Options(probe1=self.b.hcorrectors[0],probe2=self.b.hcorrectors[6])
+    def test_set_waits_after_writes_before_verification_in_every_mode(self):
+        for mode in ('orbit','dispersion','skew'):
+            with self.subTest(mode=mode):
+                data=self.s.calculate(mode,self.o);reads=self.b.acquisitions
+                events=[]
+                def wait(seconds):
+                    events.append(('wait',seconds))
+                    self.assertEqual(self.b.acquisitions,reads)
+                    np.testing.assert_allclose(self.b.read(data['kind'],data['actuators']),
+                                               np.asarray(data['centers'])+data['delta'])
+                    return False
+                signal=self.s._signal
+                def measure(*args):
+                    self.assertIn(('wait',5.),events)
+                    events.append(('measure',mode));return signal(*args)
+                with patch.object(self.s.cancel,'wait',side_effect=wait),patch.object(self.s,'_signal',side_effect=measure):
+                    self.s.apply(data,lambda n,text:events.append(('progress',text)))
+                self.assertEqual(data['after_set_settle_s'],5.)
+                self.assertGreater(self.b.acquisitions,reads)
+                self.s.reset()
+    def test_cancel_during_set_wait_restores_without_verification(self):
+        data=self.s.calculate('orbit',self.o);before=self.b.snapshot();reads=self.b.acquisitions
+        def cancel(seconds):self.s.cancel.set();return True
+        with patch.object(self.s.cancel,'wait',side_effect=cancel) as wait:
+            with self.assertRaises(Cancelled):self.s.apply(data)
+        wait.assert_called_once_with(5.)
+        self.assertEqual(self.b.snapshot(),before);self.assertEqual(self.b.acquisitions,reads)
+        self.assertFalse(data.get('applied'));self.assertEqual(self.s.undo,[])
     def test_ported_proposals_apply_and_reset(self):
         baseline=self.b.snapshot()
         for mode in ('orbit','dispersion','skew'):

@@ -41,6 +41,14 @@ def save_plot_montage(paths: List[Path], destination: Path, *, panel_width: int 
     gap = 24
     width = max(p.width() for p in panels)
     heights = [max(p.height() for p in panels[i:i + columns]) for i in range(0, len(panels), columns)]
+    # Wide plots become unreadable when tiled side by side. Prefer a portrait
+    # stack if either the panels or the resulting sheet are too wide.
+    sheet_width = columns * width + (columns + 1) * gap
+    sheet_height = sum(heights) + (len(heights) + 1) * gap
+    if columns > 1 and (sheet_width / sheet_height > 1.8
+                        or any(p.width() / p.height() > 2.2 for p in panels)):
+        columns = 1
+        heights = [p.height() for p in panels]
     canvas = QImage(columns * width + (columns + 1) * gap,
                     sum(heights) + (len(heights) + 1) * gap, QImage.Format.Format_RGB32)
     if canvas.isNull():

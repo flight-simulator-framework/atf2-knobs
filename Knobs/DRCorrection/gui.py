@@ -340,7 +340,7 @@ class CorrectionPanel(QWidget):
         self.result_tabs.setCurrentIndex(1)
 
     def apply(self):
-        if self.data:self.window.start(lambda _:self.window.service.apply(self.data),self.display)
+        if self.data:self.window.start(lambda progress:self.window.service.apply(self.data,progress),self.display)
 
     def reset(self):
         def finished(_):

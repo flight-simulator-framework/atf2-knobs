@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
     QFileDialog, QGroupBox, QMessageBox, QTabWidget, QCheckBox,
-    QPlainTextEdit, QLineEdit, QStackedWidget, QScrollArea, QFrame, QSizePolicy,
+    QPlainTextEdit, QLineEdit, QStackedWidget, QSplitter, QScrollArea, QFrame, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView, QButtonGroup, QRadioButton,
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -83,6 +83,7 @@ EPICSIPBSMController = _IPBSM_OPT.EPICSIPBSMController
 DAT_CSV_COLUMNS = _IPBSM_OPT.DAT_CSV_COLUMNS
 IPBSMInterface = _IPBSM_OPT.IPBSMInterface
 from Knobs.ipbsm_opt_plotting import save_plot_montage
+from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, PlotImage
 
 
 ZSCAN_DEFAULT_RANGE = 0.0085
@@ -295,6 +296,7 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(root)
 
         self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(TAB_STYLE)
         outer.addWidget(self.tabs)
 
         self.main_tab = QWidget()
@@ -333,48 +335,44 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText(text)
         self.status_lbl.setStyleSheet(
             "QLabel#statusBadge {"
-            f"font-size: 24px; font-weight: 800; color: {fg}; "
+            f"font-size: 14px; font-weight: 600; color: {fg}; "
             f"background: {bg}; border: 2px solid {bd}; "
             "border-radius: 10px; padding: 8px 14px;"
             "}"
         )
 
     def _build_main_tab(self):
-        layout = QVBoxLayout(self.main_tab)
-        self.main_tab.setStyleSheet(
-            "QGroupBox { font-size: 19px; font-weight: 700; margin-top: 10px; } "
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; } "
-            "QLabel { font-size: 17px; } "
-            "QCheckBox { font-size: 19px; font-weight: 500; spacing: 10px; } "
-            "QCheckBox[knobCheck=\"true\"] { font-size: 21px; font-weight: 500; } "
-            "QCheckBox[knobCheck=\"true\"]:checked { font-size: 24px; font-weight: 800; color: #111827; } "
+        root = QVBoxLayout(self.main_tab)
+        root.setContentsMargins(8, 8, 8, 8)
+        self.workspace = OptimizerWorkspace()
+        root.addWidget(self.workspace)
+        layout = self.workspace.controls_layout
+        monitor = self.workspace.monitor_layout
+        self.main_tab.setStyleSheet(WORKSPACE_STYLE +
             "QCheckBox[knobCheck=\"true\"][scanActive=\"true\"] { "
             "background: #fff4ce; border: 1px solid #f59e0b; border-radius: 6px; padding: 2px 8px; } "
             "QCheckBox[knobCheck=\"true\"][scanActive=\"true\"][scanBlink=\"true\"] { "
-            "background: #f59e0b; color: #111827; font-weight: 900; } "
+            "background: #f59e0b; color: #111827; font-weight: 600; } "
             "QCheckBox[knobCheck=\"true\"][scanDone=\"true\"] { "
             "background: #dcfce7; border: 1px solid #22c55e; border-radius: 6px; "
             "padding: 2px 8px; color: #166534; font-weight: 850; } "
             "QCheckBox[knobCheck=\"true\"][scanWaiting=\"true\"] { "
             "background: #e5e7eb; border: 1px solid #9ca3af; border-radius: 6px; "
             "padding: 2px 8px; color: #374151; font-weight: 700; } "
-            "QCheckBox::indicator { width: 22px; height: 22px; } "
-            "QPlainTextEdit { font-size: 15px; } "
-            "QLineEdit, QComboBox { font-size: 17px; min-height: 34px; }"
         )
 
         knob_group = QGroupBox("Knobs To Scan")
         layout.addWidget(knob_group)
         knob_layout = QVBoxLayout(knob_group)
 
-        preset_row = QHBoxLayout()
+        preset_row = QGridLayout()
         self.linear_preset_btn = QPushButton("Linear Knobs")
         self.nonlinear_preset_btn = QPushButton("Nonlinear Knobs")
         self.corrector_preset_btn = QPushButton("Corrector Knobs")
         self.zay_preset_btn = QPushButton("Z and Ay")
         self.selected_knobs_lbl = QLabel("")
         preset_button_css = (
-            "QPushButton { font-size: 20px; font-weight: 700; padding: 14px 24px; min-height: 52px; }"
+            "QPushButton { font-size: 14px; font-weight: 700; padding: 5px 8px; min-height: 28px; }"
         )
         self.linear_preset_btn.setStyleSheet(
             preset_button_css + " QPushButton { background: #0f5c7a; color: white; }"
@@ -388,13 +386,13 @@ class MainWindow(QMainWindow):
         self.zay_preset_btn.setStyleSheet(
             preset_button_css + " QPushButton { background: #8a5a12; color: white; }"
         )
-        self.selected_knobs_lbl.setStyleSheet("font-size: 24px; font-weight: 800; color: #0f172a;")
+        self.selected_knobs_lbl.setStyleSheet("font-size: 14px; font-weight: 600; color: #0f172a;")
         self.selected_knobs_lbl.setVisible(False)
-        preset_row.addWidget(self.linear_preset_btn)
-        preset_row.addWidget(self.nonlinear_preset_btn)
-        preset_row.addWidget(self.corrector_preset_btn)
-        preset_row.addWidget(self.zay_preset_btn)
-        preset_row.addWidget(self.selected_knobs_lbl, stretch=1)
+        preset_row.addWidget(self.linear_preset_btn, 0, 0)
+        preset_row.addWidget(self.nonlinear_preset_btn, 0, 1)
+        preset_row.addWidget(self.corrector_preset_btn, 1, 0)
+        preset_row.addWidget(self.zay_preset_btn, 1, 1)
+        preset_row.addWidget(self.selected_knobs_lbl, 2, 0, 1, 2)
         knob_layout.addLayout(preset_row)
 
         self.knob_checks: Dict[str, QCheckBox] = {}
@@ -439,7 +437,7 @@ class MainWindow(QMainWindow):
             corrector_layout.addWidget(box, idx // 2, idx % 2)
 
         zscan_group = QGroupBox("Z Scan Knob")
-        zscan_layout = QHBoxLayout(zscan_group)
+        zscan_layout = QGridLayout(zscan_group)
         knob_layout.addWidget(zscan_group)
         for name in ZSCAN_KNOBS:
             box = QCheckBox(name)
@@ -449,28 +447,29 @@ class MainWindow(QMainWindow):
             box.setProperty("scanDone", False)
             box.setProperty("scanWaiting", False)
             self.knob_checks[name] = box
-            zscan_layout.addWidget(box)
+            zscan_layout.addWidget(box, 0, 0)
         self.zscan_method_lbl = QLabel("Method")
         self.zscan_method_lbl.setStyleSheet("font-weight: 700; color: #1f2937;")
-        zscan_layout.addWidget(self.zscan_method_lbl)
+        zscan_layout.addWidget(self.zscan_method_lbl, 0, 1)
         self.zscan_method_group = QButtonGroup(self)
         self.zscan_method_bo = QRadioButton("BO")
         self.zscan_method_gf = QRadioButton("GF")
         self.zscan_method_group.addButton(self.zscan_method_bo)
         self.zscan_method_group.addButton(self.zscan_method_gf)
         self.zscan_method_bo.setChecked(True)
-        zscan_layout.addWidget(self.zscan_method_bo)
-        zscan_layout.addWidget(self.zscan_method_gf)
+        zscan_layout.addWidget(self.zscan_method_bo, 0, 2)
+        zscan_layout.addWidget(self.zscan_method_gf, 0, 3)
         self.zscan_status_lbl = QLabel("")
         self.zscan_status_lbl.setStyleSheet("color: #3f4a54;")
-        zscan_layout.addWidget(self.zscan_status_lbl)
-        zscan_layout.addStretch(1)
+        self.zscan_status_lbl.setWordWrap(True)
+        zscan_layout.addWidget(self.zscan_status_lbl, 1, 0, 1, 4)
+        zscan_layout.setColumnStretch(0, 1)
 
         ctrl_group = QGroupBox("Run Control")
         layout.addWidget(ctrl_group)
         ctrl_layout = QVBoxLayout(ctrl_group)
 
-        quick_row = QHBoxLayout()
+        quick_row = QGridLayout()
         self.main_method_box = ClickOpenComboBox()
         self.main_method_box.addItems(["BO", "Sequential"])
         self.main_method_box.setEditable(True)
@@ -479,7 +478,7 @@ class MainWindow(QMainWindow):
         for i in range(self.main_method_box.count()):
             self.main_method_box.setItemData(i, Qt.AlignmentFlag.AlignCenter, Qt.ItemDataRole.TextAlignmentRole)
         self.main_method_box.setStyleSheet(
-            "QComboBox { font-size: 24px; font-weight: 800; min-height: 44px; padding: 2px 10px; }"
+            "QComboBox { font-size: 14px; font-weight: 600; min-height: 26px; padding: 2px 10px; }"
         )
         self.main_sigma_mode_box = ClickOpenComboBox()
         self.main_sigma_mode_box.addItems(["2-8", "30", "174"])
@@ -490,18 +489,17 @@ class MainWindow(QMainWindow):
         for i in range(self.main_sigma_mode_box.count()):
             self.main_sigma_mode_box.setItemData(i, Qt.AlignmentFlag.AlignCenter, Qt.ItemDataRole.TextAlignmentRole)
         self.main_sigma_mode_box.setStyleSheet(
-            "QComboBox { font-size: 24px; font-weight: 800; min-height: 44px; padding: 2px 10px; }"
+            "QComboBox { font-size: 14px; font-weight: 600; min-height: 26px; padding: 2px 10px; }"
         )
         method_lbl = QLabel("Method")
-        method_lbl.setStyleSheet("font-size: 24px; font-weight: 900; color: #111827;")
+        method_lbl.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
         sigma_lbl = QLabel("Crossing Angle")
-        sigma_lbl.setStyleSheet("font-size: 24px; font-weight: 900; color: #111827;")
-        quick_row.addWidget(method_lbl)
-        quick_row.addWidget(self.main_method_box)
-        quick_row.addSpacing(16)
-        quick_row.addWidget(sigma_lbl)
-        quick_row.addWidget(self.main_sigma_mode_box)
-        quick_row.addStretch(1)
+        sigma_lbl.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
+        quick_row.addWidget(method_lbl, 0, 0)
+        quick_row.addWidget(self.main_method_box, 0, 1)
+        quick_row.addWidget(sigma_lbl, 1, 0)
+        quick_row.addWidget(self.main_sigma_mode_box, 1, 1)
+        quick_row.setColumnStretch(1, 1)
         ctrl_layout.addLayout(quick_row)
 
         button_row = QHBoxLayout()
@@ -512,12 +510,12 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
 
         big_button_css = (
-            "QPushButton { font-size: 22px; font-weight: 700; padding: 16px 28px; min-height: 56px; }"
+            "QPushButton { font-size: 15px; font-weight: 700; padding: 6px 10px; min-height: 30px; }"
         )
         self.run_btn.setStyleSheet(big_button_css + " QPushButton { background: #1f7a1f; color: white; }")
         self.stop_btn.setStyleSheet(big_button_css + " QPushButton { background: #a32020; color: white; }")
         self.reset_initial_btn.setStyleSheet(
-            "QPushButton { font-size: 18px; font-weight: 700; padding: 14px 22px; min-height: 52px; background: #585f66; color: white; }"
+            "QPushButton { font-size: 13px; font-weight: 700; padding: 6px 10px; min-height: 28px; background: #585f66; color: white; }"
         )
         button_row.addWidget(self.run_btn)
         button_row.addWidget(self.stop_btn)
@@ -538,14 +536,14 @@ class MainWindow(QMainWindow):
         self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("statusBadge")
         self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_lbl.setMinimumHeight(54)
+        self.status_lbl.setMinimumHeight(34)
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
-        layout.addWidget(self.status_lbl)
+        ctrl_layout.addWidget(self.status_lbl)
         self._set_status("Status: IDLE", state="idle")
 
-        plot_group = QGroupBox("Main View")
-        layout.addWidget(plot_group, stretch=1)
+        plot_group = QGroupBox("Live plots / Results")
+        monitor.addWidget(plot_group, stretch=1)
         plot_layout = QVBoxLayout(plot_group)
         self.main_view_stack = QStackedWidget()
         plot_layout.addWidget(self.main_view_stack)
@@ -553,17 +551,25 @@ class MainWindow(QMainWindow):
         live_view = QWidget()
         live_layout = QVBoxLayout(live_view)
         live_layout.setContentsMargins(0, 0, 0, 0)
-        self.fig = Figure(figsize=(9, 6), tight_layout=True)
+        self.fig = Figure(figsize=(9, 6), layout="constrained")
         self.canvas = FigureCanvas(self.fig)
         self.ax_live = self.fig.add_subplot(211)
         self.ax_live_avg = self.fig.add_subplot(212, sharex=self.ax_live)
-        live_layout.addWidget(self.canvas)
-        self.bo1d_fig = Figure(figsize=(9, 5.2), tight_layout=True)
+        self.plot_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.plot_splitter.setChildrenCollapsible(False)
+        self.canvas.setMinimumHeight(230)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.plot_splitter.addWidget(self.canvas)
+        live_layout.addWidget(self.plot_splitter)
+        self.bo1d_fig = Figure(figsize=(9, 5.2), layout="constrained")
         self.bo1d_canvas = FigureCanvas(self.bo1d_fig)
         self.bo1d_ax_obj = self.bo1d_fig.add_subplot(211)
         self.bo1d_ax_acq = self.bo1d_fig.add_subplot(212, sharex=self.bo1d_ax_obj)
         self.bo1d_canvas.setVisible(False)
-        live_layout.addWidget(self.bo1d_canvas)
+        self.bo1d_canvas.setMinimumHeight(210)
+        self.bo1d_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.plot_splitter.addWidget(self.bo1d_canvas)
+        self.plot_splitter.setSizes([420, 300])
         self.main_view_stack.addWidget(live_view)
 
         self.gallery_scroll = QScrollArea()
@@ -579,12 +585,9 @@ class MainWindow(QMainWindow):
         self.gallery_scroll.setWidget(self.gallery_widget)
         self.main_view_stack.addWidget(self.gallery_scroll)
 
-        log_group = QGroupBox("Log")
-        layout.addWidget(log_group, stretch=1)
-        log_layout = QVBoxLayout(log_group)
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
-        log_layout.addWidget(self.log_box)
+        self.workspace.add_log(self.log_box)
 
         self.result_lbl = QLabel("Result: -")
         self.result_lbl.setObjectName("resultBadge")
@@ -592,12 +595,12 @@ class MainWindow(QMainWindow):
         self.result_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.result_lbl.setStyleSheet(
             "QLabel#resultBadge { "
-            "font-size: 18px; font-weight: 700; color: #0f172a; "
-            "background: #ecf5ff; border: 2px solid #93c5fd; border-radius: 8px; "
-            "padding: 10px 12px; }"
+            "font-size: 13px; font-weight: 700; color: #0f172a; "
+            "background: #ecf5ff; border: 1px solid #bfdbfe; border-radius: 8px; "
+            "padding: 6px 8px; }"
         )
         self.result_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.result_lbl)
+        monitor.addWidget(self.result_lbl)
 
         state_group = QGroupBox("Machine Setpoint State (Initial / Current)")
         state_layout = QVBoxLayout(state_group)
@@ -618,7 +621,14 @@ class MainWindow(QMainWindow):
         self.gallery_layout.addStretch(1)
 
     def _build_config_tab(self):
-        layout = QVBoxLayout(self.config_tab)
+        self.config_tab.setStyleSheet(WORKSPACE_STYLE)
+        outer = QVBoxLayout(self.config_tab)
+        self.config_scroll = QScrollArea()
+        self.config_scroll.setWidgetResizable(True)
+        page = QWidget()
+        self.config_scroll.setWidget(page)
+        outer.addWidget(self.config_scroll)
+        layout = QVBoxLayout(page)
         layout.setSpacing(10)
 
         cfg_group = QGroupBox("Optimization Settings")
@@ -1803,22 +1813,9 @@ class MainWindow(QMainWindow):
         self._clear_gallery()
         if not png_paths:
             return
-        cols = 2
-        try:
-            viewport_w = int(self.gallery_scroll.viewport().width())
-            viewport_h = int(self.gallery_scroll.viewport().height())
-        except Exception:
-            viewport_w = 0
-            viewport_h = 0
-        if viewport_w <= 240:
-            viewport_w = 1100
-        if viewport_h <= 180:
-            viewport_h = 900
-        # Keep plots readable even when additional widgets exist in the same scroll area.
-        full_width = max(760, min(1400, viewport_w - 80))
-        two_col_width = max(420, min(860, (viewport_w - 110) // 2))
-        full_height = max(340, min(760, int(full_width * 0.55)))
-        two_col_height = max(260, min(620, int(two_col_width * 0.62)))
+        viewport_w = self.gallery_scroll.viewport().width()
+        # One column in the side monitor; two only when each plot has room.
+        cols = 2 if viewport_w >= 1100 else 1
 
         def _add_frame(
             path: Path,
@@ -1826,8 +1823,6 @@ class MainWindow(QMainWindow):
             col: int,
             *,
             col_span: int = 1,
-            width: int = 520,
-            height: int = 320,
         ) -> None:
             frame = QFrame()
             frame.setFrameShape(QFrame.Shape.StyledPanel)
@@ -1835,22 +1830,12 @@ class MainWindow(QMainWindow):
 
             lbl = QLabel(path.name)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setWordWrap(True)
+            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             v.addWidget(lbl)
 
-            img = QLabel()
-            img.setAlignment(Qt.AlignmentFlag.AlignCenter)
             pix = QPixmap(str(path))
-            if not pix.isNull():
-                img.setPixmap(
-                    pix.scaled(
-                        width,
-                        height,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
-            else:
-                img.setText("(failed to load)")
+            img = PlotImage(pix) if not pix.isNull() else QLabel("(failed to load)")
             v.addWidget(img)
 
             self.gallery_grid.addWidget(frame, row, col, 1, col_span)
@@ -1858,7 +1843,7 @@ class MainWindow(QMainWindow):
         if bo_main_layout:
             # BO Main View policy:
             # 1) Modulation/Average first and vertically stacked
-            # 2) only 1D plots in a 2-column grid
+            # 2) 1D plots in one or two columns, depending on monitor width
             # 3) hide any 2D / BO GP heatmap images
             mod_path = None
             avg_path = None
@@ -1878,16 +1863,16 @@ class MainWindow(QMainWindow):
 
             r = 0
             if mod_path is not None:
-                _add_frame(mod_path, r, 0, col_span=2, width=full_width, height=full_height)
+                _add_frame(mod_path, r, 0, col_span=cols)
                 r += 1
             if avg_path is not None:
-                _add_frame(avg_path, r, 0, col_span=2, width=full_width, height=full_height)
+                _add_frame(avg_path, r, 0, col_span=cols)
                 r += 1
 
             one_d_paths = sorted(one_d_paths, key=lambda p: str(p))
             c = 0
             for p in one_d_paths:
-                _add_frame(p, r, c, width=two_col_width, height=two_col_height)
+                _add_frame(p, r, c)
                 c += 1
                 if c >= cols:
                     c = 0
@@ -1896,7 +1881,6 @@ class MainWindow(QMainWindow):
 
         mod_name = "_modulation_vs_evaluation.png"
         avg_name = "_average_vs_evaluation.png"
-        pair_height = max(220, min(480, int(two_col_width * 0.45)))
 
         r = 0
         c = 0
@@ -1911,18 +1895,18 @@ class MainWindow(QMainWindow):
                     (name.endswith(mod_name) and name_next.endswith(avg_name))
                     or (name.endswith(avg_name) and name_next.endswith(mod_name))
                 )
-            if pair_next:
+            if pair_next and cols > 1:
                 if c != 0:
                     c = 0
                     r += 1
-                _add_frame(path, r, 0, width=two_col_width, height=pair_height)
-                _add_frame(png_paths[i + 1], r, 1, width=two_col_width, height=pair_height)
+                _add_frame(path, r, 0)
+                _add_frame(png_paths[i + 1], r, 1)
                 i += 2
                 c = 0
                 r += 1
                 continue
 
-            _add_frame(path, r, c, width=two_col_width, height=two_col_height)
+            _add_frame(path, r, c)
             i += 1
             c += 1
             if c >= cols:
@@ -2084,10 +2068,10 @@ class MainWindow(QMainWindow):
 
         handles_obj, labels_obj = self.bo1d_ax_obj.get_legend_handles_labels()
         if handles_obj:
-            self.bo1d_ax_obj.legend(loc="best")
+            self.bo1d_ax_obj.legend(loc="best", fontsize=8)
         handles_acq, labels_acq = self.bo1d_ax_acq.get_legend_handles_labels()
         if handles_acq:
-            self.bo1d_ax_acq.legend(loc="best")
+            self.bo1d_ax_acq.legend(loc="best", fontsize=8)
         self.bo1d_canvas.draw_idle()
 
     def _prime_live_history(self, warm_start_rows: List[Dict], discarded_rows: Optional[List[Dict]] = None) -> None:
@@ -2932,7 +2916,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication([])
     w = MainWindow()
-    w.resize(1280, 920)
+    w.resize(1440, 900)
     w.show()
     app.exec()
 

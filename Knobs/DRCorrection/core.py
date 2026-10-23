@@ -396,7 +396,7 @@ class CorrectionService:
             raise ValueError('File is not a matching correction dataset')
         if data['options']['plane']!=opt.plane and mode!='skew':
             raise ValueError('Select the same H/V plane as the file before CALC (FILE)')
-        for key in ('after','full_after','after_valid','after_orbit_measurements','assessment','applied_actuators'):data.pop(key,None)
+        for key in ('after','full_after','after_valid','after_orbit_measurements','after_set_settle_s','assessment','applied_actuators'):data.pop(key,None)
         names=data['names'];actuators=data['actuators']
         measured=np.asarray(data['measured'],float);target=np.asarray(data['target'],float)
         response=np.asarray(data['response'],float)
@@ -483,7 +483,7 @@ class CorrectionService:
             data['full_fitted']=full-data['full_predicted']
         return data
 
-    def apply(self,data):
+    def apply(self,data,progress=lambda *_:None):
         self.check_cancel()
         validate_bpm_sampling(Options(**data['options']))
         if data.get('backend_id')!=self.backend.identity:raise ValueError('Proposal belongs to another backend')
@@ -510,6 +510,13 @@ class CorrectionService:
         try:
             values=np.asarray(data['centers'])+np.asarray(data['delta'])
             self.backend.write(data['kind'],[data['actuators'][i] for i in changed],values[changed])
+            # Wait once after ALL correction currents have settled, before
+            # starting any verification orbit/RF/skew measurement. Keep CALC
+            # probe timing and the existing BPM averaging cadence unchanged.
+            progress(0,'SET complete: waiting 5 s before after-SET measurement')
+            self.cancel.wait(5.)
+            self.check_cancel()
+            progress(0,'Measuring after SET')
             measured,valid=self._signal(data['mode'],Options(**data['options']))
         except Exception:
             self.backend.restore(before);raise
@@ -518,6 +525,7 @@ class CorrectionService:
         data['after']=measured[:,indices];data['after_valid']=valid[indices];data['applied']=True
         data['full_after']=self.full_signal[:,indices].copy()
         data['after_orbit_measurements']=self.orbit_measurements
+        data['after_set_settle_s']=5.
         data['applied_actuators']=[data['actuators'][i] for i in changed]
         data['assessment']=assess(data)
         return data

@@ -94,6 +94,30 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual(image.pixelColor(x, y), QColor(color))
         self.assertEqual(list(output.iterdir()), [destination])
 
+    def test_wide_panels_are_stacked_without_losing_any_panel(self):
+        plots = []
+        for i, color in enumerate(("red", "green", "blue")):
+            panel = QImage(1600, 400, QImage.Format.Format_RGB32)
+            panel.fill(QColor(color))
+            path = self.root / f"wide-{i}.png"
+            panel.save(str(path))
+            plots.append(path)
+        result = QImage(str(save_plot_montage(plots, self.root / "wide-combined.png")))
+        self.assertEqual((result.width(), result.height()), (1648, 1296))
+        for row, color in enumerate(("red", "green", "blue")):
+            self.assertEqual(result.pixelColor(30, 30 + row * 424), QColor(color))
+
+    def test_landscape_sheet_switches_to_one_column(self):
+        plots = []
+        for i in range(2):
+            panel = QImage(1600, 1000, QImage.Format.Format_RGB32)
+            panel.fill(QColor("white"))
+            path = self.root / f"landscape-{i}.png"
+            panel.save(str(path))
+            plots.append(path)
+        result = QImage(str(save_plot_montage(plots, self.root / "stack.png")))
+        self.assertLess(result.width(), result.height())
+
     def test_export_saves_without_confirmation(self):
         plots = self._plots()
         with patch.object(gui, "IPBSM_TEMPFILES_DIR", self.root), \

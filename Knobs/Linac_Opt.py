@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QCheckBox, QLabel, QFileDialog, QTextEdit, QGroupBox,
     QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox, QTabWidget, QSizePolicy, QLineEdit,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QStackedWidget, QScrollArea
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QStackedWidget, QSplitter, QScrollArea
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -55,6 +55,7 @@ from machine_interfaces_atf2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT,
 from machine_interfaces_atf2.InterfaceATF2_DR import DRBPMReader, DR_BPM_NAMES, DRBPMTurnControlError
 from linac_gp import CorrectorGPModel
 from Knobs.ipbsm_opt_plotting import save_plot_montage
+from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, WrappingLabel
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
@@ -3193,7 +3194,7 @@ class MainWindow(QMainWindow):
         from Knobs.DRCorrection.input_guard import protect_settings_from_wheel
         protect_settings_from_wheel(self)
         self.setWindowTitle("Linac Optimization GUI")
-        self.resize(1180, 900)
+        self.resize(1440, 900)
 
         self.worker: Optional[OptimizationWorker] = None
         self.interface: Optional[InterfaceATF2_LinacBT] = None
@@ -3264,23 +3265,21 @@ class MainWindow(QMainWindow):
         self._set_status("Status: IDLE", state="idle", profile=RUN_PROFILE_DEVELOPER)
 
     def _create_eval_plot_bundle(self):
-        fig = Figure(figsize=(8.8, 5.6))
+        fig = Figure(figsize=(8.8, 5.6), layout="constrained")
         ax_ttot = fig.add_subplot(211)
         ax_metric = fig.add_subplot(212)
-        fig.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.12, hspace=0.42)
         canvas = FigureCanvas(fig)
-        canvas.setMinimumHeight(340)
-        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        canvas.setMinimumHeight(230)
+        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         return fig, canvas, ax_ttot, ax_metric
 
     def _create_bo1d_plot_bundle(self):
-        fig = Figure(figsize=(8.8, 5.0))
+        fig = Figure(figsize=(8.8, 5.0), layout="constrained")
         ax_obj = fig.add_subplot(211)
         ax_acq = fig.add_subplot(212, sharex=ax_obj)
-        fig.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.12, hspace=0.42)
         canvas = FigureCanvas(fig)
-        canvas.setMinimumHeight(280)
-        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        canvas.setMinimumHeight(210)
+        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         canvas.setVisible(False)
         return fig, canvas, ax_obj, ax_acq
 
@@ -3290,9 +3289,7 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(cw)
 
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            "QTabBar::tab { font-size: 16px; font-weight: 600; padding: 8px 18px; min-width: 120px; }"
-        )
+        self.tabs.setStyleSheet(TAB_STYLE)
         root.addWidget(self.tabs)
         self.main_tab = QWidget()
         self.config_tab = QWidget()
@@ -3308,7 +3305,7 @@ class MainWindow(QMainWindow):
         self.objective_row.addWidget(QLabel("Objective"))
         self.objective_box = self.dev_objective_box
         self.objective_row.addWidget(self.objective_box)
-        self.objective_row.addWidget(QLabel("BPM intensity: LINAC / BT / DR"))
+        self.objective_box.setToolTip("BPM intensity: LINAC / BT / DR")
         self.objective_row.addStretch(1)
         refresh_row = QHBoxLayout()
         self.dev_refresh_btn.setFixedWidth(240)
@@ -3338,23 +3335,19 @@ class MainWindow(QMainWindow):
         self.dev_objective_box.currentTextChanged.connect(self._update_developer_objective_ui)
 
     def _build_main_tab(self):
-        layout = QVBoxLayout(self.main_tab)
+        root = QVBoxLayout(self.main_tab)
+        root.setContentsMargins(8, 8, 8, 8)
+        self.workspace = OptimizerWorkspace(controls_width=480)
+        root.addWidget(self.workspace)
+        layout = self.workspace.controls_layout
+        monitor = self.workspace.monitor_layout
         layout.setSpacing(10)
-        self.main_tab.setStyleSheet(
-            "QGroupBox { font-size: 19px; font-weight: 700; margin-top: 10px; } "
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; } "
-            "QLabel { font-size: 17px; } "
-            "QCheckBox { font-size: 19px; font-weight: 500; spacing: 10px; } "
-            "QCheckBox[knobCheck=\"true\"] { font-size: 21px; font-weight: 500; } "
-            "QCheckBox[knobCheck=\"true\"]:checked { font-size: 24px; font-weight: 800; color: #111827; } "
-            "QCheckBox::indicator { width: 22px; height: 22px; } "
-            "QTextEdit { font-size: 15px; } "
-            "QLineEdit, QComboBox { font-size: 17px; min-height: 34px; }"
-        )
+        self.main_tab.setStyleSheet(WORKSPACE_STYLE)
 
         grp_targets = QGroupBox("Knob Groups To Scan")
         layout.addWidget(grp_targets)
         lay_t = QVBoxLayout(grp_targets)
+        lay_t.setSpacing(4)
         self.chk_gun_sol_l0_phase = self._add_target_row(
             lay_t, "gun_sol_l0", TARGET_LABELS["gun_sol_l0"], checked=True, prominent=True
         )
@@ -3396,10 +3389,10 @@ class MainWindow(QMainWindow):
         self.objective_row = QHBoxLayout()
         ctrl.addLayout(self.objective_row)
 
-        quick = QHBoxLayout()
+        quick = QGridLayout()
         method_lbl = QLabel("Method")
-        method_lbl.setStyleSheet("font-size: 24px; font-weight: 900; color: #111827;")
-        quick.addWidget(method_lbl)
+        method_lbl.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
+        quick.addWidget(method_lbl, 0, 0)
         self.mode_box = ClickOpenComboBox()
         self.mode_box.addItems(["SEQUENTIAL", "GROUP_BO"])
         self.mode_box.setCurrentText("SEQUENTIAL")
@@ -3409,13 +3402,12 @@ class MainWindow(QMainWindow):
         for i in range(self.mode_box.count()):
             self.mode_box.setItemData(i, Qt.AlignmentFlag.AlignCenter, Qt.ItemDataRole.TextAlignmentRole)
         self.mode_box.setStyleSheet(
-            "QComboBox { font-size: 24px; font-weight: 800; min-height: 44px; padding: 2px 10px; }"
+            "QComboBox { font-size: 14px; font-weight: 600; min-height: 26px; padding: 2px 10px; }"
         )
-        quick.addWidget(self.mode_box)
-        quick.addSpacing(14)
-        seq_lbl = QLabel("Sequential Method")
-        seq_lbl.setStyleSheet("font-size: 24px; font-weight: 900; color: #111827;")
-        quick.addWidget(seq_lbl)
+        quick.addWidget(self.mode_box, 0, 1)
+        seq_lbl = QLabel("Sequential method")
+        seq_lbl.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
+        quick.addWidget(seq_lbl, 1, 0)
         self.seq_method_box = ClickOpenComboBox()
         self.seq_method_box.addItems(["BO", "TERNARY"])
         self.seq_method_box.setCurrentText("BO")
@@ -3425,10 +3417,10 @@ class MainWindow(QMainWindow):
         for i in range(self.seq_method_box.count()):
             self.seq_method_box.setItemData(i, Qt.AlignmentFlag.AlignCenter, Qt.ItemDataRole.TextAlignmentRole)
         self.seq_method_box.setStyleSheet(
-            "QComboBox { font-size: 24px; font-weight: 800; min-height: 44px; padding: 2px 10px; }"
+            "QComboBox { font-size: 14px; font-weight: 600; min-height: 26px; padding: 2px 10px; }"
         )
-        quick.addWidget(self.seq_method_box)
-        quick.addStretch(1)
+        quick.addWidget(self.seq_method_box, 1, 1)
+        quick.setColumnStretch(1, 1)
         ctrl.addLayout(quick)
 
         btn_row = QHBoxLayout()
@@ -3440,12 +3432,12 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_optimization)
         self.reset_initial_btn.clicked.connect(self._on_reset_to_initial)
         big_button_css = (
-            "QPushButton { font-size: 22px; font-weight: 700; padding: 16px 28px; min-height: 56px; }"
+            "QPushButton { font-size: 15px; font-weight: 700; padding: 6px 10px; min-height: 30px; }"
         )
         self.btn_start.setStyleSheet(big_button_css + " QPushButton { background: #1f7a1f; color: white; }")
         self.btn_stop.setStyleSheet(big_button_css + " QPushButton { background: #a32020; color: white; }")
         self.reset_initial_btn.setStyleSheet(
-            "QPushButton { font-size: 18px; font-weight: 700; padding: 14px 22px; min-height: 52px; background: #585f66; color: white; }"
+            "QPushButton { font-size: 13px; font-weight: 700; padding: 6px 10px; min-height: 28px; background: #585f66; color: white; }"
         )
         btn_row.addWidget(self.btn_start)
         btn_row.addWidget(self.btn_stop)
@@ -3469,15 +3461,14 @@ class MainWindow(QMainWindow):
         self.status_lbl = QLabel("Status: IDLE")
         self.status_lbl.setObjectName("statusBadge")
         self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_lbl.setMinimumHeight(54)
+        self.status_lbl.setMinimumHeight(34)
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         ctrl.addWidget(self.status_lbl)
         self._status_labels[RUN_PROFILE_MAIN] = self.status_lbl
 
-        log_group = QGroupBox("Log")
-        log_group.setMinimumHeight(520)
-        layout.addWidget(log_group, stretch=2)
+        log_group = QGroupBox("Live plots")
+        monitor.addWidget(log_group, stretch=1)
         log_l = QVBoxLayout(log_group)
         self.turn_plot_view = QComboBox()
         self.turn_plot_view.addItem("BPM transmission N / 1", "ratio")
@@ -3488,12 +3479,16 @@ class MainWindow(QMainWindow):
         self.turn_plot_view.hide()
         log_l.addWidget(self.turn_plot_view)
         self.eval_fig, self.eval_canvas, self.ax_ttot, self.ax_downstream = self._create_eval_plot_bundle()
-        log_l.addWidget(self.eval_canvas, stretch=3)
+        self.plot_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.plot_splitter.setChildrenCollapsible(False)
+        self.plot_splitter.addWidget(self.eval_canvas)
+        log_l.addWidget(self.plot_splitter, stretch=1)
         self.bo1d_fig, self.bo1d_canvas, self.bo1d_ax_obj, self.bo1d_ax_acq = self._create_bo1d_plot_bundle()
-        log_l.addWidget(self.bo1d_canvas, stretch=2)
+        self.plot_splitter.addWidget(self.bo1d_canvas)
+        self.plot_splitter.setSizes([420, 300])
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
-        log_l.addWidget(self.txt_log, stretch=2)
+        self.workspace.add_log(self.txt_log)
         self._log_widgets[RUN_PROFILE_MAIN] = self.txt_log
         self._plot_widgets[RUN_PROFILE_MAIN] = {
             "fig": self.eval_fig,
@@ -3513,12 +3508,12 @@ class MainWindow(QMainWindow):
         self.result_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.result_lbl.setStyleSheet(
             "QLabel#resultBadge { "
-            "font-size: 18px; font-weight: 700; color: #0f172a; "
-            "background: #ecf5ff; border: 2px solid #93c5fd; border-radius: 8px; "
-            "padding: 10px 12px; }"
+            "font-size: 13px; font-weight: 700; color: #0f172a; "
+            "background: #ecf5ff; border: 1px solid #bfdbfe; border-radius: 8px; "
+            "padding: 6px 8px; }"
         )
         self.result_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.result_lbl)
+        monitor.addWidget(self.result_lbl)
         self._result_labels[RUN_PROFILE_MAIN] = self.result_lbl
 
     def _build_developer_tab(self):
@@ -3926,16 +3921,13 @@ class MainWindow(QMainWindow):
         self.config_sections.addTab(scan_scroll, "Scan settings")
         self.selection_page = QWidget()
         QVBoxLayout(self.selection_page)
-        self.config_sections.addTab(self.selection_page, "Correctors / BPMs")
+        selection_scroll = QScrollArea()
+        selection_scroll.setWidgetResizable(True)
+        selection_scroll.setWidget(self.selection_page)
+        self.config_sections.addTab(selection_scroll, "Correctors / BPMs")
         layout = QVBoxLayout(scan_page)
         layout.setSpacing(10)
-        self.config_tab.setStyleSheet(
-            "QGroupBox { font-size: 18px; font-weight: 700; margin-top: 10px; } "
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; } "
-            "QLabel { font-size: 16px; color: #111827; } "
-            "QDoubleSpinBox, QSpinBox, QComboBox { font-size: 16px; min-height: 32px; } "
-            "QPushButton { font-size: 16px; font-weight: 700; min-height: 34px; }"
-        )
+        self.config_tab.setStyleSheet(WORKSPACE_STYLE)
 
         grp_scan = QGroupBox("Scan Settings")
         layout.addWidget(grp_scan)
@@ -4673,26 +4665,26 @@ class MainWindow(QMainWindow):
         if prominent:
             box.setProperty("knobCheck", True)
         else:
-            box.setStyleSheet("font-size: 18px; font-weight: 500; color: #334155;")
+            box.setStyleSheet("font-size: 14px; font-weight: 500; color: #334155;")
         row.addWidget(box)
 
         status_lbl = QLabel("IDLE")
         status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        status_lbl.setMinimumWidth(88)
+        status_lbl.setMinimumWidth(60)
         status_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         row.addWidget(status_lbl)
 
-        if show_value:
-            value_lbl = QLabel("Current: -")
-            value_lbl.setWordWrap(True)
-            value_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            value_lbl.setStyleSheet("font-size: 14px; color: #475569;")
-            row.addWidget(value_lbl, stretch=1)
-            self.target_value_labels[key] = value_lbl
-        else:
-            row.addStretch(1)
-
+        row.addStretch(1)
         parent_layout.addLayout(row)
+        if show_value:
+            value_lbl = WrappingLabel("Current: -")
+            value_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value_lbl.setStyleSheet("font-size: 12px; color: #475569;")
+            values_row = QHBoxLayout()
+            values_row.addSpacing(indent + 24)
+            values_row.addWidget(value_lbl, stretch=1)
+            parent_layout.addLayout(values_row)
+            self.target_value_labels[key] = value_lbl
 
         self.target_checks[key] = box
         self.target_status_labels[key] = status_lbl
@@ -4714,7 +4706,7 @@ class MainWindow(QMainWindow):
         lbl.setText(text)
         lbl.setStyleSheet(
             "QLabel {"
-            f"font-size: 12px; font-weight: 800; color: {fg}; "
+            f"font-size: 11px; font-weight: 600; color: {fg}; "
             f"background: {bg}; border: 1px solid {bd}; "
             "border-radius: 9px; padding: 5px 8px; }"
         )
@@ -4969,7 +4961,6 @@ class MainWindow(QMainWindow):
             if is_turn:
                 ax_ttot.tick_params(axis="x", labelbottom=True)
                 self._draw_turn_bpm_plot(ax_metric, state)
-                widgets["fig"].subplots_adjust(bottom=.20, hspace=.65)
                 widgets["canvas"].draw_idle()
                 return
             from matplotlib.patches import Patch
@@ -5005,9 +4996,6 @@ class MainWindow(QMainWindow):
             ax_metric.legend([Patch(color="#ea580c"), Patch(color="#94a3b8")] + handles,
                              ["Selected for optimization", "Not selected"] + labels,
                              fontsize=7, ncol=3, loc="upper right")
-            widgets["fig"].subplots_adjust(bottom=.20, hspace=.65)
-        else:
-            widgets["fig"].subplots_adjust(bottom=.12, hspace=.42)
         widgets["canvas"].draw_idle()
 
     def _draw_turn_bpm_plot(self, axis, state):
@@ -5145,9 +5133,9 @@ class MainWindow(QMainWindow):
         ax_acq.grid(True, alpha=0.3)
 
         if ax_obj.get_legend_handles_labels()[0]:
-            ax_obj.legend(loc="best")
+            ax_obj.legend(loc="best", fontsize=8)
         if ax_acq.get_legend_handles_labels()[0]:
-            ax_acq.legend(loc="best")
+            ax_acq.legend(loc="best", fontsize=8)
         canvas.draw_idle()
 
     def _scan_progress_text(self, profile, *, include_stage=True):
@@ -5298,9 +5286,9 @@ class MainWindow(QMainWindow):
         target.setText(text)
         target.setStyleSheet(
             "QLabel#statusBadge {"
-            f"font-size: 24px; font-weight: 800; color: {fg}; "
+            f"font-size: 14px; font-weight: 600; color: {fg}; "
             f"background: {bg}; border: 2px solid {bd}; "
-            "border-radius: 10px; padding: 8px 14px; }"
+            "border-radius: 6px; padding: 5px 8px; }"
         )
 
     def _update_mode_ui(self):
@@ -5466,12 +5454,19 @@ class MainWindow(QMainWindow):
             figures.append((widgets["bo1d_fig"], run_dir / f"{prefix}_BO1D.png"))
         saved = []
         for figure, path in figures:
+            original_size = figure.get_size_inches().copy()
             try:
+                # Export geometry must not depend on the current window or
+                # splitter width (e.g. an ultrawide desktop).
+                figure.set_size_inches(10, 7, forward=False)
                 figure.savefig(path, dpi=180, bbox_inches="tight")
                 saved.append(path)
                 self._append_log_text(f"Saved plot: {path}", profile=context)
             except Exception as exc:
                 self._append_log_text(f"Plot save failed ({path.name}): {exc}", profile=context)
+            finally:
+                figure.set_size_inches(original_size, forward=False)
+                figure.canvas.draw_idle()
         return saved
 
     def _save_tempfiles_export(self, plots, profile):
