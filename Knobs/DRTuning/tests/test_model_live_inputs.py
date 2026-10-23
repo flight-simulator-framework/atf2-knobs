@@ -88,6 +88,8 @@ class LiveModelInputTests(unittest.TestCase):
         self.assertEqual(self.client.writes,[])
     def test_native_unstable_import_recovers_without_machine_writes(self):
         from Knobs.DRTuning.model import capture_settings,OpticsModel,ModelOpticsError
+        # Pin the original recovery fixture to the uncorrected bend reference.
+        self.backend.model_config={'bend_k1l':{}}
         settings=capture_settings(self.backend,Options(excluded_bpms=('MB97R','MB98R'),
             fixed_actuators=('ZH15R','ZV16R')),self.baseline)
         model=OpticsModel(settings);target=model.tunes()
@@ -102,6 +104,26 @@ class LiveModelInputTests(unittest.TestCase):
         np.testing.assert_allclose(model.tunes(),target,atol=1.e-5)
         self.assertLessEqual(np.max(abs(report['family_fractional_changes'])),.05)
         self.assertGreater(report['initial_stable_point_search']['evaluations'],0)
+        self.assertEqual(self.client.writes,[])
+
+    def test_sad_common_ring_initialization_imports_bend_gradients(self):
+        from Knobs.DRTuning.model import capture_settings,OpticsModel,preparation_config
+        settings=capture_settings(self.backend,Options(excluded_bpms=('MB97R','MB98R'),
+            fixed_actuators=('ZH15R','ZV16R')),self.baseline)
+        self.assertEqual(len(settings['bend_k1l']),36)
+        model=OpticsModel(settings)
+        for i in range(1,37):
+            expected=-1.17442 if i<=6 else -1.14780
+            self.assertAlmostEqual(model.elements[f'BH1R.{i}'].get_K1L(),expected)
+        original=copy.deepcopy(settings);original['bend_k1l']={}
+        uncorrected=OpticsModel(original)
+        self.assertGreater(np.linalg.norm(model.tunes()-uncorrected.tunes()),.01)
+        self.backend.model_config={'quadrupole_factors':{}}
+        self.assertEqual(len(preparation_config(self.backend)['bend_k1l']),36)
+        self.backend.model_config={'bend_k1l':{'BH1R.7':-1.15}}
+        self.assertEqual(preparation_config(self.backend)['bend_k1l'],{'BH1R.7':-1.15})
+        self.backend.model_config={'preparation':'all_currents'}
+        self.assertNotIn('bend_k1l',preparation_config(self.backend))
         self.assertEqual(self.client.writes,[])
 
     def test_unknown_active_magnet_fails_without_writing(self):

@@ -132,6 +132,15 @@ class ModelMathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Tune match failed'):
             OpticsModel.match_tunes(model,[.4,.45])
         self.assertEqual([e.value for e in elements.values()],[2.,2.])
+        self.assertIsNone(model.match_report)
+        attempt=model.match_attempt
+        self.assertEqual(attempt['status'],'failed');self.assertTrue(attempt['model_restored'])
+        self.assertTrue(any(attempt['bound_active']))
+        self.assertGreater(len(attempt['history']),1)
+        self.assertGreater(len(attempt['accepted_points']),1)
+        np.testing.assert_allclose(attempt['target'],[.4,.45])
+        np.testing.assert_allclose((attempt['final']-attempt['resolved_target']+.5)%1-.5,attempt['residual'])
+        json.dumps(serial(attempt),allow_nan=False)
     def test_initial_unstable_sad_reference_recovers_with_absolute_bounds(self):
         from types import SimpleNamespace
         class Quadrupole:
@@ -193,6 +202,24 @@ class ModelMathTests(unittest.TestCase):
                     with self.assertRaises(ValueError):manager.prepare(Options(model_match_tunes=match),lambda:None)
                     fake.match_tunes.assert_not_called()
             self.assertEqual(b.commands,[])
+
+    def test_failed_match_history_retained_in_manager_diagnostic(self):
+        b=CountedBackend();manager=ModelManager(b)
+        settings={'raw_pvs':{},'tunes':[.2,.3],'tune_alias':False}
+        fake=Mock();fake.tunes.return_value=np.array([.21,.31])
+        fake.match_attempt=dict(status='failed',target=np.array([.2,.3]),
+            history=[dict(family_fractional_changes=np.array([.05,0.]),tunes=np.array([.21,.31]))],
+            model_restored=True)
+        fake.match_tunes.side_effect=ValueError('Tune match failed at bound')
+        with patch('Knobs.DRTuning.model.capture_settings',return_value=settings),patch('Knobs.DRTuning.model.OpticsModel',return_value=fake):
+            with self.assertRaisesRegex(ValueError,'Tune match failed at bound'):
+                manager.prepare(Options(),lambda:None)
+        attempt=manager.last_attempt
+        self.assertEqual(attempt['tune_match_attempt']['status'],'failed')
+        self.assertEqual(len(attempt['tune_match_attempt']['history']),1)
+        self.assertIsNot(attempt['tune_match_attempt'],fake.match_attempt)
+        self.assertEqual(b.commands,[]);self.assertIsNone(manager.model)
+        json.dumps(serial(attempt),allow_nan=False)
 
     def test_quad_average_beta_fit_uses_integrated_transport(self):
         beta=4.;alpha=.3;gamma=(1+alpha**2)/beta;names=['q1','q2','q3','q4'];rows=[];values=[]

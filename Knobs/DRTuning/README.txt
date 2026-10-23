@@ -13,7 +13,12 @@ The SAD preset reproduces the archived CODCorrection preparation:
   Read and record all trims, including ignored ones.
 - Multiply the included main+trim strength by correctQK1[1] factors in the
   bundled sad_cod_calibration.json (98 entries, source hash and name aliases).
-  No bend-gradient override: setBH1RK1 was commented out in that COD branch.
+- Apply setBH1RK1[] from the COMMON Ring initialization in atfdrex.sad,
+  before the CODCorrection branch: BH1R.1..6 K1L=-1.17442, BH1R.7..36
+  K1L=-1.14780 [1/m] (the SAD bends have length 1 m). Earlier versions missed
+  this initialization because the duplicate call inside COD was commented out.
+  An explicit bend_k1l configuration takes precedence. These are model settings;
+  no machine bend currents are changed.
 - Set corrector/skew excitation to zero ONLY in the reference model. Virtual
   excitation is relative to the captured current; proposal centers and current
   bounds still use absolute machine currents. SET is I_captured + delta.
@@ -287,6 +292,11 @@ Debugging unstable one-turn maps:
   Save model diagnostics. The JSON records the last preparation attempt,
   stage/status, raw PVs, calibrated strengths, design-reference quad strengths,
   current snapshot, tune targets, and matrix/eigenvalue diagnostics when present.
+  If tune matching fails, tune_match_attempt also retains the target/resolved
+  tune branches, stable seed, evaluated stable points, rejected unstable trials,
+  accepted iterates, final residual and active +/-5% bounds. Model strengths are
+  restored after failure; the retained final values describe the failed trial.
+  A bound hit does not prove that no solution exists elsewhere inside the bounds.
   Saving does not read or write the machine. A partial capture failure may not
   have complete settings. Failed models cannot be used for a correction.
 - Supply the diagnostic file to distinguish calibration/geometry/input issues

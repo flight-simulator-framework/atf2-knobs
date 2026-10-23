@@ -26,9 +26,9 @@ def preparation_config(backend):
     preset=config.get('preparation','sad_cod' if backend.identity.startswith('epics:') else 'all_currents')
     if preset not in ('sad_cod','all_currents'):raise ValueError('Unknown model preparation: '+str(preset))
     config['preparation']=preset
-    if preset=='sad_cod' and 'quadrupole_factors' not in config:
+    if preset=='sad_cod' and ('quadrupole_factors' not in config or 'bend_k1l' not in config):
         defaults=json.loads(Path(__file__).with_name('sad_cod_calibration.json').read_text())
-        for key in ('quadrupole_factors','source','source_sha256'):
+        for key in ('quadrupole_factors','bend_k1l','source','source_sha256'):
             config.setdefault(key,defaults[key])
     return config
 
@@ -194,7 +194,11 @@ class OpticsModel:
         def set_scales(scales):
             for group,ks,scale in zip(groups,baseline,scales):
                 for e,k in zip(group,ks):e.set_K1(-self.momentum,k*(1+scale))
-        rejected=[];seed_report=None
+        rejected=[];seed_report=None;history=[];accepted_points=[]
+        self.match_report=None
+        self.match_attempt=dict(status='running',target=target.copy(),alias=bool(alias),
+            max_scale=max_scale,tolerance=tolerance,model_only=True,history=history,
+            accepted_points=accepted_points,rejected_unstable_trials=rejected)
         def initial_point():
             nonlocal seed_report
             try:return np.zeros(2),self.tunes()
@@ -216,12 +220,15 @@ class OpticsModel:
                                 tune_match_trial_fractional_changes=point)))
                             continue
                         goal=target if not alias else np.array([min((t,1-t),key=lambda v:abs((v-a+.5)%1-.5)) for t,a in zip(target,q)])
+                        history.append(dict(stage='stable point search',family_fractional_changes=point.copy(),
+                            tunes=q.copy(),resolved_target=goal.copy(),residual=(q-goal+.5)%1-.5))
                         candidates.append((np.linalg.norm((q-goal+.5)%1-.5),point,q))
                     if candidates:
                         _,point,q=min(candidates,key=lambda entry:entry[0]);set_scales(point)
                         seed_report=dict(initial_optics_failure=original,evaluations=evaluations,
                             family_fractional_changes=point.copy(),tunes=q.copy(),max_scale=max_scale,
                             method='expanding bounded QF1R/QF2R grid; stable point required')
+                        self.match_attempt['initial_stable_point_search']=seed_report
                         return point,q
                 raise ModelOpticsError('No stable initial RFTrack model found in bounded QF1R/QF2R search '
                     f'(+/-{max_scale:.1%}, {evaluations} trials); inspect imported currents/calibration/lattice. '+str(failure),
@@ -229,7 +236,11 @@ class OpticsModel:
                          rejected_unstable_trials=rejected)) from failure
         def residual(scales):
             self.check_cancel();set_scales(scales)
-            try:return (self.tunes()-goals+.5)%1-.5
+            try:
+                tunes=self.tunes();error=(tunes-goals+.5)%1-.5
+                history.append(dict(stage='tune matching',family_fractional_changes=np.asarray(scales).copy(),
+                    tunes=tunes.copy(),resolved_target=goals.copy(),residual=error.copy()))
+                return error
             except ModelOpticsError as exc:
                 detail=dict(exc.diagnostics,tune_match_trial_fractional_changes=np.asarray(scales).copy(),resolved_target=goals)
                 raise ModelOpticsError('Tune-match trial failed at QF1R/QF2R changes '
@@ -243,6 +254,8 @@ class OpticsModel:
             if alias:
                 goals=np.array([min((t,1-t),key=lambda v:abs((v-q+.5)%1-.5)) for t,q in zip(target,initial)])
             error=residual(scales)
+            self.match_attempt.update(initial=initial.copy(),resolved_target=goals.copy())
+            accepted_points.append(dict(family_fractional_changes=scales.copy(),residual=error.copy()))
             # Absolute family perturbations avoid the tiny relative steps near
             # zero used by generic optimizers. Reject unstable trials and back
             # track from the last stable iterate, keeping the stability test.
@@ -268,14 +281,23 @@ class OpticsModel:
                     point=np.clip(scales+step*(.5**power),-max_scale,max_scale)
                     probe=trial(point)
                     if probe is not None and np.linalg.norm(probe)<np.linalg.norm(error):
-                        scales=point;error=probe;accepted=True;break
+                        scales=point;error=probe;accepted=True
+                        accepted_points.append(dict(family_fractional_changes=scales.copy(),residual=error.copy()))
+                        break
                 if not accepted:break
             error=residual(scales)
+            self.match_attempt.update(final=history[-1]['tunes'].copy(),residual=error.copy(),
+                family_fractional_changes=scales.copy(),iterations=iteration+1,
+                bound_active=np.isclose(abs(scales),max_scale,rtol=0,atol=1.e-10))
             if np.max(abs(error))>tolerance:
                 raise ValueError(f'Tune match failed: residual {error}; QF changes {scales}; '
+                    f'target {goals}; model tunes {history[-1]["tunes"]}; '
                     f'rejected unstable trials={len(rejected)}; no machine correction calculated')
-        except Exception:
-            set_scales([0.,0.]);raise
+        except Exception as exc:
+            self.match_attempt.update(status='failed',error=str(exc),exception_type=type(exc).__name__)
+            set_scales([0.,0.]);self.match_attempt['model_restored']=True
+            raise
+        self.match_attempt['status']='ready'
         self.match_report=dict(initial=initial,target=target,resolved_target=goals,final=self.tunes(),
                                family_fractional_changes=scales,residual=error,source=self.settings.get('tune_source'),model_only=True,
                                iterations=iteration+1,rejected_unstable_trials=rejected,initial_stable_point_search=seed_report,
@@ -388,6 +410,7 @@ class ModelManager:
         attempt=dict(schema='dr-model-diagnostic-1',captured_unix_s=time.time(),stage='reading settings',
                      status='running',options=vars(opt).copy(),settings=None)
         self.last_attempt=attempt
+        model=None
         try:
             baseline=self.backend.snapshot();attempt['baseline']=baseline
             settings=capture_settings(self.backend,opt,baseline,cancel);attempt['settings']=settings
@@ -410,6 +433,8 @@ class ModelManager:
         except Exception as exc:
             attempt.update(status='failed',error=str(exc),exception_type=type(exc).__name__)
             if isinstance(exc,ModelOpticsError):attempt['optics_failure']=exc.diagnostics
+            if isinstance(getattr(model,'match_attempt',None),dict):
+                attempt['tune_match_attempt']=copy.deepcopy(model.match_attempt)
             if isinstance(exc,ValueError):
                 raise ValueError(f"RFTrack model preparation failed during {attempt['stage']}: {exc}. "
                                  "No correction applied. RFTrack model > Save model diagnostics records this attempt.") from exc

@@ -23,7 +23,7 @@ class ModelPanel(QWidget):
         self.preparation.addItem('SAD COD reference (archived calibration)','sad_cod')
         self.preparation.addItem('All captured currents (no SAD preset)','all_currents')
         self.preparation.setCurrentIndex(self.preparation.findData(preparation_config(window.backend)['preparation']))
-        self.preparation.setToolTip('SAD: QM trim except QM7; archived quadrupole factors; zero model correctors/skews. Machine currents unchanged. Used also as the reference for dispersion/skew, not exact legacy branch reproduction.')
+        self.preparation.setToolTip('SAD: QM trim except QM7; archived quadrupole factors and Ring BH1R gradient corrections; zero model correctors/skews. Machine currents unchanged. Used also as the reference for dispersion/skew, not exact legacy branch reproduction.')
         form.addRow('Model preparation',self.preparation)
         self.fields={}
         defaults={'energy_pv':'SAD:FILE:DR:ENERGY','tune_x':'SAD:DR_TUNE_X','tune_y':'SAD:DR_TUNE_Y',
