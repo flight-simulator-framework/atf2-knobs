@@ -90,6 +90,16 @@ this existing optimizer budget, while retries do not add an accepted point.
 This is an upper limit: EI, operator stop or other enabled conditions can
 end a run earlier. Editing Config during a run does not change that run's limit.
 
+A **Total progress** bar below the enlarged status shows the full run budget.
+For Sequential, it sums the selected axes' search budgets and credits an axis
+fully when its stopping condition is met. For BO, it uses BO max steps and
+reaches 100% on EI or other automatic completion. Manual stop preserves partial
+progress. Final verification measurements are excluded from the search budget.
+
+Live/result images automatically fit into a grid within the plot area, including
+all generated 1D and 2D plots. The layout adapts to plot count and window size
+without scrolling. Machine setpoint details remain available in the left panel.
+
 Config → **EI stop rule / EI stop settings** allows editing Threshold and
 Consecutive checks. Custom values survive Save config / Load config.
 The condition checks the largest EI in the candidate pool after initialization,

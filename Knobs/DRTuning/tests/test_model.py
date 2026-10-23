@@ -43,6 +43,22 @@ class ModelRoutingTests(unittest.TestCase):
         data=self.service.calculate('orbit',self.opt)
         self.assertEqual(data['probe_history'],[])
         self.assertEqual(self.machine.commands,[]);self.assertEqual(self.machine.acquisitions,1)
+    def test_model_response_shares_pause_controls_without_machine_writes(self):
+        messages=[];requested=False
+        def progress(n,text):
+            nonlocal requested
+            messages.append(text)
+            if ': pair 1/' in text and not requested:
+                requested=True;self.service.pause_requested.set()
+            if text.startswith('PAUSED:'):
+                self.assertTrue(self.service.paused.is_set())
+                self.assertEqual(self.machine.commands,[])
+                self.assertEqual(self.machine.acquisitions,0)
+                self.service.pause_requested.clear()
+        self.service.calculate('orbit',self.opt,progress)
+        self.assertTrue(any(m.startswith('PAUSED:') for m in messages))
+        self.assertTrue(any(m.startswith('RESUMED:') for m in messages))
+        self.assertFalse(self.service.paused.is_set())
     def test_dispersion_only_one_real_rf_pair(self):
         data=self.service.calculate('dispersion',self.opt)
         self.assertEqual([c[0] for c in self.machine.commands],['rf','rf','rf'])

@@ -39,12 +39,21 @@ class WorkspaceTests(unittest.TestCase):
                         window.show()
                         self.app.processEvents()
                         self.assertEqual((window.width(), window.height()), (1280, 800))
+                        progress = {"percent": 37.5, "completed": 15, "total": 40}
+                        if module is linac:
+                            window._on_worker_progress({"kind": "overall_progress", "overall_progress": progress})
+                        else:
+                            window._on_progress({"step": 0, "info": {"phase": "overall_progress", "overall_progress": progress}})
+                        self.assertEqual(window.total_progress.value(), 375)
+                        self.assertIn("37.5%", window.total_progress.format())
+                        self.assertGreater(window.total_progress.y(), window.status_lbl.y() + window.status_lbl.height())
+                        self.assertGreaterEqual(window.status_lbl.height(), 48)
                         canvas = window.eval_canvas if module is linac else window.canvas
                         controls = window.workspace.controls_scroll
                         self.assertGreater(canvas.mapTo(window, QPoint()).x(),
                                            controls.mapTo(window, QPoint()).x() + controls.width())
                         self.assertGreater(canvas.width(), 600)
-                        self.assertGreater(canvas.height(), 500)
+                        self.assertGreater(canvas.height(), 450)
                         self.assertEqual(controls.horizontalScrollBar().maximum(), 0)
                         log = window.txt_log if module is linac else window.log_box
                         self.assertTrue(log.isHidden())
@@ -65,28 +74,38 @@ class WorkspaceTests(unittest.TestCase):
                         window.close()
                         self.app.processEvents()
 
-    def test_ipbsm_gallery_scales_to_monitor_column(self):
+    def test_ipbsm_all_gallery_plots_fit_without_scrolling(self):
         window = self.make_window(ipbsm)
         try:
-            window.resize(1280, 800)
             window.show()
             window.main_view_stack.setCurrentIndex(1)
-            self.app.processEvents()
             with tempfile.TemporaryDirectory() as directory:
                 paths = []
-                for name in ("test_modulation_vs_evaluation.png", "test_average_vs_evaluation.png"):
-                    path = Path(directory) / name
-                    image = QImage(1800, 600, QImage.Format.Format_RGB32)
+                for index in range(12):
+                    path = Path(directory) / f"plot_{index}.png"
+                    image = QImage(1800, 600 if index < 2 else 1200, QImage.Format.Format_RGB32)
                     image.fill(0xFFFFFF)
                     image.save(str(path))
                     paths.append(path)
-                window._populate_gallery(paths)
-                self.app.processEvents()
-                self.assertEqual(window.gallery_grid.columnCount(), 1)
-                self.assertEqual(window.gallery_scroll.horizontalScrollBar().maximum(), 0)
-                window.workspace.splitter.setSizes([560, 680])
-                self.app.processEvents()
-                self.assertEqual(window.gallery_scroll.horizontalScrollBar().maximum(), 0)
+                for size in ((1280, 800), (1440, 900)):
+                    window.resize(*size)
+                    for count in (2, 6, 12, 1):
+                        with self.subTest(size=size, count=count):
+                            window._populate_gallery(paths[:count], bo_main_layout=True)
+                            self.app.processEvents()
+                            gallery = window.gallery_widget
+                            self.assertEqual(len(gallery.panels), count)
+                            self.assertEqual((window.width(), window.height()), size)
+                            for panel in gallery.panels:
+                                self.assertTrue(panel.isVisible())
+                                self.assertTrue(gallery.rect().contains(panel.geometry()))
+                                self.assertGreater(panel.width(), 50)
+                                self.assertGreater(panel.height(), 50)
+                            self.assertGreaterEqual(gallery.columns, 1)
+                    window.workspace.splitter.setSizes([560, 680])
+                    self.app.processEvents()
+                    for panel in window.gallery_widget.panels:
+                        self.assertTrue(window.gallery_widget.rect().contains(panel.geometry()))
         finally:
             window.close()
             self.app.processEvents()

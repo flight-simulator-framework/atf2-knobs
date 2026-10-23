@@ -567,6 +567,26 @@ unchecking Acquire new shot.
 
 Calibration files and remaining site configuration
 -------------------------------------------------
+During COD/dispersion/skew CALC, Pause requests a stop at the next restored
+probe-pair boundary (including adaptive amplitude retries). It does not freeze
+the machine at a displaced RF or magnet setting. Wait for PAUSED in the status;
+Resume continues with measured columns retained in memory. Cancel also works
+while paused and ends CALC without a completed proposal. Pause is unavailable
+for SET, file recalculation and other tools. RFTrack response calculations share
+the same controls; model preparation must finish before reaching a checkpoint.
+Settings are checked before pausing and after resuming; changed settings require
+a fresh CALC, without overwriting the intervening changes. This is an in-process
+pause, not a saved checkpoint for restarting the application.
+
+The default live horizontal nominal dispersion target is unset (null); vertical
+is zero. Measured horizontal response CALC requires Load target dispersion,
+with JSON fields names, x, y (dispersion in mm per relative momentum deviation,
+one finite value per BPM). It aligns by BPM name. A missing horizontal target
+now produces a specific message before any magnet/RF changes. Invalid lengths
+or nonfinite entries are reported separately. RFTrack response uses its prepared
+model target; model preparation must succeed first. Do not substitute zero for
+the ring's nominal horizontal dispersion.
+
 hardware_profile.default.json bundles the existing interface/op-base convention:
 96 COD BPMs (MB1R..MB98R except 20/75), the interface's 47 horizontal and 50
 vertical correctors, 34 SD and 34 SF supplies, 100 quadrupole trims, TuneDR and

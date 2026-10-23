@@ -38,13 +38,12 @@ for _path in (str(_KNOBS_DIR), str(_REPO_ROOT)):
         sys.path.insert(0, _path)
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
     QFileDialog, QGroupBox, QMessageBox, QTabWidget, QCheckBox,
-    QPlainTextEdit, QLineEdit, QStackedWidget, QSplitter, QScrollArea, QFrame, QSizePolicy,
+    QPlainTextEdit, QLineEdit, QStackedWidget, QSplitter, QScrollArea, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView, QButtonGroup, QRadioButton,
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -83,7 +82,7 @@ EPICSIPBSMController = _IPBSM_OPT.EPICSIPBSMController
 DAT_CSV_COLUMNS = _IPBSM_OPT.DAT_CSV_COLUMNS
 IPBSMInterface = _IPBSM_OPT.IPBSMInterface
 from Knobs.ipbsm_opt_plotting import save_plot_montage
-from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, PlotImage
+from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, OverallProgressBar, FitPlotGallery
 
 
 ZSCAN_DEFAULT_RANGE = 0.0085
@@ -335,7 +334,7 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText(text)
         self.status_lbl.setStyleSheet(
             "QLabel#statusBadge {"
-            f"font-size: 14px; font-weight: 600; color: {fg}; "
+            f"font-size: 17px; font-weight: 600; color: {fg}; "
             f"background: {bg}; border: 2px solid {bd}; "
             "border-radius: 10px; padding: 8px 14px;"
             "}"
@@ -536,10 +535,12 @@ class MainWindow(QMainWindow):
         self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("statusBadge")
         self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_lbl.setMinimumHeight(34)
+        self.status_lbl.setMinimumHeight(48)
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         monitor.addWidget(self.status_lbl)
+        self.total_progress = OverallProgressBar()
+        monitor.addWidget(self.total_progress)
         self._set_status("Status: IDLE", state="idle")
 
         plot_group = QGroupBox("Live plots / Results")
@@ -572,18 +573,9 @@ class MainWindow(QMainWindow):
         self.plot_splitter.setSizes([420, 300])
         self.main_view_stack.addWidget(live_view)
 
-        self.gallery_scroll = QScrollArea()
-        self.gallery_scroll.setWidgetResizable(True)
-        self.gallery_widget = QWidget()
-        self.gallery_layout = QVBoxLayout(self.gallery_widget)
-        self.gallery_layout.setContentsMargins(0, 0, 0, 0)
-        self.gallery_layout.setSpacing(10)
-        self.gallery_plots_widget = QWidget()
-        self.gallery_grid = QGridLayout(self.gallery_plots_widget)
-        self.gallery_grid.setSpacing(8)
-        self.gallery_layout.addWidget(self.gallery_plots_widget)
-        self.gallery_scroll.setWidget(self.gallery_widget)
-        self.main_view_stack.addWidget(self.gallery_scroll)
+        self.gallery_widget = FitPlotGallery()
+        self.gallery_grid = self.gallery_widget.grid
+        self.main_view_stack.addWidget(self.gallery_widget)
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
@@ -617,8 +609,8 @@ class MainWindow(QMainWindow):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.knob_state_table.setMinimumHeight(160)
         state_layout.addWidget(self.knob_state_table)
-        self.gallery_layout.addWidget(state_group)
-        self.gallery_layout.addStretch(1)
+        # Keep setpoint details accessible without taking space from the plot grid.
+        self.workspace.controls_layout.addWidget(state_group)
 
     def _build_config_tab(self):
         self.config_tab.setStyleSheet(WORKSPACE_STYLE)
@@ -1803,115 +1795,11 @@ class MainWindow(QMainWindow):
         return str(getattr(cfg, "method", "")).upper() == "BO" and list(getattr(cfg, "params", [])) == CORRECTOR_KNOBS
 
     def _clear_gallery(self):
-        while self.gallery_grid.count():
-            item = self.gallery_grid.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
+        self.gallery_widget.clear()
 
     def _populate_gallery(self, png_paths: List[Path], *, bo_main_layout: bool = False):
-        self._clear_gallery()
-        if not png_paths:
-            return
-        viewport_w = self.gallery_scroll.viewport().width()
-        # One column in the side monitor; two only when each plot has room.
-        cols = 2 if viewport_w >= 1100 else 1
-
-        def _add_frame(
-            path: Path,
-            row: int,
-            col: int,
-            *,
-            col_span: int = 1,
-        ) -> None:
-            frame = QFrame()
-            frame.setFrameShape(QFrame.Shape.StyledPanel)
-            v = QVBoxLayout(frame)
-
-            lbl = QLabel(path.name)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setWordWrap(True)
-            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-            v.addWidget(lbl)
-
-            pix = QPixmap(str(path))
-            img = PlotImage(pix) if not pix.isNull() else QLabel("(failed to load)")
-            v.addWidget(img)
-
-            self.gallery_grid.addWidget(frame, row, col, 1, col_span)
-
-        if bo_main_layout:
-            # BO Main View policy:
-            # 1) Modulation/Average first and vertically stacked
-            # 2) 1D plots in one or two columns, depending on monitor width
-            # 3) hide any 2D / BO GP heatmap images
-            mod_path = None
-            avg_path = None
-            one_d_paths: List[Path] = []
-            for p in png_paths:
-                n = p.name.lower()
-                if "_2d_" in n or "bo_gp_" in n or "heatmap" in n:
-                    continue
-                if n.endswith("_modulation_vs_evaluation.png"):
-                    mod_path = p
-                    continue
-                if n.endswith("_average_vs_evaluation.png"):
-                    avg_path = p
-                    continue
-                if "_1d_" in n:
-                    one_d_paths.append(p)
-
-            r = 0
-            if mod_path is not None:
-                _add_frame(mod_path, r, 0, col_span=cols)
-                r += 1
-            if avg_path is not None:
-                _add_frame(avg_path, r, 0, col_span=cols)
-                r += 1
-
-            one_d_paths = sorted(one_d_paths, key=lambda p: str(p))
-            c = 0
-            for p in one_d_paths:
-                _add_frame(p, r, c)
-                c += 1
-                if c >= cols:
-                    c = 0
-                    r += 1
-            return
-
-        mod_name = "_modulation_vs_evaluation.png"
-        avg_name = "_average_vs_evaluation.png"
-
-        r = 0
-        c = 0
-        i = 0
-        while i < len(png_paths):
-            path = png_paths[i]
-            name = path.name.lower()
-            pair_next = False
-            if (i + 1) < len(png_paths):
-                name_next = png_paths[i + 1].name.lower()
-                pair_next = (
-                    (name.endswith(mod_name) and name_next.endswith(avg_name))
-                    or (name.endswith(avg_name) and name_next.endswith(mod_name))
-                )
-            if pair_next and cols > 1:
-                if c != 0:
-                    c = 0
-                    r += 1
-                _add_frame(path, r, 0)
-                _add_frame(png_paths[i + 1], r, 1)
-                i += 2
-                c = 0
-                r += 1
-                continue
-
-            _add_frame(path, r, c)
-            i += 1
-            c += 1
-            if c >= cols:
-                c = 0
-                r += 1
+        # Every generated plot remains visible; grid adapts on every resize.
+        self.gallery_widget.set_plots(png_paths)
 
     def _refresh_gf_gallery_live(self, *, bo_data_only_1d: bool = False):
         cfg = self.last_run_cfg
@@ -2273,6 +2161,7 @@ class MainWindow(QMainWindow):
         out_dir.mkdir(parents=True, exist_ok=True)
         self.last_out_dir = out_dir
         self.last_run_cfg = cfg
+        self.total_progress.update_progress({})
         self.stop_flag = StopFlag()
         warm_start_rows: List[Dict] = []
         warm_start_rows_all: List[Dict] = []
@@ -2577,6 +2466,8 @@ class MainWindow(QMainWindow):
     def _on_progress(self, payload: dict):
         step = int(payload.get("step", 0))
         info = payload.get("info", {})
+        if "overall_progress" in info:
+            self.total_progress.update_progress(info["overall_progress"])
         phase = str(info.get("phase", ""))
         bo1d_trace = dict(info.get("bo1d_trace", {}) or {})
         if bo1d_trace:

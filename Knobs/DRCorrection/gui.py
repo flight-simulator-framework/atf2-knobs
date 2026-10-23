@@ -288,7 +288,8 @@ class CorrectionPanel(QWidget):
     def calculate(self,dataset=None):
         options=copy.deepcopy(self.options)
         self.invalidate()
-        self.window.start(lambda progress:self.window.service.calculate(self.mode,options,progress,dataset),self.display)
+        self.window.start(lambda progress:self.window.service.calculate(self.mode,options,progress,dataset),
+                          self.display,pausable=dataset is None)
 
     def calculate_file(self):
         path,_=QFileDialog.getOpenFileName(self,'CALC (FILE): measured response session','','JSON (*.json)')
@@ -503,21 +504,40 @@ class DRCorrectionWindow(QMainWindow):
             panel=CorrectionPanel(self,mode);self.panels[mode]=panel;self.tabs.addTab(panel,title)
         self.tbt=TBTPanel(self);self.tabs.addTab(self.tbt,'Turn1024 / TBT beta')
         row=QHBoxLayout();self.progress=QProgressBar();row.addWidget(self.progress)
+        self.pause_button=QPushButton('Pause');self.pause_button.setEnabled(False)
+        self.pause_button.setToolTip('Pause after the current probe pair restores magnets and RF. Resume keeps measured responses.')
+        self.pause_button.clicked.connect(self.toggle_pause);row.addWidget(self.pause_button)
         self.cancel_button=QPushButton('Cancel / restore probes');self.cancel_button.clicked.connect(self.service.cancel.set);row.addWidget(self.cancel_button)
+        self.cancel_button.clicked.connect(lambda:self.pause_button.setEnabled(False))
         profile=QPushButton('Hardware PV checklist');profile.clicked.connect(self.hardware_checklist);row.addWidget(profile)
         layout.addLayout(row)
         self.messages=QPlainTextEdit();self.messages.setReadOnly(True);self.messages.setMaximumHeight(105);layout.addWidget(self.messages)
         self.log('No real-machine connection is made unless the EPICS backend is explicitly configured.')
     def log(self,text):self.messages.appendPlainText(str(text))
     def error(self,text):self.log('ERROR: '+text)
-    def start(self,action,finished):
+    def prepare_pause(self,enabled):
+        self.service.pause_requested.clear();self.service.paused.clear()
+        self.pause_button.setText('Pause');self.pause_button.setEnabled(enabled)
+    def toggle_pause(self):
+        if self.task is None or not self.task.isRunning():return
+        if self.service.pause_requested.is_set():
+            self.service.pause_requested.clear();self.pause_button.setText('Pause')
+            text='Resume requested; continuing after settings verification.'
+        else:
+            self.service.pause_requested.set();self.pause_button.setText('Resume')
+            text='Pause requested: waiting for the current probe pair / operation to finish and restore settings.'
+        self.log(text)
+        if hasattr(self,'operation_status'):self.operation_status.setText(text)
+    def start(self,action,finished,pausable=False):
         if self.task is not None and self.task.isRunning():self.error('A task is already running');return
+        self.prepare_pause(pausable)
         self.service.cancel.clear();self.tabs.setEnabled(False);self.progress.setValue(0)
         self.task=Task(action,getattr(self.backend,'ramp',None));self.task.result.connect(finished);self.task.failure.connect(self.error)
         self.task.message.connect(self.log)
         self.task.progress.connect(lambda n,text:(self.progress.setValue(n),self.log(text)))
         self.task.finished.connect(self.task_finished);self.task.start()
     def task_finished(self):
+        self.prepare_pause(False)
         self.tabs.setEnabled(True)
         for panel in self.panels.values():panel.refresh()
     def selection(self):

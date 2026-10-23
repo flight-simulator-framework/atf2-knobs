@@ -55,7 +55,8 @@ from machine_interfaces_atf2.InterfaceATF2_LinacBT import InterfaceATF2_LinacBT,
 from machine_interfaces_atf2.InterfaceATF2_DR import DRBPMReader, DR_BPM_NAMES, DRBPMTurnControlError
 from linac_gp import CorrectorGPModel
 from Knobs.ipbsm_opt_plotting import save_plot_montage
-from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, WrappingLabel
+from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, WrappingLabel, OverallProgressBar
+from Knobs.optimizer_progress import BudgetProgress
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
@@ -573,6 +574,70 @@ def _resolve_group_bo_max_evals(config: Dict[str, Any], group_name: str, ndim: i
     return max(1, int(fallback))
 
 
+def _run_evaluation_budgets(config):
+    """Plan selected search budgets before the first measurement (no PV reads)."""
+    budgets = {}
+    mode = str(config.get("mode", "SEQUENTIAL")).upper()
+    main = str(config.get("run_profile", RUN_PROFILE_MAIN)).upper() == RUN_PROFILE_MAIN
+
+    def sequential(label, half, step, *, refine=False, count=None):
+        count = count if count is not None else len(np.arange(0, 2 * half + step, step))
+        budget = int(config.get("bo_max_evals", min(17, count)))
+        if refine and config.get("bo_refine", True) and str(config.get("seq_method", "BO")).upper() == "BO" and count >= 2:
+            fine_count = int((count - 1) * float(config.get("bo_refine_factor", 5))) + 1
+            budget += int(config.get("bo_refine_evals", min(10, fine_count)))
+        budgets[label] = budget
+
+    def group(label, dim):
+        if mode == "GROUP_LBO":
+            budgets[label] = (1 + max(0, int(config.get("lbo_iters", 4))) * (dim + 1)
+                              * max(0, int(config.get("lbo_line_samples", 11))))
+        else:
+            budgets[label] = _resolve_group_bo_max_evals(config, label, dim)
+
+    if main:
+        if config.get("gun_sol_l0_phase"):
+            if mode == "SEQUENTIAL":
+                sequential("GUN phase", config.get("gun_phase_half_range_deg", GUN_PHASE_HALF_RANGE_DEG), config.get("gun_phase_step_deg", GUN_PHASE_STEP_DEG))
+                lo, hi = sorted((config.get("solenoide_min_a", SOLENOIDE_MIN_A), config.get("solenoide_max_a", SOLENOIDE_MAX_A)))
+                step = config.get("solenoide_step_a", SOLENOIDE_STEP_A)
+                sequential("Solenoid current", 0, step, count=len(np.arange(lo, hi + step * .5, step)))
+                sequential("L0 phase", config.get("l0_phase_half_range_deg", L0_PHASE_HALF_RANGE_DEG), config.get("l0_phase_step_deg", L0_PHASE_STEP_DEG))
+            else:
+                group("GUN&SOLENOIDE&L0" if mode == "GROUP_LBO" else TARGET_LABELS["gun_sol_l0"], 3)
+        if config.get("kly_phase"):
+            if mode == "SEQUENTIAL":
+                for i in range(1, 9):
+                    sequential(f"Klystron {i} phase", config.get("phase_half_range_deg", PHASE_HALF_RANGE_DEG), config.get("phase_step_deg", PHASE_STEP_DEG))
+            else:
+                if config.get("grp_L1_4", True):
+                    group("L1-4", 4)
+                if config.get("grp_L5_8", True):
+                    group("L5-8", 3 if mode == "GROUP_BO" and config.get("correctors_l8") else 4)
+        if config.get("timing"):
+            if mode == "SEQUENTIAL":
+                sequential("Timing", 0, 1, count=2 * int(config.get("timing_half_steps", TIMING_HALF_STEPS)) + 1)
+            else:
+                group("Timing", 1)
+        if config.get("timing_fine"):
+            budgets[TARGET_LABELS["timing_fine"]] = 9
+        for key, count, half_default, step_default in (("qa", 5, QA_HALF_RANGE_A, QA_STEP_A), ("qm", 3, QM_HALF_RANGE_A, QM_STEP_A)):
+            if config.get(key):
+                if mode == "SEQUENTIAL":
+                    for i in range(1, count + 1):
+                        sequential(f"{key.upper()}{i}L", config.get(f"{key}_half_range_a", half_default), config.get(f"{key}_step_a", step_default), refine=True)
+                else:
+                    group(key.upper(), count)
+    if not main or config.get("correctors"):
+        actuators = [a for a in config.get("developer_actuators", []) if a.get("pv_write")]
+        if mode == "GROUP_BO":
+            budgets[DEVELOPER_GROUP_NAME] = _resolve_group_bo_max_evals(config, DEVELOPER_GROUP_NAME, len(actuators))
+        else:
+            for a in actuators:
+                sequential(str(a.get("label", a.get("name", "Actuator"))), a.get("half_range", DEVELOPER_DEFAULT_HALF_RANGE_A), a.get("step", DEVELOPER_DEFAULT_STEP_A))
+    return budgets
+
+
 def _default_readback_pv(pv_write: str) -> Optional[str]:
     if str(pv_write).strip() == SOLENOIDE_WRITE_PV:
         return SOLENOIDE_READ_PV
@@ -878,6 +943,7 @@ class OptimizationWorker(QThread):
         self._initial_eval_consumed = False
         self._eval_counter = 0
         self._scan_progress = {}
+        self._overall_progress = BudgetProgress(_run_evaluation_budgets(config))
         self._current_pv_values: Dict[str, float] = {}
         self.resume_csv_path = Path(str(config.get("resume_csv_path", "")).strip()).expanduser() if str(
             config.get("resume_csv_path", "")).strip() else None
@@ -945,11 +1011,21 @@ class OptimizationWorker(QThread):
             ])
 
     def _emit_progress(self, payload: Dict[str, object]):
-        self.progress_signal.emit(dict(payload))
+        payload = dict(payload)
+        scan = payload.get("scan_progress", {})
+        if scan and payload.get("kind") == "evaluation":
+            self._overall_progress.update(scan["label"], scan.get("index"))
+        payload["overall_progress"] = self._overall_progress.snapshot()
+        self.progress_signal.emit(payload)
 
     def _set_scan_progress(self, label, index, max_evals, stage="measuring"):
         # Local search budget, not the run-wide CSV index (which also counts
         # final verification measurements and discarded/retried measurements).
+        previous = self._scan_progress.get("label")
+        if previous and previous != str(label):
+            self._overall_progress.update(previous, done=True)
+        done = stage in ("final check", "restoring saved best")
+        self._overall_progress.update(str(label), max(0, int(index or 0) - 1), done=done)
         self._scan_progress = {
             "label": str(label), "index": index, "max_evals": int(max_evals), "stage": stage,
         }
@@ -2713,6 +2789,7 @@ class OptimizationWorker(QThread):
     def run(self):
         self.log_signal.emit(f"=== Optimization Started (profile={self.run_profile}, mode={self.mode}) ===")
         try:
+            self._emit_progress({"kind": "overall_progress"})
             self._dump_initial_snapshot()
             if self.run_profile == RUN_PROFILE_DEVELOPER:
                 self._run_correctors()
@@ -2731,6 +2808,9 @@ class OptimizationWorker(QThread):
             # Refine that result immediately after the combined group finishes.
             if self.config.get("correctors_l8") and self.config.get("correctors"):
                 self._run_timing_fine_stage(combined=True)
+            if self.is_running:
+                self._overall_progress.finish()
+                self._emit_progress({"kind": "overall_progress"})
         except SaveAndEndRequested:
             try:
                 self._finish_at_best()
@@ -3461,10 +3541,12 @@ class MainWindow(QMainWindow):
         self.status_lbl = QLabel("Status: IDLE")
         self.status_lbl.setObjectName("statusBadge")
         self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_lbl.setMinimumHeight(34)
+        self.status_lbl.setMinimumHeight(48)
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         monitor.addWidget(self.status_lbl)
+        self.total_progress = OverallProgressBar()
+        monitor.addWidget(self.total_progress)
         self._status_labels[RUN_PROFILE_MAIN] = self.status_lbl
 
         log_group = QGroupBox("Live plots")
@@ -3590,6 +3672,8 @@ class MainWindow(QMainWindow):
         self.dev_status_lbl.setMinimumHeight(46)
         self.dev_status_lbl.setWordWrap(True)
         ctrl.addWidget(self.dev_status_lbl)
+        self.dev_total_progress = OverallProgressBar()
+        ctrl.addWidget(self.dev_total_progress)
         self._status_labels[RUN_PROFILE_DEVELOPER] = self.dev_status_lbl
 
         selection_row = QHBoxLayout()
@@ -4821,6 +4905,7 @@ class MainWindow(QMainWindow):
         )
         state["eval_index"] = []
         self._scan_progress_by_profile.pop(context, None)
+        (self.total_progress if context == RUN_PROFILE_MAIN else self.dev_total_progress).update_progress({})
         state["evaluation_phase"] = []
         state["ttot"] = []
         state["metric"] = []
@@ -5149,6 +5234,8 @@ class MainWindow(QMainWindow):
     def _on_worker_progress(self, payload: dict):
         context = self._run_profile
         kind = str(payload.get("kind", ""))
+        if "overall_progress" in payload:
+            (self.total_progress if context == RUN_PROFILE_MAIN else self.dev_total_progress).update_progress(payload["overall_progress"])
         if "scan_progress" in payload:
             self._scan_progress_by_profile[context] = dict(payload["scan_progress"])
         if kind == "scan_progress":
@@ -5286,7 +5373,7 @@ class MainWindow(QMainWindow):
         target.setText(text)
         target.setStyleSheet(
             "QLabel#statusBadge {"
-            f"font-size: 14px; font-weight: 600; color: {fg}; "
+            f"font-size: 17px; font-weight: 600; color: {fg}; "
             f"background: {bg}; border: 2px solid {bd}; "
             "border-radius: 6px; padding: 5px 8px; }"
         )

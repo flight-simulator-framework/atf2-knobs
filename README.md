@@ -26,7 +26,7 @@ Both registers are saved for restoration.
 
 ## LinacOpt progress and plot export
 
-Main and Developer show the active axis/group's search budget, for example
+The enlarged status badge shows the active axis/group's search budget, for example
 `QA1L | eval=8/17`, plus `total` for the run-wide recorded evaluations.
 Initial/reused and warm-start search points count toward the local budget.
 Retries of a paused point keep the same local index. Final remeasurement of
@@ -34,7 +34,14 @@ the best settings is labelled `final check` and does not consume another
 search slot; it does increment `total`. Completed scans restored from a
 resume file show `restoring saved best` and their configured maxeval.
 
-The denominator is an upper limit for the current scan, not a promised number
+Below the status, **Total progress** shows completed search slots divided by
+the sum of the selected groups' maxeval budgets. A group that finishes early
+(including EI termination or a restored completed scan) contributes its entire
+budget. Unfinished groups retain their partial progress on manual stop. Final
+verification and retries do not add budget. Sequential QA/QM refinement is
+included in the planned total from the start.
+
+The local eval denominator is an upper limit for the current scan, not a promised number
 of measurements or a whole-run limit. BO can stop early. QA/QM refinement
 extends the displayed limit by its extra budget. Group-LBO displays the upper
 bound from its iterations, directions and line samples; deduplication and
@@ -60,7 +67,10 @@ LinacOpt and IPBSM place scrollable controls on the left and live plots,
 progress and results on the right. Drag the divider to adjust their widths;
 the divider between live and BO plots adjusts their heights. `Show log`
 opens the log below the plots. Config pages scroll independently, and saved
-IPBSM plots scale to the available monitor width.
+IPBSM plots automatically form a grid based on plot count, aspect ratios and
+the available width and height. All generated plots fit in the monitor without
+scrolling; resizing the window or divider recalculates the grid. Machine
+setpoint details are in the left controls column.
 
 ## Development
 

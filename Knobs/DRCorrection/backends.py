@@ -334,7 +334,13 @@ class EpicsBackend(DemoBackend):
         return dict(names=self.bpm_names,x=values['x']*p['mm_per_unit'],y=values['y']*p['mm_per_unit'],
                     tmit=values['tmit'],valid=status&np.isfinite(values['x'])&np.isfinite(values['y'])&(values['tmit']>0),
                     validity_diagnostics=diagnostic,position_unit='mm')
-    def target_dispersion(self,plane):return np.asarray(self.profile['target_dispersion_mm'][plane],float)
+    def target_dispersion(self,plane):
+        value=self.profile['target_dispersion_mm'].get(plane)
+        if value is None:
+            raise ValueError(f'Nominal {"horizontal" if plane=="x" else "vertical"} dispersion target is not configured '
+                f'(target_dispersion_mm.{plane}). Use Load target dispersion before Measured magnet response CALC. '
+                'Horizontal dispersion must not be assumed zero. No magnet or RF setting changed.')
+        return np.asarray(value,float)
     def tbt(self,turns=1024,pulse=None):
         if pulse:raise ValueError('Live exciter is not configured; use an externally acquired waveform')
         p=self.profile.get('tbt')

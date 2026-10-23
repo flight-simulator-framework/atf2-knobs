@@ -113,6 +113,41 @@ class GuiTests(unittest.TestCase):
             self.app.processEvents();time.sleep(.01)
             if time.monotonic()>deadline:raise AssertionError('Qt task timeout')
         self.app.processEvents()
+    def test_calc_pause_resume_and_cancel_controls(self):
+        from Knobs.DRTuning.gui import TuningSession
+        for cancel in (False,True):
+            with self.subTest(cancel=cancel):
+                backend=QuadFixture();window=TuningSession(backend);window.show()
+                original=backend.orbit;reading=threading.Event();release=threading.Event()
+                initial=backend.snapshot()
+                def orbit():
+                    if not reading.is_set():
+                        reading.set()
+                        if not release.wait(5):raise RuntimeError('test read timeout')
+                    return original()
+                backend.orbit=orbit
+                try:
+                    self.assertFalse(window.pause_button.isEnabled())
+                    panel=window.panels['orbit'];panel.options.fixed_actuators=tuple(backend.vcorrectors[2:])
+                    panel.calculate();self.assertTrue(reading.wait(5))
+                    self.assertTrue(window.pause_button.isEnabled());window.pause_button.click()
+                    self.assertEqual(window.pause_button.text(),'Resume')
+                    release.set();deadline=time.monotonic()+5
+                    while 'PAUSED:' not in window.operation_status.text():
+                        self.app.processEvents();time.sleep(.01)
+                        if time.monotonic()>deadline:self.fail(window.messages.toPlainText())
+                    self.assertEqual(backend.snapshot(),initial)
+                    self.assertFalse(window.tabs.isEnabled())
+                    (window.cancel_button if cancel else window.pause_button).click()
+                    self.wait(window)
+                    self.assertFalse(window.pause_button.isEnabled())
+                    self.assertFalse(window.service.pause_requested.is_set())
+                    self.assertEqual(backend.snapshot(),initial)
+                    if cancel:self.assertIsNone(panel.data)
+                    else:self.assertIsNotNone(panel.data,window.messages.toPlainText())
+                finally:
+                    release.set();window.service.cancel.set();window.service.pause_requested.clear()
+                    self.wait(window);window.close()
     def test_ramp_worker_trace_is_available_in_detailed_log(self):
         from Knobs.DRTuning.gui import TuningSession
         from Knobs.DRCorrection.ramp import DeltaRamp

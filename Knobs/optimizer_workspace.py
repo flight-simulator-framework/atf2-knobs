@@ -3,7 +3,7 @@ from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QSplitter,
-    QFrame, QSizePolicy, QPushButton, QLabel,
+    QFrame, QSizePolicy, QPushButton, QLabel, QProgressBar, QGridLayout,
 )
 
 
@@ -126,3 +126,89 @@ class WrappingLabel(QLabel):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._fit_height()
+
+
+class OverallProgressBar(QProgressBar):
+    """Run-wide budget progress displayed below the status badge."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRange(0, 1000)
+        self.setMinimumHeight(26)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("QProgressBar { border: 1px solid #bfdbfe; border-radius: 5px; "
+                           "background: #eff6ff; color: #172b4d; font-size: 14px; font-weight: 600; }"
+                           "QProgressBar::chunk { background: #93c5fd; border-radius: 4px; }")
+        self.setToolTip("Selected groups' total evaluation budget. Early-completed groups count as fully complete.")
+        self.update_progress({})
+
+    def update_progress(self, progress):
+        percent = max(0.0, min(100.0, float(progress.get("percent", 0))))
+        self.setValue(round(percent * 10))
+        self.setFormat(f"Total progress: {percent:.1f}%")
+
+
+class FitPlotGallery(QWidget):
+    """Choose a grid that maximizes image size inside the available viewport."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(4)
+        self.panels = []
+        self.columns = 0
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
+    def clear(self):
+        while self.grid.count():
+            widget = self.grid.takeAt(0).widget()
+            if widget is not None:
+                widget.hide()
+                widget.deleteLater()
+        self.panels = []
+        self.columns = 0
+
+    def set_plots(self, paths):
+        self.clear()
+        from PyQt6.QtGui import QPixmap
+        for path in paths:
+            pix = QPixmap(str(path))
+            panel = PlotImage(pix, self)
+            panel.setToolTip(path.name)
+            # The grid owns both dimensions; image hints must never cause scrolling.
+            panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+            self.panels.append(panel)
+        self.reflow()
+
+    def reflow(self):
+        count = len(self.panels)
+        if not count:
+            return
+        def score(cols):
+            rows = (count + cols - 1) // cols
+            width = max(1, (self.width() - (cols - 1) * 4) / cols)
+            height = max(1, (self.height() - (rows - 1) * 4) / rows)
+            areas = []
+            for panel in self.panels:
+                ratio = panel.pixmap.width() / max(1, panel.pixmap.height())
+                ratio = max(0.1, ratio)
+                areas.append(min(width, height * ratio) * min(height, width / ratio))
+            return sum(areas)
+        cols = max(range(1, count + 1), key=score)
+        if cols == self.columns:
+            return
+        for index in range(max(self.grid.rowCount(), self.grid.columnCount())):
+            self.grid.setRowStretch(index, 0)
+            self.grid.setColumnStretch(index, 0)
+        while self.grid.count():
+            self.grid.takeAt(0)
+        self.columns = cols
+        for index, panel in enumerate(self.panels):
+            row, col = divmod(index, cols)
+            self.grid.addWidget(panel, row, col)
+            self.grid.setRowStretch(row, 1)
+            self.grid.setColumnStretch(col, 1)
+            panel.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.reflow()

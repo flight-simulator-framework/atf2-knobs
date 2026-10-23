@@ -121,6 +121,8 @@ class CorrectionService:
     def __init__(self,backend):
         self.backend=backend
         self.cancel=threading.Event()
+        self.pause_requested=threading.Event()
+        self.paused=threading.Event()
         self.undo=[]
         self.orbit_measurements=[]
         self._model_manager=None
@@ -134,6 +136,26 @@ class CorrectionService:
 
     def check_cancel(self):
         if self.cancel.is_set():raise Cancelled('Cancelled; temporary scan settings restored')
+
+    def pause_checkpoint(self,progress,percent,baseline=None,ignored=()):
+        """Pause only outside probe transactions, with RF/magnets restored."""
+        self.check_cancel()
+        if not self.pause_requested.is_set():return
+        def verify():
+            if baseline is None:return
+            current=self.backend.snapshot(excluded=ignored) if ignored else self.backend.snapshot()
+            if not self.backend.same_settings(current,baseline):
+                raise ValueError('Machine settings changed at pause/resume; CALC again. No correction applied.')
+        verify()
+        self.paused.set()
+        try:
+            progress(percent,'PAUSED: probe settings restored. Resume to continue, or Cancel to stop.')
+            while self.pause_requested.is_set():
+                if self.cancel.wait(.1):self.check_cancel()
+            self.check_cancel()
+            verify()
+        finally:self.paused.clear()
+        progress(percent,'RESUMED: continuing response measurement')
 
     def _orbit(self,opt):
         count=opt.bpm_samples;interval=opt.bpm_interval_s
@@ -243,8 +265,16 @@ class CorrectionService:
         if opt.plane not in ('x','y'):raise ValueError('Select x or y')
         # Validate the nominal target before moving any magnet or RF setting.
         nominal=self.backend.target_dispersion(opt.plane) if mode=='dispersion' else None
-        if nominal is not None and (np.shape(nominal)!=(len(self.backend.bpm_names),) or not np.isfinite(nominal).all()):
-            raise ValueError('Invalid nominal dispersion target')
+        if mode=='dispersion':
+            shape=np.shape(nominal);expected=(len(self.backend.bpm_names),)
+            if nominal is None or shape!=expected or not np.isfinite(nominal).all():
+                reason='missing target' if nominal is None else 'BPM count/array shape mismatch'
+                if nominal is not None and shape==expected:
+                    bad=np.asarray(self.backend.bpm_names)[~np.isfinite(nominal)]
+                    reason='nonfinite target at '+', '.join(bad)
+                raise ValueError(f'Invalid nominal dispersion target: plane={opt.plane}; expected shape={expected}, '
+                    f'received shape={shape}; {reason}. Load target dispersion with one finite value per BPM (mm per dp/p). '
+                    'No magnet or RF setting changed.')
         if mode=='skew':
             names=[n for n in self.backend.skews if (opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF'))]
             kind='skews';probe=opt.skew_probe
@@ -265,6 +295,7 @@ class CorrectionService:
             raise RuntimeError('No usable response magnets.\n'+'\n'.join(e['error'] for e in scan_errors))
         centers=np.asarray([baseline[kind][n] for n in names] if hasattr(self.backend,'measured_snapshot') else self.backend.read(kind,names),float)
         low,high=self.backend.limits(kind,names)
+        self.pause_checkpoint(progress,0,baseline,ignored)
         measured,valid=self._signal(mode,opt)
         self.require_usable(self.backend.bpm_names,measured,np.zeros_like(measured),valid,names,opt)
         full_measured=self.full_signal.copy();columns=[];full_columns=[];probe_history=[]
@@ -275,12 +306,13 @@ class CorrectionService:
         # _signal likewise restores RF and skew-excitation correctors. Do not
         # replay the full snapshot: it includes magnets this scan never touched.
         for j,name in enumerate(names):
-            self.check_cancel()
+            self.pause_checkpoint(progress,int(100*j/len(names)),baseline,ignored)
             valid_before=valid.copy();restored=False;restoration_error=''
             try:
                 amplitude=min(probe,opt.adaptive_max_probe) if opt.adaptive_probe else probe
                 pairs=int(opt.adaptive_max_pairs) if opt.adaptive_probe else 1
                 for attempt in range(pairs):
+                    self.pause_checkpoint(progress,int(100*j/len(names)),baseline,ignored)
                     self.check_cancel();values=[];full_values=[];readbacks=[];restored=False
                     lo=max(low[j],centers[j]-amplitude);hi=min(high[j],centers[j]+amplitude)
                     if hi<=lo:raise ValueError('No available probe range')
@@ -363,6 +395,7 @@ class CorrectionService:
             columns.append(((values[1]-values[0])/span).reshape(-1))
             full_columns.append(((full_values[1]-full_values[0])/span).reshape(-1))
             progress(int(100*(j+1)/len(names)),f'{name}: response {j+1}/{len(names)}')
+        self.pause_checkpoint(progress,100,baseline,ignored)
         if not successful:
             raise RuntimeError('No usable response magnets.\n'+'\n'.join(
                 f"{e['magnet']}: {e['error']}; {e['restoration']}" for e in scan_errors))

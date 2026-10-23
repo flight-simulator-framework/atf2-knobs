@@ -302,9 +302,10 @@ class TuningSession(DRCorrectionWindow):
             self.operation_status.setStyleSheet('color:#b42318;font-weight:bold;')
             self.log_toggle.setChecked(True)
             if self.tabs.currentWidget() is self.tbt:self.tbt.acquisition_status.setText('Failed: '+message+'\nSee the detailed log below.')
-    def start(self,action,finished,label=None):
+    def start(self,action,finished,label=None,pausable=False):
         if self.task is not None and self.task.isRunning():
             self.log('An operation is running. Wait for completion or cancel.');return
+        self.prepare_pause(pausable)
         self._failed=False;self._started=time.monotonic();self._active_label=label or self.navigation.currentItem().text()
         self.operation_status.setStyleSheet('color:#175c91;font-weight:bold;')
         self.operation_status.setText(self._active_label+': working...');self.log(self._active_label+': started')
@@ -322,9 +323,11 @@ class TuningSession(DRCorrectionWindow):
         self.task.progress.connect(self.show_progress);self.task.finished.connect(self.task_finished);self.task.start()
     def show_progress(self,value,message):
         self.progress.setRange(0,100);self.progress.setValue(value)
-        self.operation_status.setText(self._active_label+'：'+message)
-        if message.startswith('SKIP '):self.log(message)
+        pending=' [Pause requested; finishing current operation]' if self.service.pause_requested.is_set() and not self.service.paused.is_set() else ''
+        self.operation_status.setText(self._active_label+'：'+message+pending)
+        if message.startswith(('SKIP ','PAUSED:','RESUMED:')):self.log(message)
     def task_finished(self):
+        self.prepare_pause(False)
         self.timer.stop();self.tick();self.tabs.setEnabled(True);self.navigation.setEnabled(True);self.cancel_button.setEnabled(False)
         self.progress.setRange(0,100);self.progress.setValue(0 if self._failed else 100)
         for panel in self.panels.values():panel.refresh()

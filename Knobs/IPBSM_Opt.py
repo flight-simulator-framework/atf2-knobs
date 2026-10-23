@@ -28,6 +28,12 @@ def now_tag() -> str:
     # Asia/Tokyo not enforced here; GUI passes local time anyway.
     return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
+try:
+    from .optimizer_progress import BudgetProgress
+except ImportError:
+    from optimizer_progress import BudgetProgress
+
+
 def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -533,6 +539,10 @@ class Optimizer:
     ):
         self.controller = controller
         self.cfg = config
+        self._sequential_progress = str(config.method).upper() in {"GF", "SEQUENTIAL"}
+        budgets = ({axis: max(1, int(config.gf_axis_min_points), int(config.gf_axis_max_steps)) for axis in config.params}
+                   if self._sequential_progress else {"search": max(1, int(config.bo_max_steps))})
+        self._overall_progress = BudgetProgress(budgets)
         self.out_dir = ensure_dir(out_dir)
         self.progress_cb = progress_cb
         self.stop_flag = stop_flag or StopFlag()
@@ -968,6 +978,14 @@ class Optimizer:
 
 
     def _emit(self, step: int, info: Dict):
+        info = dict(info)
+        phase = info.get("phase", "")
+        if self._sequential_progress:
+            axis = info.get("axis", "")
+            self._overall_progress.update(axis, info.get("axis_steps", 0), done=phase in {"axis_done", "axis_finalize"})
+        elif phase in {"init", "loop", "resume_remeasure", "model_fit", "acquisition", "stop"}:
+            self._overall_progress.update("search", step, done=phase == "stop")
+        info["overall_progress"] = self._overall_progress.snapshot()
         if self.progress_cb:
             self.progress_cb(step, info)
 
@@ -2192,6 +2210,7 @@ class Optimizer:
                         break
                     axis_resume = gf_resume["axis_states"][axis_idx] if axis_idx < len(gf_resume["axis_states"]) else {}
                     if bool(axis_resume.get("done", False)):
+                        self._emit(len(self.X), {"phase": "axis_done", "axis": axis_name, "reason": "resumed completed axis"})
                         continue
 
                     x_fixed = clamp(x_fixed, lo, hi)
@@ -2696,6 +2715,9 @@ class Optimizer:
                     "final_strategy": final_strategy,
                 })
 
+        if not self.stop_flag.is_stopped():
+            self._overall_progress.finish()
+        self._emit(len(self.X), {"phase": "overall_progress"})
         out = {
             "out_dir": str(self.out_dir),
             "measurements_csv": str(self.measurements_csv_path),

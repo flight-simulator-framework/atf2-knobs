@@ -171,6 +171,7 @@ class OpticsModel:
                 self.solver._set_corrector_kick(self.solver._single_element(physical),kick)
             self.values[n]=value
     def snapshot(self):return dict(values=self.values.copy(),frequency=self.offset)
+    def same_settings(self,left,right):return left==right
     def frequency(self):return self.offset
     def frequency_state(self):return self.offset
     def restore_frequency(self,state):self.set_frequency(state)
@@ -459,6 +460,7 @@ class ModelManager:
         # Compute response before any real RF/probe movement; invalid mappings,
         # unstable optics and calibration errors therefore fail read-only.
         virtual=CorrectionService(model);virtual.cancel=service.cancel
+        virtual.pause_requested=service.pause_requested;virtual.paused=service.paused
         options=copy.deepcopy(opt);options.response_source='measured';options.bpm_samples=1;options.bpm_interval_s=0.
         options.adaptive_probe=False  # Model finite differences need no beam-driven amplitude search.
         progress(15,'Calculating magnet responses in RFTrack; machine magnets unchanged')
@@ -467,6 +469,7 @@ class ModelManager:
             from .model_optics import extraction_constraints
             data['constraints']=extraction_constraints(model,mode,opt,data,service.check_cancel)
         service.orbit_measurements=[];b.validate_mode(mode)
+        service.pause_checkpoint(progress,90,self.baseline)
         if not b.same_settings(b.snapshot(),self.baseline):raise ValueError('Machine settings changed during model response calculation')
         verify_inputs(b,self.settings)
         measured,valid=service._signal(mode,opt);full=service.full_signal.copy()
