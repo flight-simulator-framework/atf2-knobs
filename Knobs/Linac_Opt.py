@@ -3373,11 +3373,13 @@ class MainWindow(QMainWindow):
         root.addWidget(self.tabs)
         self.main_tab = QWidget()
         self.config_tab = QWidget()
+        self.detail_config_tab = QWidget()
         # Retain legacy widget handles for old run logs, but no Developer page.
         self.developer_tab = QWidget(self)
         self.developer_tab.hide()
         self.tabs.addTab(self.main_tab, "Main")
         self.tabs.addTab(self.config_tab, "Config")
+        self.tabs.addTab(self.detail_config_tab, "Detail config")
 
         self._build_main_tab()
         self._build_config_tab()
@@ -3386,6 +3388,12 @@ class MainWindow(QMainWindow):
         self.objective_box = self.dev_objective_box
         self.objective_row.addWidget(self.objective_box)
         self.objective_box.setToolTip("BPM intensity: LINAC / BT / DR")
+        self.downstream_ict_label = QLabel("ICT")
+        self.objective_row.addWidget(self.downstream_ict_label)
+        self.objective_row.addWidget(self.cb_downstream_ict)
+        self.cb_downstream_ict.setToolTip("ICT used by the objective")
+        self._update_downstream_ict_visibility()
+        self.objective_box.currentTextChanged.connect(self._update_downstream_ict_visibility)
         self.objective_row.addStretch(1)
         refresh_row = QHBoxLayout()
         self.dev_refresh_btn.setFixedWidth(240)
@@ -3998,20 +4006,29 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(self.config_tab)
         self.config_sections = QTabWidget()
         outer.addWidget(self.config_sections)
-        scan_page = QWidget()
-        scan_scroll = QScrollArea()
-        scan_scroll.setWidgetResizable(True)
-        scan_scroll.setWidget(scan_page)
-        self.config_sections.addTab(scan_scroll, "Scan settings")
+        budget_page = QWidget()
+        budget_scroll = QScrollArea()
+        budget_scroll.setWidgetResizable(True)
+        budget_scroll.setWidget(budget_page)
+        budget_layout = QVBoxLayout(budget_page)
+        self.config_sections.addTab(budget_scroll, "Max eval")
+
+        detail_outer = QVBoxLayout(self.detail_config_tab)
+        self.detail_config_scroll = QScrollArea()
+        self.detail_config_scroll.setWidgetResizable(True)
+        detail_page = QWidget()
+        self.detail_config_scroll.setWidget(detail_page)
+        detail_outer.addWidget(self.detail_config_scroll)
         self.selection_page = QWidget()
         QVBoxLayout(self.selection_page)
         selection_scroll = QScrollArea()
         selection_scroll.setWidgetResizable(True)
         selection_scroll.setWidget(self.selection_page)
         self.config_sections.addTab(selection_scroll, "Correctors / BPMs")
-        layout = QVBoxLayout(scan_page)
+        layout = QVBoxLayout(detail_page)
         layout.setSpacing(10)
         self.config_tab.setStyleSheet(WORKSPACE_STYLE)
+        self.detail_config_tab.setStyleSheet(WORKSPACE_STYLE)
 
         grp_scan = QGroupBox("Scan Settings")
         layout.addWidget(grp_scan)
@@ -4156,15 +4173,14 @@ class MainWindow(QMainWindow):
         self.sp_score_w_downstream.setValue(1.0)
         lay_score.addWidget(self.sp_score_w_downstream)
         lay_score.addSpacing(12)
-        lay_score.addWidget(QLabel("Downstream ICT"))
         self.cb_downstream_ict = QComboBox()
         self.cb_downstream_ict.addItems(["DR", "LNE", "BTE", "LN0", "GUN", "BTM"])
         self.cb_downstream_ict.setCurrentText("DR")
-        lay_score.addWidget(self.cb_downstream_ict)
         lay_score.addStretch(1)
 
         self.grp_group_bo_budget = QGroupBox("Group BO Max Evals")
-        layout.addWidget(self.grp_group_bo_budget)
+        budget_layout.addWidget(self.grp_group_bo_budget)
+        budget_layout.addStretch(1)
         lay_gbo = QGridLayout(self.grp_group_bo_budget)
         lay_gbo.setHorizontalSpacing(18)
         lay_gbo.setVerticalSpacing(8)
@@ -4271,6 +4287,8 @@ class MainWindow(QMainWindow):
         lay_p.addWidget(self.btn_browse)
 
         layout.addStretch(1)
+        self._config_setting_groups = [grp_scan, grp_score, self.grp_group_bo_budget,
+                                       corrector_gp_group, grp_adv, path_group]
 
     def _make_check_item(self, checked: bool = False) -> QTableWidgetItem:
         item = QTableWidgetItem("")
@@ -4507,6 +4525,11 @@ class MainWindow(QMainWindow):
     def _update_developer_mode_ui(self):
         is_seq = (self.dev_mode_box.currentText() == "SEQUENTIAL")
         self.dev_seq_method_box.setEnabled(is_seq)
+
+    def _update_downstream_ict_visibility(self):
+        visible = self.objective_box.currentText() == "ICT"
+        self.cb_downstream_ict.setVisible(visible)
+        self.downstream_ict_label.setVisible(visible)
 
     def _update_developer_objective_ui(self):
         intensity = self.dev_objective_box.currentText() == "BPM intensity"
@@ -5933,10 +5956,14 @@ class MainWindow(QMainWindow):
             self.chk_gun_sol_l0_phase, self.chk_kly_phase, self.chk_kly_group1, self.chk_kly_group2,
             self.chk_timing_group, self.chk_timing, self.chk_timing_fine, self.chk_qa, self.chk_qm,
             self.chk_correctors, self.objective_box,
-            self.mode_box, self.seq_method_box, self.btn_browse, self.config_tab,
+            self.mode_box, self.seq_method_box, self.btn_browse, self.cb_downstream_ict,
             self.resume_file_edit, self.resume_file_browse_btn, self.resume_file_clear_btn
         ]:
             w.setEnabled(enabled)
+        # Disable settings, not their tab/scroll containers: operators can inspect
+        # every configuration page during acquisition without changing the run.
+        for group in self._config_setting_groups:
+            group.setEnabled(enabled)
         self.chk_timing.setEnabled(enabled and self.chk_timing_group.isChecked())
         self.chk_timing_fine.setEnabled(enabled and self.chk_timing_group.isChecked())
 

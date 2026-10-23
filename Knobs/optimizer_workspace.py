@@ -1,6 +1,9 @@
 """Shared, resizable desktop layout for the optimization GUIs."""
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QPainter
+import json
+import math
+
+from PyQt6.QtCore import Qt, QSize, QRectF, QPointF
+from PyQt6.QtGui import QPainter, QColor, QPen
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QSplitter,
     QFrame, QSizePolicy, QPushButton, QLabel, QProgressBar, QGridLayout,
@@ -86,6 +89,9 @@ class PlotImage(QWidget):
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
         self.pixmap = pixmap
+        self.axis_metadata = {}
+        self.measurement_value = None
+        self.measurement_visible = False
         policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
@@ -99,6 +105,25 @@ class PlotImage(QWidget):
     def minimumSizeHint(self):
         return QSize(100, 80)
 
+    def measurement_line(self):
+        """Widget-space line coordinates, including image letterboxing."""
+        if self.measurement_value is None or not self.axis_metadata or self.pixmap.isNull():
+            return None
+        try:
+            lo, hi = self.axis_metadata["xlim"]
+            left, top, width, height = self.axis_metadata["rect"]
+            fraction = (float(self.measurement_value) - lo) / (hi - lo)
+            if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+                return None
+            scaled = self.pixmap.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            x0, y0 = (self.width() - scaled.width()) / 2, (self.height() - scaled.height()) / 2
+            rect = QRectF(x0 + left * scaled.width(), y0 + top * scaled.height(),
+                          width * scaled.width(), height * scaled.height())
+            x = rect.left() + fraction * rect.width()
+            return rect, QPointF(x, rect.top()), QPointF(x, rect.bottom())
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return None
+
     def paintEvent(self, event):
         if self.pixmap.isNull():
             return
@@ -107,6 +132,24 @@ class PlotImage(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.drawPixmap((self.width() - scaled.width()) // 2, (self.height() - scaled.height()) // 2,
                            scaled.width(), scaled.height(), self.pixmap)
+        line = self.measurement_line()
+        if line is not None:
+            rect, start, end = line
+            painter.setClipRect(rect)
+            color = QColor("#ea580c")
+            if self.measurement_visible:
+                painter.setPen(QPen(color, 2.5, Qt.PenStyle.DotLine))
+                painter.drawLine(start, end)
+            label = f"Measuring: {self.measurement_value:+.5g}"
+            font = painter.font()
+            font.setPixelSize(12)
+            font.setBold(True)
+            painter.setFont(font)
+            label_rect = QRectF(rect.left() + 3, rect.top() + 3,
+                                min(rect.width() - 6, painter.fontMetrics().horizontalAdvance(label) + 8), 20)
+            painter.fillRect(label_rect, QColor(255, 255, 255, 225))
+            painter.setPen(color)
+            painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, label)
 
 
 class WrappingLabel(QLabel):
@@ -155,6 +198,8 @@ class FitPlotGallery(QWidget):
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setSpacing(4)
         self.panels = []
+        self.measurement_values = {}
+        self.measurement_visible = False
         self.columns = 0
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
@@ -169,15 +214,37 @@ class FitPlotGallery(QWidget):
 
     def set_plots(self, paths):
         self.clear()
-        from PyQt6.QtGui import QPixmap
+        from PyQt6.QtGui import QImage, QPixmap
         for path in paths:
-            pix = QPixmap(str(path))
-            panel = PlotImage(pix, self)
+            source = QImage(str(path))
+            panel = PlotImage(QPixmap.fromImage(source), self)
+            try:
+                panel.axis_metadata = json.loads(source.text("optimizer_axis") or "{}")
+                if not isinstance(panel.axis_metadata, dict):
+                    panel.axis_metadata = {}
+            except (ValueError, TypeError):
+                panel.axis_metadata = {}
             panel.setToolTip(path.name)
             # The grid owns both dimensions; image hints must never cause scrolling.
             panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
             self.panels.append(panel)
+        self.set_measurement_position(self.measurement_values, visible=self.measurement_visible)
         self.reflow()
+
+    def set_measurement_position(self, values, *, visible=True):
+        self.measurement_values = dict(values)
+        self.measurement_visible = visible
+        for panel in self.panels:
+            value = values.get(panel.axis_metadata.get("axis"))
+            try:
+                value = float(value)
+                if not math.isfinite(value):
+                    value = None
+            except (ValueError, TypeError):
+                value = None
+            panel.measurement_value = value
+            panel.measurement_visible = visible
+            panel.update()
 
     def reflow(self):
         count = len(self.panels)

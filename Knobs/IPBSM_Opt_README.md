@@ -80,6 +80,16 @@ kernel, signal variance (default 0.15), noise variance (default 0.0001),
 initial-point count or search bounds. Both modes update the GP predictions
 as measurements arrive, but neither re-fits hyperparameters during the run.
 
+## BO measurement position
+
+During BO acquisition, each 1D plot shows the current quantized knob setting as
+an orange dotted vertical line, blinking every 450 ms, with a numeric
+`Measuring` label. The axes cover the full configured search range, including
+before the first measurement. Lines track window resizing and clear after the
+measurement, reuse, stop or failure. Pausing suspends blinking; resuming restores
+it at the same position. These cursors are GUI overlays and are not included in
+saved plots or the tempfiles montage.
+
 ## BO progress and EI stopping
 
 The status shows, for example, `step=8/20`. The denominator is the running
@@ -100,8 +110,14 @@ Live/result images automatically fit into a grid within the plot area, including
 all generated 1D and 2D plots. The layout adapts to plot count and window size
 without scrolling. Machine setpoint details remain available in the left panel.
 
-Config → **EI stop rule / EI stop settings** allows editing Threshold and
-Consecutive checks. Custom values survive Save config / Load config.
+The operator Config shows **Average pause ratio** and **Representative Sigma
+Per Axis**, including Z-scan Sigma. Corrector knobs are hidden in Main and Config.
+Other fields, including EI thresholds and configuration file buttons, are hidden;
+their underlying values and configuration-loading code are retained. Hidden
+corrector axes are excluded from new GUI runs, including legacy config loads.
+
+The underlying **EI stop rule / EI stop settings** support Threshold and
+Consecutive checks; configured custom values are retained.
 The condition checks the largest EI in the candidate pool after initialization,
 before the next measurement. It stops when `max EI <= threshold` for the chosen
 number of consecutive checks. A higher EI resets the counter. This condition

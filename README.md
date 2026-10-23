@@ -72,6 +72,18 @@ the available width and height. All generated plots fit in the monitor without
 scrolling; resizing the window or divider recalculates the grid. Machine
 setpoint details are in the left controls column.
 
+LinacOpt's **Config** contains Max eval and Correctors / BPMs selection.
+**Detail config** contains scan ranges/steps, scoring weights, the Corrector BO
+model, advanced options and the save location. All tabs remain browsable during
+acquisition; settings are locked until the run ends. The downstream ICT selector
+is beside Objective in Main → Run Control and appears when ICT is selected.
+
+IPBSM's operator Config exposes only Average pause ratio and representative
+Sigma values. Corrector controls and their Sigma/range/origin fields are hidden
+in both Main and Config; loading a legacy configuration cannot select a hidden
+corrector for a new GUI run. Other optimizer settings retain their configured
+values internally.
+
 ## Development
 
 Development, issues and pull requests are hosted on [GitHub](https://github.com/flight-simulator-framework/atf2-knobs). The [CERN GitLab repository](https://gitlab.cern.ch/flight-simulator/atf2-knobs) receives updates from GitHub through a pull mirror.

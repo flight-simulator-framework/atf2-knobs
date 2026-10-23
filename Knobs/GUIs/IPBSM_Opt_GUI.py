@@ -285,6 +285,11 @@ class MainWindow(QMainWindow):
         self._run_final_values: Dict[str, float] = {}
         self._run_best_y: float = float("-inf")
         self._run_controller: Optional[Any] = None
+        self._measurement_position = {}
+        self._measurement_blink_on = False
+        self._measurement_blink_timer = QTimer(self)
+        self._measurement_blink_timer.setInterval(450)
+        self._measurement_blink_timer.timeout.connect(self._blink_measurement_position)
         self._scan_blink_on: bool = False
         self._scan_blink_timer = QTimer(self)
         self._scan_blink_timer.setInterval(450)
@@ -390,7 +395,8 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(self.linear_preset_btn, 0, 0)
         preset_row.addWidget(self.nonlinear_preset_btn, 0, 1)
         preset_row.addWidget(self.corrector_preset_btn, 1, 0)
-        preset_row.addWidget(self.zay_preset_btn, 1, 1)
+        self.corrector_preset_btn.hide()
+        preset_row.addWidget(self.zay_preset_btn, 1, 0, 1, 2)
         preset_row.addWidget(self.selected_knobs_lbl, 2, 0, 1, 2)
         knob_layout.addLayout(preset_row)
 
@@ -425,6 +431,7 @@ class MainWindow(QMainWindow):
         corrector_group = QGroupBox("Corrector Knobs")
         corrector_layout = QGridLayout(corrector_group)
         knob_layout.addWidget(corrector_group)
+        corrector_group.hide()
         for idx, name in enumerate(CORRECTOR_KNOBS):
             box = QCheckBox(name)
             box.setProperty("knobCheck", True)
@@ -623,8 +630,14 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setSpacing(10)
 
+        monitoring_group = QGroupBox("Monitoring")
+        layout.addWidget(monitoring_group)
+        monitoring_form = QFormLayout(monitoring_group)
+
+        # Keep saved configuration fields alive, outside the operator-facing UI.
         cfg_group = QGroupBox("Optimization Settings")
         layout.addWidget(cfg_group)
+        cfg_group.hide()
         form = QFormLayout(cfg_group)
         form.setContentsMargins(14, 12, 14, 12)
         form.setHorizontalSpacing(18)
@@ -797,7 +810,7 @@ class MainWindow(QMainWindow):
         stop_layout.addWidget(self.stop_modulation)
         form.addRow("Stop modulation", self.stop_mod_row)
         form.addRow("Sequential stop sigma ratio", self.stop_sigma_ratio)
-        form.addRow("Average pause ratio", self.avg_pause_ratio)
+        monitoring_form.addRow("Average pause ratio", self.avg_pause_ratio)
         form.addRow("UCB beta", self.ucb_beta)
         form.addRow("EI xi", self.ei_xi)
         form.addRow("GP signal variance", self.gp_sig)
@@ -846,8 +859,10 @@ class MainWindow(QMainWindow):
             box.setMaximumWidth(120)
             self.sigma_boxes[name] = box
             sigma_form.addRow(f"sigma[{name}]", box)
+            if name in CORRECTOR_KNOBS:
+                self._set_form_row_visible(sigma_form, box, False)
 
-        zscan_group = QGroupBox("Z Scan Parameter")
+        zscan_group = QGroupBox("Z Scan Sigma")
         sigma_layout.addWidget(zscan_group)
         zscan_param_layout = QGridLayout(zscan_group)
         zscan_param_layout.setContentsMargins(12, 10, 12, 10)
@@ -866,9 +881,14 @@ class MainWindow(QMainWindow):
         )
         self.zscan_param_hint_lbl.setStyleSheet("color: #5c6670;")
         zscan_param_layout.addWidget(self.zscan_param_hint_lbl, 2, 0, 1, 4)
+        for row in (0, 1):
+            for col in (2, 3):
+                zscan_param_layout.itemAtPosition(row, col).widget().hide()
+        self.zscan_param_hint_lbl.hide()
 
         corrector_cfg_group = QGroupBox("Corrector Range / Origin")
         layout.addWidget(corrector_cfg_group)
+        corrector_cfg_group.hide()
         corrector_cfg_layout = QGridLayout(corrector_cfg_group)
         corrector_cfg_layout.setContentsMargins(14, 12, 14, 12)
         corrector_cfg_layout.setHorizontalSpacing(10)
@@ -923,6 +943,7 @@ class MainWindow(QMainWindow):
 
         stop_group = QGroupBox("Stop Summary")
         layout.addWidget(stop_group)
+        stop_group.hide()
         stop_layout = QVBoxLayout(stop_group)
         stop_layout.setContentsMargins(14, 12, 14, 12)
         self.stop_summary_lbl = QLabel("")
@@ -935,6 +956,8 @@ class MainWindow(QMainWindow):
         self.load_cfg_btn = QPushButton("Load config")
         cfg_row.addWidget(self.save_cfg_btn)
         cfg_row.addWidget(self.load_cfg_btn)
+        self.save_cfg_btn.hide()
+        self.load_cfg_btn.hide()
         cfg_row.addStretch(1)
         layout.addLayout(cfg_row)
         layout.addStretch(1)
@@ -983,11 +1006,11 @@ class MainWindow(QMainWindow):
         self.load_cfg_btn.clicked.connect(self._on_load_config)
 
     def _selected_params(self) -> List[str]:
-        return [name for name in KNOB_ORDER if self.knob_checks[name].isChecked()]
+        return [name for name in KNOB_ORDER if name not in CORRECTOR_KNOBS and self.knob_checks[name].isChecked()]
 
     def _apply_knob_preset(self, knob_names: List[str]):
         max_knobs = len(KNOB_ORDER)
-        selected = set(knob_names[:max_knobs])
+        selected = set(knob_names[:max_knobs]) - set(CORRECTOR_KNOBS)
         for name, box in self.knob_checks.items():
             box.blockSignals(True)
             box.setChecked(name in selected)
@@ -1794,7 +1817,22 @@ class MainWindow(QMainWindow):
             return False
         return str(getattr(cfg, "method", "")).upper() == "BO" and list(getattr(cfg, "params", [])) == CORRECTOR_KNOBS
 
+    def _set_measurement_position(self, values):
+        self._measurement_position = dict(values)
+        self._measurement_blink_on = bool(values)
+        self.gallery_widget.set_measurement_position(values, visible=bool(values))
+        if values:
+            self._measurement_blink_timer.start()
+        else:
+            self._measurement_blink_timer.stop()
+
+    def _blink_measurement_position(self):
+        self._measurement_blink_on = not self._measurement_blink_on
+        self.gallery_widget.set_measurement_position(
+            self._measurement_position, visible=self._measurement_blink_on)
+
     def _clear_gallery(self):
+        self._set_measurement_position({})
         self.gallery_widget.clear()
 
     def _populate_gallery(self, png_paths: List[Path], *, bo_main_layout: bool = False):
@@ -1808,7 +1846,7 @@ class MainWindow(QMainWindow):
         if cfg is None or out_dir is None or csv_path is None:
             return
         X, y, yerr, chosen_by, average = self._load_measurements_from_csv(csv_path, cfg)
-        if y.size == 0:
+        if y.size == 0 and not (bo_data_only_1d and str(cfg.method).upper() == "BO"):
             return
         if self._is_sequential_method(cfg.method):
             fit = build_gf_axiswise_fit(cfg, X, y, chosen_by=chosen_by)
@@ -1855,6 +1893,7 @@ class MainWindow(QMainWindow):
         self._populate_gallery(sorted(png_saved, key=lambda p: str(p)))
 
     def _reset_live_history(self):
+        self._set_measurement_position({})
         self.live_eval_index = []
         self.live_modulation = []
         self.live_best = []
@@ -2314,6 +2353,9 @@ class MainWindow(QMainWindow):
             else:
                 self._append_log("Warm start: origin snapshot file was not found, current machine state will be used as origin")
         self.tabs.setCurrentWidget(self.main_tab)
+        if str(cfg.method).upper() == "BO":
+            self._refresh_gf_gallery_live(bo_data_only_1d=True)
+            self.main_view_stack.setCurrentIndex(1)
         self.worker.start()
 
     def _on_stop(self):
@@ -2322,7 +2364,15 @@ class MainWindow(QMainWindow):
         self.worker.request_manual_pause()
         self._set_status("Status: pause requested after current measurement", state="paused")
 
+    def _resume_measurement_from_pause(self, should_continue, **kwargs):
+        if should_continue:
+            self._set_measurement_position(self._measurement_position)
+        else:
+            self._set_measurement_position({})
+        self.worker.resume_from_pause(should_continue, **kwargs)
+
     def _on_pause_requested(self, info: dict):
+        self._measurement_blink_timer.stop()
         reason = str(info.get("reason", ""))
         if reason == "operation_error":
             operation = str(info.get("operation", "IPBSM operation"))
@@ -2368,10 +2418,10 @@ class MainWindow(QMainWindow):
             if box.clickedButton() is stop_btn:
                 self.stop_flag.request_stop()
                 self._set_status(f"Status: stop requested after {operation} error", state="warning")
-                self.worker.resume_from_pause(False)
+                self._resume_measurement_from_pause(False)
             else:
                 self._set_status(f"Status: retrying after {operation} error", state="running")
-                self.worker.resume_from_pause(True)
+                self._resume_measurement_from_pause(True)
             return
 
         if reason == "current_drop_to_zero":
@@ -2403,10 +2453,10 @@ class MainWindow(QMainWindow):
             if box.clickedButton() is stop_btn:
                 self.stop_flag.request_stop()
                 self._set_status("Status: stop requested after current drop", state="warning")
-                self.worker.resume_from_pause(False)
+                self._resume_measurement_from_pause(False)
             else:
                 self._set_status("Status: retrying after current drop", state="running")
-                self.worker.resume_from_pause(True)
+                self._resume_measurement_from_pause(True)
             return
 
         if reason == "manual_pause":
@@ -2429,10 +2479,10 @@ class MainWindow(QMainWindow):
             if box.clickedButton() is stop_btn:
                 self.stop_flag.request_stop()
                 self._set_status("Status: stop requested from pause", state="warning")
-                self.worker.resume_from_pause(False)
+                self._resume_measurement_from_pause(False)
             else:
                 self._set_status("Status: re-measuring paused point", state="running")
-                self.worker.resume_from_pause(True, remeasure_current_point=True)
+                self._resume_measurement_from_pause(True, remeasure_current_point=True)
             return
 
         avg = float(info.get("average", float("nan")))
@@ -2458,10 +2508,10 @@ class MainWindow(QMainWindow):
         if box.clickedButton() is stop_btn:
             self.stop_flag.request_stop()
             self._set_status("Status: stop requested from average warning", state="warning")
-            self.worker.resume_from_pause(False)
+            self._resume_measurement_from_pause(False)
         else:
             self._set_status("Status: re-measuring warning point", state="running")
-            self.worker.resume_from_pause(True, remeasure_current_point=True)
+            self._resume_measurement_from_pause(True, remeasure_current_point=True)
 
     def _on_progress(self, payload: dict):
         step = int(payload.get("step", 0))
@@ -2472,7 +2522,8 @@ class MainWindow(QMainWindow):
         bo1d_trace = dict(info.get("bo1d_trace", {}) or {})
         if bo1d_trace:
             self._set_bo1d_trace(bo1d_trace)
-            self.main_view_stack.setCurrentIndex(0)
+            if str(getattr(self.last_run_cfg, "method", "")).upper() != "BO":
+                self.main_view_stack.setCurrentIndex(0)
         y = info.get("y", None)
         best_y = info.get("best_y", None)
         chosen_by = str(info.get("chosen_by", ""))
@@ -2482,6 +2533,13 @@ class MainWindow(QMainWindow):
             chosen_by = "init_live"
         x = info.get("x", {})
         x_map = dict(x) if isinstance(x, dict) else {}
+        if str(getattr(self.last_run_cfg, "method", "")).upper() == "BO":
+            if phase == "measuring":
+                self._set_measurement_position(x_map)
+                self.main_view_stack.setCurrentIndex(1)
+            elif phase in {"init", "loop", "reuse", "resume_remeasure", "discarded_measurement",
+                           "model_fit", "acquisition", "final_apply", "stop"}:
+                self._set_measurement_position({})
 
         if x_map and self._run_state_channels:
             machine_vals = self._compute_machine_values_for_display(x_map)
@@ -2665,6 +2723,7 @@ class MainWindow(QMainWindow):
             self._update_run_knob_state_table()
 
     def _on_failed(self, msg: str):
+        self._set_measurement_position({})
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.worker = None
@@ -2685,6 +2744,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Failed", msg)
 
     def _on_finished(self, out: dict):
+        self._set_measurement_position({})
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.worker = None

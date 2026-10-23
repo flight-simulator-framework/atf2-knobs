@@ -567,6 +567,27 @@ unchecking Acquire new shot.
 
 Calibration files and remaining site configuration
 -------------------------------------------------
+COD and dispersion remember Target BPM response [mm] separately for H and V
+within the open GUI session (both initially 0.1 mm). This is the adaptive probe
+amplitude goal, not the nominal COD/dispersion correction target.
+
+Measure response (CALC) explicitly measures/replaces the response. Recalculate
+(saved response) reuses the current plane/source's saved response and beam data,
+without BPM acquisitions, RF changes or magnet scans. H/V results are retained
+independently when changing controls or switching planes. Use this for SVD,
+maximum corrector count, current bounds, fit weights and BPM/magnet subsets.
+Changing the adaptive probe target configures the NEXT measurement; recalculation
+does not improve the old response's noise or retroactively change its excitation.
+The GUI shows the target used at acquisition. Saved JSON keeps acquisition_options
+and acquisition_valid separately from the current fit options/selection.
+
+Newly included magnets need measured columns, and an unmeasured plane needs its
+first scan. Changed signal definitions (e.g. momentum compaction or skew probe
+span) and changed model inputs require a new response calculation. A cached fit
+uses the old beam observation: SET still checks the original machine baseline
+and rejects settings changed since CALC. Cache and H/V targets are in-memory;
+Save data and plots / Calculate from file remain available for disk storage.
+
 During COD/dispersion/skew CALC, Pause requests a stop at the next restored
 probe-pair boundary (including adaptive amplitude retries). It does not freeze
 the machine at a displaced RF or magnet setting. Wait for PAUSED in the status;

@@ -105,7 +105,7 @@ class StoredBackend(DemoBackend):
     def __init__(self,directory,workspace=None,seed=32):
         root=Path(workspace) if workspace else HERE.parents[2]
         sys.path.insert(0,str(root/'simulation-agent'))
-        from dr_stored_interface import StoredDRInterface
+        from simagent.interfaces.dr_stored_interface import StoredDRInterface
         self.interface=StoredDRInterface(dict(seed=seed,measurement_seed=100000+seed,
             alignment_rms_um=5.,initial=str(root/'simulation-agent/results/dr-fast-storage-qualified-20261020/initial_stored_beam.json')),directory)
         self.identity='stored:'+str(Path(directory).resolve())

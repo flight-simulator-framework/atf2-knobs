@@ -55,6 +55,23 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(panel.options.bpm_interval_s,.5)
             self.assertEqual(backend.acquisitions,0)
         finally:window.close()
+    def test_plane_probe_targets_and_cached_responses_survive_option_changes(self):
+        for mode in ('orbit','dispersion'):
+            panel=self.window.panels[mode]
+            panel.set_option('adaptive_target_mm',.03)
+            panel.calculate();self.wait();vertical=panel.data['response'].copy()
+            panel.set_option('plane','x');self.assertEqual(panel.options.adaptive_target_mm,.1)
+            panel.set_option('adaptive_target_mm',.2)
+            panel.calculate();self.wait()
+            panel.set_option('plane','y');self.assertEqual(panel.options.adaptive_target_mm,.03)
+            self.assertTrue(panel.recalculate_button.isEnabled())
+            panel.set_option('count_v',3);reads=self.window.backend.acquisitions
+            panel.recalculate_button.click();self.wait()
+            self.assertEqual(self.window.backend.acquisitions,reads)
+            np.testing.assert_array_equal(panel.data['response'],vertical)
+            self.assertTrue(panel.data['reused_response'])
+            panel.set_option('plane','x');self.assertEqual(panel.options.adaptive_target_mm,.2)
+            self.assertTrue(panel.recalculate_button.isEnabled())
     def test_plot_masks_excluded_predictions_but_preserves_large_valid_values(self):
         from Knobs.DRCorrection.core import Options
         panel=self.window.panels['orbit']

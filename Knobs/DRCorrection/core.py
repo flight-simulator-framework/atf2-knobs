@@ -429,6 +429,12 @@ class CorrectionService:
             raise ValueError('File is not a matching correction dataset')
         if data['options']['plane']!=opt.plane and mode!='skew':
             raise ValueError('Select the same H/V plane as the file before CALC (FILE)')
+        # Keep acquisition metadata independent of the current fit controls.
+        # In particular, excluding BPMs from one fit must not erase valid raw
+        # measurements when the user includes those BPMs in a subsequent fit.
+        data.setdefault('acquisition_options',copy.deepcopy(data['options']))
+        data.setdefault('acquisition_valid',copy.deepcopy(data['valid']))
+        data['valid']=copy.deepcopy(data['acquisition_valid'])
         for key in ('after','full_after','after_valid','after_orbit_measurements','after_set_settle_s','assessment','applied_actuators'):data.pop(key,None)
         names=data['names'];actuators=data['actuators']
         measured=np.asarray(data['measured'],float);target=np.asarray(data['target'],float)
@@ -515,6 +521,42 @@ class CorrectionService:
             data['full_predicted']=full+(np.asarray(data['full_response'])@delta).reshape(full.shape)
             data['full_fitted']=full-data['full_predicted']
         return data
+
+    def response_reuse_issue(self,data,opt):
+        if data.get('backend_id')!=self.backend.identity:return 'Response belongs to another backend.'
+        original=Options(**data.get('acquisition_options',data['options']))
+        if original.plane!=opt.plane:return 'No response saved for this plane.'
+        if original.response_source!=opt.response_source:return 'Response source changed.'
+        keys=['momentum_compaction'] if data['mode']=='dispersion' else []
+        if data['mode']=='skew':keys+=['probe1','probe2','change1_A','change2_A']
+        if opt.response_source=='rftrack':
+            keys+=['energy_gev','tune_x','tune_y','model_match_tunes','model_regional_targets',
+                   'model_fix_extraction_orbit','model_fix_extraction_dispersion','model_extraction_weight']
+        changed=[key for key in keys if getattr(original,key)!=getattr(opt,key)]
+        if changed:return 'Response definition changed: '+', '.join(changed)+'. Measure again.'
+        missing_bpms=set(self.backend.bpm_names)-set(opt.excluded_bpms)-set(data['names'])
+        if missing_bpms:return 'No saved response rows for BPMs: '+', '.join(sorted(missing_bpms))+'. Measure again.'
+        if data['mode']=='skew':
+            names=[n for n in self.backend.skews if (opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF'))]
+        else:names=self.backend.hcorrectors if opt.plane=='x' else self.backend.vcorrectors
+        missing=set(names)-set(opt.fixed_actuators)-set(data['actuators'])-{e['magnet'] for e in data.get('scan_errors',[])}
+        if missing:return 'No measured columns for: '+', '.join(sorted(missing))+'. Measure again.'
+        return ''
+
+    def recalculate(self,data,opt,progress=lambda *_:None):
+        """Refit saved measurements only; no orbit reads or machine writes."""
+        issue=self.response_reuse_issue(data,opt)
+        if issue:raise ValueError(issue)
+        saved=copy.deepcopy(data)
+        if saved['mode']=='dispersion' and opt.response_source=='measured':
+            nominal=np.asarray(self.backend.target_dispersion(opt.plane),float)
+            if nominal.shape!=(len(self.backend.bpm_names),) or not np.isfinite(nominal).all():
+                raise ValueError('Invalid nominal dispersion target for saved-response recalculation')
+            saved['target'][0]=nominal[[self.backend.bpm_names.index(n) for n in saved['names']]]
+        progress(0,'Recalculating saved response; no new beam measurements or magnet scans')
+        result=self.calculate(saved['mode'],opt,progress,dataset=saved)
+        result['reused_response']=True
+        return result
 
     def apply(self,data,progress=lambda *_:None):
         self.check_cancel()

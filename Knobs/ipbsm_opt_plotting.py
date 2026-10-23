@@ -417,6 +417,10 @@ def plot_results(
                 )
             if fit_curve is not None:
                 ax.plot(xs, fit_curve)
+            if bo_data_only_1d and is_bo:
+                # Include the whole search range so the next measurement is
+                # visible even before any data exists near that coordinate.
+                ax.set_xlim(lo[i], hi[i])
             ax.set_xlabel(p)
             ax.set_ylabel("IPBSM modulation")
             if is_sequential:
@@ -470,7 +474,12 @@ def plot_results(
             name = f"{save_prefix}{file_stamp}_1D_{p}.png" if save_prefix else f"{file_stamp}_1D_{p}.png"
             path = out_dir / name
             fig.tight_layout()
-            fig.savefig(path, dpi=150)
+            # Keep the data-to-image transform with the PNG. The GUI can draw
+            # a live cursor precisely after scaling, without regenerating files.
+            bounds = ax.get_position()
+            axis_metadata = {"axis": p, "xlim": list(ax.get_xlim()),
+                             "rect": [bounds.x0, 1.0 - bounds.y1, bounds.width, bounds.height]}
+            fig.savefig(path, dpi=150, metadata={"optimizer_axis": json.dumps(axis_metadata)})
             plt.close(fig)
             saved.append(path)
 

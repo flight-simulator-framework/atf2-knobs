@@ -58,7 +58,7 @@ class ModelPanel(QWidget):
         backend.model_config=c
     def inputs_changed(self):
         self.config();self.result=None;self.manager.model=None;self.manager.optics=None
-        for panel in self.window.panels.values():panel.invalidate()
+        for panel in self.window.panels.values():panel.invalidate(clear_model_response=True)
         self.status.setText('Model inputs changed; rebuild or CALC before use.')
     def load_lattice(self):
         path,_=QFileDialog.getOpenFileName(self,'Generated ATF lattice export','','JSON (*.json)')
@@ -66,7 +66,7 @@ class ModelPanel(QWidget):
             self.config();self.window.backend.model_config['lattice_path']=path
             self.manager.model=None;self.manager.optics=None
             self.status.setText('Selected lattice: '+path+'; rebuild before use.');self.result=None
-            for panel in self.window.panels.values():panel.invalidate()
+            for panel in self.window.panels.values():panel.invalidate(clear_model_response=True)
     def load_factors(self):
         path,_=QFileDialog.getOpenFileName(self,'Model calibration: explicit multiplicative factors / bend K1L','','JSON (*.json)')
         if not path:return
@@ -75,7 +75,7 @@ class ModelPanel(QWidget):
             if data.get('schema')!='dr-model-calibration-1' or not data.get('source'):raise ValueError('Expected versioned dr-model-calibration-1 with source')
             self.config();self.window.backend.model_config.update(data);self.result=None
             self.manager.model=None;self.manager.optics=None
-            for panel in self.window.panels.values():panel.invalidate()
+            for panel in self.window.panels.values():panel.invalidate(clear_model_response=True)
             self.status.setText('Loaded model calibration: '+data['source'])
         except Exception as e:self.window.error(str(e))
     def exclude_unmapped(self):

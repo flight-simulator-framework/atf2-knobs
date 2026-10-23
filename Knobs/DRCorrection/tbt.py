@@ -1,4 +1,4 @@
-"""Native-free TBT analysis reused from simulation-agent/dr_measured_optics.py.
+"""Native-free TBT analysis reused from simulation-agent/simagent/diagnostics/dr_measured_optics.py.
 Source SHA256: 01cb07c4366f2b9fbe1b98cf99be5697685a3f4a2dcbce2562e56a678a60a95a
 """
 import numpy as np

@@ -358,4 +358,4 @@ commands emulate a momentum offset using fixed alpha_c=0.0021; the cavity is
 disabled. Intensity is constant in this backend, so its charge guard cannot
 establish loss/transmission performance. There is no radiation equilibrium,
 200 ms storage, or demonstrated emittance improvement in this pilot.
-See simulation-agent/DR_BOUNDARY_AUDIT.txt for the separate full-chain audit.
+See simulation-agent/docs/DR_BOUNDARY_AUDIT.txt for the separate full-chain audit.

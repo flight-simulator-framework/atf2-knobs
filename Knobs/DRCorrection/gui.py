@@ -108,9 +108,10 @@ PV_FIELDS={
 
 class CorrectionPanel(QWidget):
     def __init__(self,window,mode):
-        super().__init__();self.window=window;self.mode=mode;self.data=None
+        super().__init__();self.window=window;self.mode=mode;self.data=None;self.response_cache={}
         backend=window.backend
         self.options=Options(probe1=backend.hcorrectors[0],probe2=backend.hcorrectors[len(backend.hcorrectors)//2])
+        self.plane_probe_targets={axis:self.options.adaptive_target_mm for axis in ('x','y')}
         if backend.identity.startswith('epics:'):
             self.options.bpm_samples=3;self.options.bpm_interval_s=1.
         if backend.unit('skews')=='A':self.options.skew_probe=.05;self.options.skew_step=.1
@@ -123,6 +124,9 @@ class CorrectionPanel(QWidget):
         self.detail=QLabel('');self.detail.setWordWrap(True);left_layout.addWidget(self.detail)
         advanced=QPushButton('Response / limits / SVD settings');advanced.clicked.connect(self.advanced);left_layout.addWidget(advanced)
         select=QPushButton('BPM selection / FIX DR STEER');select.clicked.connect(window.selection);left_layout.addWidget(select)
+        self.recalculate_button=QPushButton('Recalculate (saved response)');self.recalculate_button.clicked.connect(self.recalculate)
+        left_layout.addWidget(self.recalculate_button)
+        self.response_cache_label=QLabel();self.response_cache_label.setWordWrap(True);left_layout.addWidget(self.response_cache_label)
         left_layout.addStretch()
         self.plot=Plot();self.table=QTableWidget(0,6)
         self.table.setHorizontalHeaderLabels(['Magnet','Before','Delta','Proposed','Unit','SET action'])
@@ -152,7 +156,9 @@ class CorrectionPanel(QWidget):
         layout=QVBoxLayout(self);layout.addWidget(split)
         self.bind();self.refresh()
 
-    def invalidate(self):
+    def invalidate(self,clear_model_response=False):
+        if clear_model_response:
+            self.response_cache={key:data for key,data in self.response_cache.items() if key[0]!='rftrack'}
         self.data=None;self.table.setRowCount(0);self.assessment_table.setRowCount(0);self.scan_error_table.setRowCount(0)
         self.assessment_summary.setText('No current proposal. Run CALC.');self.refresh()
 
@@ -190,6 +196,11 @@ class CorrectionPanel(QWidget):
             self.form.pushButtonSRCalcFile.clicked.connect(lambda:self.window.sr_fit(None))
 
     def set_option(self,name,value):
+        if name=='plane':
+            self.plane_probe_targets[self.options.plane]=self.options.adaptive_target_mm
+            self.options.adaptive_target_mm=self.plane_probe_targets[value]
+        if name=='adaptive_target_mm':
+            self.plane_probe_targets[self.options.plane]=value
         setattr(self.options,name,value);self.invalidate()
 
     def edit(self,name):
@@ -201,6 +212,20 @@ class CorrectionPanel(QWidget):
         if ok:self.set_option(name,value)
 
     def refresh(self):
+        if hasattr(self,'adaptive_targets_label'):
+            targets=dict(self.plane_probe_targets);targets[self.options.plane]=self.options.adaptive_target_mm
+            self.adaptive_targets_label.setText(f'H: {targets["x"]:g} mm / V: {targets["y"]:g} mm (remembered separately)')
+        saved=self.response_cache.get((self.options.response_source,self.options.plane))
+        issue=self.window.service.response_reuse_issue(saved,self.options) if saved is not None else 'No saved response for this plane/source. Measure once.'
+        self.recalculate_button.setEnabled(saved is not None and not issue)
+        if saved is None or issue:self.response_cache_label.setText(issue)
+        else:
+            acquired=saved.get('acquisition_options',saved['options'])
+            probe=(f'adaptive acquisition target {acquired.get("adaptive_target_mm",.1):g} mm'
+                   if acquired.get('adaptive_probe') and acquired.get('response_source','measured')=='measured'
+                   else 'fixed probe / model response')
+            self.response_cache_label.setText(f'Saved {len(saved["actuators"])} columns; {probe}.\n'
+                'Recalculate reuses saved beam data. Probe target changes apply to the next measurement.')
         if hasattr(self,'compaction_label'):
             self.compaction_label.setText(f'{self.options.momentum_compaction:g} (fixed for these optics)')
         if hasattr(self,'selection_label'):
@@ -297,7 +322,15 @@ class CorrectionPanel(QWidget):
             try:self.calculate(load_session(path))
             except Exception as e:self.window.error(str(e))
 
+    def recalculate(self):
+        saved=self.response_cache.get((self.options.response_source,self.options.plane))
+        if saved is None:self.window.error('No saved response for this plane/source. Measure once.');return
+        options=copy.deepcopy(self.options);self.invalidate()
+        self.window.start(lambda progress:self.window.service.recalculate(saved,options,progress),self.display)
+
     def display(self,data):
+        if not data.get('applied'):
+            self.response_cache[(data['options']['response_source'],data['options']['plane'])]=copy.deepcopy(data)
         self.data=data;self.plot.correction(data)
         if not data.get('applied'):
             for probe in data.get('probe_history',[]):

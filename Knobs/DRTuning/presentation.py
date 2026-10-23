@@ -125,6 +125,9 @@ def reflow_correction(panel):
         'Dispersion uses nominal COD; skew uses the vertical probe-response change.\n'
         'Each pair restores the magnet. Limits / unreached targets are reported.')
     helptext.setWordWrap(True);form.addRow(helptext)
+    if panel.mode!='skew':
+        panel.adaptive_targets_label=QLabel();panel.adaptive_targets_label.setWordWrap(True)
+        form.addRow('Remembered response targets',panel.adaptive_targets_label)
     def update_adaptive_controls(*_):
         measured=source.currentData()=='measured';adaptive.setEnabled(measured)
         for widget in adaptive_widgets:widget.setEnabled(measured and adaptive.isChecked())
@@ -141,6 +144,8 @@ def reflow_correction(panel):
     for suffix,title in [('Calc','Measure response (CALC)'),('CalcFile','Calculate from file'),('Set','Apply correction (SET)'),('Reset','Undo correction (RESET)')]:
         w=getattr(panel.form,prefix+suffix);w.setMinimumSize(0,0);w.setMaximumSize(16777215,16777215)
         w.setText(title);layout.addWidget(w)
+        if suffix=='Calc':
+            layout.addWidget(panel.recalculate_button);layout.addWidget(panel.response_cache_label)
     box,layout=group('3. Save and analyze');left.addWidget(box)
     layout.addWidget(button('Save data and plots',panel.save_bundle))
     layout.addWidget(button('Save plot',panel.save_figure))
