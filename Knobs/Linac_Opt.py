@@ -3464,7 +3464,7 @@ class MainWindow(QMainWindow):
         self.status_lbl.setMinimumHeight(34)
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
-        ctrl.addWidget(self.status_lbl)
+        monitor.addWidget(self.status_lbl)
         self._status_labels[RUN_PROFILE_MAIN] = self.status_lbl
 
         log_group = QGroupBox("Live plots")

@@ -50,6 +50,18 @@ No separate plots or data files are copied to tempfiles. There is no confirmatio
 dialog. NAS errors are reported without deleting the normal outputs. Export
 is skipped for an empty run, a failed run, or while closing the application.
 
+LinacOpt exports use a fixed figure size independent of window geometry.
+Combined exports switch from two columns to a vertical stack for wide plots
+or an excessively wide sheet, preserving each plot's aspect ratio.
+
+## Optimizer workspace
+
+LinacOpt and IPBSM place scrollable controls on the left and live plots,
+progress and results on the right. Drag the divider to adjust their widths;
+the divider between live and BO plots adjusts their heights. `Show log`
+opens the log below the plots. Config pages scroll independently, and saved
+IPBSM plots scale to the available monitor width.
+
 ## Development
 
 Development, issues and pull requests are hosted on [GitHub](https://github.com/flight-simulator-framework/atf2-knobs). The [CERN GitLab repository](https://gitlab.cern.ch/flight-simulator/atf2-knobs) receives updates from GitHub through a pull mirror.

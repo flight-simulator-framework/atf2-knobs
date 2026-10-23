@@ -539,7 +539,7 @@ class MainWindow(QMainWindow):
         self.status_lbl.setMinimumHeight(34)
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
-        ctrl_layout.addWidget(self.status_lbl)
+        monitor.addWidget(self.status_lbl)
         self._set_status("Status: IDLE", state="idle")
 
         plot_group = QGroupBox("Live plots / Results")
