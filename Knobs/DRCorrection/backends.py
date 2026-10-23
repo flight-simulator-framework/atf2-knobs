@@ -190,22 +190,40 @@ class EpicsBackend(DemoBackend):
             raise ValueError('Command outside current limits')
         if not names:return
         old=self.read(kind,names)
-        try:
-            for n,v in zip(names,values):self.put(self.mapping[n]['set'],float(v))
-            deadline=time.monotonic()+self.profile['readback_timeout_s']
+        tolerance=float(self.profile['current_tolerance_A'])
+        timeout=float(self.profile['readback_timeout_s'])
+        def details(targets,readings):
+            return '; '.join(f'{n}: set PV={self.mapping[n]["set"]}, read PV={self.mapping[n]["read"]}, '
+                f'target={v:.9g} A, readback={r:.9g} A, error={r-v:+.9g} A'
+                for n,v,r in zip(names,targets,readings) if not np.isfinite(r) or abs(r-v)>tolerance)
+        def wait(targets):
+            deadline=time.monotonic()+timeout
             while True:
                 readings=self.read(kind,names)
-                if np.isfinite(readings).all() and np.max(abs(readings-values))<=self.profile['current_tolerance_A']:break
-                if time.monotonic()>deadline:raise RuntimeError('Magnet readback did not settle')
+                if np.max(abs(readings-targets))<=tolerance:return
+                if time.monotonic()>=deadline:
+                    raise RuntimeError(f'Magnet readback did not settle after {timeout:g} s '
+                        f'(tolerance {tolerance:g} A): '+details(targets,readings))
                 time.sleep(.05)
+        try:
+            for n,v in zip(names,values):self.put(self.mapping[n]['set'],float(v))
+            wait(values)
             # Supply readback convergence is not BPM acquisition completion.
             # Allow the beam/monitor chain to settle before the caller reads it.
             if settle:time.sleep(settle)
-            if np.max(abs(self.read(kind,names)-values))>self.profile['current_tolerance_A']:
-                raise RuntimeError('Magnet readback changed during settling wait')
-        except Exception:
-            for n,v in zip(names,old):self.put(self.mapping[n]['set'],float(v))
-            raise
+            readings=self.read(kind,names)
+            if np.max(abs(readings-values))>tolerance:
+                raise RuntimeError('Magnet readback changed during settling wait: '+details(values,readings))
+        except Exception as exc:
+            # Attempt every restoration, and never hide the original failure.
+            failures=[]
+            for n,v in zip(names,old):
+                try:self.put(self.mapping[n]['set'],float(v))
+                except Exception as restore_error:failures.append(str(restore_error))
+            try:wait(old)
+            except Exception as restore_error:failures.append(str(restore_error))
+            restoration='Restoration FAILED: '+'; '.join(failures) if failures else 'Original readback currents restored and verified.'
+            raise RuntimeError(str(exc)+'\n'+restoration) from exc
     def snapshot(self):
         result=dict(correctors=dict(zip(self.hcorrectors+self.vcorrectors,self.read('correctors',self.hcorrectors+self.vcorrectors))),
             skews=dict(zip(self.skews,self.read('skews',self.skews))),frequency=self.frequency())

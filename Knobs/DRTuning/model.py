@@ -22,6 +22,18 @@ def digest(value):
     return hashlib.sha256(json.dumps(serial(value), sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
+def preparation_config(backend):
+    config=copy.deepcopy(getattr(backend,'model_config',{}))
+    preset=config.get('preparation','sad_cod' if backend.identity.startswith('epics:') else 'all_currents')
+    if preset not in ('sad_cod','all_currents'):raise ValueError('Unknown model preparation: '+str(preset))
+    config['preparation']=preset
+    if preset=='sad_cod' and 'quadrupole_factors' not in config:
+        defaults=json.loads(Path(__file__).with_name('sad_cod_calibration.json').read_text())
+        for key in ('quadrupole_factors','source','source_sha256'):
+            config.setdefault(key,defaults[key])
+    return config
+
+
 def verify_inputs(backend,settings):
     """Include main supplies and model tune/calibration PVs in stale guards."""
     for pv,expected in settings.get('raw_pvs',{}).items():
@@ -42,17 +54,30 @@ def linear_map(lattice, state, momentum, step=1.e-4):
     return ((values[:4]-values[4:])/(2*step)).T
 
 
+class ModelOpticsError(ValueError):
+    def __init__(self,message,diagnostics):
+        super().__init__(message);self.diagnostics=diagnostics
+
+
 def normal_modes(matrix):
     """Stable symplectic eigenmodes; positive action fixes the tune branch."""
     j=np.kron(np.eye(2),[[0.,1.],[-1.,0.]])
+    matrix=np.asarray(matrix,float)
+    if matrix.shape!=(4,4) or not np.isfinite(matrix).all():raise ValueError('Invalid RFTrack one-turn map (expected finite 4x4)')
     values,vectors=np.linalg.eig(matrix);modes=[]
-    if np.max(abs(abs(values)-1))>2.e-4:raise ValueError('Unstable RFTrack one-turn map')
+    deviation=float(np.max(abs(abs(values)-1)))
+    diagnostics=dict(one_turn_matrix=matrix,eigenvalues_real=values.real,eigenvalues_imag=values.imag,
+                     eigenvalue_moduli=abs(values),max_modulus_deviation=deviation,stability_tolerance=2.e-4,
+                     determinant=float(np.linalg.det(matrix)),symplectic_residual=float(np.max(abs(matrix.T@j@matrix-j))))
+    if deviation>2.e-4:
+        raise ModelOpticsError('Unstable RFTrack one-turn map: max ||lambda|-1|='
+            f'{deviation:.6g} (limit 0.0002); |lambda|='+', '.join(f'{v:.6g}' for v in abs(values)),diagnostics)
     for eigenvalue,vector in zip(values,vectors.T):
         action=float(np.imag(np.vdot(vector,j@vector)))
         if action>1.e-8:
             vector=vector*np.sqrt(2/action)
             modes.append((float(np.angle(eigenvalue)/(2*np.pi)%1),vector))
-    if len(modes)!=2:raise ValueError('Degenerate model tunes: no two stable modes')
+    if len(modes)!=2:raise ModelOpticsError('Degenerate model tunes: no two stable modes',diagnostics)
     # Horizontal/vertical assignment is by modal coordinate participation.
     if abs(modes[0][1][0])**2/(abs(modes[0][1][0])**2+abs(modes[0][1][2])**2) < abs(modes[1][1][0])**2/(abs(modes[1][1][0])**2+abs(modes[1][1][2])**2):
         modes.reverse()
@@ -66,6 +91,10 @@ class OpticsModel:
     nominal_frequency_hz=714.e6
 
     def __init__(self,settings,cancel=lambda:None):
+        import RF_Track as rft
+        # Orbit/map calculations track only a handful of particles. Match the
+        # DR RFTrack backend; large thread pools overwhelm these small probes.
+        rft.number_of_threads=1
         from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_lattice import build_atf_dr_lattice
         from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_correction import ATFDRRingCorrection
         self.settings=copy.deepcopy(settings);self.check_cancel=cancel
@@ -128,9 +157,14 @@ class OpticsModel:
             p=self.actuators[n];value=float(value)
             if not np.isfinite(value) or not p['limits'][0]<=value<=p['limits'][1]:raise ValueError('Model actuator outside bounds: '+n)
             physical=name(n)
-            if p['kind']=='skew':self.solver.set_skew_strength(physical+'$SKEW',value*p['scale'])
+            # SAD COD uses zero steerers and no imported skew excitation.
+            # Keep absolute machine currents/limits in the adapter; only the
+            # MODEL kick is relative to the captured current. Thus SET remains
+            # I_machine + delta, never delta about zero machine current.
+            excitation=value-p['value'] if self.settings.get('preparation')=='sad_cod' else value
+            if p['kind']=='skew':self.solver.set_skew_strength(physical+'$SKEW',excitation*p['scale'])
             else:
-                kick=[0.,0.];kick[int(p['kind']=='vcorrector')]=value*p['scale']
+                kick=[0.,0.];kick[int(p['kind']=='vcorrector')]=excitation*p['scale']
                 self.solver._set_corrector_kick(self.solver._single_element(physical),kick)
             self.values[n]=value
     def snapshot(self):return dict(values=self.values.copy(),frequency=self.offset)
@@ -165,7 +199,11 @@ class OpticsModel:
                 for e,k in zip(group,ks):e.set_K1(-self.momentum,k*(1+scale))
         def residual(scales):
             self.check_cancel();set_scales(scales)
-            return (self.tunes()-goals+.5)%1-.5
+            try:return (self.tunes()-goals+.5)%1-.5
+            except ModelOpticsError as exc:
+                detail=dict(exc.diagnostics,tune_match_trial_fractional_changes=np.asarray(scales).copy(),resolved_target=goals)
+                raise ModelOpticsError('Tune-match trial failed at QF1R/QF2R changes '
+                                       +', '.join(f'{v:+.6%}' for v in scales)+': '+str(exc),detail) from exc
         try:
             result=least_squares(residual,[0.,0.],bounds=(-max_scale,max_scale),diff_step=1.e-4,
                                  xtol=1.e-10,ftol=1.e-10,gtol=1.e-10,max_nfev=40)
@@ -183,7 +221,8 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
     from .calibration import MagnetCalibration,coil_k1l
     from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_lattice import build_atf_dr_lattice,load_lattice_data
     live=backend.identity.startswith('epics:')
-    config=copy.deepcopy(getattr(backend,'model_config',{}))
+    config=preparation_config(backend)
+    sad=config['preparation']=='sad_cod'
     if not live and not hasattr(backend,'qcurrents'):raise ValueError('Model response needs RFTrack or Machine interface (DEMO/Stored unsupported)')
     baseline=baseline or backend.snapshot();raw={}
     def read(pv):
@@ -196,10 +235,11 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
     energy=read(config.get('energy_pv','SAD:FILE:DR:ENERGY')) if live else 1.2999999
     if energy<=0:raise ValueError('Model energy must be positive')
     p=energy*1000.;path=config.get('lattice_path');design=build_atf_dr_lattice(momentum_mev_c=p,rf_mode='disabled',lattice_data_path=path)
-    cal=MagnetCalibration();quads={};sexts={};coil_records={};libraries={}
+    cal=MagnetCalibration();quads={};sexts={};coil_records={};libraries={};design_quads={}
     for e in design['*']:
         cancel();n=e.get_name();kind=type(e).__name__
         if kind=='Quadrupole':
+            design_quads[n]=float(e.get_K1L(-p))
             if live:
                 hardware_name=config.get('quad_mapping',{}).get(n,'QM7R.1' if n=='QM7AR.1' else n)
                 entry=backend.quadrupoles.get(hardware_name)
@@ -212,13 +252,18 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
                     from machine_interfaces_atf2.MagKi import MagKiWrapper
                     if library not in libraries:libraries[library]=MagKiWrapper(library)
                     wrapper=libraries[library]
-                quads[n]=coil_k1l(wrapper,mag,energy,main,trim,'main')+coil_k1l(wrapper,mag,energy,main,trim,'trim')
-                coil_records[n]=dict(main_A=main,trim_A=trim,magnet=mag,hardware_name=hardware_name,library=library)
+                include_trim=not sad or (n.startswith('QM') and not n.startswith('QM7'))
+                main_k=coil_k1l(wrapper,mag,energy,main,trim,'main')
+                trim_k=coil_k1l(wrapper,mag,energy,main,trim,'trim')
+                quads[n]=main_k+(trim_k if include_trim else 0.)
+                coil_records[n]=dict(main_A=main,trim_A=trim,main_k1l=main_k,trim_k1l=trim_k,
+                    trim_included=include_trim,magnet=mag,hardware_name=hardware_name,library=library)
             else:
                 # Reconstruct from independent public design + commanded trim.
                 mag='QM7AR' if n=='QM7R.1' else n.split('.')[0]
                 k=e.get_K1L(-p);main=cal.mag.k1l_to_current(mag,k,energy);trim=backend.quadrupole_current(n)
-                quads[n]=k+coil_k1l(cal.mag,mag,energy,main,trim,'trim')-coil_k1l(cal.mag,mag,energy,main,0.,'trim')
+                include_trim=not sad or (n.startswith('QM') and not n.startswith('QM7'))
+                quads[n]=k+(coil_k1l(cal.mag,mag,energy,main,trim,'trim')-coil_k1l(cal.mag,mag,energy,main,0.,'trim') if include_trim else 0.)
         elif kind=='Sextupole':
             family=n.split('.')[0]
             sexts[n]=coil_k1l(cal.mag,family,energy,read(family+':internalCurrentWrite')) if live else float(e.get_K2L(-p))
@@ -251,12 +296,15 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
         reading=backend.measure_tunes(cancel=event);tunes=reading['tunes']
         tune_source=reading['source'];alias=True
     result=dict(schema='dr-model-settings-1',source=backend.label,captured_unix_s=time.time(),
+        preparation=config['preparation'],calibration_source_sha256=config.get('source_sha256'),
+        reference_excitation='zero correctors and skews in model; absolute machine centers retained' if sad else 'captured corrector and skew currents',
         momentum_mev_c=p,momentum_compaction=opt.momentum_compaction,lattice_path=path,lattice_sha256=digest(load_lattice_data(path)),
         quadrupoles_k1l=quads,sextupoles_k2l=sexts,quadrupole_factors=config.get('quadrupole_factors',{}),
         calibration_source=config.get('source','mag_ki_main main/trim calibration; SD1R normal-sextupole sign follows SetRingSext'),
         bend_k1l=config.get('bend_k1l',{}),actuators=actuators,frequency_offset_hz=baseline['frequency'],
         bpm_names=[n for n in backend.bpm_names if n not in opt.excluded_bpms],tunes=tunes,tune_alias=alias,
         tune_source=tune_source,raw_pvs=raw,coils=coil_records,
+        design_quadrupoles_k1l=design_quads,
         unmodelled_fixed_actuators=unmodelled,
         assumptions=['Bend geometry and unconfigured bend gradients from versioned lattice; no alignment errors inferred',
                      'RF disabled: transverse periodic optics, not radiation equilibrium'])
@@ -266,16 +314,35 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
 class ModelManager:
     def __init__(self,backend):
         self.backend=backend;self.settings=None;self.model=None;self.baseline=None;self.optics=None
+        self.last_attempt=None
     def prepare(self,opt,cancel,progress=lambda *_:None):
         progress(0,'Reading public settings for independent RFTrack model')
-        self.model=None;self.optics=None
-        baseline=self.backend.snapshot()
-        settings=capture_settings(self.backend,opt,baseline,cancel)
-        model=OpticsModel(settings,cancel)
-        progress(10,'Matching model QF1R / QF2R to tune targets (no machine writes)')
-        if opt.model_match_tunes:model.match_tunes(settings['tunes'],alias=settings['tune_alias'])
-        if not self.backend.same_settings(self.backend.snapshot(),baseline):raise ValueError('Machine settings changed during model preparation')
-        verify_inputs(self.backend,settings)
+        self.model=None;self.optics=None;self.settings=None;self.baseline=None
+        attempt=dict(schema='dr-model-diagnostic-1',captured_unix_s=time.time(),stage='reading settings',
+                     status='running',options=vars(opt).copy(),settings=None)
+        self.last_attempt=attempt
+        try:
+            baseline=self.backend.snapshot();attempt['baseline']=baseline
+            settings=capture_settings(self.backend,opt,baseline,cancel);attempt['settings']=settings
+            attempt['stage']='constructing imported model';model=OpticsModel(settings,cancel)
+            attempt['stage']='initial imported optics stability check'
+            progress(5,'Checking initial imported model stability (no machine writes)')
+            attempt['initial_tunes']=model.tunes()
+            if opt.model_match_tunes:
+                attempt['stage']='QF1R / QF2R tune matching'
+                progress(10,'Matching model QF1R / QF2R to tune targets (no machine writes)')
+                model.match_tunes(settings['tunes'],alias=settings['tune_alias'])
+            attempt['stage']='checking settings unchanged'
+            if not self.backend.same_settings(self.backend.snapshot(),baseline):raise ValueError('Machine settings changed during model preparation')
+            verify_inputs(self.backend,settings)
+        except Exception as exc:
+            attempt.update(status='failed',error=str(exc),exception_type=type(exc).__name__)
+            if isinstance(exc,ModelOpticsError):attempt['optics_failure']=exc.diagnostics
+            if isinstance(exc,ValueError):
+                raise ValueError(f"RFTrack model preparation failed during {attempt['stage']}: {exc}. "
+                                 "No correction applied. RFTrack model > Save model diagnostics records this attempt.") from exc
+            raise
+        attempt.update(status='ready',stage='model prepared',tune_match=model.match_report)
         self.model=model;self.settings=settings;self.baseline=baseline
         return model
     def acquire(self,service,mode,opt,progress):

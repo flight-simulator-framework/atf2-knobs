@@ -210,7 +210,12 @@ class CorrectionService:
                     progress(int(100*j/len(names)),f'{name}: set {setting:.6g} {self.backend.unit(kind)}; current readback + {delay:g} s extra wait; BPM {opt.bpm_samples} samples, {opt.bpm_interval_s:g} s interval (first read delayed)')
                     self.backend.write(kind,[name],[setting])
                     value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
-            finally:self.backend.write(kind,[name],[centers[j]])
+            except BaseException as exc:
+                try:self.backend.write(kind,[name],[centers[j]])
+                except Exception as restoration:
+                    raise RuntimeError(f'{exc}\nProbe restoration also failed for {name}: {restoration}') from exc
+                raise
+            else:self.backend.write(kind,[name],[centers[j]])
             columns.append(((values[1]-values[0])/(hi-lo)).reshape(-1))
             full_columns.append(((full_values[1]-full_values[0])/(hi-lo)).reshape(-1))
             progress(int(100*(j+1)/len(names)),f'{name}: response {j+1}/{len(names)}')

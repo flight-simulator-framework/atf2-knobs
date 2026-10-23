@@ -2,11 +2,13 @@
 import copy
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch,Mock
+import tempfile
+from pathlib import Path
 import numpy as np
 from Knobs.DRCorrection.backends import DemoBackend
 from Knobs.DRCorrection.core import CorrectionService,Options
-from Knobs.DRTuning.model import ModelManager,normal_modes,verify_inputs,digest
+from Knobs.DRTuning.model import ModelManager,normal_modes,verify_inputs,digest,ModelOpticsError,OpticsModel
 from Knobs.DRTuning.sr_beta import fit_sr_beta
 from Knobs.DRTuning.model_validation import compare_optics,compare_response
 
@@ -91,6 +93,34 @@ class ModelMathTests(unittest.TestCase):
         np.testing.assert_allclose([abs(modes[0,0])**2,abs(modes[2,1])**2],[4,2])
         matrix[0,0]=10.
         with self.assertRaisesRegex(ValueError,'Unstable'):normal_modes(matrix)
+    def test_failed_initial_optics_retains_inputs_and_never_writes(self):
+        b=CountedBackend();manager=ModelManager(b)
+        settings={'raw_pvs':{'main:currentRead':1.},'tunes':[.2,.3],'tune_alias':False}
+        fake=Mock();fake.tunes.side_effect=lambda:normal_modes(np.diag([2.,.5,1.,1.]))
+        # Even without tune matching, unstable imported optics must not pass.
+        with patch('Knobs.DRTuning.model.capture_settings',return_value=settings),patch('Knobs.DRTuning.model.OpticsModel',return_value=fake):
+            with self.assertRaisesRegex(ValueError,'initial imported optics stability check'):
+                manager.prepare(Options(model_match_tunes=False),lambda:None)
+        self.assertEqual(b.commands,[]);self.assertIsNone(manager.model)
+        self.assertEqual(manager.last_attempt['settings'],settings)
+        self.assertEqual(manager.last_attempt['status'],'failed')
+        self.assertEqual(manager.last_attempt['optics_failure']['max_modulus_deviation'],1.)
+        from Knobs.DRCorrection.core import serial
+        json.dumps(serial(manager.last_attempt),allow_nan=False)
+    def test_unstable_tune_trial_reports_scales_and_restores_model(self):
+        from types import SimpleNamespace
+        class Quadrupole:
+            def __init__(self):self.value=2.
+            def get_K1(self,p):return self.value
+            def set_K1(self,p,value):self.value=value
+        elements={'QF1R.1':Quadrupole(),'QF2R.1':Quadrupole()}
+        model=SimpleNamespace(elements=elements,momentum=1300.,check_cancel=lambda:None,
+            tunes=Mock(side_effect=[np.array([.2,.3]),ModelOpticsError('Unstable trial',{'max_modulus_deviation':.2})]))
+        with patch('Knobs.DRTuning.model.least_squares',side_effect=lambda fun,*a,**k:fun([.01,-.02])):
+            with self.assertRaisesRegex(ModelOpticsError,'Tune-match trial') as caught:
+                OpticsModel.match_tunes(model,[.21,.31])
+        np.testing.assert_allclose(caught.exception.diagnostics['tune_match_trial_fractional_changes'],[.01,-.02])
+        self.assertEqual([e.value for e in elements.values()],[2.,2.])
     def test_quad_average_beta_fit_uses_integrated_transport(self):
         beta=4.;alpha=.3;gamma=(1+alpha**2)/beta;names=['q1','q2','q3','q4'];rows=[];values=[]
         for n,s in zip(names,[0.,1.,2.,3.]):
@@ -134,6 +164,10 @@ class ModelGuiTests(unittest.TestCase):
             window.model_panel.inputs_changed()
             self.assertEqual(b.model_config['tune_pvs'][0],'CUSTOM:TUNE:X')
             self.assertIsNone(window.service.model_manager.model)
+            window.service.model_manager.last_attempt={'schema':'dr-model-diagnostic-1','status':'failed','settings':{'raw_pvs':{'test:pv':1.}}}
+            with tempfile.TemporaryDirectory() as root:
+                path=Path(root)/'diagnostic.json';window.model_panel.save_diagnostics(path)
+                self.assertEqual(json.loads(path.read_text())['status'],'failed')
         finally:window.close();window.deleteLater();self.app.processEvents()
 
 

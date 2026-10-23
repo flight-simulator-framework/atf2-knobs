@@ -144,6 +144,24 @@ Model inputs and calibration:
   interface. Model inputs, raw PV values, ignored fixed actuators, lattice hash,
   tune matching and assumptions are saved in every model correction dataset.
 
+Debugging unstable one-turn maps:
+- The error describes the imported RFTrack model, not measured beam stability.
+  Initial imported optics are checked even when model tune matching is disabled.
+  The stability threshold remains unchanged (max abs(abs(lambda)-1) <= 2e-4).
+- Preparation errors now identify initial optics vs QF1R/QF2R tune-match trials.
+  Unstable-map errors include eigenvalue moduli; failed trials also record QF
+  fractional changes and restore the local model before propagating the error.
+- After a failed model CALC or Build model / optics, open RFTrack model and
+  Save model diagnostics. The JSON records the last preparation attempt,
+  stage/status, raw PVs, calibrated strengths, design-reference quad strengths,
+  current snapshot, tune targets, and matrix/eigenvalue diagnostics when present.
+  Saving does not read or write the machine. A partial capture failure may not
+  have complete settings. Failed models cannot be used for a correction.
+- Supply the diagnostic file to distinguish calibration/geometry/input issues
+  from an unstable matching trial. Do not change real QF currents to make the
+  offline model stable. Stable nominal fake-EPICS input coverage is not proof
+  that current live-machine settings have been reproduced.
+
 SR / phase optics:
 - Build model first, then "Use RFTrack model" in SR beta or dispersion fit.
   The machine must still be at the captured settings. Independently supplied

@@ -3,7 +3,7 @@ import copy
 import json
 from pathlib import Path
 import numpy as np
-from PyQt6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QLabel,QFileDialog,QLineEdit,QFormLayout,QCheckBox
+from PyQt6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QLabel,QFileDialog,QLineEdit,QFormLayout,QCheckBox,QComboBox
 from Knobs.DRCorrection.gui import Plot
 from Knobs.DRCorrection.core import serial
 from .presentation import button,group,scroll
@@ -18,6 +18,13 @@ class ModelPanel(QWidget):
                     'Optics are model predictions. Tune matching alone does not identify all lattice errors.')
         note.setWordWrap(True);layout.addWidget(note)
         box,v=group('Model inputs (Machine interface)');form=QFormLayout();v.addLayout(form)
+        from .model import preparation_config
+        self.preparation=QComboBox()
+        self.preparation.addItem('SAD COD reference (archived calibration)','sad_cod')
+        self.preparation.addItem('All captured currents (no SAD preset)','all_currents')
+        self.preparation.setCurrentIndex(self.preparation.findData(preparation_config(window.backend)['preparation']))
+        self.preparation.setToolTip('SAD: QM trim except QM7; archived quadrupole factors; zero model correctors/skews. Machine currents unchanged. Used also as the reference for dispersion/skew, not exact legacy branch reproduction.')
+        form.addRow('Model preparation',self.preparation)
         self.fields={}
         defaults={'energy_pv':'SAD:FILE:DR:ENERGY','tune_x':'SAD:DR_TUNE_X','tune_y':'SAD:DR_TUNE_Y',
                   'skew_sd':'SAD:SKEWCOR_SDCALIB','skew_sf':'SAD:SKEWCOR_SFCALIB'}
@@ -32,13 +39,15 @@ class ModelPanel(QWidget):
         layout.addWidget(scroll(box),1)
         row=QHBoxLayout();layout.addLayout(row)
         for label,action in [('Build model / optics',self.build),('Save model / optics',self.save),('Compare reference file',self.compare)]:row.addWidget(button(label,action))
+        layout.addWidget(button('Save model diagnostics',self.save_diagnostics))
         self.status=QLabel('Model not built. Standard lattice: ATF DR 20111111b.');self.status.setWordWrap(True);layout.addWidget(self.status)
         self.plot=Plot();layout.addWidget(self.plot,2)
+        self.preparation.currentIndexChanged.connect(self.inputs_changed)
     @property
     def manager(self):return self.window.service.model_manager
     def config(self):
         backend=self.window.backend;c=copy.deepcopy(getattr(backend,'model_config',{}))
-        c.update(energy_pv=self.fields['energy_pv'].text().strip(),tune_pvs=[self.fields[k].text().strip() for k in ('tune_x','tune_y')],
+        c.update(preparation=self.preparation.currentData(),energy_pv=self.fields['energy_pv'].text().strip(),tune_pvs=[self.fields[k].text().strip() for k in ('tune_x','tune_y')],
                  skew_calibration_pvs={f:self.fields[k].text().strip() for f,k in [('SD','skew_sd'),('SF','skew_sf')]})
         backend.model_config=c
     def inputs_changed(self):
@@ -101,6 +110,15 @@ class ModelPanel(QWidget):
         if path:
             root=Path(path);(root/'model.json').write_text(json.dumps(serial(self.result),indent=2,allow_nan=False)+'\n')
             self.plot.save(root/'model_optics.png');self.window.log('Saved model audit: '+str(root))
+    def save_diagnostics(self,path=None):
+        attempt=self.manager.last_attempt
+        if attempt is None:self.window.error('Run Build model / optics or model CALC first');return
+        if not path:path,_=QFileDialog.getSaveFileName(self,'Save last model preparation attempt','dr_model_diagnostic.json','JSON (*.json)')
+        if not path:return
+        try:
+            Path(path).write_text(json.dumps(serial(attempt),indent=2,allow_nan=False)+'\n')
+            self.window.log('Saved model diagnostics: '+str(path))
+        except Exception as exc:self.window.error(str(exc))
     def compare(self):
         if self.result is None:self.window.error('Build model first');return
         path,_=QFileDialog.getOpenFileName(self,'Independent SAD / reference optics table','','JSON (*.json)')

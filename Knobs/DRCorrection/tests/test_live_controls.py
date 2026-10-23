@@ -37,6 +37,30 @@ def ramp_profile():
 
 
 class RecoveredControlTests(unittest.TestCase):
+    def test_stuck_current_identifies_supply_and_verifies_restoration(self):
+        profile=fake_profile();profile['actuators']['V']['set']='v_set'
+        client=FakeEpics();client.values['v_set']=0.
+        backend=EpicsBackend(profile,client)
+        with self.assertRaisesRegex(RuntimeError,'Magnet readback did not settle') as caught:
+            backend.write('correctors',['V'],[.05])
+        message=str(caught.exception)
+        for text in ('V: set PV=v_set','read PV=v','target=0.05 A','readback=0 A',
+                     'error=-0.05 A','tolerance 0.001 A','restored and verified'):
+            self.assertIn(text,message)
+        self.assertEqual(client.values['v_set'],0.)
+
+    def test_failed_restoration_retains_original_target_diagnostics(self):
+        profile=fake_profile();profile['actuators']['V']['set']='v_set'
+        client=FakeEpics();client.values['v_set']=0.
+        def put(pv,value,**kw):
+            client.values[pv]=value;client.values['v']=.02;return 1
+        client.caput=put
+        backend=EpicsBackend(profile,client)
+        with self.assertRaises(RuntimeError) as caught:backend.write('correctors',['V'],[.05])
+        message=str(caught.exception)
+        self.assertIn('target=0.05 A',message);self.assertIn('Restoration FAILED',message)
+        self.assertIn('target=0 A',message)
+
     def test_selected_preset_with_wrong_frequency_is_rejected_with_numeric_evidence(self):
         class HalfStepClient(RampClient):
             def caput(self,pv,value,**kwargs):
