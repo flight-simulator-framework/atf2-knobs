@@ -13,10 +13,10 @@ Improvements (2026-01):
 - Log additional ICTs (GUN/LNE/BTM/BTE) at every evaluation point.
 - Always wait settle_sec (default 5s) after changing any PV before reading ICTs.
 - Timing scan after klystron phase scan:
-    PV: EVE_LINAC.OT8D [count], integer step=1, range=±10 around current
+    PV: EVE_LINAC:OUT0:SetData [ns], step=11.2 ns, range=±10 steps around current
 - Optional standalone Timing fine tuning, immediately after Timing coarse:
-    OT8D (11.2 ns/count) + RFDLY0 (0.56 ns/count, 0–19),
-    scan current ±11.2 ns in 2.8 ns steps with base-20 carry/borrow.
+    EVE_LINAC:OUT0:SetData in ns,
+    scan current ±11.2 ns in 2.8 ns steps.
 - Add Group-LBO mode (discrete / quantized to the same step sizes as sequential scans).
   Groups: L1–L4, L5–L8, Timing, QA, QM (only checked groups run, in this order).
 """
@@ -57,6 +57,8 @@ from linac_gp import CorrectorGPModel
 from Knobs.ipbsm_opt_plotting import save_plot_montage
 from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, WrappingLabel, OverallProgressBar
 from Knobs.optimizer_progress import BudgetProgress
+from Knobs.current_value_monitor import CurrentValueMonitor
+from Knobs.timing_pv import TIMING_PV, validate_timing_pvs
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
@@ -99,14 +101,10 @@ QA_STEP_A = 0.05
 QM_HALF_RANGE_A = 2.0
 QM_STEP_A = 0.2
 
-TIMING_PV = "EVE_LINAC.OT8D"
-TIMING_STEP = 1
-TIMING_HALF_STEPS = 10  # ±10 counts by default
-TIMING_FINE_PV = "EVE_LINAC.RFDLY0"
-TIMING_FINE_RADIX = 20
-TIMING_FINE_TICK_NS = 0.56
-TIMING_FINE_STEP = 5  # 2.8 ns
-TIMING_FINE_HALF_RANGE = 20  # ±11.2 ns
+TIMING_STEP_NS = 11.2
+TIMING_HALF_STEPS = 10  # ±112 ns by default
+TIMING_FINE_STEP_NS = 2.8
+TIMING_FINE_HALF_STEPS = 4  # ±11.2 ns, nine points
 
 SETTLE_SEC_DEFAULT = 5.0
 ICT_SAMPLES_DEFAULT = 3
@@ -399,9 +397,8 @@ TARGET_VALUE_SPECS = {
     ],
     "kly_group_1": KLY_GROUP_1_SPECS,
     "kly_group_2": KLY_GROUP_2_SPECS,
-    "timing": [("Timing", TIMING_PV, None, "count")],
-    "timing_fine": [("OT8D", TIMING_PV, None, "count"),
-                    ("RFDLY0", TIMING_FINE_PV, None, "count")],
+    "timing": [("Timing", TIMING_PV, None, "ns")],
+    "timing_fine": [("Timing", TIMING_PV, None, "ns")],
     "qa": [(f"QA{i}L", f"QA{i}L:currentWrite", f"QA{i}L:currentRead", "A") for i in range(1, 6)],
     "qm": [(f"QM{i}L", f"QM{i}L:currentWrite", f"QM{i}L:currentRead", "A") for i in range(1, 4)],
 }
@@ -459,34 +456,36 @@ def resolve_linac_length_scale(
     return max(float(learned), floor), LINAC_LEARNED_PRESET_VERSION
 
 
-def _timing_count(value: float, pv: str = TIMING_PV) -> int:
-    """Validate integer timing registers, including the RFDLY0 digit range."""
+def _timing_value(value: float) -> float:
+    """SetData accepts a finite delay in ns, including fractional values."""
     number = float(value)
-    if not np.isfinite(number) or not number.is_integer():
-        raise ValueError(f"{pv} requires a finite integer count: {value}")
-    if pv == TIMING_FINE_PV and not 0 <= number < TIMING_FINE_RADIX:
-        raise ValueError(f"{pv} must be an integer from 0 to 19: {value}")
-    return int(number)
+    if not np.isfinite(number):
+        raise ValueError(f"{TIMING_PV} requires a finite delay in ns: {value}")
+    return number
 
 
-def timing_fine_scan(coarse: float, fine: float) -> List[Tuple[int, Dict[str, int]]]:
-    """Nine absolute settings at five-tick offsets from the current timing.
+def _timing_step_ns(config: Dict[str, Any]) -> float:
+    # Older integer-mode configs stored a step in counts. Never reinterpret
+    # that bare number as nanoseconds; the pre-integer key is timing_step_ns.
+    step = _timing_value(config.get("timing_step_ns",
+                                  float(config.get("timing_step", 1)) * TIMING_STEP_NS))
+    if step <= 0:
+        raise ValueError("Timing step must be positive")
+    return step
 
-    Preserve the current RFDLY0 residue modulo five; only the changes are
-    multiples of five. divmod handles both carry and borrow, including zero.
-    """
-    origin = TIMING_FINE_RADIX * _timing_count(coarse) + _timing_count(fine, TIMING_FINE_PV)
-    points = []
-    for offset in range(-TIMING_FINE_HALF_RANGE, TIMING_FINE_HALF_RANGE + 1, TIMING_FINE_STEP):
-        coarse_value, fine_value = divmod(origin + offset, TIMING_FINE_RADIX)
-        points.append((offset, {TIMING_PV: coarse_value, TIMING_FINE_PV: fine_value}))
-    return points
+
+def timing_fine_scan(origin: float) -> List[Tuple[float, Dict[str, float]]]:
+    """Nine relative delays on the same SetData PV; retain the exact center."""
+    origin = _timing_value(origin)
+    return [(i * TIMING_FINE_STEP_NS, {TIMING_PV: origin + i * TIMING_FINE_STEP_NS})
+            for i in range(-TIMING_FINE_HALF_STEPS, TIMING_FINE_HALF_STEPS + 1)]
 
 
 def _restore_pvs_for_config(config: Dict[str, Any]) -> List[str]:
     pvs = [str(pv) for pv in config.get("restore_pvs", RESTORE_PVS)]
     if config.get("timing_fine", False):
-        pvs.extend((TIMING_PV, TIMING_FINE_PV))
+        pvs.append(TIMING_PV)
+    validate_timing_pvs(pvs)
     return list(dict.fromkeys(pvs))
 
 
@@ -902,7 +901,7 @@ class OptimizationWorker(QThread):
         self._pause_can_remeasure = False
         self._best_recorded = None
         self._touched_pvs = set()
-        self._timing_fine_pairs = set()
+        self._timing_fine_targets = set()
         self.run_profile = str(config.get("run_profile", RUN_PROFILE_MAIN)).upper()
 
         self.settle_sec = float(config.get("settle_sec", SETTLE_SEC_DEFAULT))
@@ -2604,8 +2603,9 @@ class OptimizationWorker(QThread):
     def _read_current(self, pv_write: str, pv_read: Optional[str] = None) -> float:
         if pv_read is None:
             pv_read = _default_readback_pv(pv_write)
+        validate_timing_pvs((pv_write, pv_read))
         value = self.interface.read_current(pv_write=pv_write, pv_read=pv_read, quantize_phase=True)
-        return _timing_count(value, pv_write) if pv_write in (TIMING_PV, TIMING_FINE_PV) else value
+        return _timing_value(value) if pv_write == TIMING_PV else value
 
     def _lbo_group(self, group_name: str, params: List[tuple]):
         """
@@ -2831,17 +2831,18 @@ class OptimizationWorker(QThread):
 
     def _write_setpoints(self, values, wait=False):
         self._pause_checkpoint()
-        values = {pv: _timing_count(value, pv) if pv in (TIMING_PV, TIMING_FINE_PV) else value
+        validate_timing_pvs(values)
+        values = {pv: _timing_value(value) if pv == TIMING_PV else value
                   for pv, value in values.items()}
         if self.run_profile == RUN_PROFILE_DEVELOPER or self.config.get("correctors"):
             selected = {spec["pv_write"] for spec in self.developer_actuators}
             limits = self.config.get("actuator_limits", {})
             corrector_pvs = {f"{name}:currentWrite" for name in BT_SEQUENCE if str(name).lower().startswith("z")}
-            fine_pair = (self.run_profile == RUN_PROFILE_MAIN
-                         and (values.get(TIMING_PV), values.get(TIMING_FINE_PV)) in self._timing_fine_pairs)
+            fine_target = (self.run_profile == RUN_PROFILE_MAIN
+                           and values.get(TIMING_PV) in self._timing_fine_targets)
             for pv, value in values.items():
-                if fine_pair and pv in (TIMING_PV, TIMING_FINE_PV):
-                    # Fine tuning has its own nine verified pairs, centered on
+                if fine_target and pv == TIMING_PV:
+                    # Fine tuning has its own nine verified delays, centered on
                     # the timing after the coarse optimization finishes.
                     continue
                 if self.run_profile == RUN_PROFILE_MAIN and pv not in corrector_pvs and pv not in selected:
@@ -2956,16 +2957,13 @@ class OptimizationWorker(QThread):
         if not self.is_running:
             return
         self._emit_group_state("timing_fine", "running")
-        coarse = self._read_current(TIMING_PV)
-        fine = self._read_current(TIMING_FINE_PV)
-        points = timing_fine_scan(coarse, fine)
-        self._timing_fine_pairs = {
-            (values[TIMING_PV], values[TIMING_FINE_PV]) for _, values in points
-        }
+        origin = self._read_current(TIMING_PV)
+        points = timing_fine_scan(origin)
+        self._timing_fine_targets = {values[TIMING_PV] for _, values in points}
         group = TARGET_LABELS["timing_fine"]
         self._emit_progress({"kind": "bo1d_trace", "trace": {}})
         self.log_signal.emit(
-            f"--- {group}: OT8D={coarse}, RFDLY0={fine}; "
+            f"--- {group}: delay={origin:.6g} ns; "
             "9 points, current ±11.2 ns, step 2.8 ns ---")
         best = None
         # Measure the center first, then the remaining offsets. Ties prefer
@@ -2976,10 +2974,10 @@ class OptimizationWorker(QThread):
             self._set_scan_progress(group, index, len(points))
             result = self._evaluate_point_multi(
                 group, values, mode=self.mode, group=group,
-                note=f"TIMING_FINE offset_ns={offset * TIMING_FINE_TICK_NS:+.2f}")
+                note=f"TIMING_FINE offset_ns={offset:+.2f}")
             self.log_signal.emit(
-                f"[Timing fine] Δt={offset * TIMING_FINE_TICK_NS:+.2f} ns: "
-                f"OT8D={values[TIMING_PV]}, RFDLY0={values[TIMING_FINE_PV]}, "
+                f"[Timing fine] Δt={offset:+.2f} ns: "
+                f"delay={values[TIMING_PV]:.6g} ns, "
                 f"score={result.score:.6g}, valid={result.measurement_ok}")
             if result.measurement_ok and np.isfinite(result.score):
                 rank = (result.score, -abs(offset))
@@ -2988,7 +2986,7 @@ class OptimizationWorker(QThread):
         if not self.is_running:
             return
         if best is None:
-            self._write_setpoints({TIMING_PV: coarse, TIMING_FINE_PV: fine})
+            self._write_setpoints({TIMING_PV: origin})
             raise ValueError("Timing fine tuning: no valid measurements; restored the starting timing")
         self._set_scan_progress(group, len(points), len(points), "final check")
         self._evaluate_point_multi(group, best[1], mode=self.mode, group=group, note="OPTIMIZED_SET")
@@ -3010,7 +3008,7 @@ class OptimizationWorker(QThread):
         qa_step = float(self.config.get("qa_step_a", QA_STEP_A))
         qm_half = float(self.config.get("qm_half_range_a", QM_HALF_RANGE_A))
         qm_step = float(self.config.get("qm_step_a", QM_STEP_A))
-        timing_step = int(self.config.get("timing_step", TIMING_STEP))
+        timing_step = _timing_step_ns(self.config)
         timing_half_steps = int(self.config.get("timing_half_steps", TIMING_HALF_STEPS))
         gun_group_name = TARGET_LABELS["gun_sol_l0"]
 
@@ -3111,7 +3109,7 @@ class OptimizationWorker(QThread):
         qa_step = float(self.config.get("qa_step_a", QA_STEP_A))
         qm_half = float(self.config.get("qm_half_range_a", QM_HALF_RANGE_A))
         qm_step = float(self.config.get("qm_step_a", QM_STEP_A))
-        timing_step = int(self.config.get("timing_step", TIMING_STEP))
+        timing_step = _timing_step_ns(self.config)
         timing_half_steps = int(self.config.get("timing_half_steps", TIMING_HALF_STEPS))
         # Group order: GUN&SOLENOIDE&L0, L1-4, L5-8, Timing, QA, QM
         if self.config.get("gun_sol_l0_phase", False) and self.is_running:
@@ -3180,7 +3178,7 @@ class OptimizationWorker(QThread):
         qa_step = float(self.config.get("qa_step_a", QA_STEP_A))
         qm_half = float(self.config.get("qm_half_range_a", QM_HALF_RANGE_A))
         qm_step = float(self.config.get("qm_step_a", QM_STEP_A))
-        timing_step = int(self.config.get("timing_step", TIMING_STEP))
+        timing_step = _timing_step_ns(self.config)
         timing_half_steps = int(self.config.get("timing_half_steps", TIMING_HALF_STEPS))
         gun_group_name = TARGET_LABELS["gun_sol_l0"]
 
@@ -3332,6 +3330,7 @@ class MainWindow(QMainWindow):
         self.group_bo_budget_labels: Dict[str, QLabel] = {}
 
         self._init_ui()
+        self._current_value_monitor = None
         self._current_value_timer = QTimer(self)
         self._current_value_timer.setInterval(3000)
         self._current_value_timer.timeout.connect(self._auto_refresh_current_values)
@@ -3452,14 +3451,14 @@ class MainWindow(QMainWindow):
             lay_t, "timing_group", TARGET_LABELS["timing_group"],
             checked=True, prominent=True, show_value=False)
         self.chk_timing = self._add_target_row(
-            lay_t, "timing", "Coarse (OT8D, 11.2 ns/count)",
+            lay_t, "timing", "Coarse (step 11.2 ns)",
             checked=True, prominent=False, indent=34)
         self.chk_timing_fine = self._add_target_row(
             lay_t, "timing_fine", "Fine tuning (±11.2 ns, step 2.8 ns)",
             checked=False, prominent=False, indent=34)
         self.chk_timing_fine.setToolTip(
             "Scan 9 points around the current timing: ±11.2 ns in 2.8 ns steps. "
-            "RFDLY0 changes by 5 counts, with carry/borrow into OT8D (RFDLY0 = 0–19). "
+            "Uses EVE_LINAC:OUT0:SetData in ns for all nine settings. "
             "Runs immediately after Coarse, before QA/QM; can run on its own. "
             "With Correctors & L8, runs immediately after that combined timing search.")
         self.chk_qa = self._add_target_row(lay_t, "qa", TARGET_LABELS["qa"], checked=True, prominent=True)
@@ -4128,11 +4127,13 @@ class MainWindow(QMainWindow):
         lay_timing = QHBoxLayout()
         lay_timing.addWidget(QLabel("Timing"))
         lay_timing.addWidget(QLabel("step"))
-        self.sp_timing_step = QSpinBox()
-        self.sp_timing_step.setRange(1, 1000)
-        self.sp_timing_step.setValue(TIMING_STEP)
+        self.sp_timing_step = QDoubleSpinBox()
+        self.sp_timing_step.setDecimals(3)
+        self.sp_timing_step.setRange(0.001, 11200.)
+        self.sp_timing_step.setSingleStep(TIMING_STEP_NS)
+        self.sp_timing_step.setValue(TIMING_STEP_NS)
         lay_timing.addWidget(self.sp_timing_step)
-        lay_timing.addWidget(QLabel("count"))
+        lay_timing.addWidget(QLabel("ns"))
         lay_timing.addSpacing(12)
         lay_timing.addWidget(QLabel("half-steps"))
         self.sp_timing_half_steps = QSpinBox()
@@ -4143,7 +4144,7 @@ class MainWindow(QMainWindow):
         lay_seq.addLayout(lay_timing)
 
         self.correctors_l8 = QCheckBox("Correctors & L8: include L8 phase + Timing in one Group BO")
-        self.correctors_l8.setToolTip("Timing = EVE_LINAC.OT8D (integer counts, default current ±10). Uses Timing range/step above. L8 is excluded from the separate L5–L8 group.")
+        self.correctors_l8.setToolTip("Timing = EVE_LINAC:OUT0:SetData (ns, default current ±112 ns). Uses Timing range/step above. L8 is excluded from the separate L5–L8 group.")
         lay_seq.addWidget(self.correctors_l8)
         self.l8_phase_half = QDoubleSpinBox()
         self.l8_phase_half.setRange(0.001, 180.)
@@ -4625,7 +4626,7 @@ class MainWindow(QMainWindow):
              "half_range": self.l8_phase_half.value(), "step": self.l8_phase_step.value(), "unit": "deg"},
             {"name": "Timing", "pv_write": TIMING_PV, "pv_read": None,
              "half_range": self.sp_timing_step.value() * self.sp_timing_half_steps.value(),
-             "step": self.sp_timing_step.value(), "unit": "count"}]
+             "step": self.sp_timing_step.value(), "unit": "ns"}]
 
     def _refresh_developer_live_values(self):
         try:
@@ -4888,13 +4889,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_current_values(self, *_args):
         try:
-            interface = self._ensure_interface()
-            pv_values: Dict[str, float] = {}
-            for specs in TARGET_VALUE_SPECS.values():
-                for _label, pv_write, pv_read, _unit in specs:
-                    if pv_write in pv_values:
-                        continue
-                    pv_values[pv_write] = float(interface.read_current(pv_write, pv_read))
+            if self._current_value_monitor is None:
+                self._current_value_monitor = CurrentValueMonitor(TARGET_VALUE_SPECS)
+            pv_values = self._current_value_monitor.snapshot()
             self._update_value_labels(build_display_value_texts(pv_values))
             self._current_value_refresh_failed = False
         except Exception as exc:
@@ -5484,6 +5481,7 @@ class MainWindow(QMainWindow):
         setpoints = dict(origin.get("initial_setpoints", {}) or {})
         if not setpoints:
             raise ValueError("No initial setpoints were stored for this run.")
+        validate_timing_pvs(setpoints)
         self._ensure_interface().pv_put_many({str(k): float(v) for k, v in setpoints.items()})
 
     def _delta_specs_for_origin(self, origin: Dict[str, Any], profile: str) -> List[
@@ -5768,8 +5766,7 @@ class MainWindow(QMainWindow):
         self.sp_qa_step.setValue(float(payload.get("qa_step_a", self.sp_qa_step.value())))
         self.sp_qm_half.setValue(float(payload.get("qm_half_range_a", self.sp_qm_half.value())))
         self.sp_qm_step.setValue(float(payload.get("qm_step_a", self.sp_qm_step.value())))
-        # Old timing_step_ns belongs to OUT0:SetData; do not reuse it for OT8D.
-        self.sp_timing_step.setValue(int(payload.get("timing_step", TIMING_STEP)))
+        self.sp_timing_step.setValue(_timing_step_ns(payload))
         self.sp_timing_half_steps.setValue(int(payload.get("timing_half_steps", self.sp_timing_half_steps.value())))
         gp_mode = payload.get("corrector_gp_mode", "fixed")
         gp_index = self.corrector_gp_mode_box.findData(gp_mode)
@@ -6006,6 +6003,7 @@ class MainWindow(QMainWindow):
         limits, summary = {}, []
         if not actuators:
             return limits, summary
+        validate_timing_pvs(pv for spec in actuators for pv in (spec["pv_write"], spec.get("pv_read")))
         interface = self._ensure_interface()
         for spec in actuators:
             pv = spec["pv_write"]
@@ -6024,7 +6022,7 @@ class MainWindow(QMainWindow):
                 lo, hi = max(lo, STEER_CURRENT_MIN_A), min(hi, STEER_CURRENT_MAX_A)
             current = float(interface.read_current(pv, spec["pv_read"]))
             if pv == TIMING_PV:
-                current = _timing_count(current)
+                current = _timing_value(current)
             if not np.isfinite(current) or not lo <= current <= hi or lo >= hi:
                 raise ValueError(f"Unsafe value/range: {pv}, {current} {unit}, limits [{lo}, {hi}] {unit}")
             if not np.isfinite([spec["step"], spec["half_range"]]).all() or not 0 < spec["step"] <= 2 * spec["half_range"]:
@@ -6220,7 +6218,7 @@ class MainWindow(QMainWindow):
             "qa_step_a": float(getattr(self, "sp_qa_step").value()),
             "qm_half_range_a": float(getattr(self, "sp_qm_half").value()),
             "qm_step_a": float(getattr(self, "sp_qm_step").value()),
-            "timing_step": int(self.sp_timing_step.value()),
+            "timing_step_ns": float(self.sp_timing_step.value()),
             "timing_half_steps": int(getattr(self, "sp_timing_half_steps").value()),
             "run_profile": RUN_PROFILE_MAIN,
             "objective_type": objective,
@@ -6360,6 +6358,9 @@ class MainWindow(QMainWindow):
                 )
                 event.ignore()
                 return
+        if self._current_value_monitor is not None:
+            self._current_value_monitor.close()
+            self._current_value_monitor = None
         event.accept()
         super().closeEvent(event)
 

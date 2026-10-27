@@ -1,0 +1,28 @@
+Timing PV rollback — 2026-10-27
+==============================
+
+LinacOptのタイミング操作・観測・保存・初期値/最良値への復帰は、
+EVE_LINAC:OUT0:SetData [ns] のみを使用します。
+OT8D/RFDLY0を直接指定する古い設定は、アクセス前に拒否します。
+
+通常: 11.2 ns刻み、現在値±112 ns（初期設定）。
+Fine: 現在値±11.2 nsを2.8 ns刻みで9点測定。Fineのみの実行も可能。
+現在値の小数部分は保持します。ソフトウェア上の刻みであり、SetDataの
+実機での分解能は今回の模擬IOC試験では確認していません。
+
+main画面はCA monitorのキャッシュを3秒ごとに表示します。
+表示更新に伴う繰り返しGETは送りません。
+RandomExcitationも同じPVを使用し、Coarse/Fineの範囲・刻みは上記と同じです。
+
+配備時はKnobs/Linac_Opt.pyだけでなく、Knobs/current_value_monitor.pyと
+新規のKnobs/timing_pv.pyもコピーしてください。RandomExcitationを使用する
+場合はKnobs/RandomExcitationも更新します。起動済みGUIは終了して再起動します。
+古いinteger版のtiming_step設定は11.2を掛けてnsに変換します。
+新しい保存設定はtiming_step_nsを使用します。
+古いOT8D/RFDLY0のinitial_setpointsを含む実行記録からの復帰は拒否します。
+
+BigDataLoggerは0.8に更新し、SetDataだけをCA monitorで.pvsに保存します。
+対象OneDrive: KEK/Project/ML/op-base/Utilities/BigDataLogger。
+実行機でqmake ../../BigDataLogger.pro、make -j4を実行し、
+./BigDataLogger --versionが0.8であることを確認してから再開してください。
+古い稼働中プロセスにはソース変更は反映されません。

@@ -2,10 +2,37 @@
 
 ATF2 IPBSM optimization, beam tuning, linac optimization and controllers.
 
+## Random excitation / BigData companion
+
+Run `python Knobs/GUIs/RandomExcitation_GUI.py --demo` to try the new acquisition
+GUI without EPICS. Omit `--demo` in the LinacOpt environment for machine access.
+It offers the LinacOpt control groups, optional DR correctors, 1-degree phase
+and 0.1-A current grids, verified current limits, persistent CA monitors and an
+append-only command journal. DR diagnostic selectors are read-only. Pause
+finishes the current measurement; Resume remeasures it, and Save and End applies
+the best recorded settings. See the [operator guide](Knobs/RandomExcitation/README.txt)
+for range selection, timing, logging, completion and validation details.
+
 DR optics tools are available through `python -m Knobs.DRTuning` (or `DRTuning`
 after installation). Select RFTrack or the configured machine interface, then
 open COD, dispersion, skew, TBT beta or quadrupole-modulation measurements from
 the shared launcher. See [DRTuning usage and validation](Knobs/DRTuning/README.txt).
+
+## LinacOpt current-value display
+
+Main current values use persistent PyEPICS CA monitors (the same mechanism as
+`camonitor`), one subscription per unique preferred source PV: 21 scalar PVs.
+The 3-second timer only reads the local notification cache; it does not GET or
+PUT PVs or construct the machine interface. Readback PVs are used where listed,
+otherwise the setpoint PV is monitored. Disconnected or not-yet-received values
+show `-`; the display does not fall back to reading setpoints or showing zero.
+Phase display retains 0.5-degree rounding. Closing the window releases its
+subscriptions without clearing CA channels shared with the optimizer.
+Subscriptions remain active while other tabs or optimization are in use;
+notifications follow IOC posting rates. This reduces repeated reads, but does
+not remove subscription/search/reconnection traffic. Actual server routing
+still depends on the execution host's EPICS CA configuration. Optimizer
+acquisition and machine control are unchanged.
 
 ## LinacOpt timing
 

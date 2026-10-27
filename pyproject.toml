@@ -15,6 +15,7 @@ dependencies = [
 
 [project.gui-scripts]
 DRTuning = "Knobs.DRTuning.__main__:main"
+RandomExcitation = "Knobs.RandomExcitation.__main__:main"
 
 [project.optional-dependencies]
 atf2 = [

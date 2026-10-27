@@ -1,4 +1,4 @@
-"""Timing carry/borrow and fine-only GUI/worker regressions, without EPICS."""
+"""SetData timing and fine-only GUI/worker regressions, without EPICS."""
 import json
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,8 +14,8 @@ _APP = None  # Keep Qt alive when this module shares a process with other GUI te
 
 
 class TimingInterface:
-    def __init__(self, coarse=100, fine=18):
-        self.values = {opt.TIMING_PV: coarse, opt.TIMING_FINE_PV: fine}
+    def __init__(self, delay=1120.37):
+        self.values = {opt.TIMING_PV: delay}
         self.writes = []
 
     def read_current(self, pv_write, pv_read=None, quantize_phase=True):
@@ -25,46 +25,52 @@ class TimingInterface:
         self.writes.append(dict(values))
         self.values.update(values)
 
+    def pv_put(self, pv, value):
+        self.pv_put_many({pv: value})
+
     def write_setpoints_and_wait(self, values):
         self.pv_put_many(values)
 
 
 class TimingFineTests(unittest.TestCase):
-    def test_nine_relative_points_for_every_fine_digit(self):
-        for coarse in (0, 100):
-            for fine in range(20):
-                with self.subTest(coarse=coarse, fine=fine):
-                    points = opt.timing_fine_scan(coarse, fine)
-                    self.assertEqual([delta for delta, _ in points], list(range(-20, 21, 5)))
-                    self.assertEqual(len({tuple(v.values()) for _, v in points}), 9)
-                    for delta, values in points:
-                        c, f = values[opt.TIMING_PV], values[opt.TIMING_FINE_PV]
-                        self.assertIsInstance(c, int)
-                        self.assertIsInstance(f, int)
-                        self.assertTrue(0 <= f <= 19)
-                        self.assertEqual(20 * c + f - (20 * coarse + fine), delta)
-                        self.assertEqual(f % 5, fine % 5)
-        self.assertEqual(dict(opt.timing_fine_scan(100, 18))[5],
-                         {opt.TIMING_PV: 101, opt.TIMING_FINE_PV: 3})
-        self.assertEqual(dict(opt.timing_fine_scan(100, 2))[-5],
-                         {opt.TIMING_PV: 99, opt.TIMING_FINE_PV: 17})
+    def test_nine_relative_ns_points_and_exact_center(self):
+        for origin in (0., 100.37, 1120.37, 98765.4321):
+            points = opt.timing_fine_scan(origin)
+            np.testing.assert_allclose([delta for delta, _ in points],
+                                       [-11.2, -8.4, -5.6, -2.8, 0., 2.8, 5.6, 8.4, 11.2])
+            self.assertEqual(len(points), 9)
+            for delta, values in points:
+                self.assertEqual(set(values), {"EVE_LINAC:OUT0:SetData"})
+                self.assertAlmostEqual(values[opt.TIMING_PV] - origin, delta)
+            self.assertEqual(points[4][1][opt.TIMING_PV], origin)
 
-    def test_invalid_fine_digits_are_rejected_before_writing(self):
+
+    def test_invalid_values_and_obsolete_pvs_rejected_before_io(self):
         with tempfile.TemporaryDirectory() as directory:
             interface = TimingInterface()
             worker = opt.OptimizationWorker({}, directory, interface=interface)
-            for value in (-1, 20, 1.5, np.nan, np.inf):
-                with self.subTest(value=value):
-                    with self.assertRaises(ValueError):
-                        opt.timing_fine_scan(100, value)
-                    with self.assertRaises(ValueError):
-                        worker._write_setpoints({opt.TIMING_FINE_PV: value})
-                    interface.values[opt.TIMING_FINE_PV] = value
-                    with self.assertRaises(ValueError):
-                        worker._run_timing_fine()
+            for value in (np.nan, np.inf, -np.inf):
+                with self.assertRaises(ValueError):
+                    opt.timing_fine_scan(value)
+                with self.assertRaises(ValueError):
+                    worker._write_setpoints({opt.TIMING_PV: value})
+            for pv in ("EVE_LINAC.OT8D", "EVE_LINAC.RFDLY0", "EVE_LINAC:OT8D"):
+                with self.assertRaisesRegex(ValueError, "access disabled"):
+                    worker._read_current(pv)
+                with self.assertRaisesRegex(ValueError, "access disabled"):
+                    worker._write_setpoints({pv: 1})
+                with self.assertRaisesRegex(ValueError, "access disabled"):
+                    opt._restore_pvs_for_config({"restore_pvs": [pv]})
+                window = Mock()
+                with self.assertRaisesRegex(ValueError, "access disabled"):
+                    opt.MainWindow._apply_machine_origin(window, {"initial_setpoints": {pv: 1}})
+                with self.assertRaisesRegex(ValueError, "access disabled"):
+                    opt.MainWindow._checked_corrector_ranges(window, [{"pv_write": pv, "pv_read": None}])
+                window._ensure_interface.assert_not_called()
             self.assertEqual(interface.writes, [])
 
-    def test_fine_only_run_all_modes_measures_nine_pairs_and_applies_best(self):
+
+    def test_fine_only_run_all_modes_measures_nine_delays_and_applies_best(self):
         for mode in ("SEQUENTIAL", "GROUP_BO", "GROUP_LBO"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, patch.object(
                     opt, "InterfaceATF2_LinacBT", side_effect=AssertionError("hardware")), patch(
@@ -73,10 +79,10 @@ class TimingFineTests(unittest.TestCase):
                 config = {"mode": mode, "timing_fine": True, "settle_sec": 0,
                           "restore_pvs": [], "seq_method": "TERNARY"}
                 worker = opt.OptimizationWorker(config, directory, interface=interface)
-                # Maximum is +2.8 ns from (100, 18), crossing the digit boundary.
+                # Maximum is +2.8 ns from the fractional starting delay.
                 def measure():
-                    ticks = 20 * interface.values[opt.TIMING_PV] + interface.values[opt.TIMING_FINE_PV]
-                    score = 100. - abs(ticks - 2023)
+                    delay = interface.values[opt.TIMING_PV]
+                    score = 100. - abs(delay - (1120.37 + 2.8))
                     return {"Ttot": 1., "DR": score}, np.nan, score, "DR", score, True, ""
                 worker._measure_objective = Mock(side_effect=measure)
                 progress = []
@@ -85,15 +91,15 @@ class TimingFineTests(unittest.TestCase):
                 self.assertFalse([p for p in progress if p["kind"] == "run_error"])
                 self.assertEqual(len(interface.writes), 10)  # nine points + best remeasurement
                 self.assertEqual({tuple(v.values()) for v in interface.writes[:9]},
-                                 {tuple(v.values()) for _, v in opt.timing_fine_scan(100, 18)})
-                self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 101, opt.TIMING_FINE_PV: 3})
+                                 {tuple(v.values()) for _, v in opt.timing_fine_scan(1120.37)})
+                self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 1120.37 + 2.8})
                 self.assertEqual(worker._measure_objective.call_count, 11)  # includes initial snapshot
                 with open(worker.run_dir / f"InitialSnapshot_{worker.run_tag}.json") as stream:
                     snapshot = json.load(stream)
                 self.assertEqual(snapshot["initial_setpoints"],
-                                 {opt.TIMING_PV: 100, opt.TIMING_FINE_PV: 18})
+                                 {opt.TIMING_PV: 1120.37})
                 worker._finish_at_best()
-                self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 101, opt.TIMING_FINE_PV: 3})
+                self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 1120.37 + 2.8})
 
     def test_fine_immediately_follows_coarse_before_qa_qm_and_correctors(self):
         for mode in ("SEQUENTIAL", "GROUP_BO", "GROUP_LBO"):
@@ -133,22 +139,22 @@ class TimingFineTests(unittest.TestCase):
             worker.run()
             self.assertEqual(events, ["combined coarse", "fine"])
 
-    def test_fine_pair_may_carry_past_combined_coarse_limit(self):
+    def test_fine_range_may_extend_combined_coarse_limit(self):
         with tempfile.TemporaryDirectory() as directory:
-            interface = TimingInterface(coarse=110)
+            interface = TimingInterface(delay=110.)
             config = {"correctors": True, "timing_fine": True, "settle_sec": 0,
                       "developer_actuators": [{"pv_write": opt.TIMING_PV}],
                       "actuator_limits": {opt.TIMING_PV: [90, 110]}}
             worker = opt.OptimizationWorker(config, directory, interface=interface)
             worker._measure_objective = lambda: ({}, np.nan, 1., "DR", 1., True, "")
             worker._run_timing_fine()
-            self.assertIn({opt.TIMING_PV: 111, opt.TIMING_FINE_PV: 18}, interface.writes)
-            # Same score at every point leaves the starting timing selected.
-            self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 110, opt.TIMING_FINE_PV: 18})
+            self.assertIn({opt.TIMING_PV: 112.8}, interface.writes)
+            self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 110.})
             with self.assertRaises(ValueError):
-                worker._write_setpoints({opt.TIMING_PV: 112, opt.TIMING_FINE_PV: 18})
+                worker._write_setpoints({opt.TIMING_PV: 124.})
             with self.assertRaises(ValueError):
-                worker._write_setpoints({opt.TIMING_PV: 111})
+                worker._write_setpoints({opt.TIMING_PV: 111.})
+
 
     def test_invalid_measurements_restore_origin_and_stop_does_not_apply_best(self):
         for stop in (False, True):
@@ -167,7 +173,7 @@ class TimingFineTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, "no valid measurements"):
                         worker._run_timing_fine()
-                    self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 100, opt.TIMING_FINE_PV: 18})
+                    self.assertEqual(interface.writes[-1], {opt.TIMING_PV: 1120.37})
 
     def test_gui_allows_fine_only_and_round_trips_selection(self):
         global _APP
@@ -208,9 +214,10 @@ class TimingFineTests(unittest.TestCase):
                 self.assertTrue(config["timing_group"])
                 self.assertTrue(config["timing_fine"])
                 self.assertFalse(config["timing"])
-                self.assertIn(opt.TIMING_FINE_PV, config["restore_pvs"])
+                self.assertIn(opt.TIMING_PV, config["restore_pvs"])
+                self.assertEqual(config["timing_step_ns"], 11.2)
                 self.assertEqual([s[1] for s in opt._main_run_delta_specs(config)],
-                                 [opt.TIMING_PV, opt.TIMING_FINE_PV])
+                                 [opt.TIMING_PV])
                 window._apply_config_to_ui({})
                 self.assertFalse(window.chk_timing_fine.isChecked())
                 window._apply_config_to_ui(config)
@@ -226,7 +233,11 @@ class TimingFineTests(unittest.TestCase):
                 window._set_main_run_controls_enabled(False)
                 self.assertFalse(window.chk_timing_group.isEnabled())
                 self.assertFalse(window.chk_timing_fine.isEnabled())
-                self.assertNotIn(opt.TIMING_FINE_PV, opt._restore_pvs_for_config({}))
+                self.assertEqual([p for p in opt._restore_pvs_for_config({}) if p.startswith("EVE_LINAC")], [opt.TIMING_PV])
+                window._apply_config_to_ui({"timing_step": 2})
+                self.assertEqual(window.sp_timing_step.value(), 22.4)
+                window._apply_config_to_ui({"timing_step_ns": 11.2})
+                self.assertEqual(window.sp_timing_step.value(), 11.2)
             finally:
                 _APP.processEvents()
                 window.close()
