@@ -220,7 +220,8 @@ class FeedbackMachine:
             self._orbit_last_seen = time.monotonic()
             if len(self._orbit_samples) == BPM_SHOTS:
                 orbit = np.mean(self._orbit_samples, axis=0)
-                self.emit(dict(kind="orbit_monitor", orbit_mm=orbit.tolist(), ioc_timestamp=stamp))
+                self._orbit_samples.clear()
+                self.emit(dict(kind="orbit_monitor", orbit_mm=orbit.tolist(), ioc_timestamp=stamp, shots=BPM_SHOTS))
                 self._orbit_callback(orbit)
         elif time.monotonic() - self._orbit_last_seen > self.config.sample_timeout_sec:
             raise TimeoutError("LINAC:monitors stopped updating")
@@ -273,10 +274,10 @@ class FeedbackMachine:
         return result
 
     def monitor_transmission(self, name, record):
-        """Display-only rolling mean, fed by reads during scans and cycle waits.
+        """Display-only nonoverlapping ten-shot means during scans and waits.
 
 Both ICT timestamps must advance for a new pair. Control measurements still
-use fresh_records after settling and never consume this rolling window.
+use fresh_records after settling and never consume this monitor batch.
 """
         previous = self._live_ict_records.get(name)
         if previous is not None and record["timestamp"] <= previous["timestamp"]:
@@ -296,6 +297,7 @@ use fresh_records after settling and never consume this rolling window.
         self._live_ict_samples.append([float(item["value"]) for item in pair])
         if len(self._live_ict_samples) == ICT_SHOTS:
             values = np.asarray(self._live_ict_samples)
+            self._live_ict_samples.clear()
             transmission = float(values[:, 1].mean() / values[:, 0].mean())
             if 0 <= transmission <= 1:
                 self.emit(dict(kind="transmission_monitor", transmission=transmission, shots=ICT_SHOTS,

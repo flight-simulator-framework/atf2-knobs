@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from Knobs.linac_feedback import (BeamLoss, OrbitDrift, FeedbackConfig, FeedbackController, RecentResponse,
-                                 CURRENT_PVS, PVS, TIMING_PV, PHASE_PV)
+                                 CURRENT_PVS, PVS, TIMING_PV, PHASE_PV, RESPONSE_PLANE_MASK)
 from Knobs.linac_feedback_io import FeedbackMachine
 
 
@@ -227,6 +227,35 @@ class FeedbackTests(unittest.TestCase):
         self.assertGreater(len(controller.response.samples), samples)
         self.assertTrue(any(e["kind"] == "orbit_step" and not e["accepted"] for e in events))
 
+    def test_three_failed_corrections_restore_historical_best_rms(self):
+        plant, controller, events = self.controller()
+        residuals = iter([1., .9, 2., 1.8, 2., 2.1, 2., 2.2, 2., 2.3, .95])
+        plant.orbit = lambda: controller.reference + np.array([next(residuals), 0., 0., 0.])
+        result = controller.correct_orbit()
+        self.assertIs(result, False)
+        steps = [e for e in events if e["kind"] == "orbit_step"]
+        self.assertEqual([e["consecutive_failures"] for e in steps], [0, 0, 1, 2, 3])
+        np.testing.assert_allclose(controller.currents(), [.005, 0., 0., 0.])
+        restored = next(e for e in events if e["kind"] == "orbit_best_restored")
+        self.assertAlmostEqual(restored["best_rms_um"], 450.)
+        previous = dict.fromkeys(CURRENT_PVS, 0.)
+        for settings, _ in plant.writes:
+            for pv, value in settings.items():
+                self.assertLessEqual(abs(value - previous[pv]), .005000001)
+                previous[pv] = value
+
+    def test_three_failures_return_to_timing_and_phase_even_with_bad_orbit(self):
+        plant, controller, events = self.controller()
+        plant.response[:] = 0.
+        plant.drift[0], plant.loss = .3, .1
+        controller.cycle()
+        steps = [e for e in events if e["kind"] == "orbit_step"]
+        self.assertEqual(len(steps), 3)
+        self.assertEqual([e["consecutive_failures"] for e in steps], [1, 2, 3])
+        restored = next(i for i, e in enumerate(events) if e["kind"] == "orbit_best_restored")
+        later = [e["state"] for e in events[restored + 1:] if e["kind"] == "state"]
+        self.assertEqual(later[:3], ["Timing after orbit correction", "Checking transmission after timing", "CM8L phase recovery"])
+
     def test_range_boundary_stops_without_claiming_unbounded_optimum(self):
         plant, controller, _ = self.controller(timing_range_ns=2.8)
         plant.target_timing = 1000.
@@ -245,12 +274,100 @@ class FeedbackTests(unittest.TestCase):
         for _ in range(20):
             for dx in np.eye(4) * .01:
                 model.add(dx, 3 * dx)
-        np.testing.assert_allclose(model.matrix(), np.eye(4) * 3, atol=1e-4)
+        np.testing.assert_allclose(model.matrix(), np.where(RESPONSE_PLANE_MASK, np.eye(4) * 3, 0.), atol=1e-4)
         for _ in range(20):
             for dx in np.eye(4) * .01:
                 model.add(dx, 5 * dx)
-        np.testing.assert_allclose(model.matrix(), np.eye(4) * 5, atol=1e-4)
+        np.testing.assert_allclose(model.matrix(), np.where(RESPONSE_PLANE_MASK, np.eye(4) * 5, 0.), atol=1e-4)
         self.assertEqual(len(model.samples), 64)
+
+    def test_startup_response_targets_large_excursions_restores_and_freezes_matrix(self):
+        plant, controller, events = self.controller()
+        original = dict(plant.values)
+        controller.measure_response()
+        self.assertEqual(plant.values, original)
+        probes = [e for e in events if e["kind"] == "response_probe" and e["accepted"]]
+        self.assertEqual([e["pv"] for e in probes], list(CURRENT_PVS))
+        self.assertTrue(all(400 <= e["excursion_um"] <= 600 and e["shots"] == 10 for e in probes))
+        self.assertTrue(all(abs(e["delta_A"]) > .05 for e in probes))
+        expected = np.where(RESPONSE_PLANE_MASK, plant.response, 0.)
+        np.testing.assert_allclose(controller.response.matrix(), expected, atol=1e-6)
+        self.assertTrue(controller.response.frozen)
+        snapshot = controller.response.snapshot()
+        loaded = RecentResponse.from_snapshot(json.loads(json.dumps(snapshot)))
+        self.assertTrue(loaded.frozen)
+        loaded.add(np.ones(4) * .005, np.ones(4) * 100)
+        self.assertEqual(loaded.snapshot(), snapshot)
+        plant.drift[:] = [.2, -.1, .2, -.1]
+        controller.correct_orbit()
+        self.assertEqual(controller.response.snapshot(), snapshot)
+        self.assertLess(np.max(abs(plant.orbit() - controller.reference)), .02)
+
+    def test_startup_response_failure_restores_and_retains_previous_matrix(self):
+        for failure in ("weak", "beam loss", "stop", "read failure"):
+            with self.subTest(failure=failure):
+                plant, controller, events = self.controller()
+                seed_response(controller, plant)
+                old = controller.response.snapshot()
+                original = dict(plant.values)
+                if failure == "weak":
+                    plant.response[:] = 0
+                    expected = RuntimeError
+                else:
+                    expected = {"beam loss": BeamLoss, "stop": InterruptedError, "read failure": ValueError}[failure]
+                    orbit = plant.orbit
+                    # Fail on the second column after a successful first column.
+                    def read():
+                        if plant.values[CURRENT_PVS[1]] != original[CURRENT_PVS[1]]:
+                            raise expected("injected failure")
+                        return orbit()
+                    plant.orbit = read
+                with self.assertRaises(expected):
+                    controller.measure_response()
+                self.assertEqual(plant.values, original)
+                self.assertEqual(controller.response.snapshot(), old)
+                self.assertFalse(any(e["kind"] == "response_measured" for e in events))
+
+    def test_startup_response_uses_available_negative_direction(self):
+        plant, controller, events = self.controller()
+        for pv in CURRENT_PVS:
+            controller.limits[pv] = (-.5, .01)
+        controller.measure_response()
+        probes = [e for e in events if e["kind"] == "response_probe"]
+        self.assertTrue(all(e["delta_A"] < 0 for e in probes))
+        self.assertEqual(plant.values, controller.origin)
+
+    def test_startup_response_retries_after_loss_before_any_feedback_cycle(self):
+        plant, controller, events = self.controller(measure_response_on_start=True)
+        original = dict(plant.values)
+        lost = [False]
+        def fail_once(values, restore):
+            if not restore and not lost[0] and any(pv in CURRENT_PVS for pv in values):
+                lost[0] = True
+                raise BeamLoss("test ICT loss")
+        plant.on_write = fail_once
+        def pause(reason):
+            self.assertEqual(plant.values, original)
+            self.assertFalse(controller.response.frozen)
+        def cycle():
+            self.assertTrue(controller.response.frozen)
+            self.assertEqual(plant.values, original)
+            raise InterruptedError("test complete")
+        with patch.object(controller, "cycle", side_effect=cycle):
+            with self.assertRaises(InterruptedError):
+                controller.run(pause_for_loss=pause)
+        self.assertEqual(sum(e["kind"] == "response_measured" for e in events), 1)
+        self.assertTrue(any(e["kind"] == "beam_loss" for e in events))
+
+    def test_startup_response_disabled_or_correctors_disabled_issues_no_calibration(self):
+        for selected, correctors in ((False, True), (True, False)):
+            plant, controller, _ = self.controller(measure_response_on_start=selected, adjust_correctors=correctors)
+            with patch.object(controller, "cycle", side_effect=InterruptedError("test complete")), \
+                 patch.object(controller, "measure_response") as measure:
+                with self.assertRaises(InterruptedError):
+                    controller.run()
+                measure.assert_not_called()
+            self.assertEqual(plant.writes, [])
 
     def test_no_dedicated_learning_and_improving_first_correction_is_kept(self):
         plant, controller, events = self.controller(max_orbit_steps=1)
@@ -598,12 +715,13 @@ class MachineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid/no-beam"):
             machine.orbit()
 
-    def test_continuous_bpm_monitor_uses_latest_ten_distinct_records(self):
+    def test_continuous_bpm_monitor_uses_nonoverlapping_ten_shot_batches(self):
         from machine_interfaces_atf2.InterfaceATF2_Linac import LINAC_MONITORS
         raw = np.zeros((len(LINAC_MONITORS), 20))
         raw[:, 0], raw[:, 3] = 1., 1.
         records = []
-        for stamp, x in ([(i, (i - 1) * 100) for i in range(1, 11)] + [(10, 900), (11, 1000), (11, 1000)]):
+        for stamp, x in ([(i, (i - 1) * 100) for i in range(1, 11)] + [(10, 900)] +
+                         [(i, (i - 1) * 100) for i in range(11, 21)] + [(20, 1900)]):
             raw[LINAC_MONITORS.index("ML8L"), 1] = x
             records.append(dict(value=raw.copy().ravel(), timestamp=stamp))
         pv = Mock()
@@ -613,8 +731,11 @@ class MachineTests(unittest.TestCase):
         machine.set_orbit_monitor(means.append)
         for _ in range(12):
             machine.check_beam(force=True)
+        self.assertEqual(len(means), 1)  # Shot 11 does not produce a moving mean.
+        for _ in range(9):
+            machine.check_beam(force=True)
         self.assertEqual(len(means), 2)
-        np.testing.assert_allclose([m[0] for m in means], [.45, .55])
+        np.testing.assert_allclose([m[0] for m in means], [.45, 1.45])
         machine._orbit_last_seen = -100.
         with self.assertRaisesRegex(TimeoutError, "stopped updating"):
             machine.poll_orbit()
@@ -642,14 +763,15 @@ class MachineTests(unittest.TestCase):
         machine.monitor_transmission(up, dict(value=22, timestamp=11))
         self.assertEqual(len(events), 1)
         machine.monitor_transmission(down, dict(value=12, timestamp=11))
-        self.assertAlmostEqual(events[-1]["transmission"], 75 / 130)
+        self.assertEqual(len(events), 1)
         machine.monitor_transmission(down, dict(value=0, timestamp=12))
         for stamp in range(13, 22):
             machine.monitor_transmission(up, dict(value=2, timestamp=stamp))
             machine.monitor_transmission(down, dict(value=1, timestamp=stamp))
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 1)
         machine.monitor_transmission(up, dict(value=2, timestamp=22))
         machine.monitor_transmission(down, dict(value=1, timestamp=22))
+        self.assertEqual(len(events), 2)
         self.assertEqual(events[-1]["transmission"], .5)
 
     def test_live_transmission_updates_during_wait_without_control_measurements(self):
@@ -660,7 +782,10 @@ class MachineTests(unittest.TestCase):
         events = []
         machine = FeedbackMachine(FeedbackConfig(), lambda: False, lambda: None, events.append, factory)
         machine.transmission = Mock(side_effect=AssertionError("Control measurement must not run"))
-        machine.wait(2.2)
+        now = [0.]
+        with patch("Knobs.linac_feedback_io.time.monotonic", side_effect=lambda: now[0]), \
+             patch("Knobs.linac_feedback_io.time.sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+            machine.wait(5.)
         live = [e for e in events if e["kind"] == "transmission_monitor"]
         self.assertGreaterEqual(len(live), 2)
         self.assertTrue(all(e["shots"] == 10 and e["transmission"] == .5 for e in live))
@@ -883,6 +1008,56 @@ class GuiTests(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         _APP = QApplication.instance() or QApplication([])
 
+    def test_orbit_evaluation_plot_matches_control_while_ict_keeps_updating(self):
+        from Knobs.linac_feedback_gui import FeedbackPanel
+        panel = FeedbackPanel(lambda: "/tmp", lambda: False)
+        try:
+            panel.on_event(dict(kind="reference", transmission=.8, orbit_mm=[0.] * 4,
+                                settings=dict.fromkeys(PVS, 0.)))
+            panel.on_event(dict(kind="state", state="Correcting orbit"))
+            panel.on_event(dict(kind="transmission_monitor", transmission=.81, shots=10, elapsed=1.))
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.9] * 4, elapsed=1.))
+            self.assertEqual(list(panel.orbits), [])
+            panel.on_event(dict(kind="orbit", orbit_mm=[.1, .2, .3, .4], elapsed=2.))
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.8] * 4, elapsed=3.))
+            self.assertEqual(list(panel.orbits), [(2., [100., 200., 300., 400.])])
+            self.assertEqual(list(panel.points), [(1., .81)])
+            panel.on_event(dict(kind="state", state="Measuring response: ZH1L"))
+            panel.on_event(dict(kind="transmission_monitor", transmission=.82, shots=10, elapsed=4.))
+            self.assertEqual(panel.points[-1], (4., .82))
+            panel.on_event(dict(kind="state", state="Timing tracking"))
+            panel.on_event(dict(kind="transmission_monitor", transmission=.83, shots=10, elapsed=5.))
+            self.assertEqual(panel.points[-1], (4., .82))
+            panel.on_event(dict(kind="waiting", remaining_sec=30., elapsed=6.))
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.05] * 4, elapsed=7.))
+            self.assertEqual(panel.orbits[-1], (7., [50.] * 4))
+        finally:
+            _APP.processEvents()
+            panel.close()
+
+    def test_startup_fixed_response_is_saved_and_reused_without_small_step_learning(self):
+        from Knobs.linac_feedback_gui import FeedbackWorker
+        with tempfile.TemporaryDirectory() as directory:
+            snapshots = []
+            for acquire in (True, False):
+                plant = Plant()
+                plant.limits = lambda: {pv: (-1000., 1000.) for pv in PVS}
+                plant.close = Mock()
+                def end_after_start(controller):
+                    self.assertTrue(controller.response.frozen)
+                    snapshots.append(controller.response.snapshot())
+                    raise InterruptedError("test complete")
+                with patch.object(FeedbackController, "cycle", autospec=True, side_effect=end_after_start):
+                    worker = FeedbackWorker(FeedbackConfig(settle_sec=0, measure_response_on_start=acquire),
+                                            directory, lambda *args: plant)
+                    worker.run()
+                events = [json.loads(line) for line in (worker.run_dir / "events.jsonl").read_text().splitlines()]
+                self.assertFalse(any(e["kind"] == "error" for e in events), events)
+                self.assertEqual(any(e["kind"] == "response_measured" for e in events), acquire)
+                self.assertEqual(bool(plant.writes), acquire)
+                self.assertTrue(json.loads(worker.response_cache.read_text())["frozen"])
+            self.assertEqual(snapshots[0], snapshots[1])
+
     def test_orbit_limits_follow_promotions_without_recentring_plot(self):
         from Knobs.linac_feedback_gui import FeedbackPanel
         panel = FeedbackPanel(lambda: "/tmp", lambda: False)
@@ -891,6 +1066,7 @@ class GuiTests(unittest.TestCase):
         try:
             panel.on_event(dict(kind="reference", transmission=.8, orbit_mm=initial.tolist(),
                                 settings=dict.fromkeys(PVS, 0.), elapsed=0.))
+            panel.on_event(dict(kind="waiting", remaining_sec=30., elapsed=1.))
             panel.on_event(dict(kind="orbit_monitor", orbit_mm=(initial + offset).tolist(), elapsed=10.))
             for multiplier, baseline in ((1, .9), (2, .95)):
                 panel.on_event(dict(kind="baseline_updated", baseline=baseline, threshold=baseline - .05,
@@ -928,6 +1104,14 @@ class GuiTests(unittest.TestCase):
                 self.assertFalse(panel.isAncestorOf(panel.settings))
                 self.assertGreaterEqual(panel.start_button.minimumHeight(), 56)
                 self.assertTrue(all(box.isChecked() for box in panel.target_checks.values()))
+                self.assertFalse(panel.measure_response_check.isChecked())
+                panel.measure_response_check.setChecked(True)
+                self.assertTrue(panel.config().measure_response_on_start)
+                panel.target_checks["adjust_correctors"].setChecked(False)
+                self.assertFalse(panel.measure_response_check.isEnabled())
+                self.assertFalse(panel.config().measure_response_on_start)
+                panel.target_checks["adjust_correctors"].setChecked(True)
+                self.assertTrue(panel.measure_response_check.isEnabled())
                 panel.target_checks["adjust_phase"].setChecked(False)
                 self.assertFalse(panel.config().adjust_phase)
                 self.assertTrue(panel.config().adjust_timing)
@@ -1043,10 +1227,12 @@ class GuiTests(unittest.TestCase):
                     self.assertIsNone(panel.orbit_reference)
                     self.assertFalse(panel.settings.isEnabled())
                     self.assertFalse(panel.targets.isEnabled())
+                    self.assertFalse(panel.measure_response_check.isEnabled())
                     self.assertTrue(window.config_sections.isEnabled())
                     panel.finished()
                 self.assertTrue(panel.settings.isEnabled())
                 self.assertTrue(panel.targets.isEnabled())
+                self.assertTrue(panel.measure_response_check.isEnabled())
             finally:
                 panel.worker = None
                 window.worker = None

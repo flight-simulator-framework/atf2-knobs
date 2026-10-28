@@ -108,7 +108,8 @@ class FeedbackWorker(QThread):
             if self.response_cache.exists():
                 try:
                     controller.response = RecentResponse.from_snapshot(json.loads(self.response_cache.read_text()))
-                    self.emit_event(dict(kind="log", message="Stored response observations loaded; learning continues from correction results only."))
+                    mode = "fixed matrix retained" if controller.response.frozen else "learning continues from correction results"
+                    self.emit_event(dict(kind="log", message=f"Stored response loaded; {mode}. Cross-plane terms are zero."))
                     controller.report_response()
                 except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
                     self.emit_event(dict(kind="log", message=f"Stored response unavailable; learn from 0.005 A correction attempts: {exc}"))
@@ -142,6 +143,7 @@ class FeedbackPanel(QWidget):
         self.worker = None
         self.points, self.orbits = deque(maxlen=2000), deque(maxlen=2000)
         self.plot_waiting = False
+        self.operation = ""
         self.reference = None
         self.orbit_reference = None
         self.initial_transmission = None
@@ -177,6 +179,11 @@ class FeedbackPanel(QWidget):
             self.target_checks[name] = box
             target_layout.addWidget(box)
         run_layout.addWidget(self.targets)
+        self.measure_response_check = QCheckBox("Measure response matrix at Start")
+        self.measure_response_check.setChecked(FeedbackConfig().measure_response_on_start)
+        self.measure_response_check.setToolTip("Excite each corrector for a 400–600 µm primary-plane displacement using fresh 10-shot means, then restore it. H→y and V→x are zero. The measured matrix is saved and kept fixed. Requires Correctors enabled.")
+        self.target_checks["adjust_correctors"].toggled.connect(self.measure_response_check.setEnabled)
+        run_layout.addWidget(self.measure_response_check)
         row = QHBoxLayout()
         self.start_button, self.pause_button, self.stop_button = (QPushButton(s) for s in ("START", "PAUSE", "STOP"))
         for button, role in zip((self.start_button, self.pause_button, self.stop_button), ("start", "pause", "stop")):
@@ -266,7 +273,7 @@ class FeedbackPanel(QWidget):
         response_group = QGroupBox("Learned Response [mm/A]")
         response_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.response_group = response_group
-        response_group.setToolTip("Learned only from actual 0.005 A correction attempts and stored across runs. Improving settings are kept; unsuccessful attempts are restored. No separate response measurement.")
+        response_group.setToolTip("Start measurement targets 500 µm with 10-shot means and saves a fixed matrix. Otherwise reuse the stored matrix, or learn from corrections if no fixed matrix exists. H→y and V→x are zero.")
         response_layout = QVBoxLayout(response_group)
         response_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.response_table = QTableWidget(4, 4)
@@ -319,6 +326,8 @@ class FeedbackPanel(QWidget):
     def config(self):
         return FeedbackConfig(**{key: box.value() for key, box in self.fields.items()},
                               **{key: box.isChecked() for key, box in self.target_checks.items()},
+                              measure_response_on_start=(self.measure_response_check.isChecked()
+                                                         and self.target_checks["adjust_correctors"].isChecked()),
                               downstream=self.downstream.currentText())
 
     def start(self):
@@ -328,6 +337,7 @@ class FeedbackPanel(QWidget):
         self.worker = FeedbackWorker(self.config(), self.save_dir())
         self.points.clear()
         self.plot_waiting = False
+        self.operation = ""
         self.orbits.clear()
         self.averages.clear()
         self.threshold_history.clear()
@@ -345,6 +355,7 @@ class FeedbackPanel(QWidget):
         self.failed = False
         self.settings.setEnabled(False)
         self.targets.setEnabled(False)
+        self.measure_response_check.setEnabled(False)
         self.start_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.stop_button.setEnabled(True)
@@ -382,6 +393,8 @@ class FeedbackPanel(QWidget):
         return self.worker.wait(15000)
 
     def finished(self):
+        self.operation = ""
+        self.plot_waiting = False
         worker, self.worker = self.worker, None
         if worker is not None:
             worker.deleteLater()
@@ -389,6 +402,7 @@ class FeedbackPanel(QWidget):
         self.draw_plot()
         self.settings.setEnabled(True)
         self.targets.setEnabled(True)
+        self.measure_response_check.setEnabled(self.target_checks["adjust_correctors"].isChecked())
         self.start_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
@@ -399,6 +413,7 @@ class FeedbackPanel(QWidget):
         elapsed = event.get("elapsed", 0.)
         self.latest_elapsed = max(self.latest_elapsed, elapsed)
         if kind == "state":
+            self.operation = event["state"]
             self.plot_waiting = event["state"] in ("Waiting for next timing scan", "Waiting for next feedback cycle")
             paused = event["state"].lower().startswith(("paused", "auto-paused", "stopped"))
             labels = {"Checking orbit": "Timing scan" if self.target_checks["adjust_timing"].isChecked() else "Feedback cycle", "Timing tracking": "Timing scan",
@@ -411,10 +426,12 @@ class FeedbackPanel(QWidget):
             self.plot_waiting = True
             self.set_status(f"RUNNING | Next {event.get('next_action', 'Timing scan').lower()} in {math.ceil(event['remaining_sec'])} s")
         elif kind == "auto_pause":
+            self.operation = ""
             self.plot_waiting = False
             self.set_status(event["state"] + "\n" + event["message"], "paused")
             self.pause_button.setText("RESUME")
         elif kind == "error":
+            self.operation = ""
             self.plot_waiting = False
             self.failed = True
             self.set_status("Failed: " + event["message"], "error")
@@ -444,7 +461,9 @@ class FeedbackPanel(QWidget):
             self.points.append((elapsed, event["transmission"]))
             self.latest_transmission = event["transmission"]
             self.update_parameters(event["settings"], elapsed)
-        elif kind == "transmission_monitor" and self.plot_waiting:
+        elif kind == "transmission_monitor" and (self.plot_waiting or
+                self.operation in ("Correcting orbit", "Restoring best orbit") or
+                self.operation.startswith("Measuring response:")):
             # During a scan, plot only the exact fresh mean used by control.
             # In the cycle wait, keep displaying the background monitor.
             self.points.append((elapsed, event["transmission"]))
@@ -453,11 +472,12 @@ class FeedbackPanel(QWidget):
             self.average_result = event
             if event["complete"]:
                 self.averages.append((elapsed, event["average"]))
-        elif kind in ("orbit", "orbit_monitor") and self.reference is not None:
+        elif (kind == "orbit" or (kind == "orbit_monitor" and self.plot_waiting)) and self.reference is not None:
             drift = [1000 * (v - r) for v, r in zip(event["orbit_mm"], self.reference)]
             self.orbits.append((elapsed, drift))
         elif kind == "response":
-            self.response_group.setTitle("Learning from Corrections [mm/A]" if event["matrix_mm_per_A"] is None
+            self.response_group.setTitle("Measured Response (Fixed) [mm/A]" if event.get("model", {}).get("frozen")
+                                         else "Learning from Corrections [mm/A]" if event["matrix_mm_per_A"] is None
                                          else "Learned Response [mm/A]")
             self.response_table.clearContents()
             for row, values in enumerate(event["matrix_mm_per_A"] or []):

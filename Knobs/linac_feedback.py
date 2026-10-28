@@ -19,6 +19,11 @@ PVS = (TIMING_PV, PHASE_PV) + CURRENT_PVS
 TIMING_STEP = 2.8
 PHASE_STEP = 0.5
 CURRENT_STEP = 0.005
+RESPONSE_TARGET_MM = 0.5
+RESPONSE_INITIAL_STEP_A = 0.05
+# Rows: x8, x10, y8, y10; columns: H1, V1, H2, V2.
+RESPONSE_PLANE_MASK = np.array([[1, 0, 1, 0], [1, 0, 1, 0],
+                                [0, 1, 0, 1], [0, 1, 0, 1]], dtype=bool)
 
 
 class BeamLoss(RuntimeError):
@@ -49,6 +54,7 @@ class FeedbackConfig:
     adjust_timing: bool = True
     adjust_phase: bool = True
     adjust_correctors: bool = True
+    measure_response_on_start: bool = False
 
     def __post_init__(self):
         for name in ("orbit_threshold_um", "sample_timeout_sec", "timing_range_ns",
@@ -80,11 +86,14 @@ Four independent observed current directions are required before prediction.
 """
     def __init__(self):
         self.samples = deque(maxlen=64)
+        self.frozen = False
 
     def add(self, delta_current, delta_orbit):
         x, y = np.asarray(delta_current, float), np.asarray(delta_orbit, float)
         if x.shape != (4,) or y.shape != (4,) or not np.isfinite(np.r_[x, y]).all():
             raise ValueError("Invalid response observation")
+        if self.frozen:
+            return
         if np.linalg.norm(x) > 1e-9:
             self.samples.append((x.copy(), y.copy()))
 
@@ -97,12 +106,14 @@ Four independent observed current directions are required before prediction.
         if np.linalg.matrix_rank(x, tol=1e-7) < 4:
             return None
         # Small regularization stabilizes noisy estimates without a model prior.
-        return np.linalg.solve(x.T @ x + np.eye(4) * 1e-10, x.T @ y).T
+        matrix = np.linalg.solve(x.T @ x + np.eye(4) * 1e-10, x.T @ y).T
+        return np.where(RESPONSE_PLANE_MASK, matrix, 0.)
 
     def snapshot(self):
         return dict(version=1, correctors=list(CURRENT_PVS),
                     coordinates=["ML8L.x", "ML10L.x", "ML8L.y", "ML10L.y"],
-                    units="mm/A", samples=[[x.tolist(), y.tolist()] for x, y in self.samples])
+                    units="mm/A", frozen=self.frozen,
+                    samples=[[x.tolist(), y.tolist()] for x, y in self.samples])
 
     @classmethod
     def from_snapshot(cls, data):
@@ -116,6 +127,10 @@ Four independent observed current directions are required before prediction.
             model.add(x, y)
         if not model.samples:
             raise ValueError("Response cache contains no current changes")
+        frozen = data.get("frozen", False)
+        if not isinstance(frozen, bool) or (frozen and model.matrix() is None):
+            raise ValueError("Invalid fixed response cache")
+        model.frozen = frozen
         return model
 
 
@@ -345,6 +360,62 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
                    model=self.response.snapshot())
         return matrix
 
+    def measure_response(self):
+        """Acquire a fixed matrix from ~500 µm primary-plane excitations.
+
+Each trial is bracketed by fresh ten-shot means at its original setting.
+Restore every trial, including failures; commit all four columns atomically.
+"""
+        if not self.config.adjust_correctors:
+            return
+        model = RecentResponse()
+        for index, pv in enumerate(CURRENT_PVS):
+            self.set_state(f"Measuring response: {CORRECTORS[index]}")
+            center = self.current[pv]
+            lo, hi = self.limits[pv]
+            sign = 1. if hi - center >= center - lo else -1.
+            room = hi - center if sign > 0 else center - lo
+            if room < CURRENT_STEP - 1e-12:
+                raise RuntimeError(f"{CORRECTORS[index]}: no room to measure response")
+            amplitude = min(RESPONSE_INITIAL_STEP_A, room)
+            rows = slice(0, 2) if index % 2 == 0 else slice(2, 4)
+            for attempt in range(6):
+                self.io.checkpoint()
+                before = self.orbit()
+                delta = sign * amplitude
+                try:
+                    self.write({pv: center + delta})
+                    measured = self.orbit()
+                finally:
+                    self.write({pv: center}, restore=True)
+                after = self.orbit()
+                response = measured - (before + after) / 2
+                excursion = float(np.max(abs(response[rows])))
+                accepted = .8 * RESPONSE_TARGET_MM <= excursion <= 1.2 * RESPONSE_TARGET_MM
+                self.event("response_probe", pv=pv, delta_A=delta, attempt=attempt + 1,
+                           target_um=1000 * RESPONSE_TARGET_MM, excursion_um=1000 * excursion,
+                           before_mm=before.tolist(), measured_mm=measured.tolist(),
+                           restored_mm=after.tolist(), accepted=accepted, shots=10)
+                if accepted:
+                    current_delta = np.zeros(4)
+                    current_delta[index] = delta
+                    # Cross-plane measurements never enter the calibration fit.
+                    response[~RESPONSE_PLANE_MASK[:, index]] = 0.
+                    model.add(current_delta, response)
+                    break
+                factor = np.clip(RESPONSE_TARGET_MM / max(excursion, 1e-12), 1 / 3, 3.)
+                next_amplitude = min(room, max(CURRENT_STEP, round(amplitude * factor / CURRENT_STEP) * CURRENT_STEP))
+                if abs(next_amplitude - amplitude) < 1e-12 or attempt == 5:
+                    raise RuntimeError(f"{CORRECTORS[index]}: cannot obtain a 400–600 µm response within current limits; "
+                                       f"last excursion {1000 * excursion:.1f} µm at {amplitude:.4g} A. Previous matrix retained.")
+                amplitude = next_amplitude
+        model.frozen = True
+        self.response = model
+        self.orbit_alert = False
+        self.event("response_measured", target_um=1000 * RESPONSE_TARGET_MM, shots=10,
+                   message="Startup response acquired; cross-plane terms zero; matrix fixed for corrections")
+        self.report_response()
+
     def correct_orbit(self):
         """Learn only from correction attempts; keep every improving setting.
 
@@ -352,11 +423,16 @@ A usable stored model proposes the first move. Without one, or if its move
 fails, try individual +/-0.005 A corrections. No calibration-only excursions.
 """
         self.set_state("Correcting orbit")
+        best_currents, best_rms = self.currents().copy(), float("inf")
+        consecutive_failures = 0
         steps = np.array(list(product((-1, 0, 1), repeat=4)), float) * CURRENT_STEP
         for iteration in range(self.config.max_orbit_steps):
             self.io.checkpoint()
             before = self.orbit()
             residual = before - self.reference
+            rms = float(np.sqrt(np.mean(residual ** 2)))
+            if rms < best_rms:
+                best_currents, best_rms = self.currents().copy(), rms
             if np.max(abs(residual)) < 1e-9:
                 self.event("orbit_done", reason="reference restored")
                 return
@@ -393,6 +469,9 @@ fails, try individual +/-0.005 A corrections. No calibration-only excursions.
                 if proposal_index:
                     self.io.checkpoint()
                     before = self.orbit()
+                    rms = float(np.sqrt(np.mean((before - self.reference) ** 2)))
+                    if rms < best_rms:
+                        best_currents, best_rms = self.currents().copy(), rms
                 targets = {pv: float(value) for pv, value, d in zip(CURRENT_PVS, candidate, delta) if d}
                 original = {pv: self.current[pv] for pv in targets}
                 accepted = False
@@ -400,13 +479,32 @@ fails, try individual +/-0.005 A corrections. No calibration-only excursions.
                     self.write(targets)
                     measured = self.orbit()
                     self.response.add(delta, measured - before)
+                    rms = float(np.sqrt(np.mean((measured - self.reference) ** 2)))
+                    if rms < best_rms:
+                        best_currents, best_rms = self.currents().copy(), rms
                     accepted = np.linalg.norm(measured - self.reference) < np.linalg.norm(before - self.reference)
+                    consecutive_failures = 0 if accepted else consecutive_failures + 1
                     self.event("orbit_step", settings=targets, orbit_mm=measured.tolist(),
-                               accepted=bool(accepted), source=source)
+                               accepted=bool(accepted), source=source, rms_um=1000 * rms,
+                               consecutive_failures=consecutive_failures)
                 finally:
                     if not accepted:
                         self.write(original, restore=True)
                 self.report_response()
+                if consecutive_failures >= 3:
+                    self.set_state("Restoring best orbit")
+                    # Return in normal correction-sized steps; beam checks and
+                    # cancellation remain active during this deliberate move.
+                    while np.max(abs(best_currents - self.currents())) > 1e-12:
+                        self.io.checkpoint()
+                        values = self.currents() + np.clip(best_currents - self.currents(), -CURRENT_STEP, CURRENT_STEP)
+                        self.write({pv: float(value) for pv, value, current in zip(CURRENT_PVS, values, self.currents())
+                                    if abs(value - current) > 1e-12})
+                    restored = self.orbit()
+                    self.event("orbit_best_restored", settings=dict(zip(CURRENT_PVS, best_currents.tolist())),
+                               best_rms_um=1000 * best_rms, orbit_mm=restored.tolist(),
+                               reason="Three consecutive unsuccessful correction attempts")
+                    return False
                 if accepted:
                     break
             if not accepted:
@@ -458,13 +556,17 @@ fails, try individual +/-0.005 A corrections. No calibration-only excursions.
             orbit_normal = self.check_orbit(force=True, interrupt=False)
         if not orbit_normal and self.config.adjust_correctors:
             self.event("orbit_recovery", message="Orbit outside threshold after phase decision; correcting orbit")
-            self.correct_orbit()
+            correction_result = self.correct_orbit()
             self.orbit_alert = False
             if self.config.adjust_timing:
                 self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
             # Resume baseline confirmation only at a settled operating point.
             # If still degraded, phase recovery is reconsidered next cycle.
-            self.evaluate_transmission()
+            degraded, _ = self.evaluate_transmission()
+            if correction_result is False and degraded and self.config.adjust_phase:
+                self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery", guard_orbit=False)
+                if self.config.adjust_timing:
+                    self.search(TIMING_PV, TIMING_STEP, "Timing after phase recovery", guard_orbit=False)
         self.set_state("Monitoring")
 
     def wait_cycle(self):
@@ -483,12 +585,16 @@ fails, try individual +/-0.005 A corrections. No calibration-only excursions.
 
     def run(self, pause_for_loss=None):
         initialized = False
+        response_ready = not (self.config.measure_response_on_start and self.config.adjust_correctors)
         while True:
             try:
                 self.io.checkpoint()
                 if not initialized:
                     self.initialize()
                     initialized = True
+                if not response_ready:
+                    self.measure_response()
+                    response_ready = True
                 self.cycle()
                 self.wait_cycle()
             except OrbitDrift:

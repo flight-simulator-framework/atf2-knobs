@@ -108,11 +108,19 @@ def main():
                 machine = FeedbackMachine(config, lambda: stopped, lambda: None, events.append, factory)
                 controller = FeedbackController(machine, config, machine.limits(), events.append)
                 controller.initialize()
+                controller.measure_response()
+                calibration = [e for e in events if e["kind"] == "response_probe" and e["accepted"]]
+                assert len(calibration) == 4
+                assert all(400 <= e["excursion_um"] <= 600 for e in calibration)
+                assert controller.response.frozen
+                measured_model = controller.response.snapshot()
+                np.testing.assert_allclose(controller.currents(), np.zeros(4), atol=1e-10)
+                correction_start = len(events)
                 controller.cycle()
                 assert abs(machine.read(TIMING_PV) - 103.17) < .001
                 # The display must keep updating without a control measurement.
                 first = len(events)
-                machine.wait(.8)
+                machine.wait(2.5)
                 assert any(e["kind"] == "transmission_monitor" for e in events[first:])
                 assert not any(e["kind"] in ("transmission", "command") for e in events[first:])
                 for name, value in (("test:timing_target", 105.97), ("test:drift", .2)):
@@ -136,9 +144,9 @@ def main():
                 assert abs(decision["threshold"] - (controller.initial_transmission - .05)) < 1e-9
                 residual = machine.orbit() - controller.reference
                 assert np.max(abs(residual)) < .02, residual
-                assert any(e["kind"] == "response" and e["observations"] > 4 for e in events)
+                assert controller.response.snapshot() == measured_model
                 assert not any(e["kind"] == "response_probe_size" or e.get("state") == "Learning corrector response" for e in events)
-                for event in events:
+                for event in events[correction_start:]:
                     if event["kind"] == "command":
                         for pv, target in event["settings"].items():
                             if pv in CURRENT_PVS:

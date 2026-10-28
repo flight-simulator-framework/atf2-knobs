@@ -48,7 +48,7 @@ With all targets enabled:
    in Config. Deliberate timing/phase probe measurements are excluded from the
    recovery average. Retune timing after phase recovery.
 3. Continuously check timestamped `LINAC:monitors` records during acquisition,
-   settling and cycle waits, averaging the latest **10 distinct valid shots**.
+   settling and cycle waits, averaging nonoverlapping batches of **10 distinct valid shots**.
    If any of ML8L.x, ML10L.x, ML8L.y or ML10L.y
    differs from its current orbit reference by at least the orbit threshold
    (150 µm by default, editable in Config), check phase recovery eligibility first.
@@ -86,26 +86,38 @@ as its measured trace, move to the new reference offset ± the configured tolera
 (default 150 µm). Baseline promotion events record the previous, new and initial
 orbit references. A new START captures new initial references.
 
-Response learning uses **only actual correction attempts**; there is no separate
-calibration stage, 0.05 A excitation or mandatory four-corrector probe sequence.
-A stored response matrix proposes a 0.005 A grid correction directly. If no
-identifiable matrix is available, individual +/-0.005 A correction candidates are
-tried; an improving setting is kept immediately, and an unsuccessful attempt is
-restored. A rejected model proposal can likewise fall back to individual
-corrections. Every attempt respects the configured/IOC current limits.
-Each result is evaluated with fresh 10-shot BPM means after settling. Accepted
-and rejected correction results both update the response. A weighted fit uses
-at most 64 recent current/orbit changes, giving newer data more weight. A full
-4×4 matrix requires four independent observed current directions; until then,
-correction uses the direct candidates without adding dedicated learning moves.
-The matrix and observations, including incomplete observations, are retained
-and saved atomically to `active_feedback_response.json` in the selected save
-folder. New workers load this file. Phase changes and beam loss retain the model;
-subsequent correction results update it without a recalibration sequence. Invalid
-cache files are logged and fall back to direct corrections. A learned matrix
-includes horizontal/vertical cross-coupling and ranks neighbouring current-grid
-combinations. The existing correction acceptance and stopping criteria remain
-based on the orbit error relative to the current correction reference.
+Run Control's **Measure response matrix at Start** checkbox (off by default)
+acquires a new response before feedback when Correctors is enabled. Each corrector
+starts with a 0.05 A trial, then adapts its excitation to give a 400–600 µm
+change in the larger of the two primary-plane BPM readings (500 µm target).
+Every trial uses fresh 10-shot means before excitation, at the displaced setting,
+and after restoration. The response subtracts the average of the bracketing
+reference measurements to reduce drift. Trials obey the configured/IOC limits;
+if six attempts or the available current range cannot reach the target band,
+acquisition stops with an error and retains the previous matrix. Each trial is
+restored even on Stop, measurement failure or ICT loss. After ICT auto-pause and
+Resume, the startup acquisition retries before feedback can begin.
+
+All four successful columns are committed together, with **H→y and V→x set to
+zero**. The acquired matrix is saved and kept fixed: small correction results
+cannot overwrite it. With the checkbox off, the saved matrix is reused; without
+a fixed matrix, the existing fit to up to 64 recent correction observations
+remains available. Cross-plane entries are zero in both modes, including when
+loading older caches. The matrix, observations and fixed-mode flag are saved
+atomically to `active_feedback_response.json` in the selected save folder.
+Phase changes and beam loss retain the model.
+
+A stored response proposes a 0.005 A grid correction. If no identifiable matrix
+is available or a proposal fails, individual +/-0.005 A candidates are tried.
+Every trial is evaluated with a fresh 10-shot BPM mean after settling; improving
+settings are kept and unsuccessful attempts restored. After **three consecutive
+unsuccessful attempts**, return to the settings with the lowest recorded RMS
+error relative to the current orbit reference during this correction episode.
+The return uses steps no larger than 0.005 A. Resume timing and transmission
+evaluation, then phase recovery if still degraded and enabled. Successful
+attempts reset the failure count. In the adaptive fallback mode, accepted and
+rejected observations both update the fit; the acquired fixed matrix does not
+change. The current correction reference is used for acceptance and stopping.
 
 The Config → Active Feedback tab exposes settling time (default **2 s** after each write), cycle interval
 (default **30 s** after a complete feedback loop, before the next timing search),
@@ -121,7 +133,7 @@ Only Active Feedback allows setpoint/readback differences up to **1° for CM8L
 phase and 0.1 A for correctors**, both at initialization and after writes/restores.
 Timing tolerance remains 0.01 ns. Successful PUTs and finite readbacks are still
 required. These tolerances accommodate coarse readbacks; command increments
-remain 0.5° and 0.005 A, and observations determine whether a move is beneficial.
+remain 0.5° and 0.005 A during feedback; startup response acquisition uses larger, bounded excitations.
 Active Feedback shares Main's workspace, run-button styles and status colors.
 The log is available via **Show log**, leaving more space for live plots.
 The English status banner shows only the current operation (timing scan, phase
@@ -139,14 +151,19 @@ Threshold follows the confirmed recovery baseline minus the configured absolute
 drop (default 5 percentage points). Its step trace preserves each baseline
 promotion's time and extends the current threshold through cycle waits; Initial
 remains fixed at the starting transmission.
-During scans, its blue **Measured transmission** trace and current numeric value
+During timing/phase scans, its blue **Measured transmission** trace and current numeric value
 show the exact fresh 10-shot transmission used by control, without further
-averaging. Background rolling means do not replace those evaluation values.
-During cycle waits, the same trace continues with the background 10-shot rolling
-mean; these waiting observations are display-only. Both calculate the downstream
+averaging. Background means do not replace those evaluation values.
+During orbit correction, response acquisition, best-orbit restoration and cycle
+waits, the same trace continues with background nonoverlapping 10-shot means;
+these observations are display-only. Both calculate the downstream
 ICT mean divided by the upstream mean. Repeated timestamps do not count, and a
 nonpositive ICT clears the background window. The canvas redraws every 0.5 s;
-scan points are added only when a control measurement completes.
+timing/phase scan points are added only when a control measurement completes.
+BPM control evaluations also acquire ten new distinct shots for each mean.
+The BPM plot uses these exact evaluation means during adjustment and response
+acquisition, without interleaving separate monitor means. During waits it shows
+nonoverlapping ten-shot monitor batches; no BPM moving average is used.
 The degradation decision uses one such control measurement by default
 (10 valid ICT shot pairs, with no additional five-measurement averaging). The
 Config averaging count defaults to 1 and can be increased explicitly. The
