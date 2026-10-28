@@ -11,8 +11,8 @@ from unittest.mock import patch
 import numpy as np
 
 from Knobs.RandomExcitation.catalog import CATALOG, BY_NAME, ICT_PVS, DR_MODE, DR_TURN
-from Knobs.RandomExcitation.core import Config, Journal, Prepared, Runner, Sampler, current_bounds, inspect, prepare
-from Knobs.RandomExcitation.transport import DemoTransport
+from Knobs.RandomExcitation.core import Config, Journal, Prepared, Runner, Sampler, current_bounds, inspect, prepare, scalar
+from Knobs.RandomExcitation.transport import DemoTransport, MonitorCache
 
 
 class CoreTests(unittest.TestCase):
@@ -76,14 +76,14 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'inconsistent'):
             current_bounds(a, self.b)
 
-    def test_udf_invalid_configuration_limits_are_accepted_and_labelled(self):
+    def test_udf_invalid_configuration_limits_are_accepted_without_warning(self):
         a = BY_NAME['ZV2L']
         for pv, value in zip(a.limit_pvs, (-5., 5.)):
             self.b.on_value(pvname=pv, value=value, status=17, severity=3)
             self.assertTrue(math.isnan(self.b.sample(pv).scalar()))
         lo, hi, source = current_bounds(a, self.b)
         self.assertEqual((lo, hi), (-5., 5.))
-        self.assertIn('UDF INVALID on A/B', source)
+        self.assertNotIn('INVALID', source)
         self.assertNotIn('unavailable', source)
         self.b._metadata[a.writes[0]] = dict(lower_ctrl_limit=-2, upper_ctrl_limit=3)
         self.assertEqual(current_bounds(a, self.b)[:2], (-2., 3.))
@@ -121,6 +121,57 @@ class CoreTests(unittest.TestCase):
             prepare(a,self.b,self.config)
         self.b.on_value(pvname=ICT_PVS['DR'],value=8.,status=17,severity=3)
         self.assertTrue(math.isnan(self.b.sample(ICT_PVS['DR']).scalar()))
+
+    def test_invalid_current_commands_are_accepted_without_alarm_warning(self):
+        a = BY_NAME['ZV2L']
+        for status in (0, 1, 9, 17):
+            with self.subTest(status=status):
+                self.b.on_value(pvname=a.writes[0], value=.2, status=status, severity=3)
+                p = prepare(a, self.b, self.config)
+                self.assertEqual(p.origin, .2)
+                self.assertNotIn('INVALID', p.limit_source)
+                self.assertTrue(math.isnan(self.b.sample(a.writes[0]).scalar()))
+
+    def test_invalid_current_commands_still_require_connected_finite_scalar(self):
+        pv = BY_NAME['ZV2L'].writes[0]
+        for value in (math.nan, math.inf, -math.inf, [], [1., 2.], 'undefined'):
+            with self.subTest(value=value):
+                self.b.on_value(pvname=pv, value=value, status=17, severity=3)
+                with self.assertRaisesRegex(ValueError, 'No valid PV value'):
+                    scalar(self.b, pv)
+        self.b.on_value(pvname=pv, value=.2, status=17, severity=3)
+        self.b.on_connection(pvname=pv, conn=False)
+        with self.assertRaisesRegex(ValueError, 'No valid PV value'):
+            scalar(self.b, pv)
+
+    def test_invalid_exception_does_not_apply_to_sensors_or_other_commands(self):
+        # Use a passive cache so demo updates cannot replace an invalid ICT.
+        cache = MonitorCache()
+        for pv in (BY_NAME['ZV2L'].read, ICT_PVS['DR'], BY_NAME['L1'].writes[0],
+                   BY_NAME['Timing'].writes[0], 'UNKNOWN:currentWrite'):
+            with self.subTest(pv=pv):
+                cache.on_value(pvname=pv, value=1., status=17, severity=3)
+                with self.assertRaisesRegex(ValueError, 'No valid PV value'):
+                    scalar(cache, pv)
+
+    def test_run_and_restore_with_persistently_invalid_current_command(self):
+        a = BY_NAME['QA1L']
+        publish = self.b.publish
+        def publish_invalid_command(name, value):
+            if name == a.writes[0]:
+                self.b.on_value(pvname=name, value=value, timestamp=time.time(), status=17, severity=3)
+            else:
+                publish(name, value)
+        self.b.publish = publish_invalid_command
+        self.b.put(a.writes[0], 3.037)
+        self.config.end_action = 'initial'
+        r = self.runner(names=('QA1L',))
+        self.assertEqual(r.run(), 'complete')
+        self.assertEqual(r.visits, self.config.max_points)
+        self.assertEqual(scalar(self.b, a.writes[0]), 3.037)
+        self.assertEqual(self.b.sample(a.writes[0]).severity, 3)
+        self.assertEqual(scalar(self.b, a.read), 3.037)
+        self.assertTrue(any(record['event'] == 'command_intent' for record in self.records(r)))
 
     def test_quantization_ranges_and_exact_off_grid_restore(self):
         self.b.put('CM1L:phaseWrite', 12.37)

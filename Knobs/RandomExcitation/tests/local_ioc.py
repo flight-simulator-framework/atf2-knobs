@@ -14,7 +14,7 @@ def scalar(pv):
 class TestIOC(PVGroup):
     phase = pvproperty(name='CM1L:phaseWrite', value=12.0)
     phase_read = pvproperty(name='CM1L:phaseRead', value=12.0, read_only=True)
-    current = pvproperty(name='QA1L:currentWrite', value=3.0)
+    current = pvproperty(name='QA1L:currentWrite', value=3.0, alarm_group='command')
     current_read = pvproperty(name='QA1L:currentRead', value=3.0, read_only=True)
     lower = pvproperty(name='QA1L:parameter.A', value=1.2, read_only=True, alarm_group='limits')
     upper = pvproperty(name='QA1L:parameter.B', value=4.8, read_only=True, alarm_group='limits')
@@ -40,10 +40,17 @@ class TestIOC(PVGroup):
         await self.command_count.write(int(scalar(self.command_count)) + 1)
         return value
 
+    @current.startup
+    async def current(self, instance, async_lib):
+        await instance.alarm.write(status=AlarmStatus.UDF, severity=AlarmSeverity.INVALID_ALARM)
+
     @current.putter
     async def current(self, instance, value):
         if not scalar(self.lower) <= value <= scalar(self.upper):
             raise ValueError('Current exceeds parameter.A/B')
+        # Keep the configuration record INVALID after every command too.
+        instance.status = AlarmStatus.UDF
+        instance.severity = AlarmSeverity.INVALID_ALARM
         await self.current_read.write(value)
         await self.command_count.write(int(scalar(self.command_count)) + 1)
         return value

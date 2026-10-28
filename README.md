@@ -18,6 +18,60 @@ after installation). Select RFTrack or the configured machine interface, then
 open COD, dispersion, skew, TBT beta or quadrupole-modulation measurements from
 the shared launcher. See [DRTuning usage and validation](Knobs/DRTuning/README.txt).
 
+## LinacOpt active feedback
+
+LinacOpt also has an **Active Feedback** tab. It runs until Stop, with Main
+optimization and reset disabled while feedback owns the actuators. Start captures
+a fixed initial transmission and ML8L/ML10L orbit reference. Transmission is the
+selected downstream ICT (DR by default) divided by LN0, independently of Main's
+objective/weights. The fixed sequence is:
+
+1. Track a local transmission maximum on the relative 2.8 ns timing grid using
+   `EVE_LINAC:OUT0:SetData`. Remeasure centre and neighbours every cycle; historical
+   best scores are not reused. Centre measurements bracket each probe.
+2. If this timing maximum is below the previous timing maximum, check the latest
+   three new `LINAC:monitors` records. If any of ML8L.x, ML10L.x, ML8L.y or ML10L.y
+   differs from its initial three-record mean by at least the orbit threshold
+   (100 µm by default, editable in the tab), restore the orbit with ZH1L, ZV1L,
+   ZH2L and ZV2L. Every changed corrector moves by 0.01 A per step. The threshold
+   triggers correction; correction targets the initial orbit until no improving
+   grid move remains, a trial fails, or the iteration limit is reached.
+3. After orbit correction, repeat timing optimization. If the local maximum is
+   still below the fixed initial transmission (also checked when orbit correction
+   was not triggered), optimize CM8L phase in relative 0.5° steps.
+4. Return to timing tracking and repeat. Pause retains accepted settings; Stop
+   and closing the window remove temporary probes and retain accepted settings.
+
+The response matrix is measured internally with 0.01 A probes, refreshed in all
+four directions when orbit correction is triggered, and updated from measured
+correction results. A weighted fit uses at most 64 recent observations, giving
+newer data more weight. CM8L changes invalidate the old response. Horizontal and
+vertical cross-coupling is included; each orbit step evaluates all neighbouring
+current-grid combinations against the learned response.
+
+The tab exposes settling time, cycle interval, transmission comparison deadband
+(absolute ratio, default zero), and excursions from the starting values (defaults:
+timing ±112 ns, CM8L ±8°, correctors ±0.5 A). Correctors additionally require valid
+IOC control limits and remain within ±5 A. Reaching a timing/phase search boundary
+stops with a range message rather than treating the boundary as a local maximum.
+The worker also stops on invalid/missing data or unconfirmed writes. No fresh
+baseline is silently substituted. Measurements require three *new* IOC timestamps
+after an acquisition barrier, with a 15-second timeout; repeated cached records
+do not count. ICT pairs require both channels to advance but are not pulse-ID
+matched. The BPM waveform is interpreted with the existing LINAC monitor map and
+µm-to-mm conversion.
+
+Initial references, all commands, individual samples, accepted settings, response
+matrices and decisions are streamed to `events.jsonl`, alongside `config.json`,
+in a timestamped `ActiveFeedback` directory under the selected LinacOpt save
+location. Plots show transmission (including probes) and orbit deviations. This
+is a background worker in the open GUI, not an independent service.
+
+Offline feedback regressions: `python -m unittest Knobs.tests.test_linac_feedback`.
+For a separate, prefixed loopback IOC integration test (caproto, pyepics and
+libca required), run `python -m Knobs.tests.check_linac_feedback_ioc` in a fresh
+process. It disables CA network discovery and uses an isolated local port.
+
 ## LinacOpt current-value display
 
 Main current values use persistent PyEPICS CA monitors (the same mechanism as

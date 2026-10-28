@@ -57,8 +57,10 @@ def main():
                 p = prepare(BY_NAME['QA1L'], backend, config)
                 assert (p.lower, p.upper) == (1.2, 4.8), p
                 assert 'parameter.A' in p.limit_source
-                assert 'UDF INVALID on A/B' in p.limit_source, p.limit_source
+                assert 'INVALID' not in p.limit_source, p.limit_source
                 assert backend.sample('QA1L:parameter.A').alarm_status == 17
+                assert backend.sample('QA1L:currentWrite').severity == 3
+                assert p.origin == 3
                 events = []
                 runner = Runner(backend, [BY_NAME['L1'], BY_NAME['QA1L']], config, folder, emit=events.append)
                 result = runner.run()
@@ -68,6 +70,7 @@ def main():
                 assert runner.progressive.stage > 0
                 assert any(e['state'] == 'exploration_range' and e['reason'] == 'expanded_after_reference' for e in events)
                 assert backend.sample('QA1L:currentRead').scalar() == 3
+                assert backend.sample('QA1L:currentWrite').severity == 3
                 assert backend.sample('CM1L:phaseRead').scalar() == 12
                 assert backend.sample(DR_MODE).scalar() == 1
                 assert backend.sample(DR_TURN).scalar() == 7

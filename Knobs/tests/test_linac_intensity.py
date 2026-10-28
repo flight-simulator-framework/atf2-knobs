@@ -608,7 +608,11 @@ class IntensityTests(unittest.TestCase):
                 checked.assert_not_called()
                 warning.assert_called_once()
             finally:
+                # Drain deferred Matplotlib draws while their parent window is
+                # still alive, before the next GUI test processes Qt events.
+                app.processEvents()
                 window.close()
+                app.processEvents()
 
     def test_combined_group_has_correctors_phase_and_timing_in_one_call(self):
         actuators = [{"name": "ZH1L", "pv_write": "ZH1L:currentWrite", "step": .01, "half_range": .1},
@@ -1308,7 +1312,7 @@ class IntensityTests(unittest.TestCase):
                 self.assertEqual(window.dev_intensity_aggregation.currentData(), "raw_sum")
                 self.assertEqual(window._selected_developer_bpms(), ["MB1R"])
                 self.assertEqual(window.dev_refresh_btn.maximumWidth(), 240)
-                self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())], ["Main", "Config", "Detail config"])
+                self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())], ["Main", "Config", "Detail config", "Active Feedback"])
                 self.assertIs(window.objective_box, window.dev_objective_box)
                 self.assertTrue(window.selection_page.isAncestorOf(window.dev_actuator_table))
                 window.chk_correctors.setChecked(True)

@@ -63,6 +63,7 @@ from Knobs.linac_orbit_compensation import (
 )
 from Knobs.current_value_monitor import CurrentValueMonitor
 from Knobs.timing_pv import TIMING_PV, validate_timing_pvs
+from Knobs.linac_feedback_gui import FeedbackPanel
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
@@ -3531,6 +3532,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.main_tab, "Main")
         self.tabs.addTab(self.config_tab, "Config")
         self.tabs.addTab(self.detail_config_tab, "Detail config")
+        self.feedback_panel = FeedbackPanel(lambda: self.save_path,
+                                            lambda: self.worker is not None, self)
+        self.tabs.addTab(self.feedback_panel, "Active Feedback")
+        self.feedback_panel.busy_changed.connect(self._feedback_busy_changed)
 
         self._build_main_tab()
         self._build_config_tab()
@@ -5695,6 +5700,8 @@ class MainWindow(QMainWindow):
         if not setpoints:
             raise ValueError("No initial setpoints were stored for this run.")
         validate_timing_pvs(setpoints)
+        if self.feedback_panel.active:
+            raise RuntimeError("Stop Active Feedback before restoring machine settings")
         self._ensure_interface().pv_put_many({str(k): float(v) for k, v in setpoints.items()})
 
     def _delta_specs_for_origin(self, origin: Dict[str, Any], profile: str) -> List[
@@ -6254,6 +6261,9 @@ class MainWindow(QMainWindow):
         return limits, summary
 
     def start_developer_optimization(self):
+        if self.feedback_panel.active or self.worker is not None:
+            QMessageBox.warning(self, "Busy", "Stop the current optimizer/feedback run first.")
+            return
         mode = str(self.dev_mode_box.currentText())
         objective_key = {"BPM sumsq": DEVELOPER_OBJECTIVE_BPM, "BPM intensity": DEVELOPER_OBJECTIVE_INTENSITY}.get(self.dev_objective_box.currentText(), DEVELOPER_OBJECTIVE_ICT)
         actuators = self._selected_developer_actuators()
@@ -6357,6 +6367,9 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def start_optimization(self):
+        if self.feedback_panel.active or self.worker is not None:
+            QMessageBox.warning(self, "Busy", "Stop the current optimizer/feedback run first.")
+            return
         mode = str(self.mode_box.currentText())
         objective = {"BPM intensity": DEVELOPER_OBJECTIVE_INTENSITY,
                      "BPM sumsq": DEVELOPER_OBJECTIVE_BPM}.get(self.objective_box.currentText(), DEVELOPER_OBJECTIVE_ICT)
@@ -6570,7 +6583,24 @@ class MainWindow(QMainWindow):
             self._set_status("Status: resuming" if was_paused else "Status: pause requested — completing evaluation",
                              state="paused", profile=self._run_profile)
 
+    def _feedback_busy_changed(self, busy):
+        self.btn_start.setEnabled(not busy)
+        self.dev_btn_start.setEnabled(not busy)
+        self.reset_initial_btn.setEnabled(not busy)
+        self.dev_reset_initial_btn.setEnabled(not busy)
+        self._set_main_run_controls_enabled(not busy)
+        self._set_developer_run_controls_enabled(not busy)
+        if not busy:
+            self._update_mode_ui()
+            self._update_developer_mode_ui()
+            self._update_developer_objective_ui()
+
     def closeEvent(self, event):  # type: ignore[override]
+        if not self.feedback_panel.shutdown():
+            QMessageBox.warning(self, "Feedback still stopping",
+                                "Temporary settings are still being restored. Please wait and close again.")
+            event.ignore()
+            return
         timer_was_active = self._current_value_timer.isActive()
         self._current_value_timer.stop()
         if self.worker is not None and self.worker.isRunning():

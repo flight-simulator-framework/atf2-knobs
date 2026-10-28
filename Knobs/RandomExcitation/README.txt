@@ -114,10 +114,13 @@ GUIの位相幅やTimingを変更しても、編集済みの電流範囲は保�
 parameter.A/Bは設定保存用フィールドのため、接続済みで有限の数値を持ち、
 アラームがUDF/INVALID（status=17、severity=3）の場合に限り値を採用します。
 未処理のcalcレコードでA=-5、B=+5がUDFになるケースへの対応です。
-表には「parameter.A / parameter.B (UDF INVALID on A/B; configuration values)」
-と明示します。CTRL上下限があれば共通範囲を使い、A>=Bなら採用しません。
+表には通常どおり「parameter.A / parameter.B」と表示し、INVALIDの注記は出しません。
+CTRL上下限があれば共通範囲を使い、A>=Bなら採用しません。
 切断・NaN・無限大・他のINVALIDアラームは、この例外では採用しません。
-ICT、電流読み戻し、操作設定値などのアラーム判定は従来どおりです。
+磁石のcurrentWriteも設定保存用PVとして、INVALIDでも接続済みで有限の単一数値なら
+正常な設定値として採用し、StatusにINVALIDを表示しません。切断・非数値・NaN・無限大は
+採用しません。上下限と書き込み権限の確認は維持します。
+ICT、currentReadなどの読み戻し、位相・タイミングPVのアラーム判定は従来どおりです。
 
 ランダムな位相設定は整数度、電流設定は0.1 Aの整数倍です。
 開始値が格子に乗っていなくても、参照測定・終了時の復帰では開始値をそのまま戻します。

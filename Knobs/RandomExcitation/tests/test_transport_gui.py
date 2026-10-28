@@ -12,7 +12,7 @@ import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from Knobs.RandomExcitation.catalog import CATALOG, ICT_PVS, DR_MONITORS, DR_MODE, DR_TURN
+from Knobs.RandomExcitation.catalog import CATALOG, BY_NAME, ICT_PVS, DR_MONITORS, DR_MODE, DR_TURN
 from Knobs.RandomExcitation.core import Config, Runner, inspect
 from Knobs.RandomExcitation.transport import DemoTransport, EpicsTransport, MonitorCache
 from Knobs.RandomExcitation.gui import MainWindow
@@ -99,10 +99,13 @@ class TransportTests(unittest.TestCase):
         for pv, value in [('ZV2L:parameter.A', -5.), ('ZV2L:parameter.B', 5.)]:
             b._pvs[pv].callback(pvname=pv,value=value,timestamp=time.time(),status=17,severity=3)
             self.assertEqual(b.sample(pv).alarm_status,17)
+        pv = 'ZV2L:currentWrite'
+        b._pvs[pv].callback(pvname=pv,value=.2,timestamp=time.time(),status=17,severity=3)
         ready, errors = inspect(b, Config())
         self.assertIn('ZV2L',ready)
         self.assertEqual((ready['ZV2L'].lower,ready['ZV2L'].upper),(-5.,5.))
-        self.assertIn('UDF INVALID',ready['ZV2L'].limit_source)
+        self.assertNotIn('INVALID',ready['ZV2L'].limit_source)
+        self.assertEqual(ready['ZV2L'].origin,.2)
         self.assertFalse(FakePV.puts)
 
 
@@ -162,6 +165,18 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(len(self.window.dr_plot.curves['X [mm]']), 96)
         self.assertIn('Read only', self.window.dr_info.text())
         self.assertNotEqual(self.window.ict_labels['DR'].text(), '—')
+
+    def test_status_omits_invalid_for_usable_current_configuration(self):
+        b = self.connect_demo()
+        a = BY_NAME['ZV2L']
+        for pv, value in [(a.writes[0], .2), (a.limit_pvs[0], -5.), (a.limit_pvs[1], 5.)]:
+            b.on_value(pvname=pv, value=value, status=17, severity=3)
+        ready, errors = inspect(b, self.window.config())
+        self.window._connected(b, ready, errors)
+        row = self.window.row_by_name[a.name]
+        self.assertNotIn(a.name, errors)
+        self.assertNotIn('INVALID', self.window.table.item(row, 8).text())
+        self.assertIn('parameter.A / parameter.B', self.window.table.item(row, 8).text())
 
     def test_actual_start_button_runs_and_retains_configuration_lock_until_done(self):
         w = self.window

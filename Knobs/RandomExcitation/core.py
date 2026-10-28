@@ -71,8 +71,25 @@ class Config:
             raise ValueError("ICT maximum notification age must be positive")
 
 
+_CURRENT_COMMAND_PVS = frozenset(p for a in CATALOG if a.kind == "current" for p in a.writes)
+
+
+def _configuration_scalar(sample):
+    """Read a connected, finite scalar without interpreting its record alarm."""
+    try:
+        raw = np.asarray(sample.value)
+        value = float(raw.flat[0]) if sample.connected and raw.size == 1 else math.nan
+        return value if math.isfinite(value) else math.nan
+    except (TypeError, ValueError, OverflowError):
+        return math.nan
+
+
 def scalar(transport, name):
-    value = transport.sample(name).scalar()
+    sample = transport.sample(name)
+    # currentWrite stores a command, not a measured current. Its record may
+    # remain INVALID while the command field is usable. Keep sensors strict.
+    value = (_configuration_scalar(sample)
+             if name in _CURRENT_COMMAND_PVS and sample.severity == 3 else sample.scalar())
     if not math.isfinite(value):
         raise ValueError(f"No valid PV value: {name}")
     return value
@@ -96,20 +113,13 @@ def current_bounds(a, transport):
     # op-base/magnet/Qt/Library/MagnetLibrary/magnet.cpp: A=min, B=max.
     # These two fields store configuration, not beam/current measurements.
     # An unprocessed calc record can report UDF/INVALID for finite A/B values.
-    # Keep the exception here only; Sample.scalar() remains strict everywhere.
-    values, udf_fields = [], []
+    # Sample.scalar() remains strict for measurements.
+    values = []
     for pv in a.limit_pvs:
         sample = transport.sample(pv)
         value = sample.scalar()
         if sample.connected and sample.alarm_status == 17 and sample.severity == 3:
-            try:
-                raw = np.asarray(sample.value)
-                candidate = float(raw.flat[0]) if raw.size == 1 else math.nan
-                if math.isfinite(candidate):
-                    value = candidate
-                    udf_fields.append(pv.rsplit('.', 1)[-1])
-            except (TypeError, ValueError):
-                pass
+            value = _configuration_scalar(sample)
         values.append(value)
     lo, hi = values
     metadata = ctrl_bounds(transport, a.writes[0])
@@ -117,8 +127,6 @@ def current_bounds(a, transport):
         if lo >= hi:
             raise ValueError(f"{a.name}: parameter.A must be less than parameter.B")
         source = "parameter.A / parameter.B"
-        if udf_fields:
-            source += f" (UDF INVALID on {'/'.join(udf_fields)}; configuration values)"
         if metadata:
             lo, hi = max(lo, metadata[0]), min(hi, metadata[1])
             source += " ∩ CTRL"
