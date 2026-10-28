@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 import numpy as np
 from PyQt6.QtWidgets import QApplication
 from Knobs import Linac_Opt as linac
-from Knobs.linac_orbit_compensation import OrbitCompensation, CORRECTORS, mean_orbit
+from Knobs.linac_orbit_compensation import OrbitCompensation, CORRECTORS, mean_orbit, load_feedback_response
+from Knobs.linac_feedback import RecentResponse, CORRECTORS as FEEDBACK_CORRECTORS
 
 
 class OrbitPlant:
@@ -53,10 +54,21 @@ class OrbitPlant:
 
 
 class CompensationTests(unittest.TestCase):
+    def save_response(self, plant, directory):
+        model = RecentResponse()
+        matrix = plant.response[:, [CORRECTORS.index(name) for name in FEEDBACK_CORRECTORS]]
+        for delta in np.eye(4) * .25:
+            model.add(delta, matrix @ delta)
+        model.frozen = True
+        path = Path(directory) / "active_feedback_response.json"
+        path.write_text(json.dumps(model.snapshot()))
+        return path
+
     def make_correction(self, plant, limits=None, checkpoint=lambda: None):
         report = {}
         correction = OrbitCompensation(measure=plant.orbit, read=plant.read, write=plant.write,
-            checkpoint=checkpoint, limits=limits or {name: (-.5, .5) for name in CORRECTORS}, report=report)
+            checkpoint=checkpoint, limits=limits or {name: (-.5, .5) for name in CORRECTORS}, report=report,
+            response=plant.response)
         correction.capture()
         return correction, report
 
@@ -73,7 +85,9 @@ class CompensationTests(unittest.TestCase):
                 self.assertTrue(correction.correct())
                 self.assertEqual(report["planes"], expected)
                 self.assertEqual(report["status"], "corrected")
-                self.assertTrue(np.all(abs(plant.orbit() - plant.reference) < .1))
+                self.assertTrue(np.all(abs(plant.orbit() - plant.reference) < .15))
+                self.assertFalse(report["probes"])
+                self.assertLessEqual(len(report["iterations"]), 10)
                 for values, _ in plant.writes:
                     self.assertTrue(all(("H" if name.startswith("ZH") else "V") in expected for name in values))
                     self.assertTrue(all(abs(v) <= .5 for v in values.values()))
@@ -83,19 +97,92 @@ class CompensationTests(unittest.TestCase):
                     self.assertLessEqual(np.max(abs(trial - previous)), .100000001)
                     previous = trial
 
+    def test_cached_feedback_response_reorders_columns_and_zeroes_cross_plane(self):
+        plant = OrbitPlant()
+        plant.response[0, 2], plant.response[2, 1] = 17., -19.
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.save_response(plant, directory)
+            original = path.read_bytes()
+            matrix, metadata = load_feedback_response(path)
+            expected = plant.response.copy()
+            expected[:2, 2:], expected[2:, :2] = 0., 0.
+            np.testing.assert_allclose(matrix, expected, atol=1e-6)
+            self.assertTrue(metadata["response_frozen"])
+            self.assertTrue(metadata["response_measured_at"])
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_missing_or_incomplete_cache_stops_before_gun_scan(self):
+        for contents in (None, "broken JSON", json.dumps(RecentResponse().snapshot())):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                if contents is not None:
+                    (Path(directory) / "active_feedback_response.json").write_text(contents)
+                plant = OrbitPlant()
+                cfg = dict(mode="SEQUENTIAL", gun_sol_l0_phase=True, gun_orbit_compensation=True,
+                           gun_orbit_limits={f"{name}:currentWrite": [-.5, .5] for name in CORRECTORS})
+                worker = linac.OptimizationWorker(cfg, directory, interface=plant)
+                with patch.object(worker, "perform_1d_scan") as scan:
+                    with self.assertRaisesRegex(ValueError, "Measure response matrix at Start"):
+                        worker._run_sequential()
+                    scan.assert_not_called()
+                self.assertEqual(plant.writes, [])
+
+    def test_tenth_iteration_returns_to_historical_best_rms(self):
+        plant = OrbitPlant()
+        plant.response = np.eye(4) * 100.
+        correction, report = self.make_correction(plant)
+        residuals = iter([1., .8] + [value for _ in range(9) for value in (2., 1.9)] + [.81])
+        correction.measure = lambda: correction.reference + np.array([next(residuals), 0., 0., 0.])
+        self.assertTrue(correction.correct())
+        self.assertEqual(len(report["iterations"]), 10)
+        self.assertEqual(report["completion_reason"], "iteration_limit")
+        self.assertEqual(report["status"], "best_rms_restored")
+        self.assertFalse(report["reached_tolerance"])
+        self.assertAlmostEqual(report["best_rms_um"], 400.)
+        np.testing.assert_allclose(plant.currents, [-.007, 0., 0., 0.])
+        previous = np.zeros(4)
+        for settings, _ in plant.writes:
+            for name, value in settings.items():
+                i = CORRECTORS.index(name)
+                self.assertLessEqual(abs(value - previous[i]), .100000001)
+                previous[i] = value
+        self.assertTrue(plant.writes[-1][1])
+
+    def test_nonconvergence_finishes_and_main_continues_to_timing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plant = OrbitPlant()
+            path = self.save_response(plant, directory)
+            original = path.read_bytes()
+            cfg = dict(mode="GROUP_BO", gun_sol_l0_phase=True, timing=True,
+                       gun_orbit_compensation=True, settle_sec=0,
+                       gun_orbit_limits={f"{name}:currentWrite": [-.5, .5] for name in CORRECTORS})
+            worker = linac.OptimizationWorker(cfg, directory, interface=plant)
+            groups = []
+            def scan(group, *args):
+                groups.append(group)
+                plant.drift[0] = .3
+                plant.response[:] = 0.  # A changed machine cannot be corrected by this stored model.
+            with patch.object(worker, "_group_bo_simultaneous", side_effect=scan), \
+                 patch.object(worker, "perform_1d_scan", side_effect=lambda label, *args, **kwargs: groups.append(label)):
+                worker._run_group_bo()
+            self.assertIn("Timing", groups)
+            self.assertEqual(worker._gun_orbit_report["status"], "best_rms_restored")
+            self.assertEqual(len(worker._gun_orbit_report["iterations"]), 10)
+            np.testing.assert_array_equal(plant.currents, np.zeros(4))
+            self.assertEqual(path.read_bytes(), original)
+
     def test_below_threshold_does_not_write_and_exact_threshold_triggers(self):
         plant = OrbitPlant()
         correction, report = self.make_correction(plant)
-        plant.drift = np.array([.099, -.05, 0, .099])
+        plant.drift = np.array([.149, -.05, 0, .149])
         self.assertFalse(correction.correct())
         self.assertEqual(plant.writes, [])
         plant.reference[:] = 0
         correction, report = self.make_correction(plant)
-        plant.drift += np.array([.1, 0, 0, 0])
+        plant.drift += np.array([.15, 0, 0, 0])
         self.assertTrue(correction.correct())
         self.assertEqual(report["planes"], "H")
 
-    def test_probe_failure_restores_current(self):
+    def test_trial_measurement_failure_restores_current(self):
         plant = OrbitPlant()
         correction, report = self.make_correction(plant)
         plant.drift[0] = .2
@@ -132,32 +219,31 @@ class CompensationTests(unittest.TestCase):
             correction.correct()
         np.testing.assert_array_equal(plant.currents, np.zeros(4))
 
-    def test_crosstalk_into_untouched_plane_rolls_back(self):
+    def test_crosstalk_into_untouched_plane_retains_best_rms(self):
         plant = OrbitPlant()
         plant.response[2, 0] = 50.
         correction, report = self.make_correction(plant)
         plant.drift[0] = .3
-        with self.assertRaisesRegex(RuntimeError, "did not reach"):
-            correction.correct()
-        self.assertEqual(report["status"], "no_improvement")
-        np.testing.assert_array_equal(plant.currents, np.zeros(4))
+        correction.correct()
+        self.assertEqual(report["status"], "best_rms_restored")
+        self.assertLessEqual(np.linalg.norm(plant.orbit() - correction.reference), .3)
         self.assertFalse(any(name.startswith("ZV") for values, _ in plant.writes for name in values))
 
-    def test_rail_limited_response_uses_available_probe_and_stops_bounded(self):
+    def test_rail_limited_response_returns_best_and_finishes_normally(self):
         plant = OrbitPlant()
         limits = {name: (-.02, .02) for name in CORRECTORS}
         correction, report = self.make_correction(plant, limits)
         plant.drift[0] = 2.
-        with self.assertRaisesRegex(RuntimeError, "did not reach"):
-            correction.correct()
+        correction.correct()
+        self.assertEqual(report["status"], "best_rms_restored")
         self.assertTrue(all(abs(value) <= .02 for values, _ in plant.writes for value in values.values()))
-        self.assertLessEqual(len(report["iterations"]), 5)
+        self.assertLessEqual(len(report["iterations"]), 10)
 
-    def test_three_sample_mean_name_matching_and_invalid_data(self):
+    def test_ten_sample_mean_name_matching_and_invalid_data(self):
         plant = OrbitPlant()
-        plant.nsamples = 3
+        plant.nsamples = 10
         data = plant.get_bpms()
-        data["x"][:, 0] += [-.03, 0, .03]
+        data["x"][:, 0] += np.linspace(-.03, .03, 10)
         np.testing.assert_allclose(mean_orbit(data), plant.reference)
         for key, bad in (("x", np.nan), ("tmit", 0), ("status", 0)):
             with self.subTest(key=key):
@@ -166,7 +252,7 @@ class CompensationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     mean_orbit(data)
         plant.nsamples = 2
-        with self.assertRaisesRegex(ValueError, "exactly 3"):
+        with self.assertRaisesRegex(ValueError, "exactly 10"):
             mean_orbit(plant.get_bpms())
 
     def test_worker_brackets_all_gun_scans_and_uses_injected_interface(self):
@@ -175,6 +261,7 @@ class CompensationTests(unittest.TestCase):
                 plant = OrbitPlant()
                 cfg = dict(mode=method, gun_sol_l0_phase=True, gun_orbit_compensation=True, settle_sec=0,
                            gun_orbit_limits={f"{name}:currentWrite": [-.5, .5] for name in CORRECTORS})
+                self.save_response(plant, directory)
                 worker = linac.OptimizationWorker(cfg, directory, interface=plant)
                 def scan(*args, **kwargs):
                     plant.drift = np.array([.3, -.15, 0, 0])
@@ -194,6 +281,7 @@ class CompensationTests(unittest.TestCase):
             plant = OrbitPlant()
             cfg = dict(mode="GROUP_BO", gun_sol_l0_phase=True, gun_orbit_compensation=True, settle_sec=0,
                        gun_orbit_limits={f"{name}:currentWrite": [-.5, .5] for name in CORRECTORS})
+            self.save_response(plant, directory)
             worker = linac.OptimizationWorker(cfg, directory, interface=plant)
             events = []
             worker.progress_signal.connect(events.append)
@@ -207,9 +295,11 @@ class CompensationTests(unittest.TestCase):
             self.assertEqual(len(paths), 1)
             report = json.loads(paths[0].read_text())
             self.assertEqual(report["status"], "corrected")
-            self.assertEqual(report["samples_per_mean"], 3)
-            self.assertTrue(report["probes"])
-            self.assertEqual(np.asarray(report["acquisitions"][0]["x_samples_mm"]).shape, (3, 2))
+            self.assertEqual(report["samples_per_mean"], 10)
+            self.assertFalse(report["probes"])
+            self.assertEqual(report["response_cache"], str(Path(directory) / "active_feedback_response.json"))
+            self.assertTrue(report["response_frozen"])
+            self.assertEqual(np.asarray(report["acquisitions"][0]["x_samples_mm"]).shape, (10, 2))
 
     def test_worker_option_off_makes_no_orbit_reads_or_corrector_writes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -226,6 +316,7 @@ class CompensationTests(unittest.TestCase):
             plant = OrbitPlant()
             cfg = dict(gun_sol_l0_phase=True, gun_orbit_compensation=True, settle_sec=0,
                        gun_orbit_limits={f"{name}:currentWrite": [-.5, .5] for name in CORRECTORS})
+            self.save_response(plant, directory)
             worker = linac.OptimizationWorker(cfg, directory, interface=plant)
             worker._begin_gun_orbit_compensation()
             plant.drift[0] = .3

@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from Knobs.linac_feedback import (BeamLoss, OrbitDrift, FeedbackConfig, FeedbackController, RecentResponse,
-                                 CURRENT_PVS, PVS, TIMING_PV, PHASE_PV, RESPONSE_PLANE_MASK)
+                                 CURRENT_PVS, PVS, TIMING_PV, PHASE_PV, RESPONSE_PLANE_MASK, TargetsChanged)
 from Knobs.linac_feedback_io import FeedbackMachine
 
 
@@ -131,6 +131,78 @@ class FeedbackTests(unittest.TestCase):
             self.assertAlmostEqual((values[TIMING_PV] - 100.37) / 2.8,
                                    round((values[TIMING_PV] - 100.37) / 2.8))
 
+    def test_live_target_switch_waits_for_probe_restoration(self):
+        for operation in ("timing", "phase", "orbit", "calibration"):
+            with self.subTest(operation=operation):
+                plant, controller, events = self.controller()
+                selection = dict(adjust_timing=True, adjust_phase=True, adjust_correctors=True)
+                controller.target_provider = lambda: dict(selection)
+                original = dict(plant.values)
+                def disable(values, restore):
+                    if not restore:
+                        selection.update(dict.fromkeys(selection, False))
+                plant.on_write = disable
+                with self.assertRaises(TargetsChanged):
+                    if operation in ("timing", "phase"):
+                        controller.search(TIMING_PV if operation == "timing" else PHASE_PV,
+                                          2.8 if operation == "timing" else .5, operation)
+                    elif operation == "orbit":
+                        plant.drift[0] = .2  # First positive H1 trial is rejected.
+                        controller.correct_orbit()
+                    else:
+                        controller.measure_response()
+                self.assertEqual(plant.values, original)
+                self.assertEqual(len(plant.writes), 2)
+                self.assertTrue(plant.writes[-1][1])
+                self.assertFalse(any((controller.config.adjust_timing, controller.config.adjust_phase,
+                                      controller.config.adjust_correctors)))
+                self.assertEqual(events[-1]["kind"], "targets_changed")
+
+    def test_all_targets_off_waits_without_writes_and_resumes_on_selection(self):
+        plant, controller, events = self.controller(adjust_timing=False, adjust_phase=False, adjust_correctors=False)
+        selection = dict(adjust_timing=False, adjust_phase=False, adjust_correctors=False)
+        controller.target_provider = lambda: dict(selection)
+        waits = []
+        def wait(seconds):
+            waits.append(seconds)
+            self.assertEqual(plant.writes, [])
+            self.assertEqual(controller.state, "Waiting for adjustment targets")
+            if len(waits) == 2:
+                selection["adjust_phase"] = True
+        plant.wait = wait
+        def cycle():
+            self.assertFalse(controller.config.adjust_timing)
+            self.assertTrue(controller.config.adjust_phase)
+            self.assertFalse(controller.config.adjust_correctors)
+            raise InterruptedError("test complete")
+        with patch.object(controller, "cycle", side_effect=cycle) as cycle_mock:
+            with self.assertRaises(InterruptedError):
+                controller.run()
+            cycle_mock.assert_called_once()
+        self.assertEqual(waits, [.2, .2])
+        self.assertFalse(any(e["kind"] == "waiting" for e in events))  # No misleading scan countdown.
+
+    def test_live_switch_wakes_cycle_countdown(self):
+        plant, controller, events = self.controller(interval_sec=30.)
+        selection = dict(adjust_timing=True, adjust_phase=True, adjust_correctors=True)
+        controller.target_provider = lambda: dict(selection)
+        plant.wait = lambda seconds: selection.update(adjust_timing=False)
+        with self.assertRaises(TargetsChanged):
+            controller.wait_cycle()
+        self.assertFalse(controller.config.adjust_timing)
+        self.assertEqual(sum(e["kind"] == "waiting" for e in events), 1)
+
+    def test_ict_loss_still_pauses_while_all_targets_are_off(self):
+        plant, controller, events = self.controller(adjust_timing=False, adjust_phase=False, adjust_correctors=False)
+        plant.wait = Mock(side_effect=BeamLoss("test ICT loss"))
+        def pause(reason):
+            self.assertEqual(reason, "test ICT loss")
+            self.assertEqual(plant.writes, [])
+            raise InterruptedError("test complete")
+        with self.assertRaises(InterruptedError):
+            controller.run(pause_for_loss=pause)
+        self.assertTrue(any(e["kind"] == "beam_loss" for e in events))
+
     def test_decline_then_timing_then_phase_before_orbit_then_timing(self):
         plant, controller, events = self.controller()
         controller.cycle()
@@ -140,11 +212,11 @@ class FeedbackTests(unittest.TestCase):
         start = len(events)
         controller.cycle()
         states = [e["state"] for e in events[start:] if e["kind"] == "state"]
-        self.assertEqual(states, ["Checking orbit", "Timing tracking",
-                                  "Checking transmission after timing", "CM8L phase recovery",
-                                  "Timing after phase recovery", "Correcting orbit",
-                                  "Timing after orbit correction", "Checking transmission after timing", "Monitoring"])
-        self.assertLess(np.max(abs(plant.orbit() - reference)), .02)
+        self.assertEqual(states[:4], ["Checking orbit", "Timing tracking",
+                                     "Checking transmission after timing", "CM8L phase recovery"])
+        self.assertLess(states.index("Correcting orbit"), states.index("Timing after phase recovery"))
+        self.assertEqual(states[-1], "Monitoring")
+        self.assertLess(np.max(abs(plant.orbit() - reference)), .15)
         self.assertAlmostEqual(plant.values[PHASE_PV], 2.5)
         np.testing.assert_array_equal(controller.reference, reference)
         # The next cycle always begins with timing, including after CM8L recovery.
@@ -254,10 +326,12 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual([e["consecutive_failures"] for e in steps], [1, 2, 3])
         restored = next(i for i, e in enumerate(events) if e["kind"] == "orbit_best_restored")
         later = [e["state"] for e in events[restored + 1:] if e["kind"] == "state"]
-        self.assertEqual(later[:3], ["Timing after orbit correction", "Checking transmission after timing", "CM8L phase recovery"])
+        self.assertIn("CM8L phase recovery", later)
+        self.assertIn("Timing after phase recovery", later)
+        self.assertEqual(later[-1], "Monitoring")
 
     def test_range_boundary_stops_without_claiming_unbounded_optimum(self):
-        plant, controller, _ = self.controller(timing_range_ns=2.8)
+        plant, controller, _ = self.controller(timing_range_ns=2.8, adjust_phase=False)
         plant.target_timing = 1000.
         # Avoid the zero-transmission plateau for this boundary test.
         plant.transmission = lambda: .5 + (plant.values[TIMING_PV] - 100.37) / 100.
@@ -286,6 +360,7 @@ class FeedbackTests(unittest.TestCase):
         original = dict(plant.values)
         controller.measure_response()
         self.assertEqual(plant.values, original)
+        self.assertFalse(any(e["kind"] == "orbit_intervention" for e in events))
         probes = [e for e in events if e["kind"] == "response_probe" and e["accepted"]]
         self.assertEqual([e["pv"] for e in probes], list(CURRENT_PVS))
         self.assertTrue(all(400 <= e["excursion_um"] <= 600 and e["shots"] == 10 for e in probes))
@@ -369,6 +444,63 @@ class FeedbackTests(unittest.TestCase):
                     controller.run()
                 measure.assert_not_called()
             self.assertEqual(plant.writes, [])
+
+    def test_feedback_reference_is_recaptured_after_calibration(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant, measure_response_on_start=True)
+        measure = controller.measure_response
+        measured_model = []
+        def acquire():
+            measure()
+            measured_model.append(controller.response.snapshot())
+            plant.transmission = lambda: .91
+            plant.drift[:] = [.2, -.1, .15, -.08]
+            plant.values[TIMING_PV] += 2.8
+            plant.values[CURRENT_PVS[0]] = .02
+        def cycle():
+            self.assertEqual(controller.initial_transmission, .91)
+            self.assertEqual(controller.transmission_baseline, .91)
+            self.assertAlmostEqual(controller.recovery_threshold(), .86)
+            np.testing.assert_allclose(controller.reference, plant.orbit())
+            np.testing.assert_array_equal(controller.initial_orbit, controller.reference)
+            self.assertFalse(controller.outside_orbit_threshold(plant.orbit()))
+            self.assertFalse(controller.orbit_alert)
+            self.assertEqual(controller.origin, plant.values)
+            self.assertAlmostEqual(controller.limits[CURRENT_PVS[0]][0], -.48)
+            self.assertEqual(controller.response.snapshot(), measured_model[0])
+            raise InterruptedError("test complete")
+        with patch.object(controller, "measure_response", side_effect=acquire), \
+             patch.object(controller, "cycle", side_effect=cycle):
+            with self.assertRaises(InterruptedError):
+                controller.run()
+        final_reference = [e for e in events if e["kind"] == "reference"][-1]
+        self.assertTrue(final_reference["feedback_start"])
+        self.assertEqual(final_reference["transmission"], .91)
+
+    def test_loss_during_feedback_reference_capture_retries_without_remeasuring_matrix(self):
+        plant, controller, events = self.controller(measure_response_on_start=True)
+        measure = controller.measure_response
+        readings = iter([BeamLoss("test ICT loss"), .9])
+        def read():
+            value = next(readings)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        def acquire():
+            measure()
+            plant.transmission = read
+        def pause(reason):
+            self.assertTrue(controller.response.frozen)
+            self.assertFalse(any(e.get("feedback_start") for e in events))
+        with patch.object(controller, "measure_response", side_effect=acquire) as acquire_mock, \
+             patch.object(controller, "cycle", side_effect=InterruptedError("test complete")) as cycle:
+            with self.assertRaises(InterruptedError):
+                controller.run(pause_for_loss=pause)
+            acquire_mock.assert_called_once()
+            cycle.assert_called_once()
+        self.assertEqual(controller.initial_transmission, .9)
+        self.assertEqual(sum(bool(e.get("feedback_start")) for e in events), 1)
 
     def test_no_dedicated_learning_and_improving_first_correction_is_kept(self):
         plant, controller, events = self.controller(max_orbit_steps=1)
@@ -597,8 +729,154 @@ class FeedbackTests(unittest.TestCase):
         decision = next(e for e in events if e["kind"] == "degradation_decision")
         self.assertEqual(decision["samples"], [.95])
         self.assertFalse(decision["degraded"])
+        self.assertFalse(any(e["kind"] == "timing_yield" for e in events))
 
-    def test_orbit_drift_during_timing_defers_correction_until_scan_finishes(self):
+    def test_timing_confirmation_failure_stops_without_repeated_noise_retries(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant)
+        origin = plant.values[TIMING_PV]
+        readings = iter([.8, .8, .84, .8, .8, .8, .7])
+        plant.transmission = lambda: next(readings)
+        self.assertEqual(controller.search(TIMING_PV, 2.8, "Timing"), .7)
+        self.assertEqual(plant.values[TIMING_PV], origin)
+        self.assertEqual(len(plant.writes), 4)
+        self.assertTrue(plant.writes[-1][1])
+        self.assertFalse(controller.timing_at_optimum)
+        self.assertFalse(any(e["kind"] == "retry" for e in events))
+        self.assertEqual(sum(e["kind"] == "timing_stopped" for e in events), 1)
+        self.assertEqual(next(e["reason"] for e in events if e["kind"] == "timing_yield"), "Phase recovery needed")
+
+    def test_improving_timing_continues_with_orbit_steps_between_confirmed_moves(self):
+        plant = Plant()
+        plant.target_timing = plant.values[TIMING_PV] + 8.4
+        _, controller, events = self.controller(plant)
+        def drift(values, restore):
+            if TIMING_PV in values and not restore:
+                plant.drift[0] = .2
+        plant.on_write = drift
+        controller.search(TIMING_PV, 2.8, "Timing", guard_orbit=False)
+        self.assertAlmostEqual(plant.values[TIMING_PV], plant.target_timing)
+        accepted = [e for e in events if e["kind"] == "accepted"]
+        self.assertEqual(len(accepted), 3)
+        self.assertTrue(plant.writes[-1][1])
+        self.assertEqual(events[-1]["kind"], "local_peak")
+        first_orbit = next(i for i, e in enumerate(events) if e["kind"] == "orbit_step")
+        last_timing = max(i for i, e in enumerate(events) if e["kind"] == "accepted")
+        self.assertLess(first_orbit, last_timing)
+        self.assertFalse(controller.outside_orbit_threshold(plant.orbit()))
+
+    def test_interleaved_correction_never_writes_during_an_unaccepted_rf_probe(self):
+        for pv, step in ((TIMING_PV, 2.8), (PHASE_PV, .5)):
+            with self.subTest(pv=pv):
+                plant, controller, events = self.controller()
+                seed_response(controller, plant)
+                controller.response.frozen = True
+                model = controller.response.snapshot()
+                accepted_rf = {TIMING_PV: plant.values[TIMING_PV], PHASE_PV: plant.values[PHASE_PV]}
+                def emit(event):
+                    events.append(event)
+                    if event["kind"] == "accepted":
+                        accepted_rf[event["pv"]] = event["value"]
+                controller.emit = emit
+                plant.target_phase = 1.5
+                plant.drift[0] = .22
+                controller.orbit_alert = True
+                def on_write(values, restore):
+                    if any(name in CURRENT_PVS for name in values):
+                        self.assertEqual({name: plant.values[name] for name in accepted_rf}, accepted_rf)
+                plant.on_write = on_write
+                controller.search(pv, step, "Scan", guard_orbit=False, check_recovery_at_start=False)
+                self.assertTrue(any(e["kind"] == "orbit_step" and e["interleaved"] for e in events))
+                self.assertEqual(controller.response.snapshot(), model)
+                # Each intervention returns to RF work after at most one accepted correction.
+                accepted_steps = 0
+                for event in events:
+                    if event["kind"] == "orbit_intervention":
+                        accepted_steps = 0
+                    elif event["kind"] == "orbit_step" and event["interleaved"]:
+                        accepted_steps += int(event["accepted"])
+                        self.assertLessEqual(accepted_steps, 1)
+
+    def test_orbit_intervention_restarts_timing_comparison_with_new_measurements(self):
+        plant, controller, events = self.controller()
+        origin = plant.values[TIMING_PV]
+        seed_response(controller, plant)
+        controller.response.frozen = True
+        plant.drift[0] = .151
+        controller.orbit_alert = True
+        def transmission():
+            target = origin + (2.8 if plant.values[CURRENT_PVS[0]] < 0 else 0.)
+            return .9 - .005 * ((plant.values[TIMING_PV] - target) / 2.8) ** 2
+        plant.transmission = transmission
+        controller.search(TIMING_PV, 2.8, "Timing", guard_orbit=False, check_recovery_at_start=False)
+        self.assertAlmostEqual(plant.values[TIMING_PV], origin + 2.8)
+        intervention = next(i for i, e in enumerate(events) if e["kind"] == "orbit_intervention")
+        later = events[intervention + 1:]
+        next_probe = next(i for i, e in enumerate(later) if e["kind"] == "probe")
+        samples = [e for e in later[:next_probe] if e["kind"] == "transmission"]
+        self.assertEqual(len(samples), 3)
+        self.assertTrue(all(e["settings"][CURRENT_PVS[0]] < 0 for e in samples))
+        self.assertEqual([e["settings"][TIMING_PV] for e in samples], [origin, origin + 2.8, origin])
+
+    def test_interleaved_failure_restores_best_at_same_rf_setting_then_defers(self):
+        plant, controller, events = self.controller()
+        controller.orbit_alert = True
+        residuals = iter([1., 1., .8, 2., 2., 1.9, 2., 2., 2.1, 2., 2.2, 2., 2.3, .81])
+        plant.orbit = lambda: controller.reference + np.array([next(residuals), 0., 0., 0.])
+        for _ in range(3):
+            self.assertTrue(controller.interleave_orbit("Timing tracking"))
+        np.testing.assert_allclose(controller.currents(), [.005, 0., 0., 0.])
+        self.assertTrue(controller.orbit_intervention_blocked())
+        restored = next(e for e in events if e["kind"] == "orbit_best_restored")
+        self.assertAlmostEqual(restored["best_rms_um"], 400.)
+        self.assertEqual(controller.state, "Timing tracking")
+        controller.current[PHASE_PV] += .5
+        self.assertFalse(controller.orbit_intervention_blocked())
+
+    def test_loss_during_interleaved_correction_restores_corrector_and_keeps_accepted_rf(self):
+        plant, controller, events = self.controller()
+        plant.target_phase = .5
+        plant.drift[0] = .2
+        controller.orbit_alert = True
+        accepted_phase = [plant.values[PHASE_PV]]
+        def emit(event):
+            events.append(event)
+            if event["kind"] == "accepted" and event["pv"] == PHASE_PV:
+                accepted_phase[0] = event["value"]
+        controller.emit = emit
+        def fail(values, restore):
+            if not restore and any(pv in CURRENT_PVS for pv in values):
+                raise BeamLoss("test ICT loss")
+        plant.on_write = fail
+        with self.assertRaises(BeamLoss):
+            controller.search(PHASE_PV, .5, "Phase", guard_orbit=False)
+        np.testing.assert_array_equal(controller.currents(), np.zeros(4))
+        self.assertEqual(plant.values[PHASE_PV], accepted_phase[0])
+        self.assertEqual(accepted_phase[0], .5)
+
+    def test_existing_phase_condition_preempts_timing_writes(self):
+        plant, controller, events = self.controller()
+        plant.target_phase = 2.5
+        controller.cycle()
+        first = next(iter(plant.writes))[0]
+        self.assertEqual(set(first), {PHASE_PV})
+        self.assertTrue(any(e["kind"] == "timing_yield" and e["reason"] == "Phase recovery needed" for e in events))
+        self.assertAlmostEqual(plant.values[PHASE_PV], 2.5)
+
+    def test_unconfirmed_timing_exit_does_not_promote_baseline(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant, baseline_hold_sec=0.)
+        controller.update_transmission_baseline(.9)
+        controller.update_transmission_baseline(.9)
+        plant.transmission = lambda: .9
+        controller.evaluate_transmission(allow_baseline_update=False)
+        self.assertEqual(controller.transmission_baseline, .8)
+        self.assertEqual(controller._baseline_candidate["confirmations"], 2)
+        self.assertFalse(any(e["kind"] == "baseline_updated" for e in events))
+
+    def test_orbit_drift_during_failed_timing_probe_yields_after_restoration(self):
         plant, controller, events = self.controller()
         injected = []
         def drift(values, restore):
@@ -607,14 +885,15 @@ class FeedbackTests(unittest.TestCase):
                 plant.drift[0] = .25
         plant.on_write = drift
         controller.cycle()
-        self.assertTrue(any(e["kind"] == "orbit_recovery" for e in events))
+        self.assertTrue(any(e["kind"] == "orbit_intervention" for e in events))
         # The temporary timing offset was removed before any current excitation.
         first_current = next(i for i, (values, _) in enumerate(plant.writes) if any(p in CURRENT_PVS for p in values))
-        self.assertEqual(plant.writes[first_current - 1], ({TIMING_PV: plant.target_timing}, True))
+        self.assertEqual(plant.writes[first_current - 1], ({TIMING_PV: 100.37}, True))
+        self.assertEqual(first_current, 2)  # One failed neighbour, then immediate recovery.
         decision = next(i for i, e in enumerate(events) if e["kind"] == "degradation_decision")
-        correction = next(i for i, e in enumerate(events) if e["kind"] == "orbit_recovery")
-        self.assertLess(decision, correction)
-        self.assertLess(np.max(abs(plant.orbit() - controller.reference)), .1)
+        correction = next(i for i, e in enumerate(events) if e["kind"] == "orbit_intervention")
+        self.assertLess(correction, decision)
+        self.assertLess(np.max(abs(plant.orbit() - controller.reference)), .15)
 
     def test_temporary_probe_orbit_change_is_confirmed_at_restored_setting(self):
         plant = Plant()
@@ -633,14 +912,14 @@ class FeedbackTests(unittest.TestCase):
         plant.target_phase = 1.5
         controller.cycle()
         self.assertFalse(any(e["kind"] == "phase_blocked" for e in events))
-        self.assertTrue(any(e.get("state") == "Timing after orbit correction" for e in events))
+        self.assertTrue(any(e.get("state") == "Timing after phase recovery" for e in events))
         self.assertAlmostEqual(plant.values[PHASE_PV], 1.5)
         phase = next(i for i, (values, _) in enumerate(plant.writes) if PHASE_PV in values)
         corrector = next(i for i, (values, _) in enumerate(plant.writes) if any(pv in CURRENT_PVS for pv in values))
         self.assertLess(phase, corrector)
         self.assertTrue(controller.outside_orbit_threshold(plant.orbit()))
 
-    def test_phase_recovery_rechecks_orbit_before_corrector_writes(self):
+    def test_phase_recovery_allows_interleaved_correction_and_rechecks_final_orbit(self):
         plant, controller, events = self.controller()
         original = plant.orbit
         plant.target_phase = 2.5
@@ -649,7 +928,8 @@ class FeedbackTests(unittest.TestCase):
         controller.cycle()
         self.assertAlmostEqual(plant.values[PHASE_PV], 2.5)
         self.assertTrue(any(e["kind"] == "phase_priority" for e in events))
-        self.assertFalse(any(any(pv in CURRENT_PVS for pv in values) for values, _ in plant.writes))
+        self.assertTrue(any(any(pv in CURRENT_PVS for pv in values) for values, _ in plant.writes))
+        self.assertFalse(controller.outside_orbit_threshold(plant.orbit()))
 
     def test_countdown_and_orbit_drift_interrupt_wait(self):
         for drift in (False, True):
@@ -1046,7 +1326,7 @@ class GuiTests(unittest.TestCase):
             _APP.processEvents()
             panel.close()
 
-    def test_calibration_completion_resets_plots_but_preserves_references_logs_and_matrix(self):
+    def test_feedback_reference_resets_plots_and_origins_but_preserves_logs_and_matrix(self):
         from Knobs.linac_feedback_gui import FeedbackPanel
         panel = FeedbackPanel(lambda: "/tmp", lambda: False)
         initial = dict.fromkeys(PVS, 1.)
@@ -1065,32 +1345,39 @@ class GuiTests(unittest.TestCase):
             title = "Response matrix to use (2026-10-28 14:35:20)"
             self.assertEqual(panel.response_group.title(), title)
             panel.on_event(dict(kind="response_measured", elapsed=300., measured_at=measured_at))
-            panel.draw_plot()
-            self.assertEqual(list(panel.points), [])
-            self.assertEqual(list(panel.orbits), [])
-            self.assertEqual(list(panel.parameter_points), [(0., (0.,) * 6)])
-            self.assertEqual(list(panel.threshold_history), [(0., .75)])
-            self.assertEqual(panel.latest_elapsed, 0.)
-            self.assertIsNone(panel.latest_transmission)
+            self.assertIn("Capturing feedback reference", panel.status.text())
             self.assertEqual(panel.initial_transmission, .8)
-            self.assertEqual(panel.reference, [.1] * 4)
-            self.assertEqual(panel.orbit_reference, [.1] * 4)
+            initial = dict.fromkeys(PVS, 2.)
+            panel.on_event(dict(kind="reference", feedback_start=True, transmission=.9, orbit_mm=[.2] * 4,
+                                settings=initial, elapsed=300.))
+            panel.draw_plot()
+            self.assertEqual(list(panel.points), [(0., .9)])
+            self.assertEqual(list(panel.orbits), [(0., [0.] * 4)])
+            self.assertEqual(list(panel.parameter_points), [(0., (0.,) * 6)])
+            self.assertEqual(list(panel.threshold_history), [(0., .85)])
+            self.assertEqual(panel.latest_elapsed, 0.)
+            self.assertEqual(panel.latest_transmission, .9)
+            self.assertEqual(panel.initial_transmission, .9)
+            self.assertEqual(panel.transmission_baseline, .9)
+            self.assertEqual(panel.reference, [.2] * 4)
+            self.assertEqual(panel.orbit_reference, [.2] * 4)
             self.assertEqual(panel.initial_settings, initial)
             self.assertEqual(panel.response_group.title(), title)
             self.assertEqual(panel.response_table.item(0, 0).text(), "1")
             self.assertIn("Measuring response: ZH1L", panel.log.toPlainText())
             panel.on_event(dict(kind="state", state="Timing tracking", elapsed=301.))
             panel.on_event(dict(kind="transmission", transmission=.81, settings=initial, elapsed=302.))
-            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.2] * 4, elapsed=303.))
-            self.assertEqual(list(panel.points), [(2., .81)])
-            self.assertEqual(list(panel.orbits), [(3., [100.] * 4)])
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.3] * 4, elapsed=303.))
+            self.assertEqual(list(panel.points), [(0., .9), (2., .81)])
+            self.assertEqual(panel.orbits[-1][0], 3.)
+            np.testing.assert_allclose(panel.orbits[-1][1], [100.] * 4)
             panel.on_event(dict(matrix_event, elapsed=304., timestamp="2026-10-29T12:00:00+09:00"))
             self.assertEqual(panel.response_group.title(), title)  # A save/report is not a new measurement.
             self.assertEqual(json.loads(panel.log.toPlainText().splitlines()[-1])["elapsed"], 304.)
             panel.draw_plot()
             self.assertEqual(panel.axes[1].get_xlabel(), "Feedback elapsed [s]")
             for timing_delta, phase_delta in ((20., .5), (-5., -10.), (0., 0.)):
-                settings = dict(initial, **{TIMING_PV: 1 + timing_delta, PHASE_PV: 1 + phase_delta})
+                settings = dict(initial, **{TIMING_PV: 2 + timing_delta, PHASE_PV: 2 + phase_delta})
                 panel.on_event(dict(kind="settings", settings=settings, initial_settings=initial, elapsed=305.))
                 panel.draw_plot()
                 for axis in (panel.parameter_axes[0], panel.phase_axis):
@@ -1176,7 +1463,7 @@ class GuiTests(unittest.TestCase):
                 panel.measure_response_check.setChecked(True)
                 self.assertTrue(panel.config().measure_response_on_start)
                 panel.target_checks["adjust_correctors"].setChecked(False)
-                self.assertFalse(panel.measure_response_check.isEnabled())
+                self.assertTrue(panel.measure_response_check.isEnabled())
                 self.assertFalse(panel.config().measure_response_on_start)
                 panel.target_checks["adjust_correctors"].setChecked(True)
                 self.assertTrue(panel.measure_response_check.isEnabled())
@@ -1294,8 +1581,18 @@ class GuiTests(unittest.TestCase):
                     self.assertEqual(list(panel.threshold_history), [])
                     self.assertIsNone(panel.orbit_reference)
                     self.assertFalse(panel.settings.isEnabled())
-                    self.assertFalse(panel.targets.isEnabled())
-                    self.assertFalse(panel.measure_response_check.isEnabled())
+                    self.assertTrue(panel.targets.isEnabled())
+                    self.assertTrue(panel.measure_response_check.isEnabled())
+                    for box in panel.target_checks.values():
+                        box.setChecked(False)
+                    panel.worker.set_targets.assert_called_with(dict(adjust_timing=False, adjust_phase=False, adjust_correctors=False))
+                    panel.on_event(dict(kind="state", state="Waiting for adjustment targets", elapsed=1.))
+                    self.assertEqual(panel.status.text(), "WAITING | No adjustment targets selected")
+                    panel.on_event(dict(kind="transmission_monitor", transmission=.9, shots=10, elapsed=2.))
+                    self.assertEqual(panel.points[-1], (2., .9))
+                    panel.worker.set_targets.reset_mock()
+                    panel.measure_response_check.setChecked(False)
+                    panel.worker.set_targets.assert_not_called()  # Applies at next START.
                     self.assertTrue(window.config_sections.isEnabled())
                     panel.finished()
                 self.assertTrue(panel.settings.isEnabled())

@@ -4,7 +4,7 @@ Orbit coordinates are [ML8L.x, ML10L.x, ML8L.y, ML10L.y] in mm.
 All grids are relative to the initial setpoints (fractional origins preserved).
 """
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import product
 import time
@@ -33,6 +33,10 @@ class BeamLoss(RuntimeError):
 
 class OrbitDrift(RuntimeError):
     """Switch to orbit recovery only after a temporary probe has been restored."""
+
+
+class TargetsChanged(RuntimeError):
+    """Restart dispatch after applying target selections at a safe boundary."""
 
 
 @dataclass(frozen=True)
@@ -153,6 +157,7 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
 """
     def __init__(self, io, config, limits, emit=lambda event: None):
         self.io, self.config, self.emit = io, config, emit
+        self.machine_limits = dict(limits)
         self.limits = dict(limits)
         self.response = RecentResponse()
         self.cycle_number = 0
@@ -160,6 +165,31 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
         self.orbit_alert = False
         self.transmission_history = deque(maxlen=config.degradation_samples)
         self._baseline_candidate = None
+        self.target_provider = None
+        self.timing_at_optimum = False
+        self._interleave_context = None
+
+    def checkpoint(self):
+        # Only call at accepted settings, outside a temporary probe's try/finally.
+        self.io.checkpoint()
+        if self.target_provider is not None:
+            selection = self.target_provider()
+            changes = {name: bool(selection[name]) for name in
+                       ("adjust_timing", "adjust_phase", "adjust_correctors")}
+            if any(getattr(self.config, name) != value for name, value in changes.items()):
+                self.config = replace(self.config, **changes)
+                self._interleave_context = None
+                self.event("targets_changed", **changes)
+                raise TargetsChanged()
+
+    def wait_for_targets(self):
+        if any((self.config.adjust_timing, self.config.adjust_phase, self.config.adjust_correctors)):
+            return
+        self.set_state("Waiting for adjustment targets")
+        while not any((self.config.adjust_timing, self.config.adjust_phase, self.config.adjust_correctors)):
+            self.checkpoint()
+            # Keep timestamped BPM/ICT monitoring and the ICT loss guard alive.
+            self.io.wait(.2)
 
     def event(self, kind, **values):
         self.emit(dict(kind=kind, state=self.state, cycle=self.cycle_number, **values))
@@ -258,33 +288,43 @@ and parameter origins remain fixed.
                        remaining_sec=max(0., self.config.baseline_hold_sec - duration),
                        confirmations=candidate["confirmations"], required=self.config.baseline_min_confirmations)
 
-    def initialize(self):
-        self.set_state("Capturing reference")
-        self.io.checkpoint()
+    def initialize(self, feedback_start=False):
+        self.set_state("Capturing feedback reference" if feedback_start else "Capturing reference")
+        self.checkpoint()
         self.current = {pv: float(self.io.read(pv)) for pv in PVS}
         if not np.isfinite(list(self.current.values())).all():
             raise ValueError("Invalid initial setpoints")
-        self.origin = dict(self.current)
+        origin = dict(self.current)
+        limits = {}
         excursions = (self.config.timing_range_ns, self.config.phase_range_deg) + (self.config.current_range_A,) * 4
         for pv, span in zip(PVS, excursions):
-            lo, hi = self.limits[pv]
-            lo, hi = max(lo, self.origin[pv] - span), min(hi, self.origin[pv] + span)
-            if not np.isfinite([lo, hi]).all() or not lo <= self.origin[pv] <= hi or lo >= hi:
+            lo, hi = self.machine_limits[pv]
+            lo, hi = max(lo, origin[pv] - span), min(hi, origin[pv] + span)
+            if not np.isfinite([lo, hi]).all() or not lo <= origin[pv] <= hi or lo >= hi:
                 raise ValueError(f"Invalid limits for {pv}")
-            self.limits[pv] = (lo, hi)
-        self.reference = self.orbit()
-        self.initial_orbit = self.reference.copy()
-        self.initial_transmission = self.transmission()
-        if self.initial_transmission <= 0:
+            limits[pv] = (lo, hi)
+        reference = self.orbit()
+        transmission = self.transmission()
+        if transmission <= 0:
             raise ValueError("Establish transmitted beam before starting feedback")
+        # Publish the new reference only after both fresh measurements succeed.
+        self.origin, self.limits = origin, limits
+        self.reference = reference
+        self.initial_orbit = reference.copy()
+        self.initial_transmission = transmission
         self.transmission_baseline = self.initial_transmission
         self._baseline_candidate = None
+        self.transmission_history.clear()
+        self.orbit_alert = False
         self.event("reference", orbit_mm=self.reference.tolist(), transmission=self.initial_transmission,
                    settings=self.origin, limits=self.limits,
-                   baseline=self.transmission_baseline, degradation_threshold=self.recovery_threshold())
+                   baseline=self.transmission_baseline, degradation_threshold=self.recovery_threshold(),
+                   feedback_start=feedback_start)
         self.settings_event()
         if hasattr(self.io, "set_orbit_monitor"):
             self.io.set_orbit_monitor(self.monitor_orbit)
+        if feedback_start and hasattr(self.io, "reset_monitor_batches"):
+            self.io.reset_monitor_batches()
 
     def write(self, values, restore=False):
         for pv, value in values.items():
@@ -299,22 +339,92 @@ and parameter origins remain fixed.
         self.current.update(values)
         self.settings_event()
 
-    def search(self, pv, step, label, guard_orbit=True):
-        """Re-measure both neighbours around each accepted centre; no old best.
+    def timing_recovery_needed(self, transmission):
+        """Check recovery only at an accepted/restored timing setting."""
+        orbit_normal = self.check_orbit(force=True, interrupt=False)
+        self.checkpoint()
+        threshold = self.recovery_threshold()
+        phase_needed = self.config.adjust_phase and transmission < threshold - 1e-12
+        orbit_needed = self.config.adjust_correctors and not orbit_normal
+        if phase_needed or orbit_needed:
+            self.event("timing_yield", transmission=transmission, threshold=threshold,
+                       orbit_normal=orbit_normal,
+                       reason="Phase recovery needed" if phase_needed else "Orbit correction needed")
+            return True
+        return False
+
+    def _orbit_context_key(self):
+        # RMS results from different accepted RF settings are not comparable.
+        return (self.cycle_number, self.current[TIMING_PV], self.current[PHASE_PV], *self.reference)
+
+    def orbit_intervention_blocked(self):
+        context = self._interleave_context
+        return bool(context and context["key"] == self._orbit_context_key() and context.get("blocked"))
+
+    def interleave_orbit(self, label, transmission=None, phase_priority=False):
+        """At a completed RF trial boundary, perform at most one accepted step.
+
+Return whether any correction was attempted, so the caller discards its old
+RF comparisons. Temporary RF offsets must already be restored or accepted.
+"""
+        self.checkpoint()
+        if not self.config.adjust_correctors:
+            return False
+        if (phase_priority and self.config.adjust_phase and transmission is not None
+                and transmission < self.recovery_threshold() - 1e-12):
+            return False
+        if not self.orbit_alert and not self.outside_orbit_threshold(self.latest_orbit):
+            return False
+        if self.check_orbit(force=True, interrupt=False):
+            self._interleave_context = None
+            return False
+        key = self._orbit_context_key()
+        if self._interleave_context is None or self._interleave_context["key"] != key:
+            self._interleave_context = dict(key=key, attempts=0, steps=0, blocked=False)
+        context = self._interleave_context
+        if context["blocked"]:
+            return False
+        if context["steps"] >= self.config.max_orbit_steps:
+            context["blocked"] = True
+            self.event("orbit_intervention_deferred", reason="Correction step limit at this RF setting")
+            return False
+        attempts = context["attempts"]
+        self.event("orbit_intervention", operation=label, orbit_mm=self.latest_orbit.tolist())
+        try:
+            result = self.correct_orbit(max_steps=1, context=context)
+            if result is False or context["attempts"] == attempts:
+                context["blocked"] = True
+        finally:
+            self.set_state(label)
+        return context["attempts"] > attempts
+
+    def search(self, pv, step, label, guard_orbit=True, check_recovery_at_start=True):
+        """Measure relative neighbours around the accepted centre; no old best.
 
 Bracket each neighbour with centre measurements to reject linear time drift.
-Probe order alternates between cycles. No move on ties or insignificant gain.
+Timing follows the first confirmed improving direction and yields on recovery
+conditions or an unconfirmed improvement. Phase compares both neighbours.
+The first probe direction alternates between cycles. No move on ties.
 """
         self.set_state(label)
         center = self.current[pv]
         lo, hi = self.limits[pv]
+        timing = pv == TIMING_PV
+        direction_hint = -1 if self.cycle_number % 2 else 1
+        if timing:
+            self.timing_at_optimum = False
+            if check_recovery_at_start:
+                value = self.transmission()
+                if self.timing_recovery_needed(value):
+                    return value
         for _ in range(self.config.max_search_steps):
-            self.io.checkpoint()
-            if guard_orbit:
+            self.checkpoint()
+            if guard_orbit and not timing:
                 self.check_orbit()
             best_gain, best_value = self.config.min_gain, center
             missing_neighbor = False
-            order = (-1, 1) if self.cycle_number % 2 else (1, -1)
+            restart_comparison = False
+            order = (direction_hint, -direction_hint)
             for direction in order:
                 target = center + direction * step
                 if not lo - 1e-9 <= target <= hi + 1e-9:
@@ -327,19 +437,36 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
                 finally:
                     self.write({pv: center}, restore=True)
                 after = self.transmission()
-                if guard_orbit:
+                self.checkpoint()
+                if guard_orbit and not timing:
                     self.check_orbit()  # Probe restored; orbit can take priority.
                 gain = trial - (before + after) / 2
                 self.event("probe", pv=pv, value=target, gain=gain)
                 if gain > best_gain + 1e-12:
                     best_gain, best_value = gain, target
+                    if timing:
+                        # Confirm the first improving neighbour immediately;
+                        # keep following it while real improvements continue.
+                        break
+                elif timing:
+                    if self.interleave_orbit(label, after, phase_priority=True):
+                        restart_comparison = True
+                        break
+                    if self.timing_recovery_needed(after):
+                        return after
+            if restart_comparison:
+                continue
             if best_value == center:
+                if self.interleave_orbit(label):
+                    continue
                 value = self.transmission()
                 # A range endpoint cannot establish an unconstrained local optimum.
                 if missing_neighbor:
                     self.event("range_limit", pv=pv, value=center, transmission=value)
                     raise RuntimeError(f"{label}: range boundary reached; expand the range and restart")
                 self.event("local_peak", pv=pv, value=center, transmission=value)
+                if timing:
+                    self.timing_at_optimum = True
                 return value
             # Confirmation uses a fresh centre measurement; undo a failed move.
             before = self.transmission()
@@ -352,13 +479,26 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
                 if not accepted:
                     self.write({pv: center}, restore=True)
             if accepted:
+                if timing:
+                    direction_hint = 1 if best_value > center else -1
                 center = best_value
                 self.event("accepted", pv=pv, value=center, transmission=after)
                 if pv == PHASE_PV:
                     self.report_response()
+                self.interleave_orbit(label)
             else:
+                if timing:
+                    # The trial has been restored. Do not repeat a noisy hint
+                    # up to max_search_steps or claim an unconfirmed optimum.
+                    value = self.transmission()
+                    if self.interleave_orbit(label, value, phase_priority=True):
+                        continue
+                    self.timing_recovery_needed(value)
+                    self.event("timing_stopped", reason="No confirmed timing improvement", transmission=value)
+                    return value
                 # A noisy probe is not evidence that a local maximum was reached.
                 self.event("retry", message="Unconfirmed neighbour improvement")
+                self.interleave_orbit(label)
         raise RuntimeError(f"{label}: no confirmed local maximum within iteration limit")
 
     def currents(self):
@@ -391,7 +531,7 @@ Restore every trial, including failures; commit all four columns atomically.
             amplitude = min(RESPONSE_INITIAL_STEP_A, room)
             rows = slice(0, 2) if index % 2 == 0 else slice(2, 4)
             for attempt in range(6):
-                self.io.checkpoint()
+                self.checkpoint()
                 before = self.orbit()
                 delta = sign * amplitude
                 try:
@@ -400,6 +540,7 @@ Restore every trial, including failures; commit all four columns atomically.
                 finally:
                     self.write({pv: center}, restore=True)
                 after = self.orbit()
+                self.checkpoint()
                 response = measured - (before + after) / 2
                 excursion = float(np.max(abs(response[rows])))
                 accepted = .8 * RESPONSE_TARGET_MM <= excursion <= 1.2 * RESPONSE_TARGET_MM
@@ -431,7 +572,7 @@ Restore every trial, including failures; commit all four columns atomically.
                    message="Startup response acquired; cross-plane terms zero; matrix fixed for corrections")
         self.report_response()
 
-    def correct_orbit(self):
+    def correct_orbit(self, max_steps=None, context=None):
         """Keep improving corrections, using a fixed or adaptive response model.
 
 A usable stored model proposes the first move. Without one, or if its move
@@ -440,14 +581,22 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
         self.set_state("Correcting orbit")
         best_currents, best_rms = self.currents().copy(), float("inf")
         consecutive_failures = 0
+        offset = 0
+        if context is not None:
+            best_currents = context.get("best_currents", best_currents).copy()
+            best_rms = context.get("best_rms", best_rms)
+            consecutive_failures = context.get("failures", 0)
+            offset = context["steps"]
         steps = np.array(list(product((-1, 0, 1), repeat=4)), float) * CURRENT_STEP
-        for iteration in range(self.config.max_orbit_steps):
-            self.io.checkpoint()
+        for iteration in range(self.config.max_orbit_steps if max_steps is None else max_steps):
+            self.checkpoint()
             before = self.orbit()
             residual = before - self.reference
             rms = float(np.sqrt(np.mean(residual ** 2)))
             if rms < best_rms:
                 best_currents, best_rms = self.currents().copy(), rms
+            if context is not None:
+                context.update(best_currents=best_currents.copy(), best_rms=best_rms)
             if np.max(abs(residual)) < 1e-9:
                 self.event("orbit_done", reason="reference restored")
                 return
@@ -469,7 +618,7 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
             # Cycle the coordinate priority so one corrector does not consume
             # the whole iteration budget before other orbit components improve.
             for index in range(4):
-                direction = np.eye(4)[(iteration + index) % 4]
+                direction = np.eye(4)[(offset + iteration + index) % 4]
                 for sign in (1., -1.):
                     delta = direction * sign * CURRENT_STEP
                     if not any(np.array_equal(delta, move) for move, _ in proposals):
@@ -482,7 +631,7 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
                 # A failed trial was restored; remeasure to avoid comparing a
                 # later correction against an old orbit during beam drift.
                 if proposal_index:
-                    self.io.checkpoint()
+                    self.checkpoint()
                     before = self.orbit()
                     rms = float(np.sqrt(np.mean((before - self.reference) ** 2)))
                     if rms < best_rms:
@@ -499,19 +648,23 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
                         best_currents, best_rms = self.currents().copy(), rms
                     accepted = np.linalg.norm(measured - self.reference) < np.linalg.norm(before - self.reference)
                     consecutive_failures = 0 if accepted else consecutive_failures + 1
+                    if context is not None:
+                        context.update(attempts=context["attempts"] + 1, failures=consecutive_failures,
+                                       best_currents=best_currents.copy(), best_rms=best_rms)
                     self.event("orbit_step", settings=targets, orbit_mm=measured.tolist(),
                                accepted=bool(accepted), source=source, rms_um=1000 * rms,
-                               consecutive_failures=consecutive_failures)
+                               consecutive_failures=consecutive_failures, interleaved=context is not None)
                 finally:
                     if not accepted:
                         self.write(original, restore=True)
                 self.report_response()
+                self.checkpoint()
                 if consecutive_failures >= 3:
                     self.set_state("Restoring best orbit")
                     # Return in normal correction-sized steps; beam checks and
                     # cancellation remain active during this deliberate move.
                     while np.max(abs(best_currents - self.currents())) > 1e-12:
-                        self.io.checkpoint()
+                        self.checkpoint()
                         values = self.currents() + np.clip(best_currents - self.currents(), -CURRENT_STEP, CURRENT_STEP)
                         self.write({pv: float(value) for pv, value, current in zip(CURRENT_PVS, values, self.currents())
                                     if abs(value - current) > 1e-12})
@@ -521,26 +674,29 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
                                reason="Three consecutive unsuccessful correction attempts")
                     return False
                 if accepted:
+                    if context is not None:
+                        context["steps"] += 1
                     break
             if not accepted:
                 self.event("orbit_done", reason="no improving correction; accepted currents retained")
                 return
-        self.event("orbit_done", reason="correction iteration limit")
+        self.event("orbit_done", reason="single correction step complete" if context is not None else "correction iteration limit")
 
-    def evaluate_transmission(self):
+    def evaluate_transmission(self, allow_baseline_update=True):
         """Evaluate settled transmission; orbit drift does not block phase recovery."""
         self.transmission_history.clear()
         self.set_state("Checking transmission after timing")
         threshold = self.recovery_threshold()
         for index in range(self.config.degradation_samples):
-            self.io.checkpoint()
+            self.checkpoint()
             self.transmission_history.append(self.transmission())
             self.event("transmission_average", average=float(np.mean(self.transmission_history)),
                        samples=index + 1, required=self.config.degradation_samples,
                        threshold=threshold, complete=index + 1 == self.config.degradation_samples)
         orbit_normal = self.check_orbit(force=True, interrupt=False)
+        self.checkpoint()
         average = float(np.mean(self.transmission_history))
-        if orbit_normal:
+        if orbit_normal and allow_baseline_update:
             self.update_transmission_baseline(average, self.latest_orbit)
         elif average <= self.transmission_baseline + 1e-12:
             self.reset_baseline_candidate("Improvement was not sustained")
@@ -557,31 +713,36 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
         self.cycle_number += 1
         self.set_state("Checking orbit")
         self.check_orbit(force=True, interrupt=False)
-        # Monitoring continues during scans, but orbit recovery must wait until
-        # timing and the transmission-based phase decision have completed.
+        # Timing yields at accepted settings when recovery is needed; confirmed
+        # improving timing moves may continue until an improvement fails.
         if self.config.adjust_timing:
             self.search(TIMING_PV, TIMING_STEP, "Timing tracking", guard_orbit=False)
-        degraded, orbit_normal = self.evaluate_transmission()
+        degraded, orbit_normal = self.evaluate_transmission(
+            allow_baseline_update=not self.config.adjust_timing or self.timing_at_optimum)
         if degraded and self.config.adjust_phase:
             self.event("phase_priority", message="Transmission below threshold; phase recovery before orbit correction")
             self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery", guard_orbit=False)
             if self.config.adjust_timing:
-                self.search(TIMING_PV, TIMING_STEP, "Timing after phase recovery", guard_orbit=False)
+                self.search(TIMING_PV, TIMING_STEP, "Timing after phase recovery", guard_orbit=False,
+                            check_recovery_at_start=False)
             # Phase/timing changes may have removed the drift; use a new mean.
             orbit_normal = self.check_orbit(force=True, interrupt=False)
-        if not orbit_normal and self.config.adjust_correctors:
+        if not orbit_normal and self.config.adjust_correctors and not self.orbit_intervention_blocked():
             self.event("orbit_recovery", message="Orbit outside threshold after phase decision; correcting orbit")
-            correction_result = self.correct_orbit()
+            self.correct_orbit()
             self.orbit_alert = False
             if self.config.adjust_timing:
-                self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
+                self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False,
+                            check_recovery_at_start=False)
             # Resume baseline confirmation only at a settled operating point.
             # Three failed attempts return directly to timing/phase recovery.
-            degraded, _ = self.evaluate_transmission()
-            if correction_result is False and degraded and self.config.adjust_phase:
+            degraded, _ = self.evaluate_transmission(
+                allow_baseline_update=not self.config.adjust_timing or self.timing_at_optimum)
+            if degraded and self.config.adjust_phase:
                 self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery", guard_orbit=False)
                 if self.config.adjust_timing:
-                    self.search(TIMING_PV, TIMING_STEP, "Timing after phase recovery", guard_orbit=False)
+                    self.search(TIMING_PV, TIMING_STEP, "Timing after phase recovery", guard_orbit=False,
+                                check_recovery_at_start=False)
         self.set_state("Monitoring")
 
     def wait_cycle(self):
@@ -589,7 +750,7 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
         self.set_state("Waiting for next timing scan" if self.config.adjust_timing else "Waiting for next feedback cycle")
         deadline = time.monotonic() + self.config.interval_sec
         while True:
-            self.io.checkpoint()
+            self.checkpoint()
             self.check_orbit()
             remaining = max(0., deadline - time.monotonic())
             self.event("waiting", remaining_sec=remaining, next_action=next_action, bpm_monitoring=True)
@@ -601,20 +762,30 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
     def run(self, pause_for_loss=None):
         initialized = False
         response_ready = not (self.config.measure_response_on_start and self.config.adjust_correctors)
+        feedback_ready = response_ready
         while True:
             try:
-                self.io.checkpoint()
+                self.checkpoint()
                 if not initialized:
                     self.initialize()
                     initialized = True
+                self.wait_for_targets()
                 if not response_ready:
                     self.measure_response()
                     response_ready = True
+                if not feedback_ready:
+                    self.initialize(feedback_start=True)
+                    feedback_ready = True
                 self.cycle()
                 self.wait_cycle()
+            except TargetsChanged:
+                # Temporary probes have already restored their original settings.
+                # Redispatch immediately, including during the cycle countdown.
+                continue
             except OrbitDrift:
                 self.event("orbit_priority", message="Orbit drift during wait; starting cycle with phase priority")
             except BeamLoss as exc:
+                self._interleave_context = None
                 # Every probe/trial has already unwound its finally block.
                 # Keep the original reference and accepted machine settings;
                 # discard the interrupted search; retain response observations

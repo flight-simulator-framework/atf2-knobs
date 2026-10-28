@@ -24,13 +24,27 @@ The top-level tabs are **Main → Active Feedback → Config**. Active Feedback
 runs until Stop, with Main
 optimization and reset disabled while feedback owns the actuators. Start captures
 a fixed initial transmission and ML8L/ML10L orbit plot origin. The correction
-reference starts at that orbit and follows confirmed transmission baseline improvements. Transmission is the
+reference starts at that orbit and follows confirmed transmission baseline improvements.
+When startup response measurement is enabled, its completion is followed by
+fresh 10-shot transmission and BPM measurements and a reread of all setpoints.
+These post-calibration values become the feedback Initial, recovery baseline,
+orbit reference and parameter origins; the transmission threshold is recalculated
+from the new baseline. Feedback cannot begin until this capture succeeds. An ICT
+loss during capture pauses and retries capture on Resume without remeasuring
+the successfully acquired matrix. Transmission is the
 selected downstream ICT (DR by default) divided by LN0, independently of Main's
 objective/weights. Absolute ICT values are used only for the nonpositive-beam
 auto-pause guard. The normal feedback mode is timing tracking, with phase recovery
 taking priority over orbit correction when transmission is degraded. Run Control selects **Timing**, **CM8L phase**, and **Correctors**
-(all on by default). Unchecked targets are never written; the selections are
-locked from Start until Stop. All unchecked means monitoring only. If Correctors
+(all on by default). These target checkboxes remain editable while running.
+Changes apply at accepted settings after any temporary probe has been restored;
+disabled targets receive no new adjustment commands after the change is applied.
+Applied selections are recorded as `targets_changed` events. A changed selection
+wakes the cycle countdown and restarts dispatch with the new targets.
+All targets unchecked displays **WAITING | No adjustment targets selected**,
+retains the active run, and continues BPM/ICT monitoring and the ICT loss guard
+without actuator writes or a scan countdown. Selecting a target resumes feedback
+automatically. If Correctors
 is off, timing and phase can still track even while the orbit
 is outside tolerance. Timing off skips timing searches; phase recovery still uses
 the transmission threshold at the current operating point. All Feedback Settings
@@ -38,9 +52,15 @@ are under **Config → Active Feedback** and remain locked during a feedback run
 With all targets enabled:
 
 1. Track a local transmission maximum on the relative 2.8 ns timing grid using
-   `EVE_LINAC:OUT0:SetData`. Remeasure centre and neighbours every cycle; historical
-   best scores are not reused. Centre measurements bracket each probe.
-2. After timing reaches a local optimum, take one fresh 10-shot transmission
+   `EVE_LINAC:OUT0:SetData`. At the start of a cycle, existing actionable BPM or
+   transmission recovery conditions bypass timing writes. Otherwise, try one
+   neighbour at a time, bracketed by fresh centre measurements, and confirm the
+   first improving neighbour immediately. Follow that direction while improvements
+   are confirmed. On a non-improving probe, restore the centre and check recovery
+   conditions immediately; no full timing optimum is required before recovery.
+   Failed improvement confirmation ends this timing search instead of repeating
+   noisy candidates up to 100 times. Historical best scores are not reused.
+2. After timing finishes or yields, take one fresh 10-shot transmission
    measurement. If it is **below recovery baseline − 0.05**, run CM8L phase
    recovery in 0.5° steps before any orbit correction, even if BPM drift exceeds
    its threshold. This is an absolute drop of **5 percentage points**; a baseline
@@ -55,20 +75,43 @@ With all targets enabled:
    Recheck the orbit after phase/timing adjustments, then correct any remaining
    drift with ZH1L, ZV1L,
    ZH2L and ZV2L. Every changed corrector moves by 0.005 A per step. The threshold
-   triggers correction even if transmission is not degraded. Orbit drift does not
-   interrupt timing or phase scans. Confirm the drift using 10 fresh shots at the
+   triggers correction even if transmission is not degraded. Timing yields at a
+   non-improving probe; phase remains ahead of orbit correction. Confirm the drift using 10 fresh shots at the
    accepted settings before switching to correction. Correction targets the current orbit reference until
    no improving grid move remains, three trials fail consecutively, or the iteration limit is reached.
-4. After orbit correction, retune timing and evaluate transmission again.
-   Phase recovery is reconsidered next cycle if transmission is still degraded;
+4. After phase/orbit correction, give timing a fresh neighbour trial so it can
+   still improve even if transmission remains low. Continue confirmed improvements;
+   a failed trial yields promptly when recovery is still needed. After orbit
+   correction, evaluate transmission and run phase recovery if still degraded;
    an unresolved orbit does not block it. Orbit drift during the cycle wait starts
    another cycle with the same phase-before-orbit order.
    Pause retains accepted settings; Stop
    and closing the window remove temporary probes and retain accepted settings.
 
+Orbit correction also intervenes **during timing and phase searches** whenever
+Correctors is enabled. Monitoring latches drift continuously, and a fresh ten-shot
+BPM mean confirms it at a completed RF evaluation boundary. Correctors remain
+fixed throughout an RF before/probe/restored comparison and its acceptance
+confirmation. At the boundary, make at most one accepted 0.005 A correction step,
+then return to the RF search. Timing can also intervene after its first failed
+neighbour; a transmission drop still gives phase recovery priority there.
+An intervention discards pending RF comparisons so the next decision uses new
+ten-shot means at the corrected currents. Already accepted RF settings remain.
+This interleaving is disabled during dedicated response acquisition.
+
+RMS history and failed-attempt counts for interleaved correction belong to the
+same accepted timing/phase setting and orbit reference. After three consecutive
+failed correction attempts, restore that context's best RMS settings, then let
+the RF search proceed without repeating correction at that same setting in the
+same cycle. A changed RF setting/reference or the next cycle permits another
+attempt. The configured orbit step limit also bounds intervention at one RF
+setting. `orbit_intervention` and `orbit_step` events record these actions.
+
 The recovery baseline starts at the initial transmission. It rises only after
 improvement is confirmed for **120 seconds and at least 3 complete operating-point
 means**, with timing at a local optimum and normal BPM readings. The new baseline
+does not advance from a timing search that yielded or failed confirmation.
+The promoted value
 is the lowest confirmed mean during that interval, avoiding a transient maximum.
 The GUI's **Raise baseline after [s]** controls the duration. A confirmed mean at
 or below the current baseline, Pause or beam loss cancels pending confirmation.
@@ -87,7 +130,9 @@ as its measured trace, move to the new reference offset ± the configured tolera
 orbit references. A new START captures new initial references.
 
 Run Control's **Measure response matrix at Start** checkbox (off by default)
-acquires a new response before feedback when Correctors is enabled. Each corrector
+acquires a new response before feedback when Correctors is enabled.
+This checkbox can also be edited during a run; its changes apply at the next
+START and do not request an immediate acquisition. Each corrector
 starts with a 0.05 A trial, then adapts its excitation to give a 400–600 µm
 change in the larger of the two primary-plane BPM readings (500 µm target).
 Every trial uses fresh 10-shot means before excitation, at the displaced setting,
@@ -151,10 +196,11 @@ four corrector currents share an A-axis plot. Both show changes from the initial
 setpoints against elapsed time, including temporary probes and restorations.
 Step traces extend through cycle waits and update with the other live plots.
 Timing and phase use symmetric vertical limits, keeping zero at the center of
-both axes as their independent ranges expand. When startup response acquisition
-finishes, all plot histories clear and the feedback elapsed-time axes restart
-at zero. Initial references, thresholds, the acquired matrix and full operation
-logs are retained. Partial monitor batches are discarded at this boundary so
+both axes as their independent ranges expand. When the post-calibration feedback
+reference capture finishes, all plot histories clear and the feedback elapsed-time
+axes restart at zero using the newly captured references and thresholds. The
+acquired matrix and full operation logs are retained. Partial monitor batches
+are discarded at this boundary so
 calibration samples do not enter the first feedback monitor mean.
 The transmission plot shows only **Initial**, **Threshold** and **Measured transmission**.
 Threshold follows the confirmed recovery baseline minus the configured absolute
@@ -323,38 +369,41 @@ are preserved. With Correctors & L8, L8 remains owned by that combined optimizer
 Membership is saved in the run configuration as `kly_group_1_members` and
 `kly_group_2_members`; older configurations default to all eight members.
 
-The optional **Auto restore ML8L / ML10L orbit (≥100 µm)** checkbox under
-GUN / Solenoid / L0 is initially off. It captures three valid samples of both
-BPMs' X and Y before the gun-section scan and compares three-sample means after
-all three settings have been optimized. Correction runs once at that stage,
-before Klystron/Timing/QA/QM, rather than at each optimizer candidate.
+The optional **Auto restore ML8L / ML10L orbit (≥150 µm)** checkbox under
+GUN / Solenoid / L0 is initially off. It captures ten valid samples of both
+BPMs' X and Y before the gun-section scan and compares fresh ten-shot means after
+all three settings have been optimized. Correction runs at that stage before
+Klystron/Timing/QA/QM, rather than at each optimizer candidate.
 
-- A displacement of ≥0.100 mm at either BPM activates that plane. X uses
-  ZH1L/ZH2L only; Y uses ZV1L/ZV2L only; XY uses all four, including measured
-  cross-plane response. The target is the pre-scan orbit, not zero position.
-- Each iteration probes selected correctors by ±0.05 A around the current
-  accepted setting, shortened at verified limits. Each probe measurement uses
-  three BPM samples, and the probe is restored before moving on.
-- An SVD solve of the measured response supplies 70% of the estimated correction.
-  A response with condition number ≥100 is rejected. Changes are capped at
-  0.1 A per corrector per iteration and 0.5 A from the reference current, within
-  verified IOC limits and the existing ±5 A steer envelope.
-- A correction is kept only if the selected-plane residual norm decreases and
-  the unselected plane stays below 100 µm. Completion requires all four BPM
-  coordinates within 100 µm of the reference. There are at most five iterations.
-- Invalid/missing BPM samples, bad beam status/charge, failed current readback
-  (1 mA tolerance, 2 s after the configured settle time), singular response,
-  limits or failure to converge stop the run. Temporary probes and rejected
-  steps are restored; the last accepted correction remains. Gun/RF settings
-  themselves are not automatically undone on compensation failure. User pause
-  takes effect at a boundary with temporary probes restored; stop also restores
-  a pending probe or unaccepted trial.
+- Use `active_feedback_response.json` from the selected save folder. The cache
+  is validated and columns are matched by corrector name: Active Feedback stores
+  H1,V1,H2,V2, while Main uses H1,H2,V1,V2. H→y and V→x remain zero. Main does
+  not probe or retrain this matrix. A missing/incomplete cache must be acquired
+  through **Measure response matrix at Start** in Active Feedback before Main runs.
+- A displacement of ≥0.150 mm at either BPM activates that plane. X uses
+  ZH1L/ZH2L, Y uses ZV1L/ZV2L, and both use all four. The target is the fresh
+  pre-scan orbit. Active planes are reassessed on each iteration.
+- An SVD solve supplies 70% of the estimated correction. A response with condition
+  number ≥100 is rejected. Changes are capped at 0.1 A per corrector per iteration
+  and 0.5 A from the reference current, within verified IOC limits and ±5 A.
+- Evaluate each trial with a fresh ten-shot mean. Keep a correction when the RMS
+  over all four coordinate errors decreases; restore a rejected trial and halve
+  the next correction gain. Stop successfully when every coordinate is <150 µm.
+- Attempt at most **10 iterations**. If the target cannot be reached, including
+  at a current limit, return to the settings with the smallest measured four-coordinate
+  RMS during this restoration, including its starting point. The return respects
+  the 0.1 A step cap. Record **best_rms_restored** and finish normally so Main can
+  proceed to its next optimization stage.
+- Invalid BPM/beam data, current readback failures (1 mA tolerance, 2 s after the
+  configured settle time), and unusable response matrices still report errors.
+  Stop or a failed trial restores the previous accepted setting. Gun/RF settings
+  themselves are not automatically undone by compensation errors.
 
-`GunOrbitCompensation_<run tag>.json` records the reference, three-sample
-acquisitions, tested currents, response matrices, iterations, residuals and
-termination reason. Response probes do not count toward BO max eval and are not
-training points. Successful correction adds one final objective measurement to
-the run CSV. The four currents participate in initial-state restoration and
+`GunOrbitCompensation_<run tag>.json` records the pre-scan reference, ten-shot
+acquisitions, response cache path and measurement time, matrix used, iterations,
+RMS results, restored best setting and termination reason. The shared response
+cache is not modified. A retained correction adds one final objective measurement
+to the run CSV. The four currents participate in initial-state restoration and
 Save and End. Resume CSV is rejected with this option because a fresh pre-scan
 reference is required. The worker uses its injected interface for BPM/current
 reads and writes; offline tests use a coupled orbit model without live PV access.

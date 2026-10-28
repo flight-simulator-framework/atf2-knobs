@@ -143,7 +143,8 @@ def main():
                 assert states.index("CM8L phase recovery") < states.index("Correcting orbit")
                 assert abs(decision["threshold"] - (controller.initial_transmission - .05)) < 1e-9
                 residual = machine.orbit() - controller.reference
-                assert np.max(abs(residual)) < .02, residual
+                assert np.max(abs(residual)) < config.orbit_threshold_um / 1000., residual
+                assert any(e["kind"] == "orbit_step" and e.get("interleaved") for e in events)
                 assert controller.response.snapshot() == measured_model
                 assert not any(e["kind"] == "response_probe_size" or e.get("state") == "Learning corrector response" for e in events)
                 for event in events[correction_start:]:

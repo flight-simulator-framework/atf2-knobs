@@ -37,11 +37,22 @@ class FeedbackWorker(QThread):
         self.pause_reason = ""
         self.stage, self.cycle_number = "Starting", 0
         self.on_pause = None
+        self._targets_lock = threading.Lock()
+        self._requested_targets = {name: getattr(config, name) for name in
+                                   ("adjust_timing", "adjust_phase", "adjust_correctors")}
         self.response_cache = Path(save_dir) / "active_feedback_response.json"
 
     def stop(self):
         self.cancelled.set()
         self.paused.clear()
+
+    def set_targets(self, selection):
+        with self._targets_lock:
+            self._requested_targets = {name: bool(selection[name]) for name in self._requested_targets}
+
+    def target_selection(self):
+        with self._targets_lock:
+            return dict(self._requested_targets)
 
     def checkpoint(self):
         if self.paused.is_set() and not self.cancelled.is_set():
@@ -104,6 +115,7 @@ class FeedbackWorker(QThread):
             self.emit_event(dict(kind="log", message=f"Run data: {self.run_dir}"))
             machine = self.machine_factory(self.config, self.cancelled.is_set, self.checkpoint, self.emit_event)
             controller = FeedbackController(machine, self.config, machine.limits(), self.emit_event)
+            controller.target_provider = self.target_selection
             self.on_pause = controller.reset_baseline_candidate
             if self.response_cache.exists():
                 try:
@@ -176,14 +188,15 @@ class FeedbackPanel(QWidget):
                             ("adjust_correctors", "Correctors")):
             box = QCheckBox(label)
             box.setChecked(True)
-            box.setToolTip("Enable automatic adjustment for this run. Select before START; all unchecked runs monitoring only.")
+            box.setToolTip("Enable or disable this target during feedback. Changes apply after the current probe is restored. All targets off waits with monitoring active.")
             self.target_checks[name] = box
             target_layout.addWidget(box)
         run_layout.addWidget(self.targets)
         self.measure_response_check = QCheckBox("Measure response matrix at Start")
         self.measure_response_check.setChecked(FeedbackConfig().measure_response_on_start)
-        self.measure_response_check.setToolTip("Excite each corrector for a 400–600 µm primary-plane displacement using fresh 10-shot means, then restore it. H→y and V→x are zero. The measured matrix is saved and kept fixed. Requires Correctors enabled.")
-        self.target_checks["adjust_correctors"].toggled.connect(self.measure_response_check.setEnabled)
+        self.measure_response_check.setToolTip("Applies at the next START, including changes made while running. Excite each corrector for a 400–600 µm primary-plane displacement using fresh 10-shot means, then restore it. H→y and V→x are zero. The measured matrix is saved and kept fixed. Requires Correctors enabled at START.")
+        for box in self.target_checks.values():
+            box.toggled.connect(self.update_targets)
         run_layout.addWidget(self.measure_response_check)
         row = QHBoxLayout()
         self.start_button, self.pause_button, self.stop_button = (QPushButton(s) for s in ("START", "PAUSE", "STOP"))
@@ -331,6 +344,10 @@ class FeedbackPanel(QWidget):
                                                          and self.target_checks["adjust_correctors"].isChecked()),
                               downstream=self.downstream.currentText())
 
+    def update_targets(self, _checked=None):
+        if self.worker is not None:
+            self.worker.set_targets({name: box.isChecked() for name, box in self.target_checks.items()})
+
     def start(self):
         if self.active or self.main_busy():
             QMessageBox.warning(self, "Busy", "Stop the current optimizer/feedback run first.")
@@ -357,8 +374,8 @@ class FeedbackPanel(QWidget):
         self.log.clear()
         self.failed = False
         self.settings.setEnabled(False)
-        self.targets.setEnabled(False)
-        self.measure_response_check.setEnabled(False)
+        self.targets.setEnabled(True)
+        self.measure_response_check.setEnabled(True)
         self.start_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.stop_button.setEnabled(True)
@@ -405,7 +422,7 @@ class FeedbackPanel(QWidget):
         self.draw_plot()
         self.settings.setEnabled(True)
         self.targets.setEnabled(True)
-        self.measure_response_check.setEnabled(self.target_checks["adjust_correctors"].isChecked())
+        self.measure_response_check.setEnabled(True)
         self.start_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
@@ -417,12 +434,14 @@ class FeedbackPanel(QWidget):
         self.latest_elapsed = max(self.latest_elapsed, elapsed)
         if kind == "state":
             self.operation = event["state"]
-            self.plot_waiting = event["state"] in ("Waiting for next timing scan", "Waiting for next feedback cycle")
+            self.plot_waiting = event["state"] in ("Waiting for next timing scan", "Waiting for next feedback cycle", "Waiting for adjustment targets")
             paused = event["state"].lower().startswith(("paused", "auto-paused", "stopped"))
             labels = {"Checking orbit": "Timing scan" if self.target_checks["adjust_timing"].isChecked() else "Feedback cycle", "Timing tracking": "Timing scan",
                       "Timing after orbit correction": "Timing scan", "Timing after phase recovery": "Timing scan", "CM8L phase recovery": "Phase scan",
                       "Checking transmission after timing": "Evaluating transmission"}
-            if event["state"] not in ("Monitoring", "Waiting for next timing scan", "Waiting for next feedback cycle"):
+            if event["state"] == "Waiting for adjustment targets":
+                self.set_status("WAITING | No adjustment targets selected")
+            elif event["state"] not in ("Monitoring", "Waiting for next timing scan", "Waiting for next feedback cycle"):
                 prefix = "" if paused else "RUNNING | "
                 self.set_status(prefix + labels.get(event["state"], event["state"]), "paused" if paused else "running")
         elif kind == "waiting":
@@ -439,23 +458,25 @@ class FeedbackPanel(QWidget):
             self.failed = True
             self.set_status("Failed: " + event["message"], "error")
         elif kind == "response_measured":
-            # Start a clean feedback view without changing control references,
-            # the acquired matrix, or the unmodified timestamps in the journal.
-            self.plot_time_origin = event.get("elapsed", 0.)
-            self.latest_elapsed = 0.
-            self.points.clear()
-            self.orbits.clear()
-            self.averages.clear()
-            self.parameter_points.clear()
-            self.threshold_history.clear()
-            if self.degradation_threshold is not None:
-                self.threshold_history.append((0., self.degradation_threshold))
-            self.update_parameters(self.latest_settings, 0.)
-            self.latest_transmission = self.average_result = None
             self.plot_waiting = False
-            self.operation = "Starting feedback"
-            self.set_status("RUNNING | Starting feedback")
+            self.operation = "Capturing feedback reference"
+            self.set_status("RUNNING | Capturing feedback reference")
         elif kind == "reference":
+            if event.get("feedback_start"):
+                # Use the post-calibration reference and its completion time for
+                # all feedback plots; journal timestamps remain unchanged.
+                self.plot_time_origin = event.get("elapsed", 0.)
+                self.latest_elapsed = elapsed = 0.
+                self.points.clear()
+                self.orbits.clear()
+                self.averages.clear()
+                self.latest_transmission = event["transmission"]
+                self.average_result = None
+                self.points.append((0., self.latest_transmission))
+                self.orbits.append((0., [0.] * 4))
+                self.plot_waiting = False
+                self.operation = "Starting feedback"
+                self.set_status("RUNNING | Starting feedback")
             self.reference = event["orbit_mm"]
             self.orbit_reference = list(self.reference)
             self.initial_transmission = event["transmission"]

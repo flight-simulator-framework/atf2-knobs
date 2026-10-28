@@ -58,8 +58,9 @@ from Knobs.ipbsm_opt_plotting import save_plot_montage
 from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, WrappingLabel, OverallProgressBar
 from Knobs.optimizer_progress import BudgetProgress
 from Knobs.linac_orbit_compensation import (
-    OrbitCompensation, mean_orbit, CORRECTORS as GUN_CORRECTORS,
-    MAX_EXCURSION_A as GUN_ORBIT_RANGE_A, PROBE_A as GUN_ORBIT_PROBE_A,
+    OrbitCompensation, mean_orbit, load_feedback_response, CORRECTORS as GUN_CORRECTORS,
+    MAX_EXCURSION_A as GUN_ORBIT_RANGE_A, MAX_STEP_A as GUN_ORBIT_STEP_A,
+    SAMPLES_PER_MEAN as GUN_ORBIT_SAMPLES,
 )
 from Knobs.current_value_monitor import CurrentValueMonitor
 from Knobs.timing_pv import TIMING_PV, validate_timing_pvs
@@ -3001,7 +3002,7 @@ class OptimizationWorker(QThread):
             raise InterruptedError("Orbit compensation stopped")
         previous = self.interface.nsamples
         try:
-            self.interface.nsamples = 3
+            self.interface.nsamples = GUN_ORBIT_SAMPLES
             data = self.interface.get_bpms()
             result = mean_orbit(data)
             selected = [list(data["names"]).index(name) for name in ("ML8L", "ML10L")]
@@ -3014,7 +3015,7 @@ class OptimizationWorker(QThread):
             self.interface.nsamples = previous
         if not self.is_running:
             raise InterruptedError("Orbit compensation stopped")
-        self.log_signal.emit("[Gun orbit] 3-sample mean [x8,x10,y8,y10] mm: " +
+        self.log_signal.emit(f"[Gun orbit] {GUN_ORBIT_SAMPLES}-sample mean [x8,x10,y8,y10] mm: " +
                              np.array2string(result, precision=5))
         return result
 
@@ -3059,13 +3060,16 @@ class OptimizationWorker(QThread):
             raise ValueError("Gun orbit compensation requires a fresh reference; clear Resume CSV")
         self._gun_orbit_report = {"status": "starting"}
         try:
+            response, source = load_feedback_response(self.save_dir / "active_feedback_response.json")
+            self._gun_orbit_report.update(source)
+            self.log_signal.emit(f"[Gun orbit] Using Active Feedback response measured at {source['response_measured_at'] or 'unknown time'}")
             self._gun_orbit = OrbitCompensation(
                 measure=self._gun_orbit_measure, read=self._gun_orbit_read_currents,
                 write=self._gun_orbit_write, checkpoint=self._pause_checkpoint,
                 limits={name: [max(STEER_CURRENT_MIN_A, self.config["gun_orbit_limits"][f"{name}:currentWrite"][0]),
                                min(STEER_CURRENT_MAX_A, self.config["gun_orbit_limits"][f"{name}:currentWrite"][1])]
                         for name in GUN_CORRECTORS},
-                report=self._gun_orbit_report)
+                report=self._gun_orbit_report, response=response)
             self._gun_orbit.capture()
         except Exception as exc:
             self._gun_orbit_report.update(status="error", error=str(exc))
@@ -3598,12 +3602,13 @@ class MainWindow(QMainWindow):
         self.chk_gun_sol_l0_phase = self._add_target_row(
             lay_t, "gun_sol_l0", TARGET_LABELS["gun_sol_l0"], checked=True, prominent=True
         )
-        self.chk_gun_orbit_compensation = QCheckBox("Auto restore ML8L / ML10L orbit (≥100 µm)")
+        self.chk_gun_orbit_compensation = QCheckBox("Auto restore ML8L / ML10L orbit (≥150 µm)")
         self.chk_gun_orbit_compensation.setChecked(False)
         self.chk_gun_orbit_compensation.setToolTip(
-            "After GUN / Solenoid / L0: compare three-sample BPM means with the pre-scan orbit. "
-            "X uses ZH1L/ZH2L, Y uses ZV1L/ZV2L; both use all four. "
-            "Measured response probes ±0.05 A; ≤0.1 A per iteration, ≤0.5 A total, at most 5 iterations.")
+            "After GUN / Solenoid / L0: compare 10-shot BPM means with the pre-scan orbit. "
+            "Use the saved Active Feedback response matrix; H→y and V→x are zero. "
+            "Target <150 µm on all four coordinates; ≤0.1 A per iteration, ≤0.5 A total, at most 10 iterations. "
+            "If not reached, restore the smallest measured RMS and finish.")
         orbit_row = QHBoxLayout()
         orbit_row.setContentsMargins(34, 0, 0, 0)
         orbit_row.addWidget(self.chk_gun_orbit_compensation)
@@ -6471,7 +6476,8 @@ class MainWindow(QMainWindow):
             if config["gun_orbit_compensation"]:
                 if resume_path_text:
                     raise ValueError("Clear Resume CSV for gun orbit compensation; a fresh pre-scan reference is required.")
-                compensation_specs = [dict(_developer_actuator_spec(name), step=GUN_ORBIT_PROBE_A,
+                load_feedback_response(Path(self.save_path) / "active_feedback_response.json")
+                compensation_specs = [dict(_developer_actuator_spec(name), step=GUN_ORBIT_STEP_A,
                                            half_range=GUN_ORBIT_RANGE_A) for name in GUN_CORRECTORS]
                 config["gun_orbit_limits"], orbit_summary = self._checked_corrector_ranges(compensation_specs)
                 summary.extend(orbit_summary)
