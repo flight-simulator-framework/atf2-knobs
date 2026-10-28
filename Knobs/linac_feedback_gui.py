@@ -61,7 +61,7 @@ class FeedbackWorker(QThread):
         self.pause_reason = reason
         self.paused.set()
         self.emit_event(dict(kind="auto_pause", state="Auto-paused: " + reason,
-                             message="Temporary settings restored. Resolve beam loss, then press Resume."))
+                             message="Temporary settings restored. Resolve the beam/monitor issue, then press Resume."))
         self.checkpoint()
 
     def emit_event(self, event):
@@ -146,6 +146,9 @@ class FeedbackPanel(QWidget):
         self.initial_transmission = None
         self.transmission_baseline = None
         self.initial_settings = {}
+        self.latest_settings = {}
+        self.parameter_points = deque(maxlen=2000)
+        self.latest_elapsed = 0.
         self.degradation_threshold = None
         self.latest_transmission = None
         self.average_result = None
@@ -161,7 +164,7 @@ class FeedbackPanel(QWidget):
         run_group = QGroupBox("Run Control")
         run_layout = QVBoxLayout(run_group)
         run_layout.addWidget(WrappingLabel("Timing tracking • Orbit drift → correctors + timing • Low transmission with normal orbit → CM8L phase"))
-        note = WrappingLabel("Response stored internally: first calibration 0.05 A, refresh 0.01 A. ICT ≤ 0 pauses feedback; press RESUME after recovery.")
+        note = WrappingLabel("Response stored internally: first calibration 0.05 A, refresh 0.01 A. ICT ≤ 0 or invalid BPM for 3 consecutive shots pauses feedback; press RESUME after recovery.")
         note.setStyleSheet("font-size: 12px; color: #475569;")
         run_layout.addWidget(note)
         row = QHBoxLayout()
@@ -184,9 +187,10 @@ class FeedbackPanel(QWidget):
         self.fields = {}
         defaults = FeedbackConfig()
         descriptions = {
+            "orbit_threshold_um": "Compare the latest 10 distinct BPM shots with the initial 10-shot mean. Default: 100 µm.",
             "settle_sec": "Wait after each PV write before measuring. Default: 2 s.",
-            "interval_sec": "Wait after a full feedback cycle before starting the next timing search. This is additional to the wait after each write.",
-            "min_gain": "Minimum absolute transmission improvement to accept a local search step. 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate drop threshold.",
+            "interval_sec": "Wait after a full feedback cycle before starting the next timing search. Default: 30 s. This is additional to the wait after each write.",
+            "min_gain": "Minimum absolute transmission improvement to accept a local search step. Default: 0.01 (1 percentage point). 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate drop threshold.",
             "degradation_percent": "Absolute drop in percentage points: threshold = recovery baseline − drop / 100. Default: 80% → 75%. The baseline rises after sustained improvement and never decreases.",
             "baseline_hold_sec": "Raise the recovery baseline after improvement lasts this long AND at least 3 complete operating-point means confirm it. Uses their lowest mean; probes are excluded. Pause, beam loss or orbit recovery restarts confirmation.",
         }
@@ -240,20 +244,15 @@ class FeedbackPanel(QWidget):
         self.values.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         current_group = QGroupBox("Parameter Changes from Start")
         current_layout = QVBoxLayout(current_group)
-        self.current_values = WrappingLabel("Live settings include temporary probes. Offsets are relative to START.")
-        self.current_values.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        current_layout.addWidget(self.current_values)
-        self.parameter_table = QTableWidget(len(PVS), 4)
-        self.parameter_table.setHorizontalHeaderLabels(["Parameter", "Initial", "Current (live)", "Δ from start"])
-        self.parameter_table.verticalHeader().hide()
-        self.parameter_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.parameter_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.parameter_table.setAlternatingRowColors(True)
-        self.parameter_table.verticalHeader().setDefaultSectionSize(22)
-        self.parameter_table.setFixedHeight(162)
-        for row, name in enumerate(("Timing [ns]", "CM8L phase [°]") + tuple(f"{pv.split(':')[0]} [A]" for pv in CURRENT_PVS)):
-            self.parameter_table.setItem(row, 0, QTableWidgetItem(name))
-        current_layout.addWidget(self.parameter_table)
+        current_group.setToolTip("Changes from the initial setpoints, including temporary probes and restorations. Timing uses the left axis; CM8L phase uses the right axis.")
+        self.parameter_figure = Figure(figsize=(8, 3), layout="constrained")
+        self.parameter_axes = self.parameter_figure.subplots(1, 2, sharex=True)
+        self.phase_axis = self.parameter_axes[0].twinx()
+        self.parameter_canvas = FigureCanvasQTAgg(self.parameter_figure)
+        self.parameter_canvas.setMinimumHeight(200)
+        self.parameter_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        current_layout.addWidget(self.parameter_canvas, 1)
+        self.draw_parameters()
         response_group = QGroupBox("Learned Response [mm/A]")
         self.response_group = response_group
         response_group.setToolTip("Stored in the save folder and reused across runs. Refreshed when orbit correction starts. Phase changes and beam loss retain the matrix and require a refresh before reuse.")
@@ -285,7 +284,7 @@ class FeedbackPanel(QWidget):
         self.canvas.setMinimumHeight(180)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         plot_layout.addWidget(self.canvas, 1)
-        monitor.addWidget(current_group)
+        monitor.addWidget(current_group, stretch=1)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
@@ -318,10 +317,12 @@ class FeedbackPanel(QWidget):
         self.averages.clear()
         self.reference = self.initial_transmission = self.transmission_baseline = None
         self.initial_settings = {}
+        self.latest_settings = {}
+        self.parameter_points.clear()
+        self.latest_elapsed = 0.
         self.degradation_threshold = self.latest_transmission = self.average_result = None
-        for row in range(len(PVS)):
-            for col in range(1, 4):
-                self.parameter_table.setItem(row, col, QTableWidgetItem("—"))
+        self.dirty = True
+        self.draw_plot()
         self.response_table.clearContents()
         self.log.clear()
         self.failed = False
@@ -377,6 +378,7 @@ class FeedbackPanel(QWidget):
     def on_event(self, event):
         kind = event["kind"]
         elapsed = event.get("elapsed", 0.)
+        self.latest_elapsed = max(self.latest_elapsed, elapsed)
         if kind == "state":
             paused = event["state"].lower().startswith(("paused", "auto-paused", "stopped"))
             prefix = "" if paused else f"RUNNING | Cycle {event.get('cycle', 0)} | "
@@ -392,6 +394,12 @@ class FeedbackPanel(QWidget):
         elif kind == "auto_pause":
             self.set_status(event["state"] + "\n" + event["message"], "paused")
             self.pause_button.setText("RESUME")
+        elif kind == "beam_loss_pending":
+            self.set_status(f"RUNNING | Confirming ICT drop\n{event['pv']}: "
+                            f"{event['consecutive']} / {event['required']} consecutive nonpositive shots")
+        elif kind == "bpm_invalid_pending":
+            self.set_status(f"RUNNING | Confirming BPM validity\nML8L / ML10L: "
+                            f"{event['consecutive']} / {event['required']} consecutive invalid shots")
         elif kind == "error":
             self.failed = True
             self.set_status("Failed: " + event["message"], "error")
@@ -400,19 +408,21 @@ class FeedbackPanel(QWidget):
             self.initial_transmission = event["transmission"]
             self.transmission_baseline = event.get("baseline", self.initial_transmission)
             self.initial_settings = dict(event["settings"])
+            self.parameter_points.clear()
+            self.latest_settings = {}
             self.degradation_threshold = event.get("degradation_threshold",
                 max(0., self.transmission_baseline - self.fields["degradation_percent"].value() / 100))
-            self.update_parameters(event["settings"])
+            self.update_parameters(event["settings"], elapsed)
         elif kind == "baseline_updated":
             self.transmission_baseline = event["baseline"]
             self.degradation_threshold = event["threshold"]
         elif kind == "settings":
             self.initial_settings = dict(event["initial_settings"])
-            self.update_parameters(event["settings"])
+            self.update_parameters(event["settings"], elapsed)
         elif kind == "transmission":
             self.points.append((elapsed, event["transmission"]))
             self.latest_transmission = event["transmission"]
-            self.update_parameters(event["settings"])
+            self.update_parameters(event["settings"], elapsed)
         elif kind == "transmission_average":
             self.average_result = event
             if event["complete"]:
@@ -445,15 +455,46 @@ class FeedbackPanel(QWidget):
             self.log.appendPlainText(json.dumps(event, ensure_ascii=False))
         self.dirty = True
 
-    def update_parameters(self, settings):
-        for row, pv in enumerate(PVS):
-            if pv not in settings or pv not in self.initial_settings:
-                continue
-            initial, current = self.initial_settings[pv], settings[pv]
-            for col, text in enumerate((f"{initial:.3f}", f"{current:.3f}", f"{current - initial:+.3f}"), 1):
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                self.parameter_table.setItem(row, col, item)
+    def update_parameters(self, settings, elapsed):
+        self.latest_settings.update(settings)
+        if all(pv in self.latest_settings and pv in self.initial_settings for pv in PVS):
+            offsets = tuple(self.latest_settings[pv] - self.initial_settings[pv] for pv in PVS)
+            if not self.parameter_points or offsets != self.parameter_points[-1][1]:
+                self.parameter_points.append((elapsed, offsets))
+
+    def draw_parameters(self):
+        timing, currents = self.parameter_axes
+        for axis in (timing, currents, self.phase_axis):
+            axis.clear()
+            axis.tick_params(labelsize=8)
+        if self.parameter_points:
+            points = list(self.parameter_points)
+            if self.latest_elapsed > points[-1][0]:
+                points.append((self.latest_elapsed, points[-1][1]))
+            x = [point[0] for point in points]
+            traces = [dict(axis=timing, index=0, color="#2563eb", label="Timing"),
+                      dict(axis=self.phase_axis, index=1, color="#d97706", label="CM8L phase")]
+            traces += [dict(axis=currents, index=i + 2, color=color, label=pv.split(":")[0])
+                       for i, (pv, color) in enumerate(zip(CURRENT_PVS, ("#15803d", "#7c3aed", "#dc2626", "#0891b2")))]
+            for trace in traces:
+                trace["axis"].step(x, [point[1][trace["index"]] for point in points], where="post",
+                                   color=trace["color"], label=trace["label"], marker=".", markersize=2)
+            lines = timing.lines + self.phase_axis.lines
+            timing.legend(lines, [line.get_label() for line in lines], fontsize=8, loc="best")
+            currents.legend(fontsize=8, ncol=2, loc="best")
+        timing.set_title("Timing / CM8L phase", fontsize=10)
+        currents.set_title("Corrector currents", fontsize=10)
+        timing.set_ylabel("Δ Timing [ns]", color="#2563eb", fontsize=9)
+        self.phase_axis.set_ylabel("Δ Phase [°]", color="#d97706", fontsize=9)
+        self.phase_axis.yaxis.set_label_position("right")
+        self.phase_axis.yaxis.tick_right()
+        self.phase_axis.tick_params(axis="y", colors="#d97706")
+        timing.tick_params(axis="y", colors="#2563eb")
+        currents.set_ylabel("Δ Current [A]", fontsize=9)
+        for axis in (timing, currents):
+            axis.set_xlabel("Elapsed [s]", fontsize=9)
+            axis.grid(alpha=.25)
+        self.parameter_canvas.draw_idle()
 
     def draw_plot(self):
         if not self.dirty:
@@ -486,5 +527,6 @@ class FeedbackPanel(QWidget):
         for axis in self.axes:
             axis.grid(alpha=.25)
             if axis.lines and axis.get_legend_handles_labels()[0]:
-                axis.legend(loc="best", fontsize=8)
+                axis.legend(loc="best", fontsize=8, ncol=2)
         self.canvas.draw_idle()
+        self.draw_parameters()

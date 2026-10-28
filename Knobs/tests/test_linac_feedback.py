@@ -70,12 +70,22 @@ class FeedbackTests(unittest.TestCase):
     def controller(self, plant=None, **options):
         plant = plant or Plant()
         events = []
-        config = replace(FeedbackConfig(settle_sec=0, interval_sec=0), **options)
+        config = replace(FeedbackConfig(settle_sec=0, interval_sec=0, min_gain=0), **options)
         limits = {pv: (-10000., 10000.) for pv in PVS}
         limits.update({pv: (-.5, .5) for pv in CURRENT_PVS})
         controller = FeedbackController(plant, config, limits, events.append)
         controller.initialize()
         return plant, controller, events
+
+    def test_default_deadband_requires_more_than_one_percentage_point(self):
+        for gain, moves in ((.005, False), (.01, False), (.02, True)):
+            plant = Plant()
+            origin = plant.values[TIMING_PV]
+            target = origin + 2.8
+            plant.transmission = lambda: .9 - gain * ((plant.values[TIMING_PV] - target) / 2.8) ** 2
+            _, controller, _ = self.controller(plant, min_gain=FeedbackConfig().min_gain)
+            controller.search(TIMING_PV, 2.8, "Timing")
+            self.assertAlmostEqual(plant.values[TIMING_PV], target if moves else origin)
 
     def test_timing_tracks_moving_local_optimum_on_relative_grid(self):
         plant, controller, events = self.controller()
@@ -446,27 +456,27 @@ class MachineTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             machine.fresh_records(("test",))
 
-    def test_monitor_mapping_units_status_and_exact_three_mean(self):
+    def test_monitor_mapping_units_status_and_exact_ten_shot_mean(self):
         from machine_interfaces_atf2.InterfaceATF2_Linac import LINAC_MONITORS
         records = []
-        for i in range(3):
+        for i in range(10):
             raw = np.zeros((len(LINAC_MONITORS), 20))
             for name, x, y in (("ML8L", 100 + i * 100, -300), ("ML10L", 400, 500 + i * 100)):
                 raw[LINAC_MONITORS.index(name), :4] = [1, x, y, 10]
             records.append({"LINAC:monitors": dict(value=raw.ravel(), timestamp=i)})
         machine = self.machine(Mock())
         machine.fresh_records = lambda names: records
-        np.testing.assert_allclose(machine.orbit(), [.2, .4, -.3, .6])
+        np.testing.assert_allclose(machine.orbit(), [.55, .4, -.3, .95])
         records[0]["LINAC:monitors"]["value"][LINAC_MONITORS.index("ML8L") * 20] = 0
         with self.assertRaisesRegex(ValueError, "Invalid/no-beam"):
             machine.orbit()
 
-    def test_continuous_bpm_monitor_uses_three_distinct_records(self):
+    def test_continuous_bpm_monitor_uses_latest_ten_distinct_records(self):
         from machine_interfaces_atf2.InterfaceATF2_Linac import LINAC_MONITORS
         raw = np.zeros((len(LINAC_MONITORS), 20))
         raw[:, 0], raw[:, 3] = 1., 1.
         records = []
-        for stamp, x in ((1, 0), (2, 100), (2, 100), (3, 200), (4, 300), (4, 300)):
+        for stamp, x in ([(i, (i - 1) * 100) for i in range(1, 11)] + [(10, 900), (11, 1000), (11, 1000)]):
             raw[LINAC_MONITORS.index("ML8L"), 1] = x
             records.append(dict(value=raw.copy().ravel(), timestamp=stamp))
         pv = Mock()
@@ -474,10 +484,10 @@ class MachineTests(unittest.TestCase):
         machine = self.machine(lambda *a, **kw: pv)
         means = []
         machine.set_orbit_monitor(means.append)
-        for _ in range(5):
+        for _ in range(12):
             machine.check_beam(force=True)
         self.assertEqual(len(means), 2)
-        np.testing.assert_allclose([m[0] for m in means], [.1, .2])
+        np.testing.assert_allclose([m[0] for m in means], [.45, .55])
         machine._orbit_last_seen = -100.
         with self.assertRaisesRegex(TimeoutError, "stopped updating"):
             machine.poll_orbit()
@@ -558,20 +568,106 @@ class MachineTests(unittest.TestCase):
 
     def test_nonpositive_ict_is_detected_before_averaging_even_with_alarm(self):
         for value in (0., -1.):
+            stamps = iter(range(100))
             machine = FeedbackMachine(FeedbackConfig(), lambda: False, lambda: None, Mock(),
-                                      lambda *a, **kw: Mock(get_with_metadata=Mock(return_value=
-                                          dict(value=value, timestamp=1., severity=3))))
-            with self.assertRaises(BeamLoss):
+                                      lambda *a, **kw: Mock(get_with_metadata=Mock(side_effect=lambda **kw:
+                                          dict(value=value, timestamp=next(stamps), severity=3))))
+            with self.assertRaisesRegex(BeamLoss, "3 consecutive"):
                 machine.transmission()
-            machine.emit.assert_called_once()
+            losses = [c.args[0] for c in machine.emit.call_args_list if c.args[0]["pv"] == machine.ict_pvs[0]]
+            self.assertEqual([e["consecutive"] for e in losses], [1, 2, 3])
+            self.assertEqual(losses[-1]["kind"], "beam_loss_detected")
 
     def test_loss_during_orbit_acquisition_and_wait(self):
-        for operation in (lambda m: m.orbit(), lambda m: m.wait(.1), lambda m: m.write({TIMING_PV: 1.})):
+        for operation in (lambda m: m.orbit(), lambda m: m.wait(.5), lambda m: m.write({TIMING_PV: 1.})):
+            stamps = iter(range(100))
             machine = FeedbackMachine(FeedbackConfig(), lambda: False, lambda: None, Mock(),
-                                      lambda *a, **kw: Mock(get_with_metadata=Mock(return_value=
-                                          dict(value=0., timestamp=1.))))
+                                      lambda *a, **kw: Mock(get_with_metadata=Mock(side_effect=lambda **kw:
+                                          dict(value=0., timestamp=next(stamps)))))
             with self.assertRaises(BeamLoss):
                 operation(machine)
+
+    def test_ict_loss_counts_distinct_shots_per_channel_and_resets_on_recovery(self):
+        machine = self.machine(Mock())
+        up, down = machine.ict_pvs
+        for stamp, value in ((1, 0), (1, 0), (2, -1), (3, 1), (4, 0), (4, 0), (5, 0)):
+            machine.check_ict(down, value, stamp)
+            machine.check_ict(up, 1., stamp)
+        self.assertEqual(machine._ict_loss_counts[down], 2)
+        with self.assertRaisesRegex(BeamLoss, "3 consecutive"):
+            machine.check_ict(down, 0., 6)
+        machine.check_ict(down, 1., 7)
+        self.assertEqual(machine._ict_loss_counts[down], 0)
+
+    def test_stale_bad_ict_times_out_instead_of_counting_same_shot_three_times(self):
+        machine = FeedbackMachine(FeedbackConfig(sample_timeout_sec=.01), lambda: False, lambda: None, Mock(),
+                                  lambda *a, **kw: Mock(get_with_metadata=Mock(return_value=dict(value=0., timestamp=1.))))
+        with self.assertRaises(TimeoutError):
+            machine.check_beam(force=True)
+        self.assertEqual(list(machine._ict_loss_counts.values()), [1, 1])
+
+    def test_transient_ict_drop_is_excluded_from_transmission_average(self):
+        streams = {name: iter(range(100)) for name in ("BIM:LN0:nparticles", "BIM:DR:nparticles")}
+        def factory(name, **kwargs):
+            def read(**kwargs):
+                stamp = next(streams[name])
+                # Two bad samples during acquisition, then recovery.
+                value = 0. if name == "BIM:DR:nparticles" and stamp in (3, 4) else (2. if "LN0" in name else 1.)
+                return dict(value=value, timestamp=stamp)
+            return Mock(get_with_metadata=read)
+        events = []
+        machine = FeedbackMachine(FeedbackConfig(), lambda: False, lambda: None, events.append, factory)
+        self.assertEqual(machine.transmission(), .5)
+        self.assertFalse(any(e["kind"] == "beam_loss_detected" for e in events))
+        sample = next(e for e in events if e["kind"] == "ict_samples")
+        self.assertTrue(np.all(np.array(sample["samples"]) > 0))
+
+    def test_bpm_invalid_counts_distinct_shots_and_recovers(self):
+        from machine_interfaces_atf2.InterfaceATF2_Linac import LINAC_MONITORS
+        machine = self.machine(Mock())
+        raw = np.zeros((len(LINAC_MONITORS), 20))
+        raw[:, 0], raw[:, 3] = 1., 1.
+        for stamp, valid in ((1, False), (1, False), (2, False), (3, True), (4, False), (5, False)):
+            raw[LINAC_MONITORS.index("ML8L"), 0] = int(valid)
+            self.assertEqual(machine.check_bpm(dict(value=raw.ravel(), timestamp=stamp)), valid)
+        self.assertEqual(machine._bpm_invalid_count, 2)
+        with self.assertRaisesRegex(BeamLoss, "ML8L / ML10L invalid for 3"):
+            machine.check_bpm(dict(value=raw.ravel(), timestamp=6))
+        raw[:, 0] = 1.
+        self.assertTrue(machine.check_bpm(dict(value=raw.ravel(), timestamp=7)))
+        self.assertEqual(machine._bpm_invalid_count, 0)
+
+    def test_invalid_bpm_pauses_during_acquisition_wait_and_before_write(self):
+        from machine_interfaces_atf2.InterfaceATF2_Linac import LINAC_MONITORS
+        for operation in (lambda m: m.orbit(), lambda m: m.wait(.5), lambda m: m.write({TIMING_PV: 1.})):
+            raw = np.zeros((len(LINAC_MONITORS), 20))
+            stamps = iter(range(100))
+            pv = Mock(get_with_metadata=Mock(side_effect=lambda **kw: dict(value=raw.ravel(), timestamp=next(stamps))))
+            machine = self.machine(lambda *a, **kw: pv)
+            machine.config = FeedbackConfig(settle_sec=0)
+            # Use real wait to exercise the guard during cycle/settling waits.
+            machine.wait = lambda seconds: FeedbackMachine.wait(machine, seconds)
+            machine.set_orbit_monitor(Mock())
+            with self.assertRaisesRegex(BeamLoss, "ML8L / ML10L invalid for 3"):
+                operation(machine)
+            pv.put.assert_not_called()
+
+    def test_bpm_acquisition_requires_ten_fresh_valid_shots_after_transient_invalid(self):
+        from machine_interfaces_atf2.InterfaceATF2_Linac import LINAC_MONITORS
+        raw = np.zeros((len(LINAC_MONITORS), 20))
+        raw[:, 0], raw[:, 3] = 1., 1.
+        stamps = iter([0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        def read(**kwargs):
+            stamp = next(stamps)
+            wave = raw.copy()
+            wave[LINAC_MONITORS.index("ML10L"), 3] = 0. if stamp == 2 else 1.
+            return dict(value=wave.ravel(), timestamp=stamp)
+        machine = self.machine(lambda *a, **kw: Mock(get_with_metadata=read))
+        events = []
+        machine.emit = events.append
+        np.testing.assert_array_equal(machine.orbit(), np.zeros(4))
+        samples = next(e for e in events if e["kind"] == "orbit_samples")
+        self.assertEqual(samples["timestamps"], list(range(3, 13)))
 
     def test_command_audit_contains_before_after_and_confirmation(self):
         pv = Mock()
@@ -611,6 +707,8 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(window.tabs.tabText(window.tabs.indexOf(panel)), "Active Feedback")
                 self.assertEqual(panel.config().orbit_threshold_um, 100.)
                 self.assertEqual(panel.config().settle_sec, 2.)
+                self.assertEqual(panel.config().interval_sec, 30.)
+                self.assertEqual(panel.config().min_gain, .01)
                 self.assertEqual(panel.config().degradation_samples, 5)
                 self.assertEqual(panel.config().degradation_percent, 5.)
                 self.assertEqual(panel.config().baseline_hold_sec, 120.)
@@ -622,10 +720,18 @@ class GuiTests(unittest.TestCase):
                 self.assertIn("0.1 percentage point", panel.fields["min_gain"].toolTip())
                 origin = {pv: 1. for pv in PVS}
                 settings = dict(origin, **{TIMING_PV: 6.6, PHASE_PV: 1.5, CURRENT_PVS[0]: 1.02})
-                panel.on_event(dict(kind="settings", settings=settings, initial_settings=origin))
-                self.assertEqual(panel.parameter_table.item(0, 3).text(), "+5.600")
-                self.assertEqual(panel.parameter_table.item(1, 3).text(), "+0.500")
-                self.assertEqual(panel.parameter_table.item(2, 3).text(), "+0.020")
+                panel.on_event(dict(kind="settings", settings=settings, initial_settings=origin, elapsed=10.))
+                panel.draw_plot()
+                self.assertAlmostEqual(panel.parameter_axes[0].lines[0].get_ydata()[-1], 5.6)
+                self.assertAlmostEqual(panel.phase_axis.lines[0].get_ydata()[-1], .5)
+                self.assertAlmostEqual(panel.parameter_axes[1].lines[0].get_ydata()[-1], .02)
+                self.assertEqual(len(panel.parameter_axes[1].lines), 4)
+                panel.on_event(dict(kind="settings", settings=origin, initial_settings=origin, elapsed=12.))
+                panel.on_event(dict(kind="waiting", remaining_sec=10., cycle=2, elapsed=20.))
+                panel.draw_plot()
+                np.testing.assert_allclose(panel.parameter_axes[0].lines[0].get_xdata(), [10., 12., 20.])
+                np.testing.assert_allclose(panel.parameter_axes[0].lines[0].get_ydata(), [5.6, 0., 0.])
+                self.assertEqual(panel.parameter_axes[0].lines[0].get_drawstyle(), "steps-post")
                 panel.on_event(dict(kind="reference", transmission=.8, orbit_mm=[0.] * 4, settings=origin))
                 self.assertAlmostEqual(panel.degradation_threshold, .75)
                 panel.on_event(dict(kind="transmission_average", average=.89, samples=5, required=5,
@@ -721,7 +827,7 @@ class GuiTests(unittest.TestCase):
                     controller.initialize()
                     controller.learn_response()
                 with patch.object(FeedbackController, "run", autospec=True, side_effect=exercise):
-                    worker = FeedbackWorker(FeedbackConfig(settle_sec=0), directory, lambda *args: plant)
+                    worker = FeedbackWorker(FeedbackConfig(settle_sec=0, min_gain=0), directory, lambda *args: plant)
                     worker.run()
                 events = [json.loads(line) for line in (worker.run_dir / "events.jsonl").read_text().splitlines()]
                 self.assertFalse(any(e["kind"] == "error" for e in events), events)
@@ -738,7 +844,7 @@ class GuiTests(unittest.TestCase):
         plant.close = Mock()
         plant.wait = lambda seconds: (_ for _ in ()).throw(InterruptedError("done"))
         with tempfile.TemporaryDirectory() as directory:
-            worker = FeedbackWorker(FeedbackConfig(settle_sec=0), directory, lambda *args: plant)
+            worker = FeedbackWorker(FeedbackConfig(settle_sec=0, min_gain=0), directory, lambda *args: plant)
             worker.run()
             events = [json.loads(line) for line in (worker.run_dir / "events.jsonl").read_text().splitlines()]
             self.assertTrue(any(e["kind"] == "reference" for e in events))
@@ -765,7 +871,7 @@ class GuiTests(unittest.TestCase):
                     if not restore:
                         lost[0] = True
                 plant.on_write = write
-                worker = FeedbackWorker(FeedbackConfig(settle_sec=0), directory, lambda *args: plant)
+                worker = FeedbackWorker(FeedbackConfig(settle_sec=0, min_gain=0), directory, lambda *args: plant)
                 first_pause, second_pause = threading.Event(), threading.Event()
                 events = []
                 emit = worker.emit_event

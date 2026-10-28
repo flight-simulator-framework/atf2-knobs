@@ -32,13 +32,13 @@ taking priority:
    `EVE_LINAC:OUT0:SetData`. Remeasure centre and neighbours every cycle; historical
    best scores are not reused. Centre measurements bracket each probe.
 2. Continuously check timestamped `LINAC:monitors` records during acquisition,
-   settling and cycle waits, averaging the latest three distinct records.
+   settling and cycle waits, averaging the latest **10 distinct valid shots**.
    If any of ML8L.x, ML10L.x, ML8L.y or ML10L.y
-   differs from its initial three-record mean by at least the orbit threshold
+   differs from its initial 10-shot mean by at least the orbit threshold
    (100 µm by default, editable in the tab), restore the orbit with ZH1L, ZV1L,
    ZH2L and ZV2L. Every changed corrector moves by 0.01 A per step. The threshold
    triggers correction independently of transmission. Restore temporary probes
-   and confirm the drift using three fresh records at the accepted settings
+   and confirm the drift using 10 fresh shots at the accepted settings
    before switching to correction. Correction targets the initial orbit until
    no improving grid move remains, a trial fails, or the iteration limit is reached.
 3. After orbit correction, repeat timing optimization. Once timing has reached a
@@ -82,8 +82,8 @@ vertical cross-coupling is included; each orbit step evaluates all neighbouring
 current-grid combinations against the learned response.
 
 The tab exposes settling time (default **2 s** after each write), cycle interval
-(default 5 s after a complete feedback loop, before the next timing search),
-local-search improvement deadband (absolute ratio, default zero/off), and
+(default **30 s** after a complete feedback loop, before the next timing search),
+local-search improvement deadband (absolute ratio, default **0.01 / 1 percentage point**), and
 excursions from the starting values (defaults:
 timing ±112 ns, CM8L ±8°, correctors ±0.5 A). Correctors additionally require valid
 IOC control limits and remain within ±5 A. Reaching a timing/phase search boundary
@@ -101,21 +101,29 @@ The log is available via **Show log**, leaving more space for live plots.
 The English status banner identifies the cycle and operation, shows acquisition
 and settling progress, and counts down **Next timing scan in N s** during cycle
 waits. BPM drift interrupts that wait immediately at the next monitoring check.
-**Parameter Changes from Start** lists the initial setting, current confirmed
-setting (including probes) and signed offset for timing, CM8L and all four
-correctors. The transmission plot shows the initial value, adaptive recovery baseline, recovery threshold
+**Parameter Changes from Start** shows two live plots in place of the parameter
+table: timing and CM8L phase share a plot with separate ns/degree axes, and all
+four corrector currents share an A-axis plot. Both show changes from the initial
+setpoints against elapsed time, including temporary probes and restorations.
+Step traces extend through cycle waits and update with the other live plots.
+The transmission plot shows the initial value, adaptive recovery baseline, recovery threshold
 and operating-point average separately.
-If either LN0 or the selected downstream ICT is zero or negative, feedback
+If either LN0 or the selected downstream ICT is zero or negative for **3 consecutive
+distinct shots**, or ML8L/ML10L BPM data is invalid for **3 consecutive distinct shots**, feedback
 automatically pauses after restoring temporary timing, phase or corrector probes.
 ICTs are checked during orbit acquisition, settling and the between-cycle wait,
-as well as during transmission measurement; a single detected nonpositive sample
-triggers the pause without waiting for a three-sample average. Restore commands
+as well as during transmission measurement. ICT counters are independent per
+channel; the BPM counter tracks invalid ML8L/ML10L records. Normal readings reset
+the corresponding counter, and repeated cached timestamps never count again.
+During confirmation, new commands wait; invalid readings are excluded from
+averages. BPM monitoring refills its 10-shot window after invalid data. Restore commands
 are permitted during beam loss. Resume is manual: if the loss persists, feedback
 pauses again before further exploration. After recovery, timing tracking restarts
 with the original reference and accepted settings; the interrupted search is
 discarded and the retained response model requires refresh. An incomplete initial reference is acquired again
 on Resume. Other invalid/missing data or unconfirmed writes stop the worker.
-Baseline promotions are explicit logged events. Measurements require three *new* IOC timestamps
+Baseline promotions are explicit logged events. Measurements require 10 *new* BPM
+timestamps or three *new* ICT timestamps
 after an acquisition barrier, with a 15-second timeout; repeated cached records
 do not count. ICT pairs require both channels to advance but are not pulse-ID
 matched. The BPM waveform is interpreted with the existing LINAC monitor map and

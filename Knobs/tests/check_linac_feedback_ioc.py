@@ -34,6 +34,7 @@ def serve():
         phase_target = pvproperty(name="test:phase_target", value=0.)
         drift = pvproperty(name="test:drift", value=0.)
         beam = pvproperty(name="test:beam", value=1.)
+        bpm_valid = pvproperty(name="test:bpm_valid", value=1.)
         h1 = pvproperty(name="ZH1L:currentWrite", value=0., lower_ctrl_limit=-5., upper_ctrl_limit=5.)
         h1_read = pvproperty(name="ZH1L:currentRead", value=0., read_only=True)
         v1 = pvproperty(name="ZV1L:currentWrite", value=0., lower_ctrl_limit=-5., upper_ctrl_limit=5.)
@@ -59,7 +60,7 @@ def serve():
                 await read.write(scalar(write))
             waveform = np.zeros((len(LINAC_MONITORS), 20))
             for i, name in enumerate(("ML8L", "ML10L")):
-                waveform[LINAC_MONITORS.index(name), :4] = [1., orbit[i] * 1000, orbit[i + 2] * 1000, 1.]
+                waveform[LINAC_MONITORS.index(name), :4] = [scalar(self.bpm_valid), orbit[i] * 1000, orbit[i + 2] * 1000, 1.]
             await instance.write(waveform.ravel())
             timing = (scalar(self.timing) - scalar(self.timing_target)) / 2.8
             phase = (scalar(self.phase) - scalar(self.phase_target)) / .5
@@ -131,7 +132,7 @@ def main():
                 assert any(e["kind"] == "response" and e["observations"] > 4 for e in events)
                 for event in events:
                     if event["kind"] == "orbit_samples":
-                        assert len(event["timestamps"]) == len(set(event["timestamps"])) == 3
+                        assert len(event["timestamps"]) == len(set(event["timestamps"])) == 10
                 accepted_timing = controller.current[TIMING_PV]
                 original = machine.transmission
 
@@ -185,6 +186,20 @@ def main():
                     assert worker.paused.is_set(), "Must not automatically resume when beam returns"
                     worker.paused.clear()  # operator Resume
                     assert monitoring.wait(15), worker_events[-5:]
+                    paused.clear()
+                    monitoring.clear()
+                    assert factory("test:bpm_valid").put(0., wait=True) == 1
+                    assert paused.wait(15), worker_events[-5:]
+                    invalids = [e for e in worker_events if e["kind"].startswith("bpm_invalid_")]
+                    assert [e["consecutive"] for e in invalids] == [1, 2, 3], invalids
+                    losses = [e for e in worker_events if e["kind"] in ("beam_loss_pending", "beam_loss_detected")]
+                    assert [e["consecutive"] for e in losses] == [1, 2, 3], losses
+                    assert factory("test:bpm_valid").put(1., wait=True) == 1
+                    time.sleep(.2)
+                    assert worker.paused.is_set(), "BPM recovery also requires manual Resume"
+                    monitoring.clear()
+                    worker.paused.clear()
+                    assert monitoring.wait(15), worker_events[-5:]
                 finally:
                     worker.stop()
                     thread.join(10)
@@ -198,7 +213,7 @@ def main():
                 print(json.dumps(dict(result="passed", timing_ns=accepted_timing,
                                       cm8l_phase_deg=machine.scalar(PHASE_PV),
                                       residual_um=(residual * 1000).tolist(), events=len(events),
-                                      auto_pause_resume="passed", continuous_bpm_wait="passed",
+                                      auto_pause_resume="passed", bpm_invalid_pause_resume="passed", continuous_bpm_wait="passed",
                                       absolute_five_point_threshold="passed", operation_rows=len(operations)), indent=2))
             finally:
                 if machine is not None:

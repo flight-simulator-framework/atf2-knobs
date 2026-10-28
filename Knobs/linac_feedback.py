@@ -23,7 +23,7 @@ INITIAL_PROBE_A = 0.05
 
 
 class BeamLoss(RuntimeError):
-    """A nonpositive ICT measurement: unwind probes, then wait for the operator."""
+    """Confirmed beam loss: unwind probes, then wait for the operator."""
 
 
 class OrbitDrift(RuntimeError):
@@ -34,12 +34,12 @@ class OrbitDrift(RuntimeError):
 class FeedbackConfig:
     orbit_threshold_um: float = 100.
     settle_sec: float = 2.
-    interval_sec: float = 5.
+    interval_sec: float = 30.
     sample_timeout_sec: float = 15.
     timing_range_ns: float = 112.
     phase_range_deg: float = 8.
     current_range_A: float = 0.5
-    min_gain: float = 0.0  # absolute transmission, not percent; GUI-adjustable
+    min_gain: float = 0.01  # absolute transmission, 1 percentage point; GUI-adjustable
     max_search_steps: int = 100
     max_orbit_steps: int = 50
     downstream: str = "DR"
@@ -153,7 +153,7 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
     def orbit(self):
         value = np.asarray(self.io.orbit(), float)
         if value.shape != (4,) or not np.isfinite(value).all():
-            raise ValueError("Invalid three-sample orbit mean")
+            raise ValueError("Invalid ten-shot orbit mean")
         self.event("orbit", orbit_mm=value.tolist())
         return value
 
