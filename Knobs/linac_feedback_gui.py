@@ -141,7 +141,7 @@ class FeedbackPanel(QWidget):
         self.save_dir, self.main_busy = save_dir, main_busy
         self.worker = None
         self.points, self.orbits = deque(maxlen=2000), deque(maxlen=2000)
-        self.live_points = deque(maxlen=2000)
+        self.plot_waiting = False
         self.reference = None
         self.initial_transmission = None
         self.transmission_baseline = None
@@ -150,6 +150,7 @@ class FeedbackPanel(QWidget):
         self.parameter_points = deque(maxlen=2000)
         self.latest_elapsed = 0.
         self.degradation_threshold = None
+        self.threshold_history = deque(maxlen=2000)
         self.latest_transmission = None
         self.average_result = None
         self.averages = deque(maxlen=2000)
@@ -196,12 +197,12 @@ class FeedbackPanel(QWidget):
         self.fields = {}
         defaults = FeedbackConfig()
         descriptions = {
-            "orbit_threshold_um": "Compare the latest 10 distinct BPM shots with the initial 10-shot mean. Default: 100 µm.",
+            "orbit_threshold_um": "Compare the latest 10 distinct BPM shots with the initial 10-shot mean. Default: 150 µm.",
             "settle_sec": "Wait after each PV write before measuring. Default: 2 s.",
             "interval_sec": "Wait after a full feedback cycle before starting the next timing search. Default: 30 s. This is additional to the wait after each write.",
-            "min_gain": "Minimum absolute transmission improvement to accept a local search step. Default: 0.01 (1 percentage point). 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate drop threshold.",
+            "min_gain": "Minimum absolute transmission improvement to accept a local search step. Default: 0.0005 (0.05 percentage point). 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate drop threshold.",
             "degradation_percent": "Absolute drop in percentage points: threshold = recovery baseline − drop / 100. Default: 80% → 75%. The baseline rises after sustained improvement and never decreases.",
-            "baseline_hold_sec": "Raise the recovery baseline after improvement lasts this long AND at least 3 complete operating-point means confirm it. Uses their lowest mean; probes are excluded. Pause, beam loss or orbit recovery restarts confirmation.",
+            "baseline_hold_sec": "Raise the recovery baseline after improvement lasts this long AND at least 3 complete operating-point means confirm it. Uses their lowest mean; probes are excluded. Orbit correction retains the candidate, elapsed time and confirmations. Pause or beam loss restarts confirmation.",
         }
         for name, label, lower, upper, decimals, step in (
                 ("orbit_threshold_um", "Orbit threshold [µm]", 1., 10000., 1, 10.),
@@ -209,7 +210,7 @@ class FeedbackPanel(QWidget):
                 ("interval_sec", "Wait between cycles [s]", 0., 600., 1, 1.),
                 ("degradation_percent", "Transmission drop [pp]", 0., 99., 1, 1.),
                 ("baseline_hold_sec", "Raise baseline after [s]", 0., 3600., 0, 30.),
-                ("min_gain", "Search deadband [ratio]", 0., .1, 5, .001),
+                ("min_gain", "Search deadband [ratio]", 0., .1, 5, .0001),
                 ("timing_range_ns", "Timing range from start [±ns]", 2.8, 1120., 1, 2.8),
                 ("phase_range_deg", "CM8L range from start [±°]", .5, 90., 1, .5),
                 ("current_range_A", "Corrector range from start [±A]", .01, 2., 2, .01)):
@@ -232,7 +233,7 @@ class FeedbackPanel(QWidget):
         average_count = QSpinBox()
         average_count.setRange(1, 100)
         average_count.setValue(defaults.degradation_samples)
-        average_count.setToolTip(f"Average new measurements at the timing optimum. Each measurement averages {ICT_SHOTS} fresh ICT shots. Temporary probe measurements are excluded.")
+        average_count.setToolTip(f"Degradation decision: default 1 measurement = {ICT_SHOTS} fresh ICT shots at the timing optimum. Higher counts average multiple measurements. Temporary probe measurements are excluded.")
         self.fields["degradation_samples"] = average_count
         form.addRow("Transmission average [measurements]", average_count)
         self.downstream = QComboBox()
@@ -325,9 +326,10 @@ class FeedbackPanel(QWidget):
             return
         self.worker = FeedbackWorker(self.config(), self.save_dir())
         self.points.clear()
-        self.live_points.clear()
+        self.plot_waiting = False
         self.orbits.clear()
         self.averages.clear()
+        self.threshold_history.clear()
         self.reference = self.initial_transmission = self.transmission_baseline = None
         self.initial_settings = {}
         self.latest_settings = {}
@@ -395,6 +397,7 @@ class FeedbackPanel(QWidget):
         elapsed = event.get("elapsed", 0.)
         self.latest_elapsed = max(self.latest_elapsed, elapsed)
         if kind == "state":
+            self.plot_waiting = event["state"] in ("Waiting for next timing scan", "Waiting for next feedback cycle")
             paused = event["state"].lower().startswith(("paused", "auto-paused", "stopped"))
             labels = {"Checking orbit": "Timing scan" if self.target_checks["adjust_timing"].isChecked() else "Feedback cycle", "Timing tracking": "Timing scan",
                       "Timing after orbit correction": "Timing scan", "CM8L phase recovery": "Phase scan",
@@ -403,11 +406,14 @@ class FeedbackPanel(QWidget):
                 prefix = "" if paused else "RUNNING | "
                 self.set_status(prefix + labels.get(event["state"], event["state"]), "paused" if paused else "running")
         elif kind == "waiting":
+            self.plot_waiting = True
             self.set_status(f"RUNNING | Next {event.get('next_action', 'Timing scan').lower()} in {math.ceil(event['remaining_sec'])} s")
         elif kind == "auto_pause":
+            self.plot_waiting = False
             self.set_status(event["state"] + "\n" + event["message"], "paused")
             self.pause_button.setText("RESUME")
         elif kind == "error":
+            self.plot_waiting = False
             self.failed = True
             self.set_status("Failed: " + event["message"], "error")
         elif kind == "reference":
@@ -419,20 +425,24 @@ class FeedbackPanel(QWidget):
             self.latest_settings = {}
             self.degradation_threshold = event.get("degradation_threshold",
                 max(0., self.transmission_baseline - self.fields["degradation_percent"].value() / 100))
+            self.threshold_history.clear()
+            self.threshold_history.append((elapsed, self.degradation_threshold))
             self.update_parameters(event["settings"], elapsed)
         elif kind == "baseline_updated":
             self.transmission_baseline = event["baseline"]
             self.degradation_threshold = event["threshold"]
+            self.threshold_history.append((elapsed, self.degradation_threshold))
         elif kind == "settings":
             self.initial_settings = dict(event["initial_settings"])
             self.update_parameters(event["settings"], elapsed)
         elif kind == "transmission":
             self.points.append((elapsed, event["transmission"]))
-            if not self.live_points:
-                self.latest_transmission = event["transmission"]
+            self.latest_transmission = event["transmission"]
             self.update_parameters(event["settings"], elapsed)
-        elif kind == "transmission_monitor":
-            self.live_points.append((elapsed, event["transmission"]))
+        elif kind == "transmission_monitor" and self.plot_waiting:
+            # During a scan, plot only the exact fresh mean used by control.
+            # In the cycle wait, keep displaying the background monitor.
+            self.points.append((elapsed, event["transmission"]))
             self.latest_transmission = event["transmission"]
         elif kind == "transmission_average":
             self.average_result = event
@@ -513,14 +523,26 @@ class FeedbackPanel(QWidget):
         upper, lower = self.axes
         upper.clear()
         lower.clear()
-        if self.live_points or self.points:
-            x, y = zip(*(self.live_points or self.points))
+        if self.points:
+            x, y = zip(*self.points)
             upper.plot(x, y, ".-", markersize=3, color="#2563eb",
                        label="Measured transmission")
         if self.initial_transmission is not None:
             upper.axhline(self.initial_transmission, color="gray", linestyle="--", label="Initial")
         if self.degradation_threshold is not None:
-            upper.axhline(self.degradation_threshold, color="#d97706", linestyle=":", label="Threshold")
+            if self.threshold_history and self.latest_elapsed > self.threshold_history[0][0]:
+                history = list(self.threshold_history)
+                # Keep threshold history aligned with the visible measurements,
+                # rather than stretching the plot back to the start forever.
+                start = max(history[0][0], self.points[0][0]) if self.points else history[0][0]
+                prior = next(value for stamp, value in reversed(history) if stamp <= start)
+                visible = [(start, prior)] + [(stamp, value) for stamp, value in history if stamp > start]
+                if self.latest_elapsed > visible[-1][0]:
+                    visible.append((self.latest_elapsed, visible[-1][1]))
+                x, y = zip(*visible)
+                upper.step(x, y, where="post", color="#d97706", linestyle=":", label="Threshold")
+            else:
+                upper.axhline(self.degradation_threshold, color="#d97706", linestyle=":", label="Threshold")
         if self.orbits:
             for i, label in enumerate(("ML8L x", "ML10L x", "ML8L y", "ML10L y")):
                 lower.plot([p[0] for p in self.orbits], [p[1][i] for p in self.orbits], label=label)

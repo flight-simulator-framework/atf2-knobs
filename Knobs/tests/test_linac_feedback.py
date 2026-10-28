@@ -84,8 +84,8 @@ class FeedbackTests(unittest.TestCase):
         controller.initialize()
         return plant, controller, events
 
-    def test_default_deadband_requires_more_than_one_percentage_point(self):
-        for gain, moves in ((.005, False), (.01, False), (.02, True)):
+    def test_default_deadband_requires_more_than_005_percentage_point(self):
+        for gain, moves in ((.00025, False), (.0005, False), (.001, True)):
             plant = Plant()
             origin = plant.values[TIMING_PV]
             target = origin + 2.8
@@ -279,8 +279,8 @@ class FeedbackTests(unittest.TestCase):
         self.assertTrue(plant.writes)
         self.assertTrue(all(abs(v) <= .020000001 for values, _ in plant.writes for v in values.values()))
 
-    def test_phase_recovery_uses_five_point_mean_and_absolute_five_point_drop(self):
-        for samples, degraded in (([.95] * 4 + [.75], False), ([.90] * 5, False), ([.899] * 5, True)):
+    def test_phase_recovery_uses_one_ten_shot_measurement_and_absolute_five_point_drop(self):
+        for samples, degraded in (([.95], False), ([.90], False), ([.899], True)):
             plant = Plant()
             plant.target_timing = plant.values[TIMING_PV]
             plant, controller, events = self.controller(plant)
@@ -342,13 +342,45 @@ class FeedbackTests(unittest.TestCase):
         self.assertTrue(any(e.get("state") == "CM8L phase recovery" for e in events))
         self.assertIsNone(controller._baseline_candidate)
 
-    def test_orbit_recovery_cancels_pending_baseline(self):
-        plant, controller, events = self.controller()
-        controller.update_transmission_baseline(.99)
+    def test_orbit_recovery_retains_pending_baseline_and_promotes_after_recovery(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant)
+        for now, value in ((0., .91), (60., .90)):
+            with patch("Knobs.linac_feedback.time.monotonic", return_value=now):
+                controller.update_transmission_baseline(value)
+        candidate = dict(controller._baseline_candidate)
+        correct_orbit = controller.correct_orbit
+        def recover():
+            self.assertEqual(controller._baseline_candidate, candidate)
+            correct_orbit()
+            self.assertEqual(controller._baseline_candidate, candidate)
+            self.assertEqual(controller.transmission_baseline, .8)
+        controller.correct_orbit = recover
+        plant.transmission = lambda: .92
         plant.drift[0] = .2
-        controller.cycle()
-        self.assertTrue(any(e["kind"] == "baseline_pending_reset" and
-                            e["reason"] == "Orbit recovery required" for e in events))
+        with patch("Knobs.linac_feedback.time.monotonic", return_value=120.):
+            controller.cycle()
+        self.assertTrue(any(e["kind"] == "orbit_priority" for e in events))
+        self.assertFalse(any(e["kind"] == "baseline_pending_reset" for e in events))
+        promotion = next(e for e in events if e["kind"] == "baseline_updated")
+        self.assertEqual(promotion["confirmations"], 3)
+        self.assertEqual(promotion["sustained_sec"], 120.)
+        self.assertAlmostEqual(controller.transmission_baseline, .90)
+        self.assertAlmostEqual(controller.recovery_threshold(), .85)
+
+    def test_orbit_drift_during_wait_retains_pending_baseline(self):
+        _, controller, events = self.controller()
+        controller.update_transmission_baseline(.99)
+        candidate = dict(controller._baseline_candidate)
+        with patch.object(controller, "initialize"), \
+             patch.object(controller, "cycle", side_effect=[None, InterruptedError("test complete")]), \
+             patch.object(controller, "wait_cycle", side_effect=OrbitDrift("drift during wait")):
+            with self.assertRaises(InterruptedError):
+                controller.run()
+        self.assertEqual(controller._baseline_candidate, candidate)
+        self.assertTrue(any(e["kind"] == "orbit_priority" for e in events))
+        self.assertFalse(any(e["kind"] == "baseline_pending_reset" for e in events))
 
     def test_baseline_threshold_is_clamped_at_zero(self):
         plant = Plant()
@@ -403,7 +435,7 @@ class FeedbackTests(unittest.TestCase):
         _, controller, events = self.controller(plant)
         controller.cycle()
         decision = next(e for e in events if e["kind"] == "degradation_decision")
-        self.assertEqual(decision["samples"], [.95] * 5)
+        self.assertEqual(decision["samples"], [.95])
         self.assertFalse(decision["degraded"])
 
     def test_orbit_drift_during_timing_interrupts_and_restores_probe(self):
@@ -816,11 +848,11 @@ class GuiTests(unittest.TestCase):
                 self.assertTrue(panel.config().adjust_timing)
                 panel.target_checks["adjust_phase"].setChecked(True)
                 self.assertEqual(window.tabs.tabText(window.tabs.indexOf(panel)), "Active Feedback")
-                self.assertEqual(panel.config().orbit_threshold_um, 100.)
+                self.assertEqual(panel.config().orbit_threshold_um, 150.)
                 self.assertEqual(panel.config().settle_sec, 2.)
                 self.assertEqual(panel.config().interval_sec, 30.)
-                self.assertEqual(panel.config().min_gain, .01)
-                self.assertEqual(panel.config().degradation_samples, 5)
+                self.assertEqual(panel.config().min_gain, .0005)
+                self.assertEqual(panel.config().degradation_samples, 1)
                 self.assertEqual(panel.config().degradation_percent, 5.)
                 self.assertEqual(panel.config().baseline_hold_sec, 120.)
                 self.assertIn("percentage points", panel.fields["degradation_percent"].toolTip())
@@ -847,16 +879,24 @@ class GuiTests(unittest.TestCase):
                 self.assertAlmostEqual(panel.degradation_threshold, .75)
                 panel.on_event(dict(kind="transmission_average", average=.89, samples=5, required=5,
                                     complete=True, threshold=.75))
-                panel.on_event(dict(kind="baseline_updated", baseline=.89, threshold=.84))
+                panel.on_event(dict(kind="baseline_updated", baseline=.89, threshold=.84, elapsed=21.))
                 self.assertIn("Initial: 0.800000", panel.values.text())
                 self.assertIn("Recovery baseline: 0.890000", panel.values.text())
                 self.assertIn("Threshold: 0.840000", panel.values.text())
                 self.assertNotIn("0.750000", panel.values.text())
                 panel.draw_plot()
                 lines = {line.get_label(): line for line in panel.axes[0].lines}
-                self.assertEqual(lines["Threshold"].get_ydata()[0], .84)
+                np.testing.assert_allclose(lines["Threshold"].get_xdata(), [0., 21.])
+                np.testing.assert_allclose(lines["Threshold"].get_ydata(), [.75, .84])
+                self.assertEqual(lines["Threshold"].get_drawstyle(), "steps-post")
                 self.assertEqual(lines["Initial"].get_ydata()[0], .8)
-                panel.on_event(dict(kind="waiting", cycle=3, remaining_sec=4.1))
+                panel.on_event(dict(kind="baseline_updated", baseline=.91, threshold=.86, elapsed=25.))
+                panel.on_event(dict(kind="waiting", cycle=3, remaining_sec=4.1, elapsed=30.))
+                panel.draw_plot()
+                lines = {line.get_label(): line for line in panel.axes[0].lines}
+                np.testing.assert_allclose(lines["Threshold"].get_xdata(), [0., 21., 25., 30.])
+                np.testing.assert_allclose(lines["Threshold"].get_ydata(), [.75, .84, .86, .86])
+                self.assertEqual(lines["Initial"].get_ydata()[0], .8)
                 self.assertIn("Next timing scan in 5 s", panel.status.text())
                 waiting_status = panel.status.text()
                 panel.on_event(dict(kind="activity", state="Timing tracking", cycle=3,
@@ -868,6 +908,10 @@ class GuiTests(unittest.TestCase):
                     panel.on_event(dict(kind="activity", detail=detail))
                     self.assertEqual(panel.status.text(), "RUNNING | Timing scan")
                 panel.on_event(dict(kind="transmission_monitor", transmission=.91, shots=10, elapsed=42.))
+                self.assertEqual(list(panel.points), [])
+                panel.on_event(dict(kind="transmission", transmission=.89, settings=origin, elapsed=43.))
+                panel.on_event(dict(kind="transmission_monitor", transmission=.92, shots=10, elapsed=44.))
+                self.assertEqual(panel.latest_transmission, .89)
                 panel.on_event(dict(kind="transmission_average", average=.89, samples=3, required=5,
                                     complete=False, threshold=.84))
                 self.assertEqual(panel.status.text(), "RUNNING | Timing scan")
@@ -875,10 +919,22 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual({line.get_label() for line in panel.axes[0].lines},
                                  {"Measured transmission", "Initial", "Threshold"})
                 live_line = next(line for line in panel.axes[0].lines if line.get_label() == "Measured transmission")
-                self.assertEqual(list(live_line.get_xdata()), [42.])
-                self.assertEqual(list(live_line.get_ydata()), [.91])
-                panel.fields["orbit_threshold_um"].setValue(150.)
-                self.assertEqual(panel.config().orbit_threshold_um, 150.)
+                self.assertEqual(list(live_line.get_xdata()), [43.])
+                self.assertEqual(list(live_line.get_ydata()), [.89])
+                threshold_line = next(line for line in panel.axes[0].lines if line.get_label() == "Threshold")
+                self.assertEqual(list(threshold_line.get_xdata()), [43., 44.])
+                self.assertEqual(list(threshold_line.get_ydata()), [.86, .86])
+                panel.on_event(dict(kind="waiting", remaining_sec=10., elapsed=45.))
+                panel.on_event(dict(kind="transmission_monitor", transmission=.93, shots=10, elapsed=46.))
+                self.assertEqual(panel.latest_transmission, .93)
+                panel.on_event(dict(kind="state", state="Timing tracking", elapsed=47.))
+                panel.on_event(dict(kind="transmission_monitor", transmission=.94, shots=10, elapsed=48.))
+                self.assertEqual(list(panel.points), [(43., .89), (46., .93)])
+                panel.on_event(dict(kind="transmission", transmission=.95, settings=origin, elapsed=49.))
+                self.assertEqual(panel.points[-1], (49., .95))
+                self.assertEqual(panel.latest_transmission, .95)
+                panel.fields["orbit_threshold_um"].setValue(200.)
+                self.assertEqual(panel.config().orbit_threshold_um, 200.)
                 fake = Mock()
                 panel.worker = fake
                 window._feedback_busy_changed(True)
@@ -898,6 +954,7 @@ class GuiTests(unittest.TestCase):
                 self.assertTrue(window.btn_start.isEnabled())
                 with patch("Knobs.linac_feedback_gui.FeedbackWorker", return_value=Mock()):
                     panel.start()
+                    self.assertEqual(list(panel.threshold_history), [])
                     self.assertFalse(panel.settings.isEnabled())
                     self.assertFalse(panel.targets.isEnabled())
                     self.assertTrue(window.config_sections.isEnabled())

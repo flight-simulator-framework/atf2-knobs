@@ -43,16 +43,16 @@ With all targets enabled:
    settling and cycle waits, averaging the latest **10 distinct valid shots**.
    If any of ML8L.x, ML10L.x, ML8L.y or ML10L.y
    differs from its initial 10-shot mean by at least the orbit threshold
-   (100 µm by default, editable in the tab), restore the orbit with ZH1L, ZV1L,
+   (150 µm by default, editable in Config), restore the orbit with ZH1L, ZV1L,
    ZH2L and ZV2L. Every changed corrector moves by 0.01 A per step. The threshold
    triggers correction independently of transmission. Restore temporary probes
    and confirm the drift using 10 fresh shots at the accepted settings
    before switching to correction. Correction targets the initial orbit until
    no improving grid move remains, a trial fails, or the iteration limit is reached.
 3. After orbit correction, repeat timing optimization. Once timing has reached a
-   local optimum and the orbit is within tolerance, measure transmission five
-   times at that operating point. Phase recovery starts only when the mean of
-   these latest five measurements is **below recovery baseline − 0.05** by
+   local optimum and the orbit is within tolerance, take one fresh 10-shot
+   transmission measurement at that operating point. Phase recovery starts only
+   when this measurement is **below recovery baseline − 0.05** by
    default. This is an absolute drop of **5 percentage points**. For example,
    a baseline transmission of 0.80 gives a recovery threshold of 0.75. Each
    measurement uses ten fresh ICT samples; deliberate timing/phase probe
@@ -67,8 +67,11 @@ improvement is confirmed for **120 seconds and at least 3 complete operating-poi
 means**, with timing at a local optimum and normal BPM readings. The new baseline
 is the lowest confirmed mean during that interval, avoiding a transient maximum.
 The GUI's **Raise baseline after [s]** controls the duration. A confirmed mean at
-or below the current baseline, orbit recovery, Pause or beam loss cancels pending
-confirmation. The baseline never moves down; for example, once it reaches 0.90,
+or below the current baseline, Pause or beam loss cancels pending confirmation.
+Orbit correction retains the candidate, elapsed time and confirmation count;
+correction probes do not count, and promotion requires a subsequent complete
+operating-point mean with normal BPM readings. The baseline never moves down;
+for example, once it reaches 0.90,
 phase recovery uses 0.85. The initial transmission, orbit reference and parameter
 origins remain fixed throughout the run. A new START captures new initial references.
 
@@ -95,7 +98,7 @@ based on the orbit error relative to the initial reference.
 
 The Config → Active Feedback tab exposes settling time (default **2 s** after each write), cycle interval
 (default **30 s** after a complete feedback loop, before the next timing search),
-local-search improvement deadband (absolute ratio, default **0.01 / 1 percentage point**), and
+local-search improvement deadband (absolute ratio, default **0.0005 / 0.05 percentage point**), and
 excursions from the starting values (defaults:
 timing ±112 ns, CM8L ±8°, correctors ±0.5 A). Correctors additionally require valid
 IOC control limits and remain within ±5 A. Reaching a timing/phase search boundary
@@ -121,14 +124,22 @@ four corrector currents share an A-axis plot. Both show changes from the initial
 setpoints against elapsed time, including temporary probes and restorations.
 Step traces extend through cycle waits and update with the other live plots.
 The transmission plot shows only **Initial**, **Threshold** and **Measured transmission**.
-Its blue **Measured transmission** trace is the ratio of the latest
-ten downstream ICT readings' mean to the ten upstream readings' mean. It
-updates when both channels have new timestamps, including during settling, BPM
-acquisition and cycle waits; the canvas redraws every 0.5 s. Repeated timestamps
-do not count, and a nonpositive ICT clears the display window. This display-only
-window never feeds optimization or degradation decisions: those still use fresh
-post-settling samples. The operating-point mean averages five such control
-measurements by default (normally 50 valid ICT shot pairs) and updates once per
+Threshold follows the confirmed recovery baseline minus the configured absolute
+drop (default 5 percentage points). Its step trace preserves each baseline
+promotion's time and extends the current threshold through cycle waits; Initial
+remains fixed at the starting transmission.
+During scans, its blue **Measured transmission** trace and current numeric value
+show the exact fresh 10-shot transmission used by control, without further
+averaging. Background rolling means do not replace those evaluation values.
+During cycle waits, the same trace continues with the background 10-shot rolling
+mean; these waiting observations are display-only. Both calculate the downstream
+ICT mean divided by the upstream mean. Repeated timestamps do not count, and a
+nonpositive ICT clears the background window. The canvas redraws every 0.5 s;
+scan points are added only when a control measurement completes.
+The degradation decision uses one such control measurement by default
+(10 valid ICT shot pairs, with no additional five-measurement averaging). The
+Config averaging count defaults to 1 and can be increased explicitly. The
+operating-point result updates once per
 completed transmission check; it and the adaptive baseline remain in the summary
 and logs rather than adding curves to the plot. ICT pairing uses timestamp advancement, not pulse IDs.
 Only ICT loss triggers automatic pause: if either LN0 or the selected downstream

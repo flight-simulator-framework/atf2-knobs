@@ -31,18 +31,18 @@ class OrbitDrift(RuntimeError):
 
 @dataclass(frozen=True)
 class FeedbackConfig:
-    orbit_threshold_um: float = 100.
+    orbit_threshold_um: float = 150.
     settle_sec: float = 2.
     interval_sec: float = 30.
     sample_timeout_sec: float = 15.
     timing_range_ns: float = 112.
     phase_range_deg: float = 8.
     current_range_A: float = 0.5
-    min_gain: float = 0.01  # absolute transmission, 1 percentage point; GUI-adjustable
+    min_gain: float = 0.0005  # absolute transmission, 0.05 percentage point; GUI-adjustable
     max_search_steps: int = 100
     max_orbit_steps: int = 50
     downstream: str = "DR"
-    degradation_samples: int = 5
+    degradation_samples: int = 1  # one control measurement = ten fresh ICT shots
     degradation_percent: float = 5.  # absolute percentage points, 5 pp = 0.05
     baseline_hold_sec: float = 120.
     baseline_min_confirmations: int = 3
@@ -412,7 +412,7 @@ fails, try individual +/-0.01 A corrections. No calibration-only excursions.
                 if self.config.adjust_timing:
                     self.search(TIMING_PV, TIMING_STEP, timing_label)
                 self.check_orbit(force=True)
-                # Compare five new operating-point measurements, never a mix of
+                # Compare fresh operating-point measurements, never a mix of
                 # deliberate probe losses or obsolete timing/corrector settings.
                 self.transmission_history.clear()
                 self.set_state("Checking transmission after timing")
@@ -443,7 +443,8 @@ fails, try individual +/-0.01 A corrections. No calibration-only excursions.
                 self.set_state("Monitoring")
                 return
             except OrbitDrift as exc:
-                self.reset_baseline_candidate("Orbit recovery required")
+                # Keep prior baseline confirmations across orbit correction;
+                # only the next settled operating-point mean can confirm it.
                 self.event("orbit_priority", message=str(exc))
                 self.correct_orbit()
                 self.orbit_alert = False
@@ -483,7 +484,6 @@ fails, try individual +/-0.01 A corrections. No calibration-only excursions.
                 self.cycle()
                 self.wait_cycle()
             except OrbitDrift:
-                self.reset_baseline_candidate("Orbit drift during wait")
                 self.event("orbit_priority", message="Orbit drift during wait; starting recovery now")
             except BeamLoss as exc:
                 # Every probe/trial has already unwound its finally block.
