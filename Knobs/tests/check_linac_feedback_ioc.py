@@ -125,7 +125,7 @@ def main():
                 assert abs(machine.read(PHASE_PV) - 2.5) < .001
                 decision = next(e for e in events if e["kind"] == "degradation_decision" and e["degraded"])
                 assert len(decision["samples"]) == 5 and decision["orbit_normal"]
-                assert abs(decision["threshold"] - controller.initial_transmission * .95) < 1e-9
+                assert abs(decision["threshold"] - (controller.initial_transmission - .05)) < 1e-9
                 residual = machine.orbit() - controller.reference
                 assert np.max(abs(residual)) < .02, residual
                 assert any(e["kind"] == "response" and e["observations"] > 4 for e in events)
@@ -199,7 +199,7 @@ def main():
                                       cm8l_phase_deg=machine.scalar(PHASE_PV),
                                       residual_um=(residual * 1000).tolist(), events=len(events),
                                       auto_pause_resume="passed", continuous_bpm_wait="passed",
-                                      relative_five_point_threshold="passed", operation_rows=len(operations)), indent=2))
+                                      absolute_five_point_threshold="passed", operation_rows=len(operations)), indent=2))
             finally:
                 if machine is not None:
                     machine.close()

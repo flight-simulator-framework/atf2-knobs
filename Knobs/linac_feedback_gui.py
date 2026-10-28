@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
-from Knobs.linac_feedback import FeedbackConfig, FeedbackController, CURRENT_PVS, PVS, PHASE_PV, TIMING_PV
+from Knobs.linac_feedback import FeedbackConfig, FeedbackController, RecentResponse, CURRENT_PVS, PVS, PHASE_PV, TIMING_PV
 from Knobs.linac_feedback_io import FeedbackMachine
 from Knobs.optimizer_workspace import (OptimizerWorkspace, WORKSPACE_STYLE, WrappingLabel,
                                       run_button_style, status_badge_style)
@@ -36,6 +36,8 @@ class FeedbackWorker(QThread):
         self.paused = threading.Event()
         self.pause_reason = ""
         self.stage, self.cycle_number = "Starting", 0
+        self.on_pause = None
+        self.response_cache = Path(save_dir) / "active_feedback_response.json"
 
     def stop(self):
         self.cancelled.set()
@@ -43,6 +45,8 @@ class FeedbackWorker(QThread):
 
     def checkpoint(self):
         if self.paused.is_set() and not self.cancelled.is_set():
+            if self.on_pause is not None:
+                self.on_pause("Feedback paused")
             self.emit_event(dict(kind="state", state=("Auto-paused: " + self.pause_reason if self.pause_reason
                                                        else "Paused (accepted settings retained)")))
             while self.paused.is_set() and not self.cancelled.wait(.05):
@@ -76,6 +80,13 @@ class FeedbackWorker(QThread):
                     event["command_id"], pv, event.get("previous", {}).get(pv), target,
                     event.get("readbacks", {}).get(pv), event["restore"], event["status"], event.get("error", "")])
             self.operations.flush()
+        if event["kind"] == "response" and event.get("matrix_mm_per_A") is not None:
+            try:
+                temporary = self.response_cache.with_name(self.run_dir.name + "_response.tmp")
+                temporary.write_text(json.dumps(dict(event["model"], saved_at=event["timestamp"]), allow_nan=False))
+                temporary.replace(self.response_cache)
+            except OSError as exc:
+                self.emit_event(dict(kind="log", message=f"Response cache could not be saved: {exc}"))
         self.event_signal.emit(event)
 
     def run(self):
@@ -93,6 +104,15 @@ class FeedbackWorker(QThread):
             self.emit_event(dict(kind="log", message=f"Run data: {self.run_dir}"))
             machine = self.machine_factory(self.config, self.cancelled.is_set, self.checkpoint, self.emit_event)
             controller = FeedbackController(machine, self.config, machine.limits(), self.emit_event)
+            self.on_pause = controller.reset_baseline_candidate
+            if self.response_cache.exists():
+                try:
+                    controller.response = RecentResponse.from_snapshot(json.loads(self.response_cache.read_text()))
+                    controller.response_needs_refresh = True
+                    self.emit_event(dict(kind="log", message="Stored response loaded; refresh with 0.01 A probes before orbit correction."))
+                    controller.report_response()
+                except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                    self.emit_event(dict(kind="log", message=f"Stored response unavailable; new calibration required: {exc}"))
             controller.run(pause_for_loss=self.pause_for_loss)
         except InterruptedError:
             self.emit_event(dict(kind="state", state="Stopped; accepted settings retained"))
@@ -103,6 +123,7 @@ class FeedbackWorker(QThread):
             except Exception:
                 self.event_signal.emit(dict(kind="error", message=str(exc)))
         finally:
+            self.on_pause = None
             try:
                 if machine is not None:
                     machine.close()
@@ -123,6 +144,7 @@ class FeedbackPanel(QWidget):
         self.points, self.orbits = deque(maxlen=2000), deque(maxlen=2000)
         self.reference = None
         self.initial_transmission = None
+        self.transmission_baseline = None
         self.initial_settings = {}
         self.degradation_threshold = None
         self.latest_transmission = None
@@ -139,7 +161,7 @@ class FeedbackPanel(QWidget):
         run_group = QGroupBox("Run Control")
         run_layout = QVBoxLayout(run_group)
         run_layout.addWidget(WrappingLabel("Timing tracking • Orbit drift → correctors + timing • Low transmission with normal orbit → CM8L phase"))
-        note = WrappingLabel("Initial response probe: 0.05 A. ICT ≤ 0 pauses feedback automatically; press RESUME after recovery.")
+        note = WrappingLabel("Response stored internally: first calibration 0.05 A, refresh 0.01 A. ICT ≤ 0 pauses feedback; press RESUME after recovery.")
         note.setStyleSheet("font-size: 12px; color: #475569;")
         run_layout.addWidget(note)
         row = QHBoxLayout()
@@ -164,14 +186,16 @@ class FeedbackPanel(QWidget):
         descriptions = {
             "settle_sec": "Wait after each PV write before measuring. Default: 2 s.",
             "interval_sec": "Wait after a full feedback cycle before starting the next timing search. This is additional to the wait after each write.",
-            "min_gain": "Minimum absolute transmission improvement to accept a local search step. 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate relative drop threshold.",
-            "degradation_percent": "Phase recovery threshold = initial transmission × (1 − drop / 100). Default: 95% of initial, not a 5 percentage-point subtraction.",
+            "min_gain": "Minimum absolute transmission improvement to accept a local search step. 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate drop threshold.",
+            "degradation_percent": "Absolute drop in percentage points: threshold = recovery baseline − drop / 100. Default: 80% → 75%. The baseline rises after sustained improvement and never decreases.",
+            "baseline_hold_sec": "Raise the recovery baseline after improvement lasts this long AND at least 3 complete operating-point means confirm it. Uses their lowest mean; probes are excluded. Pause, beam loss or orbit recovery restarts confirmation.",
         }
         for name, label, lower, upper, decimals, step in (
                 ("orbit_threshold_um", "Orbit threshold [µm]", 1., 10000., 1, 10.),
                 ("settle_sec", "Settle after write [s]", 0., 120., 2, .5),
                 ("interval_sec", "Wait between cycles [s]", 0., 600., 1, 1.),
-                ("degradation_percent", "Transmission drop [% of initial]", 0., 99., 1, 1.),
+                ("degradation_percent", "Transmission drop [pp]", 0., 99., 1, 1.),
+                ("baseline_hold_sec", "Raise baseline after [s]", 0., 3600., 0, 30.),
                 ("min_gain", "Search deadband [ratio]", 0., .1, 5, .001),
                 ("timing_range_ns", "Timing range from start [±ns]", 2.8, 1120., 1, 2.8),
                 ("phase_range_deg", "CM8L range from start [±°]", .5, 90., 1, .5),
@@ -231,6 +255,8 @@ class FeedbackPanel(QWidget):
             self.parameter_table.setItem(row, 0, QTableWidgetItem(name))
         current_layout.addWidget(self.parameter_table)
         response_group = QGroupBox("Learned Response [mm/A]")
+        self.response_group = response_group
+        response_group.setToolTip("Stored in the save folder and reused across runs. Refreshed when orbit correction starts. Phase changes and beam loss retain the matrix and require a refresh before reuse.")
         response_layout = QVBoxLayout(response_group)
         self.response_table = QTableWidget(4, 4)
         self.response_table.setHorizontalHeaderLabels([pv.split(":")[0] for pv in CURRENT_PVS])
@@ -290,7 +316,7 @@ class FeedbackPanel(QWidget):
         self.points.clear()
         self.orbits.clear()
         self.averages.clear()
-        self.reference = self.initial_transmission = None
+        self.reference = self.initial_transmission = self.transmission_baseline = None
         self.initial_settings = {}
         self.degradation_threshold = self.latest_transmission = self.average_result = None
         for row in range(len(PVS)):
@@ -372,10 +398,14 @@ class FeedbackPanel(QWidget):
         elif kind == "reference":
             self.reference = event["orbit_mm"]
             self.initial_transmission = event["transmission"]
+            self.transmission_baseline = event.get("baseline", self.initial_transmission)
             self.initial_settings = dict(event["settings"])
             self.degradation_threshold = event.get("degradation_threshold",
-                self.initial_transmission * (1 - self.fields["degradation_percent"].value() / 100))
+                max(0., self.transmission_baseline - self.fields["degradation_percent"].value() / 100))
             self.update_parameters(event["settings"])
+        elif kind == "baseline_updated":
+            self.transmission_baseline = event["baseline"]
+            self.degradation_threshold = event["threshold"]
         elif kind == "settings":
             self.initial_settings = dict(event["initial_settings"])
             self.update_parameters(event["settings"])
@@ -393,18 +423,22 @@ class FeedbackPanel(QWidget):
             drift = [1000 * (v - r) for v, r in zip(event["orbit_mm"], self.reference)]
             self.orbits.append((elapsed, drift))
         elif kind == "response":
+            self.response_group.setTitle("Stored Response [mm/A] — refresh pending" if event.get("needs_refresh")
+                                         else "Learned Response [mm/A]")
             self.response_table.clearContents()
             for row, values in enumerate(event["matrix_mm_per_A"] or []):
                 for col, value in enumerate(values):
                     self.response_table.setItem(row, col, QTableWidgetItem(f"{value:.4g}"))
-        if kind in ("transmission", "transmission_average", "reference"):
-            baseline = f"{self.initial_transmission:.6f}" if self.initial_transmission is not None else "—"
+        if kind in ("transmission", "transmission_average", "reference", "baseline_updated"):
+            initial = f"{self.initial_transmission:.6f}" if self.initial_transmission is not None else "—"
             current = f"{self.latest_transmission:.6f}" if self.latest_transmission is not None else "—"
-            text = f"Transmission ({self.downstream.currentText()} / LN0): {current} | Initial: {baseline}"
+            text = f"Transmission ({self.downstream.currentText()} / LN0): {current} | Initial: {initial}"
+            if self.transmission_baseline is not None:
+                text += (f"\nRecovery baseline: {self.transmission_baseline:.6f}"
+                         f" | Threshold: {self.degradation_threshold:.6f}")
             if self.average_result:
                 avg = self.average_result
-                text += (f"\nLatest operating-point mean ({avg['samples']}/{avg['required']}): {avg['average']:.6f}"
-                         f" | Recovery threshold: {avg['threshold']:.6f}")
+                text += f"\nLatest operating-point mean ({avg['samples']}/{avg['required']}): {avg['average']:.6f}"
             self.values.setText(text)
         if kind not in ("transmission", "orbit", "orbit_monitor", "orbit_samples", "ict_samples", "command",
                         "command_result", "settings", "activity", "waiting"):
@@ -433,6 +467,8 @@ class FeedbackPanel(QWidget):
             upper.plot(x, y, ".-", markersize=3, label="Measured transmission (includes probes)")
         if self.initial_transmission is not None:
             upper.axhline(self.initial_transmission, color="gray", linestyle="--", label="Initial")
+        if self.transmission_baseline is not None:
+            upper.axhline(self.transmission_baseline, color="#7c3aed", linestyle="-.", label="Recovery baseline")
         if self.degradation_threshold is not None:
             upper.axhline(self.degradation_threshold, color="#d97706", linestyle=":", label="Recovery threshold")
         if self.averages:

@@ -227,8 +227,8 @@ class FeedbackTests(unittest.TestCase):
         controller.learn_response()
         self.assertTrue(all(abs(v) <= .020000001 for values, _ in plant.writes for v in values.values()))
 
-    def test_phase_recovery_uses_five_point_mean_and_relative_five_percent_drop(self):
-        for samples, degraded in (([.95] * 4 + [.75], False), ([.9025] * 5, False), ([.90] * 5, True)):
+    def test_phase_recovery_uses_five_point_mean_and_absolute_five_point_drop(self):
+        for samples, degraded in (([.95] * 4 + [.75], False), ([.90] * 5, False), ([.899] * 5, True)):
             plant = Plant()
             plant.target_timing = plant.values[TIMING_PV]
             plant, controller, events = self.controller(plant)
@@ -240,9 +240,112 @@ class FeedbackTests(unittest.TestCase):
             controller.cycle()
             decision = next(e for e in events if e["kind"] == "degradation_decision")
             self.assertEqual(decision["samples"], samples)
-            self.assertAlmostEqual(decision["threshold"], .95 * .95)
+            self.assertAlmostEqual(decision["threshold"], .95 - .05)
             self.assertEqual(decision["degraded"], degraded)
             self.assertEqual(any(e.get("state") == "CM8L phase recovery" for e in events), degraded)
+
+    def test_sustained_improvement_promotes_floor_and_preserves_initial_references(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant)
+        origin, orbit = dict(controller.origin), controller.reference.copy()
+        for now, average in ((0., .90), (60., .89), (120., .91)):
+            with patch("Knobs.linac_feedback.time.monotonic", return_value=now):
+                controller.update_transmission_baseline(average)
+            self.assertAlmostEqual(controller.transmission_baseline, .89 if now == 120. else .8)
+        self.assertAlmostEqual(controller.recovery_threshold(), .84)
+        self.assertEqual(controller.initial_transmission, .8)
+        self.assertEqual(controller.origin, origin)
+        np.testing.assert_array_equal(controller.reference, orbit)
+        event = next(e for e in events if e["kind"] == "baseline_updated")
+        self.assertEqual((event["previous"], event["confirmations"], event["sustained_sec"]), (.8, 3, 120.))
+        controller.update_transmission_baseline(.7)
+        self.assertEqual(controller.transmission_baseline, .89)
+
+    def test_baseline_requires_time_and_confirmations_and_restarts_after_a_dip(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant)
+        for now, value in ((0., .9), (60., .8), (120., .91), (240., .90)):
+            with patch("Knobs.linac_feedback.time.monotonic", return_value=now):
+                controller.update_transmission_baseline(value)
+        self.assertEqual(controller.transmission_baseline, .8)  # only two new confirmations
+        with patch("Knobs.linac_feedback.time.monotonic", return_value=241.):
+            controller.update_transmission_baseline(.92)
+        self.assertEqual(controller.transmission_baseline, .90)
+        self.assertTrue(any(e["kind"] == "baseline_pending_reset" for e in events))
+
+    def test_phase_recovery_uses_promoted_baseline(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant)
+        for now in (0., 60., 120.):
+            with patch("Knobs.linac_feedback.time.monotonic", return_value=now):
+                controller.update_transmission_baseline(.95)
+        plant.transmission = lambda: .89
+        controller.cycle()
+        decision = next(e for e in events if e["kind"] == "degradation_decision")
+        self.assertTrue(decision["degraded"])
+        self.assertAlmostEqual(decision["threshold"], .90)
+        self.assertTrue(any(e.get("state") == "CM8L phase recovery" for e in events))
+        self.assertIsNone(controller._baseline_candidate)
+
+    def test_orbit_recovery_cancels_pending_baseline(self):
+        plant, controller, events = self.controller()
+        controller.update_transmission_baseline(.99)
+        plant.drift[0] = .2
+        controller.cycle()
+        self.assertTrue(any(e["kind"] == "baseline_pending_reset" and
+                            e["reason"] == "Orbit recovery required" for e in events))
+
+    def test_baseline_threshold_is_clamped_at_zero(self):
+        plant = Plant()
+        plant.transmission = lambda: .03
+        _, controller, _ = self.controller(plant)
+        self.assertEqual(controller.recovery_threshold(), 0.)
+
+    def test_phase_keeps_response_and_refresh_replaces_stale_observations(self):
+        plant, controller, events = self.controller()
+        controller.learn_response()
+        previous = controller.response.snapshot()
+        plant.target_phase = .5
+        controller.search(PHASE_PV, .5, "Phase")
+        self.assertEqual(controller.response.snapshot(), previous)
+        self.assertTrue(controller.response_needs_refresh)
+        plant.response *= -1
+        plant.writes.clear()
+        controller.learn_response()
+        self.assertFalse(controller.response_needs_refresh)
+        self.assertEqual(len(controller.response.samples), 4)
+        np.testing.assert_allclose(controller.response.matrix(), plant.response, atol=1e-4)
+        for values, restore in plant.writes:
+            self.assertAlmostEqual(abs(next(iter(values.values()))), 0. if restore else .01)
+
+    def test_interrupted_response_refresh_retains_previous_model(self):
+        plant, controller, _ = self.controller()
+        controller.learn_response()
+        previous = controller.response.snapshot()
+        controller.response_needs_refresh = True
+        def fail(values, restore):
+            if not restore:
+                raise BeamLoss("ICT = 0")
+        plant.on_write = fail
+        with self.assertRaises(BeamLoss):
+            controller.learn_response()
+        self.assertEqual(controller.response.snapshot(), previous)
+        self.assertTrue(controller.response_needs_refresh)
+        np.testing.assert_array_equal(controller.currents(), np.zeros(4))
+
+    def test_response_cache_roundtrip_and_validation(self):
+        _, controller, _ = self.controller()
+        controller.learn_response()
+        data = json.loads(json.dumps(controller.response.snapshot()))
+        loaded = RecentResponse.from_snapshot(data)
+        np.testing.assert_array_equal(loaded.matrix(), controller.response.matrix())
+        for changes in (dict(units="um/A"), dict(samples=[]), dict(correctors=list(reversed(CURRENT_PVS))),
+                        dict(samples=[[[.01, 0, 0, 0], [1, 2, 3, 4]]] * 4)):
+            with self.assertRaises(ValueError):
+                RecentResponse.from_snapshot(dict(data, **changes))
 
     def test_probe_losses_do_not_pollute_degradation_average(self):
         plant = Plant()
@@ -403,6 +506,29 @@ class MachineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Disconnected"):
             machine.write({CURRENT_PVS[0]: .01})
 
+    def test_active_feedback_readback_tolerances_at_start_and_after_write(self):
+        for name, tolerance in ((CURRENT_PVS[0], .1), (PHASE_PV, 1.), (TIMING_PV, .01)):
+            for error, accepted in ((tolerance, True), (tolerance + .001, False)):
+                with self.subTest(name=name, error=error):
+                    channel = Mock()
+                    channel.get_ctrlvars.return_value = dict(lower_ctrl_limit=-3., upper_ctrl_limit=3.)
+                    channel.put.return_value = 1
+                    machine = self.machine(lambda *a, **kw: channel)
+                    machine.limits()
+                    machine.check_beam = Mock()
+                    channel.get.side_effect = [0., error]
+                    if accepted:
+                        self.assertEqual(machine.read(name), 0.)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "Setpoint/readback mismatch"):
+                            machine.read(name)
+                    channel.get.side_effect = [0., error]
+                    with patch("Knobs.linac_feedback_io.time.monotonic", side_effect=[0., 4.]):
+                        if accepted:
+                            machine.write({name: 0.})
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "readback did not reach target"):
+                                machine.write({name: 0.})
     def test_logging_failure_does_not_block_probe_restoration(self):
         pv = Mock()
         pv.get_ctrlvars.return_value = dict(lower_ctrl_limit=-3., upper_ctrl_limit=3.)
@@ -487,6 +613,8 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(panel.config().settle_sec, 2.)
                 self.assertEqual(panel.config().degradation_samples, 5)
                 self.assertEqual(panel.config().degradation_percent, 5.)
+                self.assertEqual(panel.config().baseline_hold_sec, 120.)
+                self.assertIn("percentage points", panel.fields["degradation_percent"].toolTip())
                 self.assertEqual(panel.start_button.styleSheet(), window.btn_start.styleSheet())
                 self.assertEqual(panel.pause_button.styleSheet(), window.btn_stop.styleSheet())
                 self.assertTrue(panel.log.isHidden())
@@ -498,6 +626,19 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(panel.parameter_table.item(0, 3).text(), "+5.600")
                 self.assertEqual(panel.parameter_table.item(1, 3).text(), "+0.500")
                 self.assertEqual(panel.parameter_table.item(2, 3).text(), "+0.020")
+                panel.on_event(dict(kind="reference", transmission=.8, orbit_mm=[0.] * 4, settings=origin))
+                self.assertAlmostEqual(panel.degradation_threshold, .75)
+                panel.on_event(dict(kind="transmission_average", average=.89, samples=5, required=5,
+                                    complete=True, threshold=.75))
+                panel.on_event(dict(kind="baseline_updated", baseline=.89, threshold=.84))
+                self.assertIn("Initial: 0.800000", panel.values.text())
+                self.assertIn("Recovery baseline: 0.890000", panel.values.text())
+                self.assertIn("Threshold: 0.840000", panel.values.text())
+                self.assertNotIn("0.750000", panel.values.text())
+                panel.draw_plot()
+                lines = {line.get_label(): line for line in panel.axes[0].lines}
+                self.assertEqual(lines["Recovery baseline"].get_ydata()[0], .89)
+                self.assertEqual(lines["Initial"].get_ydata()[0], .8)
                 panel.on_event(dict(kind="waiting", cycle=3, remaining_sec=4.1))
                 self.assertIn("Next timing scan in 5 s", panel.status.text())
                 self.assertIn("BPM monitoring active", panel.status.text())
@@ -530,6 +671,65 @@ class GuiTests(unittest.TestCase):
                 _APP.processEvents()
                 window.close()
                 _APP.processEvents()
+
+    def test_pause_cancels_pending_baseline_without_lowering_confirmed_baseline(self):
+        from Knobs.linac_feedback_gui import FeedbackWorker
+        _, controller, events = FeedbackTests().controller()
+        controller.update_transmission_baseline(.99)
+        baseline = controller.transmission_baseline
+        with tempfile.TemporaryDirectory() as directory:
+            worker = FeedbackWorker(FeedbackConfig(), directory)
+            worker.on_pause = controller.reset_baseline_candidate
+            worker.paused.set()
+            worker.emit_event = lambda event: worker.paused.clear()
+            worker.checkpoint()
+        self.assertIsNone(controller._baseline_candidate)
+        self.assertEqual(controller.transmission_baseline, baseline)
+        self.assertEqual(events[-1]["reason"], "Feedback paused")
+
+    def test_beam_loss_retains_model_and_cancels_pending_baseline(self):
+        plant, controller, events = FeedbackTests().controller()
+        controller.learn_response()
+        previous = controller.response.snapshot()
+        def fail_cycle():
+            controller.update_transmission_baseline(.99)
+            raise BeamLoss("ICT = 0")
+        controller.cycle = fail_cycle
+        def pause(reason):
+            self.assertEqual(controller.response.snapshot(), previous)
+            self.assertTrue(controller.response_needs_refresh)
+            self.assertIsNone(controller._baseline_candidate)
+            raise InterruptedError("test complete")
+        with self.assertRaises(InterruptedError):
+            controller.run(pause_for_loss=pause)
+
+    def test_response_is_saved_and_loaded_by_a_new_worker(self):
+        from Knobs.linac_feedback_gui import FeedbackWorker
+        with tempfile.TemporaryDirectory() as directory:
+            for number in range(3):
+                plant = Plant()
+                plant.limits = lambda: {pv: (-1000., 1000.) for pv in PVS}
+                plant.close = Mock()
+                if number == 2:
+                    (Path(directory) / "active_feedback_response.json").write_text("broken cache")
+                def exercise(controller, **kwargs):
+                    if number == 1:
+                        np.testing.assert_allclose(controller.response.matrix(), plant.response, atol=1e-4)
+                        self.assertTrue(controller.response_needs_refresh)
+                    else:
+                        self.assertIsNone(controller.response.matrix())
+                    controller.initialize()
+                    controller.learn_response()
+                with patch.object(FeedbackController, "run", autospec=True, side_effect=exercise):
+                    worker = FeedbackWorker(FeedbackConfig(settle_sec=0), directory, lambda *args: plant)
+                    worker.run()
+                events = [json.loads(line) for line in (worker.run_dir / "events.jsonl").read_text().splitlines()]
+                self.assertFalse(any(e["kind"] == "error" for e in events), events)
+                probe = next(e["probe_A"] for e in events if e["kind"] == "response_probe_size")
+                self.assertEqual(probe, .01 if number == 1 else .05)
+                saved = RecentResponse.from_snapshot(json.loads(worker.response_cache.read_text()))
+                np.testing.assert_allclose(saved.matrix(), plant.response, atol=1e-4)
+                plant.close.assert_called_once()
 
     def test_worker_journals_reference_commands_and_stop(self):
         from Knobs.linac_feedback_gui import FeedbackWorker

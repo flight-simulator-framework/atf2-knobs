@@ -63,10 +63,15 @@ class FeedbackMachine:
         self.check_stop()
         # The setpoint defines the grid, the readback confirms the starting state.
         value, actual = self.scalar(pv), self.scalar(self.readbacks[pv])
-        tolerance = .002 if pv in CURRENT_PVS else .1 if pv == PHASE_PV else .01
-        if abs(value - actual) > tolerance:
+        if abs(value - actual) > self.readback_tolerance(pv) + 1e-12:
             raise ValueError(f"Setpoint/readback mismatch: {pv}")
         return value
+
+    @staticmethod
+    def readback_tolerance(pv):
+        # Active Feedback only: coarse hardware readbacks cannot resolve the
+        # fine command grid. Confirmation still requires a successful PUT.
+        return .1 if pv in CURRENT_PVS else 1. if pv == PHASE_PV else .01
 
     def limits(self):
         limits = {TIMING_PV: (-float("inf"), float("inf")), PHASE_PV: (-float("inf"), float("inf"))}
@@ -137,7 +142,7 @@ class FeedbackMachine:
                     self.check_beam()
                 readbacks = {pv: self.scalar(self.readbacks[pv]) for pv in values}
                 matched = all(abs(readbacks[pv] - target) <=
-                              (.002 if pv in CURRENT_PVS else .1 if pv == PHASE_PV else .01)
+                              self.readback_tolerance(pv) + 1e-12
                               for pv, target in values.items())
                 if matched:
                     break
