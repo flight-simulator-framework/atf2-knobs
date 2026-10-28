@@ -5,6 +5,7 @@ All grids are relative to the initial setpoints (fractional origins preserved).
 """
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import product
 import time
 
@@ -87,6 +88,7 @@ Four independent observed current directions are required before prediction.
     def __init__(self):
         self.samples = deque(maxlen=64)
         self.frozen = False
+        self.measured_at = None
 
     def add(self, delta_current, delta_orbit):
         x, y = np.asarray(delta_current, float), np.asarray(delta_orbit, float)
@@ -96,6 +98,7 @@ Four independent observed current directions are required before prediction.
             return
         if np.linalg.norm(x) > 1e-9:
             self.samples.append((x.copy(), y.copy()))
+            self.measured_at = datetime.now().astimezone().isoformat(timespec="seconds")
 
     def matrix(self):
         if len(self.samples) < 4:
@@ -112,7 +115,7 @@ Four independent observed current directions are required before prediction.
     def snapshot(self):
         return dict(version=1, correctors=list(CURRENT_PVS),
                     coordinates=["ML8L.x", "ML10L.x", "ML8L.y", "ML10L.y"],
-                    units="mm/A", frozen=self.frozen,
+                    units="mm/A", frozen=self.frozen, measured_at=self.measured_at,
                     samples=[[x.tolist(), y.tolist()] for x, y in self.samples])
 
     @classmethod
@@ -131,6 +134,14 @@ Four independent observed current directions are required before prediction.
         if not isinstance(frozen, bool) or (frozen and model.matrix() is None):
             raise ValueError("Invalid fixed response cache")
         model.frozen = frozen
+        # A cache save/reload is not a measurement. Older caches have no
+        # acquisition time; never substitute their continually changing saved_at.
+        stamp = data.get("measured_at")
+        try:
+            datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            stamp = None
+        model.measured_at = stamp
         return model
 
 
@@ -410,17 +421,21 @@ Restore every trial, including failures; commit all four columns atomically.
                                        f"last excursion {1000 * excursion:.1f} µm at {amplitude:.4g} A. Previous matrix retained.")
                 amplitude = next_amplitude
         model.frozen = True
+        model.measured_at = datetime.now().astimezone().isoformat(timespec="seconds")
         self.response = model
         self.orbit_alert = False
+        if hasattr(self.io, "reset_monitor_batches"):
+            self.io.reset_monitor_batches()
         self.event("response_measured", target_um=1000 * RESPONSE_TARGET_MM, shots=10,
+                   measured_at=model.measured_at,
                    message="Startup response acquired; cross-plane terms zero; matrix fixed for corrections")
         self.report_response()
 
     def correct_orbit(self):
-        """Learn only from correction attempts; keep every improving setting.
+        """Keep improving corrections, using a fixed or adaptive response model.
 
 A usable stored model proposes the first move. Without one, or if its move
-fails, try individual +/-0.005 A corrections. No calibration-only excursions.
+fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
 """
         self.set_state("Correcting orbit")
         best_currents, best_rms = self.currents().copy(), float("inf")
@@ -561,7 +576,7 @@ fails, try individual +/-0.005 A corrections. No calibration-only excursions.
             if self.config.adjust_timing:
                 self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
             # Resume baseline confirmation only at a settled operating point.
-            # If still degraded, phase recovery is reconsidered next cycle.
+            # Three failed attempts return directly to timing/phase recovery.
             degraded, _ = self.evaluate_transmission()
             if correction_result is False and degraded and self.config.adjust_phase:
                 self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery", guard_orbit=False)

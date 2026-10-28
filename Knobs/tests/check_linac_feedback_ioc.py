@@ -239,7 +239,7 @@ def main():
                                       residual_um=(residual * 1000).tolist(), events=len(events),
                                       auto_pause_resume="passed", bpm_invalid_retry_without_pause="passed", continuous_bpm_wait="passed",
                                       live_transmission_during_wait="passed",
-                                      correction_only_learning="passed",
+                                      startup_response_500um_and_fixed_matrix="passed",
                                       absolute_five_point_threshold="passed", operation_rows=len(operations)), indent=2))
             finally:
                 if machine is not None:

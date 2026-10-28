@@ -58,7 +58,7 @@ With all targets enabled:
    triggers correction even if transmission is not degraded. Orbit drift does not
    interrupt timing or phase scans. Confirm the drift using 10 fresh shots at the
    accepted settings before switching to correction. Correction targets the current orbit reference until
-   no improving grid move remains, a trial fails, or the iteration limit is reached.
+   no improving grid move remains, three trials fail consecutively, or the iteration limit is reached.
 4. After orbit correction, retune timing and evaluate transmission again.
    Phase recovery is reconsidered next cycle if transmission is still degraded;
    an unresolved orbit does not block it. Orbit drift during the cycle wait starts
@@ -106,6 +106,10 @@ remains available. Cross-plane entries are zero in both modes, including when
 loading older caches. The matrix, observations and fixed-mode flag are saved
 atomically to `active_feedback_response.json` in the selected save folder.
 Phase changes and beam loss retain the model.
+The **Response matrix to use (YYYY-MM-DD HH:MM:SS)** heading shows the last
+measurement time, which is saved with the matrix and preserved on reload.
+Legacy caches without a measurement timestamp show **measurement time unknown**;
+their file-save time is not substituted for an acquisition time.
 
 A stored response proposes a 0.005 A grid correction. If no identifiable matrix
 is available or a proposal fails, individual +/-0.005 A candidates are tried.
@@ -146,6 +150,12 @@ table: timing and CM8L phase share a plot with separate ns/degree axes, and all
 four corrector currents share an A-axis plot. Both show changes from the initial
 setpoints against elapsed time, including temporary probes and restorations.
 Step traces extend through cycle waits and update with the other live plots.
+Timing and phase use symmetric vertical limits, keeping zero at the center of
+both axes as their independent ranges expand. When startup response acquisition
+finishes, all plot histories clear and the feedback elapsed-time axes restart
+at zero. Initial references, thresholds, the acquired matrix and full operation
+logs are retained. Partial monitor batches are discarded at this boundary so
+calibration samples do not enter the first feedback monitor mean.
 The transmission plot shows only **Initial**, **Threshold** and **Measured transmission**.
 Threshold follows the confirmed recovery baseline minus the configured absolute
 drop (default 5 percentage points). Its step trace preserves each baseline
@@ -161,9 +171,9 @@ ICT mean divided by the upstream mean. Repeated timestamps do not count, and a
 nonpositive ICT clears the background window. The canvas redraws every 0.5 s;
 timing/phase scan points are added only when a control measurement completes.
 BPM control evaluations also acquire ten new distinct shots for each mean.
-The BPM plot uses these exact evaluation means during adjustment and response
-acquisition, without interleaving separate monitor means. During waits it shows
-nonoverlapping ten-shot monitor batches; no BPM moving average is used.
+The BPM plot includes these evaluation means and updates on every new
+nonoverlapping ten-shot monitor batch, including during timing/phase scans,
+orbit correction, response acquisition and waits. No BPM moving average is used.
 The degradation decision uses one such control measurement by default
 (10 valid ICT shot pairs, with no additional five-measurement averaging). The
 Config averaging count defaults to 1 and can be increased explicitly. The

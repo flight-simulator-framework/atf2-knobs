@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
-from Knobs.linac_feedback import FeedbackConfig, FeedbackController, RecentResponse, CURRENT_PVS, PVS, PHASE_PV, TIMING_PV
+from Knobs.linac_feedback import FeedbackConfig, FeedbackController, RecentResponse, CURRENT_PVS, PVS, PHASE_PV, TIMING_PV, TIMING_STEP, PHASE_STEP
 from Knobs.linac_feedback_io import FeedbackMachine, ICT_SHOTS
 from Knobs.optimizer_workspace import (OptimizerWorkspace, WORKSPACE_STYLE, WrappingLabel,
                                       run_button_style, status_badge_style)
@@ -152,6 +152,7 @@ class FeedbackPanel(QWidget):
         self.latest_settings = {}
         self.parameter_points = deque(maxlen=2000)
         self.latest_elapsed = 0.
+        self.plot_time_origin = 0.
         self.degradation_threshold = None
         self.threshold_history = deque(maxlen=2000)
         self.latest_transmission = None
@@ -205,7 +206,7 @@ class FeedbackPanel(QWidget):
         self.fields = {}
         defaults = FeedbackConfig()
         descriptions = {
-            "orbit_threshold_um": "Compare the latest 10 distinct BPM shots with the orbit reference, updated when the transmission baseline rises. Default: 150 µm. The plot remains relative to the initial orbit; dotted limits follow the reference.",
+            "orbit_threshold_um": "Compare each new 10-shot BPM mean with the orbit reference, updated when the transmission baseline rises. Default: 150 µm. The plot remains relative to the initial orbit; dotted limits follow the reference.",
             "settle_sec": "Wait after each PV write before measuring. Default: 2 s.",
             "interval_sec": "Wait after a full feedback cycle before starting the next timing search. Default: 30 s. This is additional to the wait after each write.",
             "min_gain": "Minimum absolute transmission improvement to accept a local search step. Default: 0.0005 (0.05 percentage point). 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate drop threshold.",
@@ -270,10 +271,10 @@ class FeedbackPanel(QWidget):
         self.parameter_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         current_layout.addWidget(self.parameter_canvas, 1)
         self.draw_parameters(redraw=False)
-        response_group = QGroupBox("Learned Response [mm/A]")
+        response_group = QGroupBox("Response matrix to use (not measured)")
         response_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.response_group = response_group
-        response_group.setToolTip("Start measurement targets 500 µm with 10-shot means and saves a fixed matrix. Otherwise reuse the stored matrix, or learn from corrections if no fixed matrix exists. H→y and V→x are zero.")
+        response_group.setToolTip("Response units: mm/A. The date is the last measurement time, retained across reloads. Start measurement targets 500 µm with 10-shot means and saves a fixed matrix. Otherwise reuse the stored matrix, or learn from corrections if no fixed matrix exists. H→y and V→x are zero.")
         response_layout = QVBoxLayout(response_group)
         response_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.response_table = QTableWidget(4, 4)
@@ -347,10 +348,12 @@ class FeedbackPanel(QWidget):
         self.latest_settings = {}
         self.parameter_points.clear()
         self.latest_elapsed = 0.
+        self.plot_time_origin = 0.
         self.degradation_threshold = self.latest_transmission = self.average_result = None
         self.dirty = True
         self.draw_plot()
         self.response_table.clearContents()
+        self.response_group.setTitle("Response matrix to use (not measured)")
         self.log.clear()
         self.failed = False
         self.settings.setEnabled(False)
@@ -410,7 +413,7 @@ class FeedbackPanel(QWidget):
 
     def on_event(self, event):
         kind = event["kind"]
-        elapsed = event.get("elapsed", 0.)
+        elapsed = max(0., event.get("elapsed", 0.) - self.plot_time_origin)
         self.latest_elapsed = max(self.latest_elapsed, elapsed)
         if kind == "state":
             self.operation = event["state"]
@@ -435,6 +438,23 @@ class FeedbackPanel(QWidget):
             self.plot_waiting = False
             self.failed = True
             self.set_status("Failed: " + event["message"], "error")
+        elif kind == "response_measured":
+            # Start a clean feedback view without changing control references,
+            # the acquired matrix, or the unmodified timestamps in the journal.
+            self.plot_time_origin = event.get("elapsed", 0.)
+            self.latest_elapsed = 0.
+            self.points.clear()
+            self.orbits.clear()
+            self.averages.clear()
+            self.parameter_points.clear()
+            self.threshold_history.clear()
+            if self.degradation_threshold is not None:
+                self.threshold_history.append((0., self.degradation_threshold))
+            self.update_parameters(self.latest_settings, 0.)
+            self.latest_transmission = self.average_result = None
+            self.plot_waiting = False
+            self.operation = "Starting feedback"
+            self.set_status("RUNNING | Starting feedback")
         elif kind == "reference":
             self.reference = event["orbit_mm"]
             self.orbit_reference = list(self.reference)
@@ -464,26 +484,31 @@ class FeedbackPanel(QWidget):
         elif kind == "transmission_monitor" and (self.plot_waiting or
                 self.operation in ("Correcting orbit", "Restoring best orbit") or
                 self.operation.startswith("Measuring response:")):
-            # During a scan, plot only the exact fresh mean used by control.
-            # In the cycle wait, keep displaying the background monitor.
+            # Timing/phase scans plot their exact control mean; orbit work and
+            # waits keep ICT visible through independent ten-shot monitor batches.
             self.points.append((elapsed, event["transmission"]))
             self.latest_transmission = event["transmission"]
         elif kind == "transmission_average":
             self.average_result = event
             if event["complete"]:
                 self.averages.append((elapsed, event["average"]))
-        elif (kind == "orbit" or (kind == "orbit_monitor" and self.plot_waiting)) and self.reference is not None:
+        elif kind in ("orbit", "orbit_monitor") and self.reference is not None:
             drift = [1000 * (v - r) for v, r in zip(event["orbit_mm"], self.reference)]
             self.orbits.append((elapsed, drift))
         elif kind == "response":
-            self.response_group.setTitle("Measured Response (Fixed) [mm/A]" if event.get("model", {}).get("frozen")
-                                         else "Learning from Corrections [mm/A]" if event["matrix_mm_per_A"] is None
-                                         else "Learned Response [mm/A]")
+            stamp = event.get("model", {}).get("measured_at")
+            try:
+                measured = datetime.fromisoformat(stamp).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                measured = "measurement time unknown"
+            if event["matrix_mm_per_A"] is None:
+                measured = "not available yet"
+            self.response_group.setTitle(f"Response matrix to use ({measured})")
             self.response_table.clearContents()
             for row, values in enumerate(event["matrix_mm_per_A"] or []):
                 for col, value in enumerate(values):
                     self.response_table.setItem(row, col, QTableWidgetItem(f"{value:.4g}"))
-        if kind in ("transmission", "transmission_monitor", "transmission_average", "reference", "baseline_updated"):
+        if kind in ("transmission", "transmission_monitor", "transmission_average", "reference", "baseline_updated", "response_measured"):
             initial = f"{self.initial_transmission:.6f}" if self.initial_transmission is not None else "—"
             current = f"{self.latest_transmission:.6f}" if self.latest_transmission is not None else "—"
             text = f"Transmission ({self.downstream.currentText()} / LN0): {current} | Initial: {initial}"
@@ -534,9 +559,13 @@ class FeedbackPanel(QWidget):
         self.phase_axis.yaxis.tick_right()
         self.phase_axis.tick_params(axis="y", colors="#d97706")
         timing.tick_params(axis="y", colors="#2563eb")
+        for axis, index, minimum in ((timing, 0, TIMING_STEP), (self.phase_axis, 1, PHASE_STEP)):
+            extent = max((abs(point[1][index]) for point in self.parameter_points), default=0.)
+            span = max(minimum, extent * 1.1)
+            axis.set_ylim(-span, span)
         currents.set_ylabel("Δ Current [A]", fontsize=9)
         for axis in (timing, currents):
-            axis.set_xlabel("Elapsed [s]", fontsize=9)
+            axis.set_xlabel("Feedback elapsed [s]" if self.plot_time_origin else "Elapsed [s]", fontsize=9)
             axis.grid(alpha=.25)
         if redraw:
             self.parameter_canvas.draw_idle()
@@ -580,7 +609,7 @@ class FeedbackPanel(QWidget):
                 lower.axhline(value, color=colors[i], linestyle=":", alpha=.6)
         upper.set_ylabel("Transmission")
         lower.set_ylabel("Orbit change from initial [µm]")
-        lower.set_xlabel("Elapsed [s]")
+        lower.set_xlabel("Feedback elapsed [s]" if self.plot_time_origin else "Elapsed [s]")
         for axis in self.axes:
             axis.grid(alpha=.25)
             if axis.lines and axis.get_legend_handles_labels()[0]:

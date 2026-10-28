@@ -293,6 +293,7 @@ class FeedbackTests(unittest.TestCase):
         expected = np.where(RESPONSE_PLANE_MASK, plant.response, 0.)
         np.testing.assert_allclose(controller.response.matrix(), expected, atol=1e-6)
         self.assertTrue(controller.response.frozen)
+        self.assertIsNotNone(controller.response.measured_at)
         snapshot = controller.response.snapshot()
         loaded = RecentResponse.from_snapshot(json.loads(json.dumps(snapshot)))
         self.assertTrue(loaded.frozen)
@@ -577,6 +578,11 @@ class FeedbackTests(unittest.TestCase):
         data = json.loads(json.dumps(controller.response.snapshot()))
         loaded = RecentResponse.from_snapshot(data)
         np.testing.assert_array_equal(loaded.matrix(), controller.response.matrix())
+        self.assertEqual(loaded.measured_at, controller.response.measured_at)
+        legacy = dict(data)
+        legacy.pop("measured_at")
+        legacy["saved_at"] = "2030-01-01T00:00:00+09:00"
+        self.assertIsNone(RecentResponse.from_snapshot(legacy).measured_at)
         for changes in (dict(units="um/A"), dict(samples=[]), dict(correctors=list(reversed(CURRENT_PVS))),
                         dict(samples=[[[.01, 0, 0], [1, 2, 3, 4]]])):
             with self.assertRaises(ValueError):
@@ -1008,7 +1014,7 @@ class GuiTests(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         _APP = QApplication.instance() or QApplication([])
 
-    def test_orbit_evaluation_plot_matches_control_while_ict_keeps_updating(self):
+    def test_bpm_monitor_updates_during_all_scans_and_ict_updates_during_orbit_work(self):
         from Knobs.linac_feedback_gui import FeedbackPanel
         panel = FeedbackPanel(lambda: "/tmp", lambda: False)
         try:
@@ -1017,20 +1023,82 @@ class GuiTests(unittest.TestCase):
             panel.on_event(dict(kind="state", state="Correcting orbit"))
             panel.on_event(dict(kind="transmission_monitor", transmission=.81, shots=10, elapsed=1.))
             panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.9] * 4, elapsed=1.))
-            self.assertEqual(list(panel.orbits), [])
+            self.assertEqual(list(panel.orbits), [(1., [900.] * 4)])
             panel.on_event(dict(kind="orbit", orbit_mm=[.1, .2, .3, .4], elapsed=2.))
             panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.8] * 4, elapsed=3.))
-            self.assertEqual(list(panel.orbits), [(2., [100., 200., 300., 400.])])
+            self.assertEqual(list(panel.orbits), [(1., [900.] * 4), (2., [100., 200., 300., 400.]), (3., [800.] * 4)])
             self.assertEqual(list(panel.points), [(1., .81)])
             panel.on_event(dict(kind="state", state="Measuring response: ZH1L"))
             panel.on_event(dict(kind="transmission_monitor", transmission=.82, shots=10, elapsed=4.))
             self.assertEqual(panel.points[-1], (4., .82))
             panel.on_event(dict(kind="state", state="Timing tracking"))
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.3] * 4, elapsed=4.5))
+            self.assertEqual(panel.orbits[-1], (4.5, [300.] * 4))
             panel.on_event(dict(kind="transmission_monitor", transmission=.83, shots=10, elapsed=5.))
             self.assertEqual(panel.points[-1], (4., .82))
+            panel.on_event(dict(kind="state", state="CM8L phase recovery"))
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.2] * 4, elapsed=5.5))
+            self.assertEqual(panel.orbits[-1], (5.5, [200.] * 4))
             panel.on_event(dict(kind="waiting", remaining_sec=30., elapsed=6.))
             panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.05] * 4, elapsed=7.))
             self.assertEqual(panel.orbits[-1], (7., [50.] * 4))
+        finally:
+            _APP.processEvents()
+            panel.close()
+
+    def test_calibration_completion_resets_plots_but_preserves_references_logs_and_matrix(self):
+        from Knobs.linac_feedback_gui import FeedbackPanel
+        panel = FeedbackPanel(lambda: "/tmp", lambda: False)
+        initial = dict.fromkeys(PVS, 1.)
+        measured_at = "2026-10-28T14:35:20+09:00"
+        matrix_event = dict(kind="response", matrix_mm_per_A=np.eye(4).tolist(),
+                            model=dict(frozen=True, measured_at=measured_at), elapsed=300.)
+        try:
+            panel.on_event(dict(kind="reference", transmission=.8, orbit_mm=[.1] * 4, settings=initial, elapsed=1.))
+            panel.on_event(dict(kind="state", state="Measuring response: ZH1L", elapsed=2.))
+            panel.on_event(dict(kind="settings", settings=dict(initial, **{CURRENT_PVS[0]: 1.25}),
+                                initial_settings=initial, elapsed=5.))
+            panel.on_event(dict(kind="orbit", orbit_mm=[.6] * 4, elapsed=10.))
+            panel.on_event(dict(kind="transmission_monitor", transmission=.7, elapsed=10.))
+            panel.on_event(dict(kind="settings", settings=initial, initial_settings=initial, elapsed=299.))
+            panel.on_event(matrix_event)
+            title = "Response matrix to use (2026-10-28 14:35:20)"
+            self.assertEqual(panel.response_group.title(), title)
+            panel.on_event(dict(kind="response_measured", elapsed=300., measured_at=measured_at))
+            panel.draw_plot()
+            self.assertEqual(list(panel.points), [])
+            self.assertEqual(list(panel.orbits), [])
+            self.assertEqual(list(panel.parameter_points), [(0., (0.,) * 6)])
+            self.assertEqual(list(panel.threshold_history), [(0., .75)])
+            self.assertEqual(panel.latest_elapsed, 0.)
+            self.assertIsNone(panel.latest_transmission)
+            self.assertEqual(panel.initial_transmission, .8)
+            self.assertEqual(panel.reference, [.1] * 4)
+            self.assertEqual(panel.orbit_reference, [.1] * 4)
+            self.assertEqual(panel.initial_settings, initial)
+            self.assertEqual(panel.response_group.title(), title)
+            self.assertEqual(panel.response_table.item(0, 0).text(), "1")
+            self.assertIn("Measuring response: ZH1L", panel.log.toPlainText())
+            panel.on_event(dict(kind="state", state="Timing tracking", elapsed=301.))
+            panel.on_event(dict(kind="transmission", transmission=.81, settings=initial, elapsed=302.))
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=[.2] * 4, elapsed=303.))
+            self.assertEqual(list(panel.points), [(2., .81)])
+            self.assertEqual(list(panel.orbits), [(3., [100.] * 4)])
+            panel.on_event(dict(matrix_event, elapsed=304., timestamp="2026-10-29T12:00:00+09:00"))
+            self.assertEqual(panel.response_group.title(), title)  # A save/report is not a new measurement.
+            self.assertEqual(json.loads(panel.log.toPlainText().splitlines()[-1])["elapsed"], 304.)
+            panel.draw_plot()
+            self.assertEqual(panel.axes[1].get_xlabel(), "Feedback elapsed [s]")
+            for timing_delta, phase_delta in ((20., .5), (-5., -10.), (0., 0.)):
+                settings = dict(initial, **{TIMING_PV: 1 + timing_delta, PHASE_PV: 1 + phase_delta})
+                panel.on_event(dict(kind="settings", settings=settings, initial_settings=initial, elapsed=305.))
+                panel.draw_plot()
+                for axis in (panel.parameter_axes[0], panel.phase_axis):
+                    lo, hi = axis.get_ylim()
+                    self.assertAlmostEqual(lo, -hi)
+                    self.assertLess(lo, 0.)
+            panel.on_event(dict(kind="response", matrix_mm_per_A=np.eye(4).tolist(), model={}, elapsed=306.))
+            self.assertIn("measurement time unknown", panel.response_group.title())
         finally:
             _APP.processEvents()
             panel.close()

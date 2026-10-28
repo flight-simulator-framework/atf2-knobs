@@ -195,6 +195,12 @@ class FeedbackMachine:
         self._orbit_timestamp = None
         self._orbit_last_seen = time.monotonic()
 
+    def reset_monitor_batches(self):
+        """Keep calibration shots out of feedback's first monitor batches."""
+        self._orbit_samples.clear()
+        self._live_ict_samples.clear()
+        self._live_ict_records.clear()
+
     @staticmethod
     def decode_orbit(record):
         from machine_interfaces_atf2.InterfaceATF2_Linac import LINAC_MONITORS
