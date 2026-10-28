@@ -19,7 +19,6 @@ PVS = (TIMING_PV, PHASE_PV) + CURRENT_PVS
 TIMING_STEP = 2.8
 PHASE_STEP = 0.5
 CURRENT_STEP = 0.01
-INITIAL_PROBE_A = 0.05
 
 
 class BeamLoss(RuntimeError):
@@ -47,6 +46,9 @@ class FeedbackConfig:
     degradation_percent: float = 5.  # absolute percentage points, 5 pp = 0.05
     baseline_hold_sec: float = 120.
     baseline_min_confirmations: int = 3
+    adjust_timing: bool = True
+    adjust_phase: bool = True
+    adjust_correctors: bool = True
 
     def __post_init__(self):
         for name in ("orbit_threshold_um", "sample_timeout_sec", "timing_range_ns",
@@ -74,7 +76,7 @@ class RecentResponse:
     """Exponentially weighted fit to the last 64 measured current/orbit changes.
 
 Only isolated corrector moves enter this fit, never timing or phase changes.
-Separate excitation of all four correctors is required before prediction.
+Four independent observed current directions are required before prediction.
 """
     def __init__(self):
         self.samples = deque(maxlen=64)
@@ -108,12 +110,12 @@ Separate excitation of all four correctors is required before prediction.
         expected = model.snapshot()
         if any(data.get(key) != expected[key] for key in ("version", "correctors", "coordinates", "units")):
             raise ValueError("Incompatible response cache")
-        if not isinstance(data.get("samples"), list) or not 4 <= len(data["samples"]) <= 64:
+        if not isinstance(data.get("samples"), list) or not 1 <= len(data["samples"]) <= 64:
             raise ValueError("Invalid response cache observations")
         for x, y in data["samples"]:
             model.add(x, y)
-        if model.matrix() is None:
-            raise ValueError("Response cache lacks independent corrector observations")
+        if not model.samples:
+            raise ValueError("Response cache contains no current changes")
         return model
 
 
@@ -127,7 +129,6 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
         self.io, self.config, self.emit = io, config, emit
         self.limits = dict(limits)
         self.response = RecentResponse()
-        self.response_needs_refresh = False
         self.cycle_number = 0
         self.state = "Idle"
         self.orbit_alert = False
@@ -170,9 +171,12 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
         if force or self.orbit_alert:
             self.orbit_alert = False
             orbit = self.orbit()
-            if self.outside_orbit_threshold(orbit):
+            normal = not self.outside_orbit_threshold(orbit)
+            if not normal and self.config.adjust_correctors:
                 raise OrbitDrift("ML8L / ML10L orbit exceeds the drift threshold")
             self.orbit_alert = False
+            return normal
+        return True
 
     def settings_event(self):
         self.event("settings", settings=dict(self.current), initial_settings=dict(self.origin),
@@ -246,6 +250,10 @@ The original orbit/current references and initial transmission remain fixed.
 
     def write(self, values, restore=False):
         for pv, value in values.items():
+            enabled = (self.config.adjust_timing if pv == TIMING_PV else
+                       self.config.adjust_phase if pv == PHASE_PV else self.config.adjust_correctors)
+            if not enabled:
+                raise ValueError(f"Feedback adjustment disabled: {pv}")
             lo, hi = self.limits[pv]
             if not np.isfinite(value) or not lo - 1e-9 <= value <= hi + 1e-9:
                 raise ValueError(f"Feedback target outside range: {pv}={value}")
@@ -309,7 +317,6 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
                 center = best_value
                 self.event("accepted", pv=pv, value=center, transmission=after)
                 if pv == PHASE_PV:
-                    self.response_needs_refresh = True  # Retain information; refresh before reuse.
                     self.report_response()
             else:
                 # A noisy probe is not evidence that a local maximum was reached.
@@ -319,93 +326,79 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
     def currents(self):
         return np.array([self.current[pv] for pv in CURRENT_PVS])
 
-    def learn_response(self):
-        self.set_state("Learning corrector response")
-        probe = INITIAL_PROBE_A if self.response.matrix() is None else CURRENT_STEP
-        self.event("response_probe_size", probe_A=probe)
-        # Keep the previous model intact if calibration is interrupted. Changed
-        # optics need fresh observations so old, larger probes do not dominate.
-        refreshed = RecentResponse.from_snapshot(self.response.snapshot()) if (
-            self.response.matrix() is not None and not self.response_needs_refresh) else RecentResponse()
-        for index, pv in enumerate(CURRENT_PVS):
-            self.io.checkpoint()
-            current = self.current[pv]
-            lo, hi = self.limits[pv]
-            # Preserve the 0.01 A grid if a configured limit leaves less room
-            # than the initial 0.05 A calibration excursion.
-            room = max(hi - current, current - lo)
-            amplitude = min(probe, np.floor((room + 1e-9) / CURRENT_STEP) * CURRENT_STEP)
-            if amplitude < CURRENT_STEP - 1e-9:
-                raise RuntimeError(f"No 0.01 A probe headroom for {pv}")
-            delta = amplitude if current + amplitude <= hi + 1e-9 else -amplitude
-            if current + delta < lo - 1e-9:
-                raise RuntimeError(f"No 0.01 A probe headroom for {pv}")
-            before = self.orbit()
-            try:
-                self.write({pv: current + delta})
-                measured = self.orbit()
-            finally:
-                self.write({pv: current}, restore=True)
-            after = self.orbit()
-            dx = np.zeros(4)
-            dx[index] = delta
-            refreshed.add(dx, measured - (before + after) / 2)
-        self.response = refreshed
-        self.response_needs_refresh = False
-        self.report_response()
-
     def report_response(self):
         matrix = self.response.matrix()
         self.event("response", matrix_mm_per_A=None if matrix is None else matrix.tolist(),
                    observations=len(self.response.samples), correctors=list(CORRECTORS),
-                   needs_refresh=self.response_needs_refresh, model=self.response.snapshot())
+                   model=self.response.snapshot())
         return matrix
 
     def correct_orbit(self):
-        # Refresh each independent direction on every correction episode. Recent
-        # accepted/rejected moves also refine the weighted response continuously.
-        self.learn_response()
+        """Learn only from correction attempts; keep every improving setting.
+
+A usable stored model proposes the first move. Without one, or if its move
+fails, try individual +/-0.01 A corrections. No calibration-only excursions.
+"""
         self.set_state("Correcting orbit")
         steps = np.array(list(product((-1, 0, 1), repeat=4)), float) * CURRENT_STEP
-        for _ in range(self.config.max_orbit_steps):
+        for iteration in range(self.config.max_orbit_steps):
             self.io.checkpoint()
             before = self.orbit()
             residual = before - self.reference
-            # The GUI threshold triggers correction; the target remains the
-            # initial orbit, down to the resolution of the 0.01 A current grid.
             if np.max(abs(residual)) < 1e-9:
                 self.event("orbit_done", reason="reference restored")
                 return
-            matrix = self.response.matrix()
-            if matrix is None or np.linalg.norm(matrix) < 1e-9:
-                self.event("orbit_done", reason="response not identifiable")
-                return
             currents = self.currents()
             bounds = np.array([self.limits[pv] for pv in CURRENT_PVS])
-            candidates = currents + steps
-            allowed = np.all((candidates >= bounds[:, 0] - 1e-9) & (candidates <= bounds[:, 1] + 1e-9), axis=1)
-            norms = np.linalg.norm(residual + steps @ matrix.T, axis=1)
-            norms[~allowed] = np.inf
-            best = int(np.argmin(norms))
-            delta = steps[best]
-            if not np.any(delta) or norms[best] >= np.linalg.norm(residual) - 1e-12:
-                self.event("orbit_done", reason="no improving 0.01 A move within limits")
-                return
-            targets = {pv: float(value) for pv, value, d in zip(CURRENT_PVS, candidates[best], delta) if d}
-            original = {pv: self.current[pv] for pv in targets}
+            proposals = []
+            matrix = self.response.matrix()
+            if matrix is not None and np.linalg.norm(matrix) >= 1e-9:
+                candidates = currents + steps
+                allowed = np.all((candidates >= bounds[:, 0] - 1e-9) & (candidates <= bounds[:, 1] + 1e-9), axis=1)
+                norms = np.linalg.norm(residual + steps @ matrix.T, axis=1)
+                norms[~allowed] = np.inf
+                best = int(np.argmin(norms))
+                if np.any(steps[best]) and norms[best] < np.linalg.norm(residual) - 1e-12:
+                    proposals.append((steps[best], "response model"))
+                else:
+                    self.event("orbit_done", reason="no improving 0.01 A move within limits")
+                    return
+            # Cycle the coordinate priority so one corrector does not consume
+            # the whole iteration budget before other orbit components improve.
+            for index in range(4):
+                direction = np.eye(4)[(iteration + index) % 4]
+                for sign in (1., -1.):
+                    delta = direction * sign * CURRENT_STEP
+                    if not any(np.array_equal(delta, move) for move, _ in proposals):
+                        proposals.append((delta, "direct correction"))
             accepted = False
-            try:
-                self.write(targets)
-                measured = self.orbit()
-                self.response.add(delta, measured - before)
-                accepted = np.linalg.norm(measured - self.reference) < np.linalg.norm(residual)
-                self.event("orbit_step", settings=targets, orbit_mm=measured.tolist(), accepted=bool(accepted))
-            finally:
-                if not accepted:
-                    self.write(original, restore=True)
-            self.report_response()
+            for proposal_index, (delta, source) in enumerate(proposals):
+                candidate = currents + delta
+                if np.any(candidate < bounds[:, 0] - 1e-9) or np.any(candidate > bounds[:, 1] + 1e-9):
+                    continue
+                # A failed trial was restored; remeasure to avoid comparing a
+                # later correction against an old orbit during beam drift.
+                if proposal_index:
+                    self.io.checkpoint()
+                    before = self.orbit()
+                targets = {pv: float(value) for pv, value, d in zip(CURRENT_PVS, candidate, delta) if d}
+                original = {pv: self.current[pv] for pv in targets}
+                accepted = False
+                try:
+                    self.write(targets)
+                    measured = self.orbit()
+                    self.response.add(delta, measured - before)
+                    accepted = np.linalg.norm(measured - self.reference) < np.linalg.norm(before - self.reference)
+                    self.event("orbit_step", settings=targets, orbit_mm=measured.tolist(),
+                               accepted=bool(accepted), source=source)
+                finally:
+                    if not accepted:
+                        self.write(original, restore=True)
+                self.report_response()
+                if accepted:
+                    break
             if not accepted:
-                self.event("orbit_done", reason="unconfirmed correction; restored accepted currents")
+                self.event("orbit_done", reason="no improving correction; accepted currents retained")
                 return
         self.event("orbit_done", reason="correction iteration limit")
 
@@ -416,7 +409,8 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
             try:
                 self.set_state("Checking orbit")
                 self.check_orbit(force=True)
-                self.search(TIMING_PV, TIMING_STEP, timing_label)
+                if self.config.adjust_timing:
+                    self.search(TIMING_PV, TIMING_STEP, timing_label)
                 self.check_orbit(force=True)
                 # Compare five new operating-point measurements, never a mix of
                 # deliberate probe losses or obsolete timing/corrector settings.
@@ -430,17 +424,22 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
                     self.event("transmission_average", average=float(np.mean(self.transmission_history)),
                                samples=index + 1, required=self.config.degradation_samples,
                                threshold=threshold, complete=index + 1 == self.config.degradation_samples)
-                self.check_orbit(force=True)
+                orbit_normal = self.check_orbit(force=True)
                 average = float(np.mean(self.transmission_history))
-                self.update_transmission_baseline(average)
+                if orbit_normal:
+                    self.update_transmission_baseline(average)
+                else:
+                    self.reset_baseline_candidate("Orbit outside threshold; correctors disabled")
                 threshold = self.recovery_threshold()
                 degraded = average < threshold - 1e-12
                 self.event("degradation_decision", average=average, threshold=threshold, degraded=degraded,
-                           samples=list(self.transmission_history), orbit_normal=True,
+                           samples=list(self.transmission_history), orbit_normal=orbit_normal,
                            baseline=self.transmission_baseline, initial=self.initial_transmission)
-                if degraded:
+                if degraded and self.config.adjust_phase and orbit_normal:
                     self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery")
                     self.check_orbit(force=True)
+                elif degraded and self.config.adjust_phase and not orbit_normal:
+                    self.event("phase_blocked", reason="Orbit outside threshold; correctors disabled")
                 self.set_state("Monitoring")
                 return
             except OrbitDrift as exc:
@@ -451,7 +450,8 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
                 if self.outside_orbit_threshold(self.orbit()):
                     # Still retune timing, but never mistake an unresolved orbit
                     # problem for a reason to scan phase.
-                    self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
+                    if self.config.adjust_timing:
+                        self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
                     self.event("phase_blocked", reason="Orbit remains outside threshold")
                     self.set_state("Orbit outside threshold; phase recovery blocked")
                     return
@@ -459,13 +459,14 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
         self.set_state("Orbit recovery retry limit; monitoring before next cycle")
 
     def wait_cycle(self):
-        self.set_state("Waiting for next timing scan")
+        next_action = "Timing scan" if self.config.adjust_timing else "Feedback cycle"
+        self.set_state("Waiting for next timing scan" if self.config.adjust_timing else "Waiting for next feedback cycle")
         deadline = time.monotonic() + self.config.interval_sec
         while True:
             self.io.checkpoint()
             self.check_orbit()
             remaining = max(0., deadline - time.monotonic())
-            self.event("waiting", remaining_sec=remaining, next_action="Timing scan", bpm_monitoring=True)
+            self.event("waiting", remaining_sec=remaining, next_action=next_action, bpm_monitoring=True)
             if remaining <= 0:
                 self.io.wait(0)
                 return
@@ -487,11 +488,10 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
             except BeamLoss as exc:
                 # Every probe/trial has already unwound its finally block.
                 # Keep the original reference and accepted machine settings;
-                # discard the interrupted search and refresh the retained model
-                # before using it for another orbit correction.
+                # discard the interrupted search; retain response observations
+                # and update them only through subsequent correction attempts.
                 if pause_for_loss is None:
                     raise
-                self.response_needs_refresh = True
                 self.reset_baseline_candidate("Beam loss")
                 self.transmission_history.clear()
                 self.report_response()

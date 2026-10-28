@@ -94,7 +94,7 @@ def main():
                     raise RuntimeError(log.read())
                 import numpy as np
                 from epics import PV
-                from Knobs.linac_feedback import FeedbackConfig, FeedbackController, OrbitDrift, TIMING_PV, PHASE_PV
+                from Knobs.linac_feedback import FeedbackConfig, FeedbackController, OrbitDrift, TIMING_PV, PHASE_PV, CURRENT_PVS
                 from Knobs.linac_feedback_io import FeedbackMachine
 
                 def factory(name, **kwargs):
@@ -110,6 +110,11 @@ def main():
                 controller.initialize()
                 controller.cycle()
                 assert abs(machine.read(TIMING_PV) - 103.17) < .001
+                # The display must keep updating without a control measurement.
+                first = len(events)
+                machine.wait(.8)
+                assert any(e["kind"] == "transmission_monitor" for e in events[first:])
+                assert not any(e["kind"] in ("transmission", "command") for e in events[first:])
                 for name, value in (("test:timing_target", 105.97), ("test:drift", .2)):
                     assert factory(name).put(value, wait=True) == 1
                 # Drift must wake the wait independently of the transmission test.
@@ -130,9 +135,18 @@ def main():
                 residual = machine.orbit() - controller.reference
                 assert np.max(abs(residual)) < .02, residual
                 assert any(e["kind"] == "response" and e["observations"] > 4 for e in events)
+                assert not any(e["kind"] == "response_probe_size" or e.get("state") == "Learning corrector response" for e in events)
                 for event in events:
+                    if event["kind"] == "command":
+                        for pv, target in event["settings"].items():
+                            if pv in CURRENT_PVS:
+                                assert abs(target - event["previous"][pv]) <= .010000001
                     if event["kind"] == "orbit_samples":
                         assert len(event["timestamps"]) == len(set(event["timestamps"])) == 10
+                    if event["kind"] == "ict_samples":
+                        assert len(event["samples"]) == 10
+                        for channel in (0, 1):
+                            assert len({pair[channel] for pair in event["timestamps"]}) == 10
                 accepted_timing = controller.current[TIMING_PV]
                 original = machine.transmission
 
@@ -153,6 +167,7 @@ def main():
                 from Knobs.linac_feedback_gui import FeedbackWorker
                 beam = factory("test:beam")
                 paused, monitoring = threading.Event(), threading.Event()
+                bpm_invalid = threading.Event()
                 injected = []
                 worker_events = []
                 def worker_machine(cfg, cancelled, checkpoint, emit):
@@ -173,6 +188,8 @@ def main():
                     worker_events.append(event)
                     if event["kind"] == "auto_pause":
                         paused.set()
+                    if event["kind"] == "bpm_invalid" and event["consecutive"] >= 5:
+                        bpm_invalid.set()
                     if event["kind"] == "state" and event.get("state") == "Monitoring":
                         monitoring.set()
                 worker.emit_event = record
@@ -189,17 +206,14 @@ def main():
                     paused.clear()
                     monitoring.clear()
                     assert factory("test:bpm_valid").put(0., wait=True) == 1
-                    assert paused.wait(15), worker_events[-5:]
-                    invalids = [e for e in worker_events if e["kind"].startswith("bpm_invalid_")]
-                    assert [e["consecutive"] for e in invalids] == [1, 2, 3], invalids
+                    assert bpm_invalid.wait(10), worker_events[-5:]
+                    assert not paused.is_set() and not worker.paused.is_set(), "BPM invalid must not auto-pause"
                     losses = [e for e in worker_events if e["kind"] in ("beam_loss_pending", "beam_loss_detected")]
-                    assert [e["consecutive"] for e in losses] == [1, 2, 3], losses
-                    assert factory("test:bpm_valid").put(1., wait=True) == 1
-                    time.sleep(.2)
-                    assert worker.paused.is_set(), "BPM recovery also requires manual Resume"
+                    assert [e["consecutive"] for e in losses] == list(range(1, 11)), losses
                     monitoring.clear()
-                    worker.paused.clear()
+                    assert factory("test:bpm_valid").put(1., wait=True) == 1
                     assert monitoring.wait(15), worker_events[-5:]
+                    assert sum(e["kind"] == "auto_pause" for e in worker_events) == 1
                 finally:
                     worker.stop()
                     thread.join(10)
@@ -213,7 +227,9 @@ def main():
                 print(json.dumps(dict(result="passed", timing_ns=accepted_timing,
                                       cm8l_phase_deg=machine.scalar(PHASE_PV),
                                       residual_um=(residual * 1000).tolist(), events=len(events),
-                                      auto_pause_resume="passed", bpm_invalid_pause_resume="passed", continuous_bpm_wait="passed",
+                                      auto_pause_resume="passed", bpm_invalid_retry_without_pause="passed", continuous_bpm_wait="passed",
+                                      live_transmission_during_wait="passed",
+                                      correction_only_learning="passed",
                                       absolute_five_point_threshold="passed", operation_rows=len(operations)), indent=2))
             finally:
                 if machine is not None:

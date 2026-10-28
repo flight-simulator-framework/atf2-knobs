@@ -1,6 +1,6 @@
 """EPICS acquisition for active feedback, owned exclusively by its worker.
 
-Ten BPM records or three ICT records are required for each mean. Repeated cached
+Ten BPM or ICT records are required for each mean. Repeated cached
 waveforms never count as separate samples. No diagnostic selectors are written.
 """
 import time
@@ -12,8 +12,8 @@ import numpy as np
 from Knobs.linac_feedback import BeamLoss, CURRENT_PVS, PHASE_PV, PVS, TIMING_PV
 
 BPM_SHOTS = 10
-ICT_LOSS_SHOTS = 3
-BPM_INVALID_SHOTS = 3
+ICT_SHOTS = 10
+ICT_LOSS_SHOTS = 10
 
 
 class FeedbackMachine:
@@ -30,6 +30,9 @@ class FeedbackMachine:
         self._orbit_samples = deque(maxlen=BPM_SHOTS)
         self._ict_loss_counts = dict.fromkeys(self.ict_pvs, 0)
         self._ict_timestamps = dict.fromkeys(self.ict_pvs, -float("inf"))
+        self._live_ict_records = {}
+        self._live_ict_stamps = dict.fromkeys(self.ict_pvs, -float("inf"))
+        self._live_ict_samples = deque(maxlen=ICT_SHOTS)
         self._bpm_invalid_count = 0
         self._bpm_check_timestamp = -float("inf")
         self._orbit_timestamp = None
@@ -177,7 +180,7 @@ class FeedbackMachine:
                 if all(float(record["value"]) > 0 for record in records) and self.poll_orbit() is not False:
                     break
                 # Do not issue a new command or consume no-beam BPM data while
-                # a drop is unconfirmed. Wait for recovery or three new losses.
+                # a drop is unconfirmed. Wait for recovery or ten new losses.
                 if deadline is None:
                     deadline = time.monotonic() + self.config.sample_timeout_sec
                 if time.monotonic() >= deadline:
@@ -235,11 +238,8 @@ class FeedbackMachine:
             self._bpm_invalid_count = 0 if valid else self._bpm_invalid_count + 1
             if not valid:
                 self._orbit_samples.clear()
-                self.emit(dict(kind="bpm_invalid_detected" if self._bpm_invalid_count >= BPM_INVALID_SHOTS else "bpm_invalid_pending",
-                               consecutive=self._bpm_invalid_count, required=BPM_INVALID_SHOTS,
+                self.emit(dict(kind="bpm_invalid", consecutive=self._bpm_invalid_count,
                                ioc_timestamp=record["timestamp"], reason=reason))
-        if self._bpm_invalid_count >= BPM_INVALID_SHOTS:
-            raise BeamLoss(f"ML8L / ML10L invalid for {BPM_INVALID_SHOTS} consecutive shots: {reason}")
         return valid
 
     def check_ict(self, name, value, timestamp):
@@ -265,14 +265,45 @@ class FeedbackMachine:
         self.check_ict(name, result["value"], result["timestamp"])
         if name == "LINAC:monitors":
             return dict(result, feedback_valid=self.check_bpm(result))
-        # A no-beam alarm on an ICT must follow the same three-shot decision.
+        # A no-beam alarm on an ICT must follow the same consecutive-shot decision.
         if result.get("severity", 0) >= 2 and not (name in self.ict_pvs and float(result["value"]) <= 0):
             raise ValueError(f"Invalid alarm state: {name}")
+        if name in self.ict_pvs:
+            self.monitor_transmission(name, result)
         return result
+
+    def monitor_transmission(self, name, record):
+        """Display-only rolling mean, fed by reads during scans and cycle waits.
+
+Both ICT timestamps must advance for a new pair. Control measurements still
+use fresh_records after settling and never consume this rolling window.
+"""
+        previous = self._live_ict_records.get(name)
+        if previous is not None and record["timestamp"] <= previous["timestamp"]:
+            return
+        self._live_ict_records[name] = record
+        if float(record["value"]) <= 0:
+            self._live_ict_samples.clear()
+            # Do not pair a recovered channel with a pre-loss sample.
+            self._live_ict_stamps.update({pv: value["timestamp"] for pv, value in self._live_ict_records.items()})
+            return
+        if not all(pv in self._live_ict_records and
+                   self._live_ict_records[pv]["timestamp"] > self._live_ict_stamps[pv] and
+                   float(self._live_ict_records[pv]["value"]) > 0 for pv in self.ict_pvs):
+            return
+        pair = [self._live_ict_records[pv] for pv in self.ict_pvs]
+        self._live_ict_stamps = {pv: item["timestamp"] for pv, item in zip(self.ict_pvs, pair)}
+        self._live_ict_samples.append([float(item["value"]) for item in pair])
+        if len(self._live_ict_samples) == ICT_SHOTS:
+            values = np.asarray(self._live_ict_samples)
+            transmission = float(values[:, 1].mean() / values[:, 0].mean())
+            if 0 <= transmission <= 1:
+                self.emit(dict(kind="transmission_monitor", transmission=transmission, shots=ICT_SHOTS,
+                               ioc_timestamps=dict(self._live_ict_stamps)))
 
     def fresh_records(self, names):
         # Establish a barrier AFTER settling. Every record must be newer.
-        count = BPM_SHOTS if "LINAC:monitors" in names else 3
+        count = BPM_SHOTS if "LINAC:monitors" in names else ICT_SHOTS
         self.check_beam(force=True)
         stamps = {name: self.metadata(name)["timestamp"] for name in names}
         samples = []
@@ -314,7 +345,7 @@ class FeedbackMachine:
         up, down = "BIM:LN0:nparticles", f"BIM:{self.config.downstream}:nparticles"
         records = self.fresh_records((up, down))
         values = np.array([[r[up]["value"], r[down]["value"]] for r in records], float)
-        if values.shape != (3, 2) or not np.isfinite(values).all():
+        if values.shape != (ICT_SHOTS, 2) or not np.isfinite(values).all():
             raise ValueError("Invalid ICT measurement")
         if np.any(values <= 0):
             raise ValueError("Nonpositive ICT sample in transmission average")

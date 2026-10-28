@@ -20,13 +20,21 @@ the shared launcher. See [DRTuning usage and validation](Knobs/DRTuning/README.t
 
 ## LinacOpt active feedback
 
-LinacOpt also has an **Active Feedback** tab. It runs until Stop, with Main
+The top-level tabs are **Main → Active Feedback → Config**. Active Feedback
+runs until Stop, with Main
 optimization and reset disabled while feedback owns the actuators. Start captures
 a fixed initial transmission and ML8L/ML10L orbit reference. Transmission is the
 selected downstream ICT (DR by default) divided by LN0, independently of Main's
 objective/weights. Absolute ICT values are used only for the nonpositive-beam
 auto-pause guard. The normal feedback mode is timing tracking, with orbit recovery
-taking priority:
+taking priority. Run Control selects **Timing**, **CM8L phase**, and **Correctors**
+(all on by default). Unchecked targets are never written; the selections are
+locked from Start until Stop. All unchecked means monitoring only. If Correctors
+is off, timing can still track, but phase recovery remains blocked while the orbit
+is outside tolerance. Timing off skips timing searches; phase recovery still uses
+the transmission threshold at the current operating point. All Feedback Settings
+are under **Config → Active Feedback** and remain locked during a feedback run.
+With all targets enabled:
 
 1. Track a local transmission maximum on the relative 2.8 ns timing grid using
    `EVE_LINAC:OUT0:SetData`. Remeasure centre and neighbours every cycle; historical
@@ -47,7 +55,7 @@ taking priority:
    these latest five measurements is **below recovery baseline − 0.05** by
    default. This is an absolute drop of **5 percentage points**. For example,
    a baseline transmission of 0.80 gives a recovery threshold of 0.75. Each
-   measurement uses three fresh ICT samples; deliberate timing/phase probe
+   measurement uses ten fresh ICT samples; deliberate timing/phase probe
    measurements are excluded from the recovery average. The drop in percentage points and
    averaging count are adjustable in the GUI. CM8L recovery uses 0.5° steps.
    An unresolved orbit blocks phase recovery, even if transmission is low.
@@ -64,24 +72,28 @@ confirmation. The baseline never moves down; for example, once it reaches 0.90,
 phase recovery uses 0.85. The initial transmission, orbit reference and parameter
 origins remain fixed throughout the run. A new START captures new initial references.
 
-The initial response matrix is measured internally with 0.05 A probes **when
-orbit correction is first needed and no stored matrix is available**. Subsequent
-refresh probes and each actual correction step are 0.01 A. Probes respect the
-configured/IOC limits, using the opposite direction or a smaller grid excursion
-if necessary. The matrix is refreshed in all four directions when orbit
-correction is triggered and updated from measured
-correction results. A weighted fit uses at most 64 recent observations, giving
-newer data more weight. The matrix and observations are retained internally and
-saved atomically to `active_feedback_response.json` in the selected save folder.
-New workers, including after application restart, load this file. Loading a stored
-matrix, accepted CM8L changes and beam loss mark it for refresh without deleting
-it. Before the next orbit correction, four fresh 0.01 A probes replace outdated
-observations; an interrupted refresh retains the previous model. Invalid cache
-files are logged and fall back to first calibration. Horizontal and
-vertical cross-coupling is included; each orbit step evaluates all neighbouring
-current-grid combinations against the learned response.
+Response learning uses **only actual correction attempts**; there is no separate
+calibration stage, 0.05 A excitation or mandatory four-corrector probe sequence.
+A stored response matrix proposes a 0.01 A grid correction directly. If no
+identifiable matrix is available, individual +/-0.01 A correction candidates are
+tried; an improving setting is kept immediately, and an unsuccessful attempt is
+restored. A rejected model proposal can likewise fall back to individual
+corrections. Every attempt respects the configured/IOC current limits.
+Each result is evaluated with fresh 10-shot BPM means after settling. Accepted
+and rejected correction results both update the response. A weighted fit uses
+at most 64 recent current/orbit changes, giving newer data more weight. A full
+4×4 matrix requires four independent observed current directions; until then,
+correction uses the direct candidates without adding dedicated learning moves.
+The matrix and observations, including incomplete observations, are retained
+and saved atomically to `active_feedback_response.json` in the selected save
+folder. New workers load this file. Phase changes and beam loss retain the model;
+subsequent correction results update it without a recalibration sequence. Invalid
+cache files are logged and fall back to direct corrections. A learned matrix
+includes horizontal/vertical cross-coupling and ranks neighbouring current-grid
+combinations. The existing correction acceptance and stopping criteria remain
+based on the orbit error relative to the initial reference.
 
-The tab exposes settling time (default **2 s** after each write), cycle interval
+The Config → Active Feedback tab exposes settling time (default **2 s** after each write), cycle interval
 (default **30 s** after a complete feedback loop, before the next timing search),
 local-search improvement deadband (absolute ratio, default **0.01 / 1 percentage point**), and
 excursions from the starting values (defaults:
@@ -98,32 +110,46 @@ required. These tolerances accommodate coarse readbacks; command increments
 remain 0.5° and 0.01 A, and observations determine whether a move is beneficial.
 Active Feedback shares Main's workspace, run-button styles and status colors.
 The log is available via **Show log**, leaving more space for live plots.
-The English status banner identifies the cycle and operation, shows acquisition
-and settling progress, and counts down **Next timing scan in N s** during cycle
-waits. BPM drift interrupts that wait immediately at the next monitoring check.
+The English status banner shows only the current operation (timing scan, phase
+scan, orbit correction or transmission evaluation).
+Routine BPM checks, sample counts and settling countdowns stay in the run's
+`events.jsonl` log. Only cycle waits show **Next timing scan in N s**.
+BPM drift interrupts that wait immediately at the next monitoring check.
 **Parameter Changes from Start** shows two live plots in place of the parameter
 table: timing and CM8L phase share a plot with separate ns/degree axes, and all
 four corrector currents share an A-axis plot. Both show changes from the initial
 setpoints against elapsed time, including temporary probes and restorations.
 Step traces extend through cycle waits and update with the other live plots.
-The transmission plot shows the initial value, adaptive recovery baseline, recovery threshold
-and operating-point average separately.
-If either LN0 or the selected downstream ICT is zero or negative for **3 consecutive
-distinct shots**, or ML8L/ML10L BPM data is invalid for **3 consecutive distinct shots**, feedback
+The transmission plot shows only **Initial**, **Threshold** and **Measured transmission**.
+Its blue **Measured transmission** trace is the ratio of the latest
+ten downstream ICT readings' mean to the ten upstream readings' mean. It
+updates when both channels have new timestamps, including during settling, BPM
+acquisition and cycle waits; the canvas redraws every 0.5 s. Repeated timestamps
+do not count, and a nonpositive ICT clears the display window. This display-only
+window never feeds optimization or degradation decisions: those still use fresh
+post-settling samples. The operating-point mean averages five such control
+measurements by default (normally 50 valid ICT shot pairs) and updates once per
+completed transmission check; it and the adaptive baseline remain in the summary
+and logs rather than adding curves to the plot. ICT pairing uses timestamp advancement, not pulse IDs.
+Only ICT loss triggers automatic pause: if either LN0 or the selected downstream
+ICT is zero or negative for **10 consecutive distinct shots**, feedback
 automatically pauses after restoring temporary timing, phase or corrector probes.
 ICTs are checked during orbit acquisition, settling and the between-cycle wait,
 as well as during transmission measurement. ICT counters are independent per
-channel; the BPM counter tracks invalid ML8L/ML10L records. Normal readings reset
+channel. Normal readings reset
 the corresponding counter, and repeated cached timestamps never count again.
 During confirmation, new commands wait; invalid readings are excluded from
-averages. BPM monitoring refills its 10-shot window after invalid data. Restore commands
+averages. Invalid ML8L/ML10L records are logged and retried without automatic pause
+or manual Resume; BPM monitoring refills its 10-shot window after recovery.
+The existing acquisition timeout still applies when valid data remain unavailable.
+Restore commands
 are permitted during beam loss. Resume is manual: if the loss persists, feedback
 pauses again before further exploration. After recovery, timing tracking restarts
 with the original reference and accepted settings; the interrupted search is
-discarded and the retained response model requires refresh. An incomplete initial reference is acquired again
+discarded and the response model is retained for updates from subsequent corrections. An incomplete initial reference is acquired again
 on Resume. Other invalid/missing data or unconfirmed writes stop the worker.
 Baseline promotions are explicit logged events. Measurements require 10 *new* BPM
-timestamps or three *new* ICT timestamps
+timestamps or ten *new* ICT timestamps
 after an acquisition barrier, with a 15-second timeout; repeated cached records
 do not count. ICT pairs require both channels to advance but are not pulse-ID
 matched. The BPM waveform is interpreted with the existing LINAC monitor map and

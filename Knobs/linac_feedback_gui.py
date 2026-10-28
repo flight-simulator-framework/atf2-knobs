@@ -14,12 +14,12 @@ from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                             QGroupBox, QDoubleSpinBox, QSpinBox, QComboBox, QLabel,
                             QPushButton, QPlainTextEdit, QMessageBox, QSizePolicy,
-                            QTableWidget, QTableWidgetItem, QHeaderView)
+                            QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox)
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from Knobs.linac_feedback import FeedbackConfig, FeedbackController, RecentResponse, CURRENT_PVS, PVS, PHASE_PV, TIMING_PV
-from Knobs.linac_feedback_io import FeedbackMachine
+from Knobs.linac_feedback_io import FeedbackMachine, ICT_SHOTS
 from Knobs.optimizer_workspace import (OptimizerWorkspace, WORKSPACE_STYLE, WrappingLabel,
                                       run_button_style, status_badge_style)
 
@@ -61,7 +61,7 @@ class FeedbackWorker(QThread):
         self.pause_reason = reason
         self.paused.set()
         self.emit_event(dict(kind="auto_pause", state="Auto-paused: " + reason,
-                             message="Temporary settings restored. Resolve the beam/monitor issue, then press Resume."))
+                             message="Temporary settings restored. Resolve the ICT beam loss, then press Resume."))
         self.checkpoint()
 
     def emit_event(self, event):
@@ -80,7 +80,7 @@ class FeedbackWorker(QThread):
                     event["command_id"], pv, event.get("previous", {}).get(pv), target,
                     event.get("readbacks", {}).get(pv), event["restore"], event["status"], event.get("error", "")])
             self.operations.flush()
-        if event["kind"] == "response" and event.get("matrix_mm_per_A") is not None:
+        if event["kind"] == "response" and event.get("model", {}).get("samples"):
             try:
                 temporary = self.response_cache.with_name(self.run_dir.name + "_response.tmp")
                 temporary.write_text(json.dumps(dict(event["model"], saved_at=event["timestamp"]), allow_nan=False))
@@ -108,11 +108,10 @@ class FeedbackWorker(QThread):
             if self.response_cache.exists():
                 try:
                     controller.response = RecentResponse.from_snapshot(json.loads(self.response_cache.read_text()))
-                    controller.response_needs_refresh = True
-                    self.emit_event(dict(kind="log", message="Stored response loaded; refresh with 0.01 A probes before orbit correction."))
+                    self.emit_event(dict(kind="log", message="Stored response observations loaded; learning continues from correction results only."))
                     controller.report_response()
                 except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-                    self.emit_event(dict(kind="log", message=f"Stored response unavailable; new calibration required: {exc}"))
+                    self.emit_event(dict(kind="log", message=f"Stored response unavailable; learn from 0.01 A correction attempts: {exc}"))
             controller.run(pause_for_loss=self.pause_for_loss)
         except InterruptedError:
             self.emit_event(dict(kind="state", state="Stopped; accepted settings retained"))
@@ -142,6 +141,7 @@ class FeedbackPanel(QWidget):
         self.save_dir, self.main_busy = save_dir, main_busy
         self.worker = None
         self.points, self.orbits = deque(maxlen=2000), deque(maxlen=2000)
+        self.live_points = deque(maxlen=2000)
         self.reference = None
         self.initial_transmission = None
         self.transmission_baseline = None
@@ -163,14 +163,22 @@ class FeedbackPanel(QWidget):
         left.setSpacing(10)
         run_group = QGroupBox("Run Control")
         run_layout = QVBoxLayout(run_group)
-        run_layout.addWidget(WrappingLabel("Timing tracking • Orbit drift → correctors + timing • Low transmission with normal orbit → CM8L phase"))
-        note = WrappingLabel("Response stored internally: first calibration 0.05 A, refresh 0.01 A. ICT ≤ 0 or invalid BPM for 3 consecutive shots pauses feedback; press RESUME after recovery.")
-        note.setStyleSheet("font-size: 12px; color: #475569;")
-        run_layout.addWidget(note)
+        self.targets = QWidget()
+        target_layout = QHBoxLayout(self.targets)
+        target_layout.setContentsMargins(0, 0, 0, 0)
+        self.target_checks = {}
+        for name, label in (("adjust_timing", "Timing"), ("adjust_phase", "CM8L phase"),
+                            ("adjust_correctors", "Correctors")):
+            box = QCheckBox(label)
+            box.setChecked(True)
+            box.setToolTip("Enable automatic adjustment for this run. Select before START; all unchecked runs monitoring only.")
+            self.target_checks[name] = box
+            target_layout.addWidget(box)
+        run_layout.addWidget(self.targets)
         row = QHBoxLayout()
         self.start_button, self.pause_button, self.stop_button = (QPushButton(s) for s in ("START", "PAUSE", "STOP"))
         for button, role in zip((self.start_button, self.pause_button, self.stop_button), ("start", "pause", "stop")):
-            button.setStyleSheet(run_button_style(role))
+            button.setStyleSheet(run_button_style(role) + "QPushButton { min-height: 44px; }")
             row.addWidget(button)
         run_layout.addLayout(row)
         left.addWidget(run_group)
@@ -180,7 +188,8 @@ class FeedbackPanel(QWidget):
         self.pause_button.clicked.connect(self.pause)
         self.stop_button.clicked.connect(self.stop)
 
-        self.settings = QGroupBox("Feedback Settings")
+        self.settings = QGroupBox("Feedback Settings", self)
+        self.settings.hide()  # MainWindow installs it in Config / Active Feedback.
         form = QFormLayout(self.settings)
         form.setVerticalSpacing(8)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -223,13 +232,12 @@ class FeedbackPanel(QWidget):
         average_count = QSpinBox()
         average_count.setRange(1, 100)
         average_count.setValue(defaults.degradation_samples)
-        average_count.setToolTip("Average new measurements at the timing optimum. Temporary probe measurements are excluded.")
+        average_count.setToolTip(f"Average new measurements at the timing optimum. Each measurement averages {ICT_SHOTS} fresh ICT shots. Temporary probe measurements are excluded.")
         self.fields["degradation_samples"] = average_count
         form.addRow("Transmission average [measurements]", average_count)
         self.downstream = QComboBox()
         self.downstream.addItems(["DR", "LNE", "BTM", "BTE"])
         form.addRow("Transmission / LN0", self.downstream)
-        left.addWidget(self.settings)
         self.status = QLabel("Status: IDLE")
         self.status.setObjectName("statusBadge")
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -252,11 +260,13 @@ class FeedbackPanel(QWidget):
         self.parameter_canvas.setMinimumHeight(200)
         self.parameter_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         current_layout.addWidget(self.parameter_canvas, 1)
-        self.draw_parameters()
+        self.draw_parameters(redraw=False)
         response_group = QGroupBox("Learned Response [mm/A]")
+        response_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.response_group = response_group
-        response_group.setToolTip("Stored in the save folder and reused across runs. Refreshed when orbit correction starts. Phase changes and beam loss retain the matrix and require a refresh before reuse.")
+        response_group.setToolTip("Learned only from actual 0.01 A correction attempts and stored across runs. Improving settings are kept; unsuccessful attempts are restored. No separate response measurement.")
         response_layout = QVBoxLayout(response_group)
+        response_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.response_table = QTableWidget(4, 4)
         self.response_table.setHorizontalHeaderLabels([pv.split(":")[0] for pv in CURRENT_PVS])
         self.response_table.setVerticalHeaderLabels(["ML8L x", "ML10L x", "ML8L y", "ML10L y"])
@@ -270,6 +280,7 @@ class FeedbackPanel(QWidget):
                                          "QHeaderView::section { background: #ecf5ff; color: #172b4d; padding: 4px; border: none; }")
         response_layout.addWidget(self.response_table)
         left.addWidget(response_group)
+        left.addStretch(1)
         plot_group = QGroupBox("Live Plots")
         plot_layout = QVBoxLayout(plot_group)
         monitor.addWidget(plot_group, stretch=1)
@@ -305,6 +316,7 @@ class FeedbackPanel(QWidget):
 
     def config(self):
         return FeedbackConfig(**{key: box.value() for key, box in self.fields.items()},
+                              **{key: box.isChecked() for key, box in self.target_checks.items()},
                               downstream=self.downstream.currentText())
 
     def start(self):
@@ -313,6 +325,7 @@ class FeedbackPanel(QWidget):
             return
         self.worker = FeedbackWorker(self.config(), self.save_dir())
         self.points.clear()
+        self.live_points.clear()
         self.orbits.clear()
         self.averages.clear()
         self.reference = self.initial_transmission = self.transmission_baseline = None
@@ -327,6 +340,7 @@ class FeedbackPanel(QWidget):
         self.log.clear()
         self.failed = False
         self.settings.setEnabled(False)
+        self.targets.setEnabled(False)
         self.start_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.stop_button.setEnabled(True)
@@ -370,6 +384,7 @@ class FeedbackPanel(QWidget):
         self.plot_timer.stop()
         self.draw_plot()
         self.settings.setEnabled(True)
+        self.targets.setEnabled(True)
         self.start_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
@@ -381,25 +396,17 @@ class FeedbackPanel(QWidget):
         self.latest_elapsed = max(self.latest_elapsed, elapsed)
         if kind == "state":
             paused = event["state"].lower().startswith(("paused", "auto-paused", "stopped"))
-            prefix = "" if paused else f"RUNNING | Cycle {event.get('cycle', 0)} | "
-            self.set_status(prefix + event["state"], "paused" if paused else "running")
-        elif kind == "activity":
-            detail = event["detail"]
-            if "remaining_sec" in event:
-                detail += f" — {event['remaining_sec']:.1f} s remaining"
-            self.set_status(f"RUNNING | Cycle {event.get('cycle', 0)} | {event.get('state', 'Working')}\n{detail}")
+            labels = {"Checking orbit": "Timing scan" if self.target_checks["adjust_timing"].isChecked() else "Feedback cycle", "Timing tracking": "Timing scan",
+                      "Timing after orbit correction": "Timing scan", "CM8L phase recovery": "Phase scan",
+                      "Checking transmission after timing": "Evaluating transmission"}
+            if event["state"] not in ("Monitoring", "Waiting for next timing scan", "Waiting for next feedback cycle"):
+                prefix = "" if paused else "RUNNING | "
+                self.set_status(prefix + labels.get(event["state"], event["state"]), "paused" if paused else "running")
         elif kind == "waiting":
-            self.set_status(f"RUNNING | Cycle {event.get('cycle', 0)} | Waiting\n"
-                            f"Next timing scan in {math.ceil(event['remaining_sec'])} s • BPM monitoring active")
+            self.set_status(f"RUNNING | Next {event.get('next_action', 'Timing scan').lower()} in {math.ceil(event['remaining_sec'])} s")
         elif kind == "auto_pause":
             self.set_status(event["state"] + "\n" + event["message"], "paused")
             self.pause_button.setText("RESUME")
-        elif kind == "beam_loss_pending":
-            self.set_status(f"RUNNING | Confirming ICT drop\n{event['pv']}: "
-                            f"{event['consecutive']} / {event['required']} consecutive nonpositive shots")
-        elif kind == "bpm_invalid_pending":
-            self.set_status(f"RUNNING | Confirming BPM validity\nML8L / ML10L: "
-                            f"{event['consecutive']} / {event['required']} consecutive invalid shots")
         elif kind == "error":
             self.failed = True
             self.set_status("Failed: " + event["message"], "error")
@@ -421,25 +428,27 @@ class FeedbackPanel(QWidget):
             self.update_parameters(event["settings"], elapsed)
         elif kind == "transmission":
             self.points.append((elapsed, event["transmission"]))
-            self.latest_transmission = event["transmission"]
+            if not self.live_points:
+                self.latest_transmission = event["transmission"]
             self.update_parameters(event["settings"], elapsed)
+        elif kind == "transmission_monitor":
+            self.live_points.append((elapsed, event["transmission"]))
+            self.latest_transmission = event["transmission"]
         elif kind == "transmission_average":
             self.average_result = event
             if event["complete"]:
                 self.averages.append((elapsed, event["average"]))
-            self.set_status(f"RUNNING | Cycle {event.get('cycle', 0)} | Verifying transmission\n"
-                            f"Operating-point measurements: {event['samples']} / {event['required']}")
         elif kind in ("orbit", "orbit_monitor") and self.reference is not None:
             drift = [1000 * (v - r) for v, r in zip(event["orbit_mm"], self.reference)]
             self.orbits.append((elapsed, drift))
         elif kind == "response":
-            self.response_group.setTitle("Stored Response [mm/A] — refresh pending" if event.get("needs_refresh")
+            self.response_group.setTitle("Learning from Corrections [mm/A]" if event["matrix_mm_per_A"] is None
                                          else "Learned Response [mm/A]")
             self.response_table.clearContents()
             for row, values in enumerate(event["matrix_mm_per_A"] or []):
                 for col, value in enumerate(values):
                     self.response_table.setItem(row, col, QTableWidgetItem(f"{value:.4g}"))
-        if kind in ("transmission", "transmission_average", "reference", "baseline_updated"):
+        if kind in ("transmission", "transmission_monitor", "transmission_average", "reference", "baseline_updated"):
             initial = f"{self.initial_transmission:.6f}" if self.initial_transmission is not None else "—"
             current = f"{self.latest_transmission:.6f}" if self.latest_transmission is not None else "—"
             text = f"Transmission ({self.downstream.currentText()} / LN0): {current} | Initial: {initial}"
@@ -450,7 +459,7 @@ class FeedbackPanel(QWidget):
                 avg = self.average_result
                 text += f"\nLatest operating-point mean ({avg['samples']}/{avg['required']}): {avg['average']:.6f}"
             self.values.setText(text)
-        if kind not in ("transmission", "orbit", "orbit_monitor", "orbit_samples", "ict_samples", "command",
+        if kind not in ("transmission", "transmission_monitor", "orbit", "orbit_monitor", "orbit_samples", "ict_samples", "command",
                         "command_result", "settings", "activity", "waiting"):
             self.log.appendPlainText(json.dumps(event, ensure_ascii=False))
         self.dirty = True
@@ -462,7 +471,7 @@ class FeedbackPanel(QWidget):
             if not self.parameter_points or offsets != self.parameter_points[-1][1]:
                 self.parameter_points.append((elapsed, offsets))
 
-    def draw_parameters(self):
+    def draw_parameters(self, redraw=True):
         timing, currents = self.parameter_axes
         for axis in (timing, currents, self.phase_axis):
             axis.clear()
@@ -494,7 +503,8 @@ class FeedbackPanel(QWidget):
         for axis in (timing, currents):
             axis.set_xlabel("Elapsed [s]", fontsize=9)
             axis.grid(alpha=.25)
-        self.parameter_canvas.draw_idle()
+        if redraw:
+            self.parameter_canvas.draw_idle()
 
     def draw_plot(self):
         if not self.dirty:
@@ -503,18 +513,14 @@ class FeedbackPanel(QWidget):
         upper, lower = self.axes
         upper.clear()
         lower.clear()
-        if self.points:
-            x, y = zip(*self.points)
-            upper.plot(x, y, ".-", markersize=3, label="Measured transmission (includes probes)")
+        if self.live_points or self.points:
+            x, y = zip(*(self.live_points or self.points))
+            upper.plot(x, y, ".-", markersize=3, color="#2563eb",
+                       label="Measured transmission")
         if self.initial_transmission is not None:
             upper.axhline(self.initial_transmission, color="gray", linestyle="--", label="Initial")
-        if self.transmission_baseline is not None:
-            upper.axhline(self.transmission_baseline, color="#7c3aed", linestyle="-.", label="Recovery baseline")
         if self.degradation_threshold is not None:
-            upper.axhline(self.degradation_threshold, color="#d97706", linestyle=":", label="Recovery threshold")
-        if self.averages:
-            x, y = zip(*self.averages)
-            upper.plot(x, y, "o-", color="#15803d", label="Operating-point mean", markersize=4)
+            upper.axhline(self.degradation_threshold, color="#d97706", linestyle=":", label="Threshold")
         if self.orbits:
             for i, label in enumerate(("ML8L x", "ML10L x", "ML8L y", "ML10L y")):
                 lower.plot([p[0] for p in self.orbits], [p[1][i] for p in self.orbits], label=label)

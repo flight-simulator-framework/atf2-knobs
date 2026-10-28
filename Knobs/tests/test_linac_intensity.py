@@ -1313,7 +1313,7 @@ class IntensityTests(unittest.TestCase):
                 self.assertEqual(window.dev_intensity_aggregation.currentData(), "raw_sum")
                 self.assertEqual(window._selected_developer_bpms(), ["MB1R"])
                 self.assertEqual(window.dev_refresh_btn.maximumWidth(), 240)
-                self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())], ["Main", "Config", "Active Feedback"])
+                self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())], ["Main", "Active Feedback", "Config"])
                 self.assertEqual(window.config_sections.tabText(window.config_sections.indexOf(window.detail_config_tab)), "Detail config")
                 self.assertIs(window.objective_box, window.dev_objective_box)
                 self.assertTrue(window.selection_page.isAncestorOf(window.dev_actuator_table))
