@@ -104,7 +104,7 @@ class FeedbackTests(unittest.TestCase):
                 controller.cycle()
                 touched = {pv for values, _ in plant.writes for pv in values}
                 self.assertEqual(TIMING_PV in touched, timing)
-                self.assertEqual(PHASE_PV in touched, phase and (not drift or correctors))
+                self.assertEqual(PHASE_PV in touched, phase)
                 self.assertEqual(bool(touched.intersection(CURRENT_PVS)), correctors and drift)
                 if not correctors:
                     self.assertEqual(len(controller.response.samples), 0)
@@ -131,7 +131,7 @@ class FeedbackTests(unittest.TestCase):
             self.assertAlmostEqual((values[TIMING_PV] - 100.37) / 2.8,
                                    round((values[TIMING_PV] - 100.37) / 2.8))
 
-    def test_decline_then_orbit_then_timing_then_phase_then_timing(self):
+    def test_decline_then_timing_then_phase_before_orbit_then_timing(self):
         plant, controller, events = self.controller()
         controller.cycle()
         reference = controller.reference.copy()
@@ -140,9 +140,10 @@ class FeedbackTests(unittest.TestCase):
         start = len(events)
         controller.cycle()
         states = [e["state"] for e in events[start:] if e["kind"] == "state"]
-        self.assertEqual(states, ["Checking orbit", "Correcting orbit",
-                                  "Checking orbit", "Timing after orbit correction",
-                                  "Checking transmission after timing", "CM8L phase recovery", "Monitoring"])
+        self.assertEqual(states, ["Checking orbit", "Timing tracking",
+                                  "Checking transmission after timing", "CM8L phase recovery",
+                                  "Timing after phase recovery", "Correcting orbit",
+                                  "Timing after orbit correction", "Checking transmission after timing", "Monitoring"])
         self.assertLess(np.max(abs(plant.orbit() - reference)), .02)
         self.assertAlmostEqual(plant.values[PHASE_PV], 2.5)
         np.testing.assert_array_equal(controller.reference, reference)
@@ -154,13 +155,13 @@ class FeedbackTests(unittest.TestCase):
         for values, _ in plant.writes:
             for pv, value in values.items():
                 if pv in CURRENT_PVS:
-                    self.assertLessEqual(abs(value - previous[pv]), .0100000001)
+                    self.assertLessEqual(abs(value - previous[pv]), .0050000001)
                     previous[pv] = value
         accepted_current = dict.fromkeys(CURRENT_PVS, 0.)
         for event in events:
             if event["kind"] == "orbit_step" and event["accepted"]:
                 for pv, value in event["settings"].items():
-                    self.assertLessEqual(abs(value - accepted_current[pv]), .0100000001)
+                    self.assertLessEqual(abs(value - accepted_current[pv]), .0050000001)
                     accepted_current[pv] = value
         self.assertTrue(any(e["kind"] == "response" and e["observations"] > 4 for e in events))
 
@@ -255,7 +256,7 @@ class FeedbackTests(unittest.TestCase):
         plant, controller, events = self.controller(max_orbit_steps=1)
         plant.drift[0] = -.2  # First +H1 correction improves the orbit.
         controller.correct_orbit()
-        self.assertEqual(plant.writes, [({CURRENT_PVS[0]: .01}, False)])
+        self.assertEqual(plant.writes, [({CURRENT_PVS[0]: .005}, False)])
         self.assertEqual(len(controller.response.samples), 1)
         self.assertEqual([e["state"] for e in events if e["kind"] == "state"][-1], "Correcting orbit")
         self.assertFalse(any(e["kind"] == "response_probe_size" for e in events))
@@ -327,6 +328,42 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(controller.transmission_baseline, .90)
         self.assertTrue(any(e["kind"] == "baseline_pending_reset" for e in events))
 
+    def test_promoted_orbit_reference_controls_drift_detection_and_correction(self):
+        plant = Plant()
+        plant.transmission = lambda: .8
+        _, controller, events = self.controller(plant)
+        initial = controller.initial_orbit.copy()
+        origin = dict(controller.origin)
+        # Each promotion uses the final fresh ten-shot orbit at that operating
+        # point, rather than the initial orbit or a temporary scan probe.
+        for start, transmission, displacement in ((0., .9, .06), (180., .95, .18)):
+            plant.transmission = lambda: transmission
+            plant.drift[:] = [displacement, -displacement / 2, displacement / 3, 0.]
+            previous = controller.reference.copy()
+            for elapsed in (start, start + 60, start + 120):
+                with patch("Knobs.linac_feedback.time.monotonic", return_value=elapsed):
+                    controller.evaluate_transmission()
+                if elapsed < start + 120:
+                    np.testing.assert_array_equal(controller.reference, previous)
+            np.testing.assert_allclose(controller.reference, plant.orbit())
+            event = [e for e in events if e["kind"] == "baseline_updated"][-1]
+            np.testing.assert_allclose(event["orbit_reference_mm"], controller.reference)
+            np.testing.assert_array_equal(event["previous_orbit_reference_mm"], previous)
+            np.testing.assert_array_equal(event["initial_orbit_mm"], initial)
+        np.testing.assert_array_equal(controller.initial_orbit, initial)
+        self.assertEqual(controller.origin, origin)
+        self.assertEqual(controller.initial_transmission, .8)
+        self.assertFalse(controller.outside_orbit_threshold(plant.orbit()))
+        self.assertTrue(controller.outside_orbit_threshold(initial))
+        target = controller.reference.copy()
+        plant.drift[0] += .2
+        controller.monitor_orbit(plant.orbit())
+        self.assertTrue(controller.orbit_alert)
+        seed_response(controller, plant)
+        controller.correct_orbit()
+        self.assertLess(np.max(abs(plant.orbit() - target)), .01)
+        self.assertGreater(np.max(abs(plant.orbit() - initial)), .15)
+
     def test_phase_recovery_uses_promoted_baseline(self):
         plant = Plant()
         plant.transmission = lambda: .8
@@ -361,7 +398,7 @@ class FeedbackTests(unittest.TestCase):
         plant.drift[0] = .2
         with patch("Knobs.linac_feedback.time.monotonic", return_value=120.):
             controller.cycle()
-        self.assertTrue(any(e["kind"] == "orbit_priority" for e in events))
+        self.assertTrue(any(e["kind"] == "orbit_recovery" for e in events))
         self.assertFalse(any(e["kind"] == "baseline_pending_reset" for e in events))
         promotion = next(e for e in events if e["kind"] == "baseline_updated")
         self.assertEqual(promotion["confirmations"], 3)
@@ -438,7 +475,7 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(decision["samples"], [.95])
         self.assertFalse(decision["degraded"])
 
-    def test_orbit_drift_during_timing_interrupts_and_restores_probe(self):
+    def test_orbit_drift_during_timing_defers_correction_until_scan_finishes(self):
         plant, controller, events = self.controller()
         injected = []
         def drift(values, restore):
@@ -447,10 +484,13 @@ class FeedbackTests(unittest.TestCase):
                 plant.drift[0] = .25
         plant.on_write = drift
         controller.cycle()
-        self.assertTrue(any(e["kind"] == "orbit_priority" for e in events))
+        self.assertTrue(any(e["kind"] == "orbit_recovery" for e in events))
         # The temporary timing offset was removed before any current excitation.
         first_current = next(i for i, (values, _) in enumerate(plant.writes) if any(p in CURRENT_PVS for p in values))
-        self.assertEqual(plant.writes[first_current - 1], ({TIMING_PV: 100.37}, True))
+        self.assertEqual(plant.writes[first_current - 1], ({TIMING_PV: plant.target_timing}, True))
+        decision = next(i for i, e in enumerate(events) if e["kind"] == "degradation_decision")
+        correction = next(i for i, e in enumerate(events) if e["kind"] == "orbit_recovery")
+        self.assertLess(decision, correction)
         self.assertLess(np.max(abs(plant.orbit() - controller.reference)), .1)
 
     def test_temporary_probe_orbit_change_is_confirmed_at_restored_setting(self):
@@ -460,17 +500,33 @@ class FeedbackTests(unittest.TestCase):
         plant.orbit = lambda: original() + (np.array([.2, 0, 0, 0]) if abs(plant.values[TIMING_PV] - 100.37) > .001 else 0)
         _, controller, events = self.controller(plant)
         controller.cycle()
-        self.assertFalse(any(e["kind"] == "orbit_priority" for e in events))
+        self.assertFalse(any(e["kind"] == "orbit_recovery" for e in events))
         self.assertTrue(all(set(values) == {TIMING_PV} for values, _ in plant.writes))
 
-    def test_unresolved_orbit_blocks_phase_even_when_transmission_is_low(self):
+    def test_unresolved_orbit_does_not_block_phase_when_transmission_is_low(self):
         plant, controller, events = self.controller()
         plant.response[:] = 0
         plant.drift[0], plant.loss = .3, .1
+        plant.target_phase = 1.5
         controller.cycle()
-        self.assertTrue(any(e["kind"] == "phase_blocked" for e in events))
+        self.assertFalse(any(e["kind"] == "phase_blocked" for e in events))
         self.assertTrue(any(e.get("state") == "Timing after orbit correction" for e in events))
-        self.assertFalse(any(PHASE_PV in values for values, _ in plant.writes))
+        self.assertAlmostEqual(plant.values[PHASE_PV], 1.5)
+        phase = next(i for i, (values, _) in enumerate(plant.writes) if PHASE_PV in values)
+        corrector = next(i for i, (values, _) in enumerate(plant.writes) if any(pv in CURRENT_PVS for pv in values))
+        self.assertLess(phase, corrector)
+        self.assertTrue(controller.outside_orbit_threshold(plant.orbit()))
+
+    def test_phase_recovery_rechecks_orbit_before_corrector_writes(self):
+        plant, controller, events = self.controller()
+        original = plant.orbit
+        plant.target_phase = 2.5
+        plant.orbit = lambda: original() + (np.array([.2, 0., 0., 0.])
+                                            if abs(plant.values[PHASE_PV] - 2.5) > .01 else 0.)
+        controller.cycle()
+        self.assertAlmostEqual(plant.values[PHASE_PV], 2.5)
+        self.assertTrue(any(e["kind"] == "phase_priority" for e in events))
+        self.assertFalse(any(any(pv in CURRENT_PVS for pv in values) for values, _ in plant.writes))
 
     def test_countdown_and_orbit_drift_interrupt_wait(self):
         for drift in (False, True):
@@ -827,6 +883,35 @@ class GuiTests(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         _APP = QApplication.instance() or QApplication([])
 
+    def test_orbit_limits_follow_promotions_without_recentring_plot(self):
+        from Knobs.linac_feedback_gui import FeedbackPanel
+        panel = FeedbackPanel(lambda: "/tmp", lambda: False)
+        initial = np.array([.5, -.2, .7, -.4])
+        offset = np.array([.04, -.03, .02, -.01])
+        try:
+            panel.on_event(dict(kind="reference", transmission=.8, orbit_mm=initial.tolist(),
+                                settings=dict.fromkeys(PVS, 0.), elapsed=0.))
+            panel.on_event(dict(kind="orbit_monitor", orbit_mm=(initial + offset).tolist(), elapsed=10.))
+            for multiplier, baseline in ((1, .9), (2, .95)):
+                panel.on_event(dict(kind="baseline_updated", baseline=baseline, threshold=baseline - .05,
+                                    orbit_reference_mm=(initial + multiplier * offset).tolist(), elapsed=multiplier * 120.))
+                panel.on_event(dict(kind="orbit", orbit_mm=(initial + offset).tolist(), elapsed=multiplier * 120. + 1))
+                panel.draw_plot()
+                np.testing.assert_array_equal(panel.reference, initial)
+                traces = [line for line in panel.axes[1].lines if line.get_label().startswith("ML")]
+                limits = [line for line in panel.axes[1].lines if line.get_linestyle() == ":"]
+                self.assertEqual(len(traces), 4)
+                self.assertEqual(len(limits), 8)
+                for i, trace in enumerate(traces):
+                    np.testing.assert_allclose(trace.get_ydata(), offset[i] * 1000)
+                    for j, sign in enumerate((-1, 1)):
+                        line = limits[2 * i + j]
+                        np.testing.assert_allclose(line.get_ydata(), multiplier * offset[i] * 1000 + sign * 150)
+                        self.assertEqual(line.get_color(), trace.get_color())
+        finally:
+            _APP.processEvents()
+            panel.close()
+
     def test_tab_threshold_and_mutual_exclusion_without_live_access(self):
         from Knobs import Linac_Opt as linac
         with patch.object(linac.MainWindow, "_refresh_current_values"), patch.object(
@@ -955,6 +1040,7 @@ class GuiTests(unittest.TestCase):
                 with patch("Knobs.linac_feedback_gui.FeedbackWorker", return_value=Mock()):
                     panel.start()
                     self.assertEqual(list(panel.threshold_history), [])
+                    self.assertIsNone(panel.orbit_reference)
                     self.assertFalse(panel.settings.isEnabled())
                     self.assertFalse(panel.targets.isEnabled())
                     self.assertTrue(window.config_sections.isEnabled())
@@ -1023,7 +1109,7 @@ class GuiTests(unittest.TestCase):
                 events = [json.loads(line) for line in (worker.run_dir / "events.jsonl").read_text().splitlines()]
                 self.assertFalse(any(e["kind"] == "error" for e in events), events)
                 self.assertFalse(any(e["kind"] == "response_probe_size" for e in events))
-                self.assertEqual(plant.writes, [({CURRENT_PVS[0]: .01}, False)])
+                self.assertEqual(plant.writes, [({CURRENT_PVS[0]: .005}, False)])
                 saved = RecentResponse.from_snapshot(json.loads(worker.response_cache.read_text()))
                 self.assertEqual(len(saved.samples), 2 if number == 1 else 1)
                 self.assertIsNone(saved.matrix())  # Incomplete observations still survive restart.

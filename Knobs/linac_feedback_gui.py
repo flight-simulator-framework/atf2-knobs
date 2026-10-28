@@ -111,7 +111,7 @@ class FeedbackWorker(QThread):
                     self.emit_event(dict(kind="log", message="Stored response observations loaded; learning continues from correction results only."))
                     controller.report_response()
                 except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-                    self.emit_event(dict(kind="log", message=f"Stored response unavailable; learn from 0.01 A correction attempts: {exc}"))
+                    self.emit_event(dict(kind="log", message=f"Stored response unavailable; learn from 0.005 A correction attempts: {exc}"))
             controller.run(pause_for_loss=self.pause_for_loss)
         except InterruptedError:
             self.emit_event(dict(kind="state", state="Stopped; accepted settings retained"))
@@ -143,6 +143,7 @@ class FeedbackPanel(QWidget):
         self.points, self.orbits = deque(maxlen=2000), deque(maxlen=2000)
         self.plot_waiting = False
         self.reference = None
+        self.orbit_reference = None
         self.initial_transmission = None
         self.transmission_baseline = None
         self.initial_settings = {}
@@ -197,7 +198,7 @@ class FeedbackPanel(QWidget):
         self.fields = {}
         defaults = FeedbackConfig()
         descriptions = {
-            "orbit_threshold_um": "Compare the latest 10 distinct BPM shots with the initial 10-shot mean. Default: 150 µm.",
+            "orbit_threshold_um": "Compare the latest 10 distinct BPM shots with the orbit reference, updated when the transmission baseline rises. Default: 150 µm. The plot remains relative to the initial orbit; dotted limits follow the reference.",
             "settle_sec": "Wait after each PV write before measuring. Default: 2 s.",
             "interval_sec": "Wait after a full feedback cycle before starting the next timing search. Default: 30 s. This is additional to the wait after each write.",
             "min_gain": "Minimum absolute transmission improvement to accept a local search step. Default: 0.0005 (0.05 percentage point). 0 disables the deadband; 0.001 means 0.1 percentage point. Phase recovery uses the separate drop threshold.",
@@ -265,7 +266,7 @@ class FeedbackPanel(QWidget):
         response_group = QGroupBox("Learned Response [mm/A]")
         response_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.response_group = response_group
-        response_group.setToolTip("Learned only from actual 0.01 A correction attempts and stored across runs. Improving settings are kept; unsuccessful attempts are restored. No separate response measurement.")
+        response_group.setToolTip("Learned only from actual 0.005 A correction attempts and stored across runs. Improving settings are kept; unsuccessful attempts are restored. No separate response measurement.")
         response_layout = QVBoxLayout(response_group)
         response_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.response_table = QTableWidget(4, 4)
@@ -331,6 +332,7 @@ class FeedbackPanel(QWidget):
         self.averages.clear()
         self.threshold_history.clear()
         self.reference = self.initial_transmission = self.transmission_baseline = None
+        self.orbit_reference = None
         self.initial_settings = {}
         self.latest_settings = {}
         self.parameter_points.clear()
@@ -400,7 +402,7 @@ class FeedbackPanel(QWidget):
             self.plot_waiting = event["state"] in ("Waiting for next timing scan", "Waiting for next feedback cycle")
             paused = event["state"].lower().startswith(("paused", "auto-paused", "stopped"))
             labels = {"Checking orbit": "Timing scan" if self.target_checks["adjust_timing"].isChecked() else "Feedback cycle", "Timing tracking": "Timing scan",
-                      "Timing after orbit correction": "Timing scan", "CM8L phase recovery": "Phase scan",
+                      "Timing after orbit correction": "Timing scan", "Timing after phase recovery": "Timing scan", "CM8L phase recovery": "Phase scan",
                       "Checking transmission after timing": "Evaluating transmission"}
             if event["state"] not in ("Monitoring", "Waiting for next timing scan", "Waiting for next feedback cycle"):
                 prefix = "" if paused else "RUNNING | "
@@ -418,6 +420,7 @@ class FeedbackPanel(QWidget):
             self.set_status("Failed: " + event["message"], "error")
         elif kind == "reference":
             self.reference = event["orbit_mm"]
+            self.orbit_reference = list(self.reference)
             self.initial_transmission = event["transmission"]
             self.transmission_baseline = event.get("baseline", self.initial_transmission)
             self.initial_settings = dict(event["settings"])
@@ -432,6 +435,8 @@ class FeedbackPanel(QWidget):
             self.transmission_baseline = event["baseline"]
             self.degradation_threshold = event["threshold"]
             self.threshold_history.append((elapsed, self.degradation_threshold))
+            if "orbit_reference_mm" in event:
+                self.orbit_reference = list(event["orbit_reference_mm"])
         elif kind == "settings":
             self.initial_settings = dict(event["initial_settings"])
             self.update_parameters(event["settings"], elapsed)
@@ -543,14 +548,18 @@ class FeedbackPanel(QWidget):
                 upper.step(x, y, where="post", color="#d97706", linestyle=":", label="Threshold")
             else:
                 upper.axhline(self.degradation_threshold, color="#d97706", linestyle=":", label="Threshold")
-        if self.orbits:
-            for i, label in enumerate(("ML8L x", "ML10L x", "ML8L y", "ML10L y")):
-                lower.plot([p[0] for p in self.orbits], [p[1][i] for p in self.orbits], label=label)
         threshold = self.fields["orbit_threshold_um"].value()
-        for value in (-threshold, threshold):
-            lower.axhline(value, color="gray", linestyle="--")
+        colors = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728")
+        for i, label in enumerate(("ML8L x", "ML10L x", "ML8L y", "ML10L y")):
+            if self.orbits:
+                lower.plot([p[0] for p in self.orbits], [p[1][i] for p in self.orbits],
+                           label=label, color=colors[i])
+            offset = (1000 * (self.orbit_reference[i] - self.reference[i])
+                      if self.reference is not None and self.orbit_reference is not None else 0.)
+            for value in (offset - threshold, offset + threshold):
+                lower.axhline(value, color=colors[i], linestyle=":", alpha=.6)
         upper.set_ylabel("Transmission")
-        lower.set_ylabel("Orbit change [µm]")
+        lower.set_ylabel("Orbit change from initial [µm]")
         lower.set_xlabel("Elapsed [s]")
         for axis in self.axes:
             axis.grid(alpha=.25)

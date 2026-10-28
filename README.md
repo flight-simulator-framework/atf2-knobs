@@ -23,14 +23,15 @@ the shared launcher. See [DRTuning usage and validation](Knobs/DRTuning/README.t
 The top-level tabs are **Main → Active Feedback → Config**. Active Feedback
 runs until Stop, with Main
 optimization and reset disabled while feedback owns the actuators. Start captures
-a fixed initial transmission and ML8L/ML10L orbit reference. Transmission is the
+a fixed initial transmission and ML8L/ML10L orbit plot origin. The correction
+reference starts at that orbit and follows confirmed transmission baseline improvements. Transmission is the
 selected downstream ICT (DR by default) divided by LN0, independently of Main's
 objective/weights. Absolute ICT values are used only for the nonpositive-beam
-auto-pause guard. The normal feedback mode is timing tracking, with orbit recovery
-taking priority. Run Control selects **Timing**, **CM8L phase**, and **Correctors**
+auto-pause guard. The normal feedback mode is timing tracking, with phase recovery
+taking priority over orbit correction when transmission is degraded. Run Control selects **Timing**, **CM8L phase**, and **Correctors**
 (all on by default). Unchecked targets are never written; the selections are
 locked from Start until Stop. All unchecked means monitoring only. If Correctors
-is off, timing can still track, but phase recovery remains blocked while the orbit
+is off, timing and phase can still track even while the orbit
 is outside tolerance. Timing off skips timing searches; phase recovery still uses
 the transmission threshold at the current operating point. All Feedback Settings
 are under **Config → Active Feedback** and remain locked during a feedback run.
@@ -39,27 +40,30 @@ With all targets enabled:
 1. Track a local transmission maximum on the relative 2.8 ns timing grid using
    `EVE_LINAC:OUT0:SetData`. Remeasure centre and neighbours every cycle; historical
    best scores are not reused. Centre measurements bracket each probe.
-2. Continuously check timestamped `LINAC:monitors` records during acquisition,
+2. After timing reaches a local optimum, take one fresh 10-shot transmission
+   measurement. If it is **below recovery baseline − 0.05**, run CM8L phase
+   recovery in 0.5° steps before any orbit correction, even if BPM drift exceeds
+   its threshold. This is an absolute drop of **5 percentage points**; a baseline
+   of 0.80 gives a threshold of 0.75. The drop and averaging count are adjustable
+   in Config. Deliberate timing/phase probe measurements are excluded from the
+   recovery average. Retune timing after phase recovery.
+3. Continuously check timestamped `LINAC:monitors` records during acquisition,
    settling and cycle waits, averaging the latest **10 distinct valid shots**.
    If any of ML8L.x, ML10L.x, ML8L.y or ML10L.y
-   differs from its initial 10-shot mean by at least the orbit threshold
-   (150 µm by default, editable in Config), restore the orbit with ZH1L, ZV1L,
-   ZH2L and ZV2L. Every changed corrector moves by 0.01 A per step. The threshold
-   triggers correction independently of transmission. Restore temporary probes
-   and confirm the drift using 10 fresh shots at the accepted settings
-   before switching to correction. Correction targets the initial orbit until
+   differs from its current orbit reference by at least the orbit threshold
+   (150 µm by default, editable in Config), check phase recovery eligibility first.
+   Recheck the orbit after phase/timing adjustments, then correct any remaining
+   drift with ZH1L, ZV1L,
+   ZH2L and ZV2L. Every changed corrector moves by 0.005 A per step. The threshold
+   triggers correction even if transmission is not degraded. Orbit drift does not
+   interrupt timing or phase scans. Confirm the drift using 10 fresh shots at the
+   accepted settings before switching to correction. Correction targets the current orbit reference until
    no improving grid move remains, a trial fails, or the iteration limit is reached.
-3. After orbit correction, repeat timing optimization. Once timing has reached a
-   local optimum and the orbit is within tolerance, take one fresh 10-shot
-   transmission measurement at that operating point. Phase recovery starts only
-   when this measurement is **below recovery baseline − 0.05** by
-   default. This is an absolute drop of **5 percentage points**. For example,
-   a baseline transmission of 0.80 gives a recovery threshold of 0.75. Each
-   measurement uses ten fresh ICT samples; deliberate timing/phase probe
-   measurements are excluded from the recovery average. The drop in percentage points and
-   averaging count are adjustable in the GUI. CM8L recovery uses 0.5° steps.
-   An unresolved orbit blocks phase recovery, even if transmission is low.
-4. Return to timing tracking and repeat. Pause retains accepted settings; Stop
+4. After orbit correction, retune timing and evaluate transmission again.
+   Phase recovery is reconsidered next cycle if transmission is still degraded;
+   an unresolved orbit does not block it. Orbit drift during the cycle wait starts
+   another cycle with the same phase-before-orbit order.
+   Pause retains accepted settings; Stop
    and closing the window remove temporary probes and retain accepted settings.
 
 The recovery baseline starts at the initial transmission. It rises only after
@@ -72,13 +76,20 @@ Orbit correction retains the candidate, elapsed time and confirmation count;
 correction probes do not count, and promotion requires a subsequent complete
 operating-point mean with normal BPM readings. The baseline never moves down;
 for example, once it reaches 0.90,
-phase recovery uses 0.85. The initial transmission, orbit reference and parameter
-origins remain fixed throughout the run. A new START captures new initial references.
+phase recovery uses 0.85. Each transmission baseline promotion also sets the orbit
+correction reference to the fresh 10-shot BPM mean at that operating point.
+Subsequent drift detection and correction use this new reference; the tolerance
+width stays unchanged. The initial transmission, orbit plot origin and parameter
+origins remain fixed throughout the run. The BPM plot retains all measurements
+relative to the initial orbit. Each coordinate's dotted limits, in the same color
+as its measured trace, move to the new reference offset ± the configured tolerance
+(default 150 µm). Baseline promotion events record the previous, new and initial
+orbit references. A new START captures new initial references.
 
 Response learning uses **only actual correction attempts**; there is no separate
 calibration stage, 0.05 A excitation or mandatory four-corrector probe sequence.
-A stored response matrix proposes a 0.01 A grid correction directly. If no
-identifiable matrix is available, individual +/-0.01 A correction candidates are
+A stored response matrix proposes a 0.005 A grid correction directly. If no
+identifiable matrix is available, individual +/-0.005 A correction candidates are
 tried; an improving setting is kept immediately, and an unsuccessful attempt is
 restored. A rejected model proposal can likewise fall back to individual
 corrections. Every attempt respects the configured/IOC current limits.
@@ -94,7 +105,7 @@ subsequent correction results update it without a recalibration sequence. Invali
 cache files are logged and fall back to direct corrections. A learned matrix
 includes horizontal/vertical cross-coupling and ranks neighbouring current-grid
 combinations. The existing correction acceptance and stopping criteria remain
-based on the orbit error relative to the initial reference.
+based on the orbit error relative to the current correction reference.
 
 The Config → Active Feedback tab exposes settling time (default **2 s** after each write), cycle interval
 (default **30 s** after a complete feedback loop, before the next timing search),
@@ -110,7 +121,7 @@ Only Active Feedback allows setpoint/readback differences up to **1° for CM8L
 phase and 0.1 A for correctors**, both at initialization and after writes/restores.
 Timing tolerance remains 0.01 ns. Successful PUTs and finite readbacks are still
 required. These tolerances accommodate coarse readbacks; command increments
-remain 0.5° and 0.01 A, and observations determine whether a move is beneficial.
+remain 0.5° and 0.005 A, and observations determine whether a move is beneficial.
 Active Feedback shares Main's workspace, run-button styles and status colors.
 The log is available via **Show log**, leaving more space for live plots.
 The English status banner shows only the current operation (timing scan, phase

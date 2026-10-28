@@ -130,7 +130,9 @@ def main():
                 assert abs(machine.read(TIMING_PV) - 105.97) < .001
                 assert abs(machine.read(PHASE_PV) - 2.5) < .001
                 decision = next(e for e in events if e["kind"] == "degradation_decision" and e["degraded"])
-                assert len(decision["samples"]) == 1 and decision["orbit_normal"]
+                assert len(decision["samples"]) == 1 and not decision["orbit_normal"]
+                states = [e["state"] for e in events if e["kind"] == "state"]
+                assert states.index("CM8L phase recovery") < states.index("Correcting orbit")
                 assert abs(decision["threshold"] - (controller.initial_transmission - .05)) < 1e-9
                 residual = machine.orbit() - controller.reference
                 assert np.max(abs(residual)) < .02, residual
@@ -140,7 +142,7 @@ def main():
                     if event["kind"] == "command":
                         for pv, target in event["settings"].items():
                             if pv in CURRENT_PVS:
-                                assert abs(target - event["previous"][pv]) <= .010000001
+                                assert abs(target - event["previous"][pv]) <= .005000001
                     if event["kind"] == "orbit_samples":
                         assert len(event["timestamps"]) == len(set(event["timestamps"])) == 10
                     if event["kind"] == "ict_samples":

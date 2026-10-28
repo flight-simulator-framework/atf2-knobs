@@ -18,7 +18,7 @@ CURRENT_PVS = tuple(f"{name}:currentWrite" for name in CORRECTORS)
 PVS = (TIMING_PV, PHASE_PV) + CURRENT_PVS
 TIMING_STEP = 2.8
 PHASE_STEP = 0.5
-CURRENT_STEP = 0.01
+CURRENT_STEP = 0.005
 
 
 class BeamLoss(RuntimeError):
@@ -155,6 +155,7 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
         value = np.asarray(self.io.orbit(), float)
         if value.shape != (4,) or not np.isfinite(value).all():
             raise ValueError("Invalid ten-shot orbit mean")
+        self.latest_orbit = value.copy()
         self.event("orbit", orbit_mm=value.tolist())
         return value
 
@@ -167,12 +168,12 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
         if self.outside_orbit_threshold(value):
             self.orbit_alert = True
 
-    def check_orbit(self, force=False):
+    def check_orbit(self, force=False, interrupt=True):
         if force or self.orbit_alert:
             self.orbit_alert = False
             orbit = self.orbit()
             normal = not self.outside_orbit_threshold(orbit)
-            if not normal and self.config.adjust_correctors:
+            if not normal and self.config.adjust_correctors and interrupt:
                 raise OrbitDrift("ML8L / ML10L orbit exceeds the drift threshold")
             self.orbit_alert = False
             return normal
@@ -190,11 +191,12 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
             self._baseline_candidate = None
             self.event("baseline_pending_reset", reason=reason)
 
-    def update_transmission_baseline(self, average):
+    def update_transmission_baseline(self, average, orbit_mm=None):
         """Promote a sustained operating-point floor, never a transient maximum.
 
 Only complete averages at timing optima with a confirmed normal orbit qualify.
-The original orbit/current references and initial transmission remain fixed.
+The correction reference follows the orbit at promotion. Initial plot origins
+and parameter origins remain fixed.
 """
         if not np.isfinite(average) or not 0 < average <= 1:
             raise ValueError("Invalid transmission baseline observation")
@@ -209,10 +211,19 @@ The original orbit/current references and initial transmission remain fixed.
         candidate["confirmations"] += 1
         duration = max(0., now - candidate["started"])
         if duration >= self.config.baseline_hold_sec and candidate["confirmations"] >= self.config.baseline_min_confirmations:
+            new_reference = self.orbit() if orbit_mm is None else np.asarray(orbit_mm, float)
+            if new_reference.shape != (4,) or not np.isfinite(new_reference).all():
+                raise ValueError("Invalid orbit reference at baseline promotion")
             previous = self.transmission_baseline
+            previous_orbit = self.reference.copy()
             self.transmission_baseline = candidate["floor"]
+            self.reference = new_reference.copy()
+            self.orbit_alert = False
             self.event("baseline_updated", previous=previous, baseline=self.transmission_baseline,
                        initial=self.initial_transmission, threshold=self.recovery_threshold(),
+                       orbit_reference_mm=self.reference.tolist(),
+                       previous_orbit_reference_mm=previous_orbit.tolist(),
+                       initial_orbit_mm=self.initial_orbit.tolist(),
                        sustained_sec=duration, confirmations=candidate["confirmations"],
                        settings=dict(self.current), reason="Sustained improvement; minimum confirmed mean")
             self._baseline_candidate = None
@@ -236,6 +247,7 @@ The original orbit/current references and initial transmission remain fixed.
                 raise ValueError(f"Invalid limits for {pv}")
             self.limits[pv] = (lo, hi)
         self.reference = self.orbit()
+        self.initial_orbit = self.reference.copy()
         self.initial_transmission = self.transmission()
         if self.initial_transmission <= 0:
             raise ValueError("Establish transmitted beam before starting feedback")
@@ -337,7 +349,7 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
         """Learn only from correction attempts; keep every improving setting.
 
 A usable stored model proposes the first move. Without one, or if its move
-fails, try individual +/-0.01 A corrections. No calibration-only excursions.
+fails, try individual +/-0.005 A corrections. No calibration-only excursions.
 """
         self.set_state("Correcting orbit")
         steps = np.array(list(product((-1, 0, 1), repeat=4)), float) * CURRENT_STEP
@@ -361,7 +373,7 @@ fails, try individual +/-0.01 A corrections. No calibration-only excursions.
                 if np.any(steps[best]) and norms[best] < np.linalg.norm(residual) - 1e-12:
                     proposals.append((steps[best], "response model"))
                 else:
-                    self.event("orbit_done", reason="no improving 0.01 A move within limits")
+                    self.event("orbit_done", reason=f"no improving {CURRENT_STEP:g} A move within limits")
                     return
             # Cycle the coordinate priority so one corrector does not consume
             # the whole iteration budget before other orbit components improve.
@@ -402,62 +414,58 @@ fails, try individual +/-0.01 A corrections. No calibration-only excursions.
                 return
         self.event("orbit_done", reason="correction iteration limit")
 
+    def evaluate_transmission(self):
+        """Evaluate settled transmission; orbit drift does not block phase recovery."""
+        self.transmission_history.clear()
+        self.set_state("Checking transmission after timing")
+        threshold = self.recovery_threshold()
+        for index in range(self.config.degradation_samples):
+            self.io.checkpoint()
+            self.transmission_history.append(self.transmission())
+            self.event("transmission_average", average=float(np.mean(self.transmission_history)),
+                       samples=index + 1, required=self.config.degradation_samples,
+                       threshold=threshold, complete=index + 1 == self.config.degradation_samples)
+        orbit_normal = self.check_orbit(force=True, interrupt=False)
+        average = float(np.mean(self.transmission_history))
+        if orbit_normal:
+            self.update_transmission_baseline(average, self.latest_orbit)
+        elif average <= self.transmission_baseline + 1e-12:
+            self.reset_baseline_candidate("Improvement was not sustained")
+        # Above-baseline observations with a displaced orbit retain the pending
+        # candidate but cannot add confirmations or promote it.
+        threshold = self.recovery_threshold()
+        degraded = average < threshold - 1e-12
+        self.event("degradation_decision", average=average, threshold=threshold, degraded=degraded,
+                   samples=list(self.transmission_history), orbit_normal=orbit_normal,
+                   baseline=self.transmission_baseline, initial=self.initial_transmission)
+        return degraded, orbit_normal
+
     def cycle(self):
         self.cycle_number += 1
-        timing_label = "Timing tracking"
-        for _ in range(3):
-            try:
-                self.set_state("Checking orbit")
-                self.check_orbit(force=True)
-                if self.config.adjust_timing:
-                    self.search(TIMING_PV, TIMING_STEP, timing_label)
-                self.check_orbit(force=True)
-                # Compare fresh operating-point measurements, never a mix of
-                # deliberate probe losses or obsolete timing/corrector settings.
-                self.transmission_history.clear()
-                self.set_state("Checking transmission after timing")
-                threshold = self.recovery_threshold()
-                for index in range(self.config.degradation_samples):
-                    self.io.checkpoint()
-                    self.transmission_history.append(self.transmission())
-                    self.check_orbit()
-                    self.event("transmission_average", average=float(np.mean(self.transmission_history)),
-                               samples=index + 1, required=self.config.degradation_samples,
-                               threshold=threshold, complete=index + 1 == self.config.degradation_samples)
-                orbit_normal = self.check_orbit(force=True)
-                average = float(np.mean(self.transmission_history))
-                if orbit_normal:
-                    self.update_transmission_baseline(average)
-                else:
-                    self.reset_baseline_candidate("Orbit outside threshold; correctors disabled")
-                threshold = self.recovery_threshold()
-                degraded = average < threshold - 1e-12
-                self.event("degradation_decision", average=average, threshold=threshold, degraded=degraded,
-                           samples=list(self.transmission_history), orbit_normal=orbit_normal,
-                           baseline=self.transmission_baseline, initial=self.initial_transmission)
-                if degraded and self.config.adjust_phase and orbit_normal:
-                    self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery")
-                    self.check_orbit(force=True)
-                elif degraded and self.config.adjust_phase and not orbit_normal:
-                    self.event("phase_blocked", reason="Orbit outside threshold; correctors disabled")
-                self.set_state("Monitoring")
-                return
-            except OrbitDrift as exc:
-                # Keep prior baseline confirmations across orbit correction;
-                # only the next settled operating-point mean can confirm it.
-                self.event("orbit_priority", message=str(exc))
-                self.correct_orbit()
-                self.orbit_alert = False
-                if self.outside_orbit_threshold(self.orbit()):
-                    # Still retune timing, but never mistake an unresolved orbit
-                    # problem for a reason to scan phase.
-                    if self.config.adjust_timing:
-                        self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
-                    self.event("phase_blocked", reason="Orbit remains outside threshold")
-                    self.set_state("Orbit outside threshold; phase recovery blocked")
-                    return
-                timing_label = "Timing after orbit correction"
-        self.set_state("Orbit recovery retry limit; monitoring before next cycle")
+        self.set_state("Checking orbit")
+        self.check_orbit(force=True, interrupt=False)
+        # Monitoring continues during scans, but orbit recovery must wait until
+        # timing and the transmission-based phase decision have completed.
+        if self.config.adjust_timing:
+            self.search(TIMING_PV, TIMING_STEP, "Timing tracking", guard_orbit=False)
+        degraded, orbit_normal = self.evaluate_transmission()
+        if degraded and self.config.adjust_phase:
+            self.event("phase_priority", message="Transmission below threshold; phase recovery before orbit correction")
+            self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery", guard_orbit=False)
+            if self.config.adjust_timing:
+                self.search(TIMING_PV, TIMING_STEP, "Timing after phase recovery", guard_orbit=False)
+            # Phase/timing changes may have removed the drift; use a new mean.
+            orbit_normal = self.check_orbit(force=True, interrupt=False)
+        if not orbit_normal and self.config.adjust_correctors:
+            self.event("orbit_recovery", message="Orbit outside threshold after phase decision; correcting orbit")
+            self.correct_orbit()
+            self.orbit_alert = False
+            if self.config.adjust_timing:
+                self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
+            # Resume baseline confirmation only at a settled operating point.
+            # If still degraded, phase recovery is reconsidered next cycle.
+            self.evaluate_transmission()
+        self.set_state("Monitoring")
 
     def wait_cycle(self):
         next_action = "Timing scan" if self.config.adjust_timing else "Feedback cycle"
@@ -484,7 +492,7 @@ fails, try individual +/-0.01 A corrections. No calibration-only excursions.
                 self.cycle()
                 self.wait_cycle()
             except OrbitDrift:
-                self.event("orbit_priority", message="Orbit drift during wait; starting recovery now")
+                self.event("orbit_priority", message="Orbit drift during wait; starting cycle with phase priority")
             except BeamLoss as exc:
                 # Every probe/trial has already unwound its finally block.
                 # Keep the original reference and accepted machine settings;
