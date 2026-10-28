@@ -51,17 +51,22 @@ def main():
                     return PV('BDXRTEST:' + name, **kwargs)
 
                 backend = EpicsTransport(pv_factory=pv_factory).connect(timeout=3)
-                config = Config(max_points=5, samples=3, guard_seconds=.05, arrival_timeout=3,
-                                measurement_timeout=2, end_action='initial', reference_every=0)
+                config = Config(max_points=12, samples=3, guard_seconds=.05, arrival_timeout=3,
+                                measurement_timeout=2, end_action='initial', reference_every=0,
+                                expansion_points=2, expansion_coverage=1)
                 p = prepare(BY_NAME['QA1L'], backend, config)
                 assert (p.lower, p.upper) == (1.2, 4.8), p
                 assert 'parameter.A' in p.limit_source
+                assert 'UDF INVALID on A/B' in p.limit_source, p.limit_source
+                assert backend.sample('QA1L:parameter.A').alarm_status == 17
                 events = []
                 runner = Runner(backend, [BY_NAME['L1'], BY_NAME['QA1L']], config, folder, emit=events.append)
                 result = runner.run()
                 assert result == 'complete', events[-1]
                 points = [e for e in events if e['state'] == 'point']
-                assert len(points) == 5 and all(p['quality'] == 'complete' for p in points)
+                assert len(points) == 12 and all(p['quality'] == 'complete' for p in points)
+                assert runner.progressive.stage > 0
+                assert any(e['state'] == 'exploration_range' and e['reason'] == 'expanded_after_reference' for e in events)
                 assert backend.sample('QA1L:currentRead').scalar() == 3
                 assert backend.sample('CM1L:phaseRead').scalar() == 12
                 assert backend.sample(DR_MODE).scalar() == 1
@@ -77,6 +82,9 @@ def main():
                 commands = [r for r in records if r['event'] == 'command_intent']
                 assert commands
                 assert all(r['pv'] in ('CM1L:phaseWrite', 'QA1L:currentWrite') for r in commands)
+                for record in commands:
+                    limit = .1 if record['pv'] == 'QA1L:currentWrite' else 1.
+                    assert abs(record['requested'] - record['before']) <= limit + 1e-8, record
                 backend.close()
                 backend = None
                 # Exercise actual Qt connection/acquisition worker threads too.

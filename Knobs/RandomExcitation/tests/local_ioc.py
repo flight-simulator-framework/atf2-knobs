@@ -4,6 +4,7 @@ import os
 import numpy as np
 
 from caproto.server import PVGroup, pvproperty, run
+from caproto import AlarmStatus, AlarmSeverity
 
 
 def scalar(pv):
@@ -15,8 +16,8 @@ class TestIOC(PVGroup):
     phase_read = pvproperty(name='CM1L:phaseRead', value=12.0, read_only=True)
     current = pvproperty(name='QA1L:currentWrite', value=3.0)
     current_read = pvproperty(name='QA1L:currentRead', value=3.0, read_only=True)
-    lower = pvproperty(name='QA1L:parameter.A', value=1.2, read_only=True)
-    upper = pvproperty(name='QA1L:parameter.B', value=4.8, read_only=True)
+    lower = pvproperty(name='QA1L:parameter.A', value=1.2, read_only=True, alarm_group='limits')
+    upper = pvproperty(name='QA1L:parameter.B', value=4.8, read_only=True, alarm_group='limits')
     gun = pvproperty(name='BIM:GUN:nparticles', value=4.0, read_only=True)
     ln0 = pvproperty(name='BIM:LN0:nparticles', value=3.8, read_only=True)
     lne = pvproperty(name='BIM:LNE:nparticles', value=3.6, read_only=True)
@@ -27,6 +28,11 @@ class TestIOC(PVGroup):
     mode = pvproperty(name='DRBPM:ORBIT_MODE', value=1, read_only=True)
     turn = pvproperty(name='DRBPM:INJ:TURN_COUNT', value=7, read_only=True)
     command_count = pvproperty(name='test:command_count', value=0, read_only=True)
+
+    @lower.startup
+    async def lower(self, instance, async_lib):
+        # Finite configuration fields on an unprocessed record, as at ATF.
+        await instance.alarm.write(status=AlarmStatus.UDF, severity=AlarmSeverity.INVALID_ALARM)
 
     @phase.putter
     async def phase(self, instance, value):

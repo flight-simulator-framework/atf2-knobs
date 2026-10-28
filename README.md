@@ -111,6 +111,53 @@ in both Main and Config; loading a legacy configuration cannot select a hidden
 corrector for a new GUI run. Other optimizer settings retain their configured
 values internally.
 
+## Manual Klystron membership and gun orbit compensation
+
+Main now has individual L1–L4 checkboxes under Group 1 and L5–L8 under Group 2.
+All are initially checked. Only checked members of enabled groups are scanned,
+in both Sequential and Group BO (also the legacy Group LBO runner). Empty groups
+are skipped. BO dimensionality and progress budgets follow the selection;
+automatic preset budgets follow the member count while manually entered maxima
+are preserved. With Correctors & L8, L8 remains owned by that combined optimizer.
+Membership is saved in the run configuration as `kly_group_1_members` and
+`kly_group_2_members`; older configurations default to all eight members.
+
+The optional **Auto restore ML8L / ML10L orbit (≥100 µm)** checkbox under
+GUN / Solenoid / L0 is initially off. It captures three valid samples of both
+BPMs' X and Y before the gun-section scan and compares three-sample means after
+all three settings have been optimized. Correction runs once at that stage,
+before Klystron/Timing/QA/QM, rather than at each optimizer candidate.
+
+- A displacement of ≥0.100 mm at either BPM activates that plane. X uses
+  ZH1L/ZH2L only; Y uses ZV1L/ZV2L only; XY uses all four, including measured
+  cross-plane response. The target is the pre-scan orbit, not zero position.
+- Each iteration probes selected correctors by ±0.05 A around the current
+  accepted setting, shortened at verified limits. Each probe measurement uses
+  three BPM samples, and the probe is restored before moving on.
+- An SVD solve of the measured response supplies 70% of the estimated correction.
+  A response with condition number ≥100 is rejected. Changes are capped at
+  0.1 A per corrector per iteration and 0.5 A from the reference current, within
+  verified IOC limits and the existing ±5 A steer envelope.
+- A correction is kept only if the selected-plane residual norm decreases and
+  the unselected plane stays below 100 µm. Completion requires all four BPM
+  coordinates within 100 µm of the reference. There are at most five iterations.
+- Invalid/missing BPM samples, bad beam status/charge, failed current readback
+  (1 mA tolerance, 2 s after the configured settle time), singular response,
+  limits or failure to converge stop the run. Temporary probes and rejected
+  steps are restored; the last accepted correction remains. Gun/RF settings
+  themselves are not automatically undone on compensation failure. User pause
+  takes effect at a boundary with temporary probes restored; stop also restores
+  a pending probe or unaccepted trial.
+
+`GunOrbitCompensation_<run tag>.json` records the reference, three-sample
+acquisitions, tested currents, response matrices, iterations, residuals and
+termination reason. Response probes do not count toward BO max eval and are not
+training points. Successful correction adds one final objective measurement to
+the run CSV. The four currents participate in initial-state restoration and
+Save and End. Resume CSV is rejected with this option because a fresh pre-scan
+reference is required. The worker uses its injected interface for BPM/current
+reads and writes; offline tests use a coupled orbit model without live PV access.
+
 ## Development
 
 Development, issues and pull requests are hosted on [GitHub](https://github.com/flight-simulator-framework/atf2-knobs). The [CERN GitLab repository](https://gitlab.cern.ch/flight-simulator/atf2-knobs) receives updates from GitHub through a pull mirror.

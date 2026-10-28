@@ -16,6 +16,7 @@ import uuid
 import numpy as np
 
 from .catalog import Actuator, CATALOG, ICT_PVS, DR_MONITORS, DR_MODE, DR_TURN
+from .progressive import ProgressiveRange, QualityTrip
 
 
 @dataclass
@@ -37,6 +38,12 @@ class Config:
     score_ict: str = "DR"
     end_action: str = "initial"
     save_ict_summary: bool = False
+    initial_radius_steps: int = 1
+    expansion_points: int = 40
+    expansion_coverage: int = 2
+    max_step_steps: int = 1
+    min_transmission_fraction: float = .10
+    ict_max_age: float = 2.0
 
     def validate(self):
         for name in ("hours", "phase_half_range", "arrival_timeout", "measurement_timeout",
@@ -47,7 +54,8 @@ class Config:
             raise ValueError("Invalid arrival guard")
         if self.phase_half_range > 180 or self.arrival_timeout <= self.guard_seconds:
             raise ValueError("Invalid phase range / arrival timeout")
-        for name in ("samples", "max_changed"):
+        for name in ("samples", "max_changed", "initial_radius_steps", "expansion_points",
+                     "expansion_coverage", "max_step_steps"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if any(type(getattr(self, n)) is not int or getattr(self, n) < 0
@@ -57,6 +65,10 @@ class Config:
             raise ValueError("Unknown ICT / timing mode")
         if self.end_action not in ("initial", "best", "keep"):
             raise ValueError("Unknown completion action")
+        if not math.isfinite(self.min_transmission_fraction) or not 0 < self.min_transmission_fraction <= 1:
+            raise ValueError("Minimum DR/LN0 must be greater than 0% and at most 100% of the initial ratio")
+        if not math.isfinite(self.ict_max_age) or self.ict_max_age <= 0:
+            raise ValueError("ICT maximum notification age must be positive")
 
 
 def scalar(transport, name):
@@ -82,12 +94,31 @@ def ctrl_bounds(transport, pv):
 
 def current_bounds(a, transport):
     # op-base/magnet/Qt/Library/MagnetLibrary/magnet.cpp: A=min, B=max.
-    lo, hi = [transport.sample(p).scalar() for p in a.limit_pvs]
+    # These two fields store configuration, not beam/current measurements.
+    # An unprocessed calc record can report UDF/INVALID for finite A/B values.
+    # Keep the exception here only; Sample.scalar() remains strict everywhere.
+    values, udf_fields = [], []
+    for pv in a.limit_pvs:
+        sample = transport.sample(pv)
+        value = sample.scalar()
+        if sample.connected and sample.alarm_status == 17 and sample.severity == 3:
+            try:
+                raw = np.asarray(sample.value)
+                candidate = float(raw.flat[0]) if raw.size == 1 else math.nan
+                if math.isfinite(candidate):
+                    value = candidate
+                    udf_fields.append(pv.rsplit('.', 1)[-1])
+            except (TypeError, ValueError):
+                pass
+        values.append(value)
+    lo, hi = values
     metadata = ctrl_bounds(transport, a.writes[0])
     if math.isfinite(lo) and math.isfinite(hi):
         if lo >= hi:
             raise ValueError(f"{a.name}: parameter.A must be less than parameter.B")
         source = "parameter.A / parameter.B"
+        if udf_fields:
+            source += f" (UDF INVALID on {'/'.join(udf_fields)}; configuration values)"
         if metadata:
             lo, hi = max(lo, metadata[0]), min(hi, metadata[1])
             source += " ∩ CTRL"
@@ -206,9 +237,10 @@ def inspect(transport, config):
 
 
 class Sampler:
-    def __init__(self, items, config):
+    def __init__(self, items, config, progressive=None):
         self.items = items
         self.config = config
+        self.progressive = progressive
         self.rng = np.random.default_rng(config.seed)
         self.groups = list(dict.fromkeys(p.actuator.group for p in items.values()))
         self.groups = list(self.rng.permutation(self.groups))
@@ -242,7 +274,8 @@ class Sampler:
             if len(represented) == 1:
                 other = [n for n in pool if self.items[n].actuator.group not in represented]
                 names[-1] = str(self.rng.choice(other))
-        return kind, {n: self.items[n].random_value(self.rng) for n in names}
+        active = self.progressive.active() if self.progressive else self.items
+        return kind, {n: active[n].random_value(self.rng) for n in names}
 
 
 def clean_json(value):
@@ -314,6 +347,9 @@ class Runner:
         self.visits = 0
         self.random_index = 0
         self.touched = set()
+        self.progressive = None
+        self.quality_held = False
+        self._point_changed = set()
 
     def event(self, state, **payload):
         self.emit(dict(state=state, visits=self.visits, best=self.best, **payload))
@@ -331,7 +367,7 @@ class Runner:
 
     def save_and_end(self):
         with self._condition:
-            if not self.is_paused or self.best is None:
+            if not self.is_paused or self.best is None or self.quality_held:
                 return
             self.pause_action = "best"
             self.pause_requested = False
@@ -345,6 +381,49 @@ class Runner:
     def _check_stop(self):
         if self.cancel.is_set():
             raise InterruptedError("Stopped; current settings retained")
+        if self.progressive and self.progressive.baseline is not None:
+            self._check_live_quality()
+
+    def _check_live_quality(self):
+        samples = {n: self.transport.sample(ICT_PVS[n]) for n in ('LN0', 'DR')}
+        now = time.monotonic()
+        for name, sample in samples.items():
+            if not math.isfinite(sample.scalar()) or sample.scalar() <= 0:
+                raise QualityTrip(f"Missing, invalid or non-positive {name} monitor value")
+            if now - sample.received > self.config.ict_max_age:
+                raise QualityTrip(f"{name} has no fresh notification within {self.config.ict_max_age:g} s")
+        # A monitor ratio is an operational quality indicator, not a calibrated
+        # same-pulse transmission or a measurement of radiation / beam loss.
+        ratio = samples['DR'].scalar() / samples['LN0'].scalar()
+        floor = self.progressive.baseline * self.config.min_transmission_fraction
+        if not math.isfinite(ratio) or ratio < floor:
+            raise QualityTrip(f"DR/LN0={ratio:g} below initial-ratio threshold {floor:g}")
+
+    def _range_event(self, reason):
+        state = self.progressive.snapshot()
+        self.journal.write('exploration_range', reason=reason, **state)
+        self.event('exploration_range', reason=reason, **state)
+
+    def _quality_hold(self, error):
+        self.progressive.shrink_and_limit()
+        self._range_event('quality_hold_shrink')
+        with self._condition:
+            self.quality_held = self.is_paused = self.pause_requested = True
+            details = dict(reason=str(error), step_id=self.visits + 1,
+                           last_commanded_state=dict(self.state),
+                           ict={n: dict(value=self.transport.sample(p).scalar(),
+                                        timestamp=self.transport.sample(p).timestamp,
+                                        received=self.transport.sample(p).received)
+                                for n, p in ICT_PVS.items()},
+                           beam_inhibit_sent=False)
+            self.journal.write('quality_hold', **details)
+            self.event('quality_hold', **details)
+            while self.pause_requested and not self.cancel.is_set():
+                self._condition.wait(.2)
+            self.quality_held = self.is_paused = False
+            if self.cancel.is_set():
+                raise InterruptedError('Stopped during quality hold; no beam inhibit was sent')
+            self.journal.write('quality_recheck_requested')
 
     def _guard(self, changed_at):
         start = time.monotonic()
@@ -369,6 +448,11 @@ class Runner:
             if pending:
                 within_since = None
             else:
+                if (changed_at and self.progressive and self.progressive.baseline is not None
+                        and any(self.transport.sample(ICT_PVS[n]).received < max(changed_at.values())
+                                for n in ('LN0', 'DR'))):
+                    self.transport.wait(.02)
+                    continue
                 if within_since is None:
                     within_since = now
                     self.event("guard", seconds=self.config.guard_seconds)
@@ -378,6 +462,29 @@ class Runner:
         raise RuntimeError("Arrival timeout / external setting change: " + ", ".join(dict.fromkeys(pending)))
 
     def _apply(self, targets, kind, exact_restore=False):
+        for name, target in targets.items():
+            self.items[name].validate_target(target, self.transport, exact_restore)
+        # Bound each physical command, including reference/best/initial returns.
+        # Wait for arrival and new ICT monitor data at each intermediate step.
+        while True:
+            self._check_stop()
+            waypoint = {}
+            for name, target in targets.items():
+                item = self.items[name]
+                current = command_value(item.actuator, self.transport)
+                if item.actuator.kind == 'phase':
+                    current += 360 * round((self.state[name] - current) / 360)
+                self.state[name] = current
+                limit = item.step * self.config.max_step_steps
+                waypoint[name] = (target if abs(target - current) <= limit + 1e-9 else
+                                  current + math.copysign(limit, target - current))
+            final = all(abs(waypoint[n] - v) < 1e-9 for n, v in targets.items())
+            self._apply_once(waypoint, kind if final else kind + '_transition',
+                             exact_restore=exact_restore if final else True)
+            if final:
+                return
+
+    def _apply_once(self, targets, kind, exact_restore=False):
         # Validate the entire vector before the first write, then each command
         # again against current limit notifications before sending it.
         for name, target in targets.items():
@@ -393,6 +500,8 @@ class Runner:
                 before = scalar(self.transport, pv)
                 if abs(before - value) <= 1e-9:
                     continue
+                if item.error(before, value) > item.step * self.config.max_step_steps + 1e-8:
+                    raise RuntimeError(f"Setting changed before command / step limit exceeded: {pv}")
                 command_id = uuid.uuid4().hex
                 # Persist intent before a physical side effect. If the process
                 # dies between intent/ack, the command outcome is explicitly unknown.
@@ -401,6 +510,7 @@ class Runner:
                                    logical_target=target, exact_restore=exact_restore)
                 changed_at[name] = time.monotonic()
                 self.touched.add(pv)
+                self._point_changed.add(name)
                 try:
                     self.transport.put(pv, value, timeout=2.)
                 except Exception as exc:
@@ -468,6 +578,13 @@ class Runner:
             measurement_end_utc_ns=end_ns, quality=quality, sample_counts=json.dumps(counts),
             score=score if math.isfinite(score) else "", requested_names=",".join(targets),
             ict_means_optional=json.dumps(clean_json(means)) if self.config.save_ict_summary else ""))
+        first_baseline = self.progressive.baseline is None
+        ratio = self.progressive.check_means(means, valid)
+        self.journal.write('quality_evaluation', step_id=self.visits, ratio=ratio,
+                           baseline_ratio=self.progressive.baseline,
+                           minimum_ratio=self.progressive.baseline * self.config.min_transmission_fraction)
+        if first_baseline:
+            self._range_event('initial_baseline')
         if math.isfinite(score) and (self.best is None or score > self.best["score"]):
             self.best = dict(score=score, visit=self.visits, settings=dict(self.state))
             self.journal.write("best_observed", **self.best)
@@ -496,40 +613,64 @@ class Runner:
             if not self.selected or len({a.name for a in self.selected}) != len(self.selected):
                 raise ValueError("Select one or more unique actuators")
             self.items = {a.name: prepare(a, self.transport, self.config, self.overrides.get(a.name)) for a in self.selected}
+            self.progressive = ProgressiveRange(self.items, self.config)
             self.state = {n: p.origin for n, p in self.items.items()}
             for pv in ICT_PVS.values():
                 scalar(self.transport, pv)
             self.journal = Journal(self.root, dict(config=asdict(self.config), demo=self.transport.is_demo,
                 actuators={n: asdict(p) for n, p in self.items.items()}, ict_pvs=ICT_PVS,
                 raw_measurements_saved=False, dr_diagnostics_read_only=True,
-                schema="random-excitation-commands/1", clock="UTC nanoseconds + ISO8601; local monotonic waits"))
+                schema="random-excitation-commands/2", clock="UTC nanoseconds + ISO8601; local monotonic waits"))
             self.event("started", directory=str(self.journal.directory), prepared=self.items)
+            self._range_event('initial_range')
             deadline = time.monotonic() + self.config.hours * 3600
-            sampler = Sampler(self.items, self.config)
+            sampler = Sampler(self.items, self.config, self.progressive)
             targets, kind, exact = dict(self.state), "initial", True
             while True:
-                self._check_stop()
-                self._apply(targets, kind, exact_restore=exact)
-                self._measure(kind, targets)
-                action = self._pause_checkpoint()
-                if action == "best":
-                    self._apply(self.best["settings"], "save_and_end_best", exact_restore=True)
-                    status = "saved_best"
-                    break
-                if action == "resume":
-                    targets, kind, exact = dict(self.state), "pause_remeasure", True
-                    continue
-                if time.monotonic() >= deadline or (self.config.max_points and self.visits >= self.config.max_points):
-                    if self.config.end_action == "initial":
-                        self._apply({n: p.origin for n, p in self.items.items()}, "finish_initial", exact_restore=True)
-                    elif self.config.end_action == "best":
-                        if self.best is None:
-                            raise RuntimeError("No valid best point available; current settings retained")
-                        self._apply(self.best["settings"], "finish_best", exact_restore=True)
-                    break
-                self.random_index += 1
-                kind, targets = sampler.next(self.random_index)
-                exact = kind == "reference"
+                try:
+                    self._check_stop()
+                    self._point_changed = set()
+                    self._apply(targets, kind, exact_restore=exact)
+                    self._measure(kind, targets)
+                    if kind == 'expansion_reference':
+                        if self.progressive.expand_after_reference():
+                            self._range_event('expanded_after_reference')
+                    else:
+                        self.progressive.observe(kind, self._point_changed)
+                    action = self._pause_checkpoint()
+                    if action == "best":
+                        self._apply(self.best["settings"], "save_and_end_best", exact_restore=True)
+                        status = "saved_best"
+                        break
+                    if action == "resume":
+                        targets, kind, exact = dict(self.state), "pause_remeasure", True
+                        continue
+                    if time.monotonic() >= deadline or (self.config.max_points and self.visits >= self.config.max_points):
+                        if self.config.end_action == "initial":
+                            self._apply({n: p.origin for n, p in self.items.items()}, "finish_initial", exact_restore=True)
+                        elif self.config.end_action == "best":
+                            if self.best is None:
+                                raise RuntimeError("No valid best point available; current settings retained")
+                            self._apply(self.best["settings"], "finish_best", exact_restore=True)
+                        break
+                    if self.progressive.ready_to_expand:
+                        targets = {n: p.origin for n, p in self.items.items()}
+                        kind, exact = 'expansion_reference', True
+                    else:
+                        self.random_index += 1
+                        kind, targets = sampler.next(self.random_index)
+                        exact = kind == "reference"
+                except QualityTrip as exc:
+                    if self.progressive.baseline is None:
+                        raise  # No valid reference: no exploratory command is allowed.
+                    self._quality_hold(exc)
+                    # Live quality is rechecked BEFORE any recovery command.
+                    targets = {n: p.origin for n, p in self.items.items()}
+                    kind, exact = 'quality_recovery', True
+        except QualityTrip as exc:
+            status, error = "quality_stopped", str(exc)
+            if self.journal:
+                self.journal.write('quality_stop', reason=str(exc), beam_inhibit_sent=False)
         except InterruptedError as exc:
             status, error = "stopped", str(exc)
         except Exception as exc:

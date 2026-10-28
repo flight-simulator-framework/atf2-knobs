@@ -57,6 +57,10 @@ from linac_gp import CorrectorGPModel
 from Knobs.ipbsm_opt_plotting import save_plot_montage
 from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE, WrappingLabel, OverallProgressBar
 from Knobs.optimizer_progress import BudgetProgress
+from Knobs.linac_orbit_compensation import (
+    OrbitCompensation, mean_orbit, CORRECTORS as GUN_CORRECTORS,
+    MAX_EXCURSION_A as GUN_ORBIT_RANGE_A, PROBE_A as GUN_ORBIT_PROBE_A,
+)
 from Knobs.current_value_monitor import CurrentValueMonitor
 from Knobs.timing_pv import TIMING_PV, validate_timing_pvs
 
@@ -485,6 +489,8 @@ def _restore_pvs_for_config(config: Dict[str, Any]) -> List[str]:
     pvs = [str(pv) for pv in config.get("restore_pvs", RESTORE_PVS)]
     if config.get("timing_fine", False):
         pvs.append(TIMING_PV)
+    if config.get("gun_sol_l0_phase") and config.get("gun_orbit_compensation"):
+        pvs.extend(f"{name}:currentWrite" for name in GUN_CORRECTORS)
     validate_timing_pvs(pvs)
     return list(dict.fromkeys(pvs))
 
@@ -573,6 +579,19 @@ def _resolve_group_bo_max_evals(config: Dict[str, Any], group_name: str, ndim: i
     return max(1, int(fallback))
 
 
+def selected_klystrons(config, group):
+    """Selected members of the two fixed racks; absent keys retain old defaults."""
+    defaults = list(range(1, 5) if group == 1 else range(5, 9))
+    if not config.get("kly_phase", False) or not config.get("grp_L1_4" if group == 1 else "grp_L5_8", True):
+        return []
+    selected = config.get(f"kly_group_{group}_members", defaults)
+    if any(type(i) is not int or i not in defaults for i in selected):
+        raise ValueError(f"Invalid Klystron Group {group} membership")
+    return [i for i in defaults if i in selected and not
+            (i == 8 and config.get("correctors_l8") and config.get("correctors")
+             and str(config.get("mode", "")).upper() == "GROUP_BO")]
+
+
 def _run_evaluation_budgets(config):
     """Plan selected search budgets before the first measurement (no PV reads)."""
     budgets = {}
@@ -606,13 +625,13 @@ def _run_evaluation_budgets(config):
                 group("GUN&SOLENOIDE&L0" if mode == "GROUP_LBO" else TARGET_LABELS["gun_sol_l0"], 3)
         if config.get("kly_phase"):
             if mode == "SEQUENTIAL":
-                for i in range(1, 9):
+                for i in selected_klystrons(config, 1) + selected_klystrons(config, 2):
                     sequential(f"Klystron {i} phase", config.get("phase_half_range_deg", PHASE_HALF_RANGE_DEG), config.get("phase_step_deg", PHASE_STEP_DEG))
             else:
-                if config.get("grp_L1_4", True):
-                    group("L1-4", 4)
-                if config.get("grp_L5_8", True):
-                    group("L5-8", 3 if mode == "GROUP_BO" and config.get("correctors_l8") else 4)
+                for number, label in ((1, "L1-4"), (2, "L5-8")):
+                    members = selected_klystrons(config, number)
+                    if members:
+                        group(label, len(members))
         if config.get("timing"):
             if mode == "SEQUENTIAL":
                 sequential("Timing", 0, 1, count=2 * int(config.get("timing_half_steps", TIMING_HALF_STEPS)) + 1)
@@ -638,6 +657,8 @@ def _run_evaluation_budgets(config):
 
 
 def _default_readback_pv(pv_write: str) -> Optional[str]:
+    if pv_write in {f"{name}:currentWrite" for name in GUN_CORRECTORS}:
+        return pv_write.replace(":currentWrite", ":currentRead")
     if str(pv_write).strip() == SOLENOIDE_WRITE_PV:
         return SOLENOIDE_READ_PV
     return None
@@ -658,14 +679,8 @@ def _main_run_delta_specs(config: Dict[str, Any]) -> List[Tuple[str, str, Option
     if bool(config.get("gun_sol_l0_phase", False)):
         specs.extend(TARGET_VALUE_SPECS["gun_sol_l0"])
     if bool(config.get("kly_phase", False)):
-        if str(config.get("mode", "")).upper() == "GROUP_BO":
-            if bool(config.get("grp_L1_4", False)):
-                specs.extend(KLY_GROUP_1_SPECS)
-            if bool(config.get("grp_L5_8", False)):
-                specs.extend(KLY_GROUP_2_SPECS)
-        else:
-            specs.extend(KLY_GROUP_1_SPECS)
-            specs.extend(KLY_GROUP_2_SPECS)
+        selected = selected_klystrons(config, 1) + selected_klystrons(config, 2)
+        specs.extend(spec for i, spec in enumerate(KLY_GROUP_1_SPECS + KLY_GROUP_2_SPECS, 1) if i in selected)
     if bool(config.get("timing", False)):
         specs.extend(TARGET_VALUE_SPECS["timing"])
     if bool(config.get("timing_fine", False)):
@@ -675,6 +690,8 @@ def _main_run_delta_specs(config: Dict[str, Any]) -> List[Tuple[str, str, Option
     if bool(config.get("qm", False)):
         specs.extend(TARGET_VALUE_SPECS["qm"])
 
+    if config.get("gun_sol_l0_phase") and config.get("gun_orbit_compensation"):
+        specs.extend((name, f"{name}:currentWrite", f"{name}:currentRead", "A") for name in GUN_CORRECTORS)
     deduped: List[Tuple[str, str, Optional[str], str]] = []
     seen_pvs = set()
     for label, pv_write, pv_read, unit in specs:
@@ -902,6 +919,8 @@ class OptimizationWorker(QThread):
         self._best_recorded = None
         self._touched_pvs = set()
         self._timing_fine_targets = set()
+        self._gun_orbit = None
+        self._gun_orbit_report = {}
         self.run_profile = str(config.get("run_profile", RUN_PROFILE_MAIN)).upper()
 
         self.settle_sec = float(config.get("settle_sec", SETTLE_SEC_DEFAULT))
@@ -1903,7 +1922,7 @@ class OptimizationWorker(QThread):
                 lo, hi, steps, refit_interval=self.config.get("corrector_gp_refit_interval", 5),
                 log=self.log_signal.emit, cancelled=lambda: not self.is_running, names=pvs)
 
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self.config.get("gbo_random_seed"))
         grid_max_idx = np.maximum(0, np.round((hi - lo) / steps).astype(int))
         grid_axes = [
             np.unique(np.clip(lo[i] + np.arange(grid_max_idx[i] + 1, dtype=float) * steps[i], lo[i], hi[i]))
@@ -2826,6 +2845,17 @@ class OptimizationWorker(QThread):
             self._emit_progress({"kind": "run_error", "message": str(e)})
             self.log_signal.emit(f"Error: {str(e)}")
         finally:
+            if self._gun_orbit_report:
+                if self._gun_orbit_report.get("status") in {"starting", "reference_captured"}:
+                    self._gun_orbit_report["status"] = "interrupted_before_correction"
+                path = self.run_dir / f"GunOrbitCompensation_{self.run_tag}.json"
+                try:
+                    with open(path, "w") as stream:
+                        json.dump(self._gun_orbit_report, stream, indent=2)
+                    self.log_signal.emit(f"[Gun orbit] Report: {path}")
+                except Exception as exc:
+                    self._emit_progress({"kind": "run_error", "message": f"Gun orbit report save failed: {exc}"})
+                    self.log_signal.emit(f"[Gun orbit] Report save failed: {exc}")
             self.log_signal.emit("=== Optimization Finished ===")
             self.finished_signal.emit()
 
@@ -2841,6 +2871,12 @@ class OptimizationWorker(QThread):
             fine_target = (self.run_profile == RUN_PROFILE_MAIN
                            and values.get(TIMING_PV) in self._timing_fine_targets)
             for pv, value in values.items():
+                if (self.config.get("gun_sol_l0_phase") and self.config.get("gun_orbit_compensation")
+                        and pv in {f"{name}:currentWrite" for name in GUN_CORRECTORS}):
+                    lo, hi = self.config["gun_orbit_limits"][pv]
+                    if not np.isfinite(value) or not lo <= value <= hi:
+                        raise ValueError(f"Gun corrector outside verified range: {pv}={value}")
+                    continue
                 if fine_target and pv == TIMING_PV:
                     # Fine tuning has its own nine verified delays, centered on
                     # the timing after the coarse optimization finishes.
@@ -2946,6 +2982,117 @@ class OptimizationWorker(QThread):
             if self.is_running:
                 self._emit_developer_actuator_state(label, "done")
 
+    def _gun_orbit_read_currents(self):
+        values = []
+        for name in GUN_CORRECTORS:
+            # Live reads must fail on disconnection rather than use read_current's
+            # legacy zero fallback. Injected simulators own their read semantics.
+            value = (self.interface.read_current(f"{name}:currentWrite", f"{name}:currentRead")
+                     if self._interface_injected else self.interface.pv_get(f"{name}:currentRead", default=np.nan))
+            values.append(float(value))
+        if not np.isfinite(values).all():
+            raise ValueError("Invalid gun corrector readback")
+        return np.asarray(values)
+
+    def _gun_orbit_measure(self):
+        if not self.is_running:
+            raise InterruptedError("Orbit compensation stopped")
+        previous = self.interface.nsamples
+        try:
+            self.interface.nsamples = 3
+            data = self.interface.get_bpms()
+            result = mean_orbit(data)
+            selected = [list(data["names"]).index(name) for name in ("ML8L", "ML10L")]
+            self._gun_orbit_report.setdefault("acquisitions", []).append({
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "x_samples_mm": np.asarray(data["x"])[:, selected].tolist(),
+                "y_samples_mm": np.asarray(data["y"])[:, selected].tolist(),
+                "mean_mm": result.tolist()})
+        finally:
+            self.interface.nsamples = previous
+        if not self.is_running:
+            raise InterruptedError("Orbit compensation stopped")
+        self.log_signal.emit("[Gun orbit] 3-sample mean [x8,x10,y8,y10] mm: " +
+                             np.array2string(result, precision=5))
+        return result
+
+    def _gun_orbit_write(self, values, *, restore=False):
+        targets = {f"{name}:currentWrite": float(value) for name, value in values.items()}
+        for pv, value in targets.items():
+            if pv not in self.config["gun_orbit_limits"]:
+                raise ValueError(f"Unverified gun corrector: {pv}")
+            lo, hi = self.config["gun_orbit_limits"][pv]
+            lo, hi = max(lo, STEER_CURRENT_MIN_A), min(hi, STEER_CURRENT_MAX_A)
+            if not np.isfinite(value) or not lo <= value <= hi:
+                raise ValueError(f"Gun corrector outside verified range: {pv}={value}")
+        if not restore and not self.is_running:
+            raise InterruptedError("Orbit compensation stopped")
+        # Cleanup deliberately bypasses pause/stop to remove a temporary probe.
+        # All writes still use the injected machine interface and verified limits.
+        self._touched_pvs.update(targets)
+        self._gun_orbit_report.setdefault("commands", []).append(dict(setpoints=targets, restore=restore))
+        self.interface.pv_put_many(targets)
+        self._current_pv_values.update(targets)
+        deadline = time.monotonic() + self.settle_sec
+        while time.monotonic() < deadline:
+            if not restore and not self.is_running:
+                raise InterruptedError("Orbit compensation stopped")
+            time.sleep(min(0.05, max(0., deadline - time.monotonic())))
+        deadline = time.monotonic() + 2.0
+        while True:
+            actual = dict(zip(GUN_CORRECTORS, self._gun_orbit_read_currents()))
+            if all(abs(actual[name] - value) <= 0.001 for name, value in values.items()):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Gun corrector readback did not reach requested current")
+            if not restore and not self.is_running:
+                raise InterruptedError("Orbit compensation stopped")
+            time.sleep(0.05)
+        self._emit_display_values()
+
+    def _begin_gun_orbit_compensation(self):
+        if not self.config.get("gun_orbit_compensation"):
+            return
+        if self.resume_csv_path:
+            raise ValueError("Gun orbit compensation requires a fresh reference; clear Resume CSV")
+        self._gun_orbit_report = {"status": "starting"}
+        try:
+            self._gun_orbit = OrbitCompensation(
+                measure=self._gun_orbit_measure, read=self._gun_orbit_read_currents,
+                write=self._gun_orbit_write, checkpoint=self._pause_checkpoint,
+                limits={name: [max(STEER_CURRENT_MIN_A, self.config["gun_orbit_limits"][f"{name}:currentWrite"][0]),
+                               min(STEER_CURRENT_MAX_A, self.config["gun_orbit_limits"][f"{name}:currentWrite"][1])]
+                        for name in GUN_CORRECTORS},
+                report=self._gun_orbit_report)
+            self._gun_orbit.capture()
+        except Exception as exc:
+            self._gun_orbit_report.update(status="error", error=str(exc))
+            raise
+
+    def _finish_gun_orbit_compensation(self):
+        if self._gun_orbit is None:
+            return
+        if not self.is_running:
+            self._gun_orbit_report["status"] = "stopped_before_correction"
+            return
+        self._emit_progress({"kind": "orbit_compensation", "stage": "ML8L / ML10L orbit correction"})
+        try:
+            applied = self._gun_orbit.correct()
+            self.log_signal.emit(f"[Gun orbit] {self._gun_orbit_report['status']}; plane={self._gun_orbit_report['planes']}")
+            if applied:
+                # Record the score at the actual compensated state; response
+                # probes themselves do not enter the optimizer's training data.
+                values = {f"{name}:currentWrite": float(value) for name, value in
+                          zip(GUN_CORRECTORS, self._gun_orbit_read_currents())
+                          if ("H" if name.startswith("ZH") else "V") in self._gun_orbit_report["planes"]}
+                self._evaluate_point_multi("Gun orbit compensation", values, self.mode,
+                                          TARGET_LABELS["gun_sol_l0"], note="ORBIT_COMPENSATION_FINAL")
+        except Exception as exc:
+            self._gun_orbit_report["error"] = str(exc)
+            if self._gun_orbit_report.get("status") == "reference_captured":
+                self._gun_orbit_report["status"] = "error"
+            raise
+
     def _run_timing_fine_stage(self, combined=False):
         timing_in_correctors = bool(self.config.get("correctors_l8") and self.config.get("correctors"))
         if (self.run_profile == RUN_PROFILE_MAIN and self.config.get("timing_fine")
@@ -3014,6 +3161,7 @@ class OptimizationWorker(QThread):
 
         # 1) GUN/SOLENOIDE/L0 mode (head of sequence)
         if self.config.get("gun_sol_l0_phase", False) and self.is_running:
+            self._begin_gun_orbit_compensation()
             self._emit_group_state("gun_sol_l0", "running")
             self.log_signal.emit(f"--- {gun_group_name} (GUN -> Solenoid -> L0) ---")
             sol_lo = min(sol_min, sol_max)
@@ -3032,6 +3180,7 @@ class OptimizationWorker(QThread):
                     cur = self._read_current(pv_write, None)
                     scan = np.arange(cur - half, cur + half + step, step)
                 self.perform_1d_scan(label, pv_write, scan, group=gun_group_name, mode="SEQUENTIAL")
+            self._finish_gun_orbit_compensation()
             if self.is_running:
                 self._emit_group_state("gun_sol_l0", "done")
 
@@ -3039,7 +3188,7 @@ class OptimizationWorker(QThread):
         if self.config.get("kly_phase", False) and self.is_running:
             self._emit_group_state("kly_phase", "running")
             self.log_signal.emit("--- Klystron Phase (1-8) ---")
-            for i in range(1, 9):
+            for i in selected_klystrons(self.config, 1) + selected_klystrons(self.config, 2):
                 if not self.is_running:
                     break
                 pv_write = f"CM{i}L:phaseWrite"
@@ -3113,6 +3262,7 @@ class OptimizationWorker(QThread):
         timing_half_steps = int(self.config.get("timing_half_steps", TIMING_HALF_STEPS))
         # Group order: GUN&SOLENOIDE&L0, L1-4, L5-8, Timing, QA, QM
         if self.config.get("gun_sol_l0_phase", False) and self.is_running:
+            self._begin_gun_orbit_compensation()
             sol_lo = min(sol_min, sol_max)
             sol_hi = max(sol_min, sol_max)
             params = [
@@ -3122,21 +3272,22 @@ class OptimizationWorker(QThread):
             ]
             self.log_signal.emit("--- GROUP_LBO: GUN&SOLENOIDE&L0 ---")
             self._lbo_group("GUN&SOLENOIDE&L0", params)
+            self._finish_gun_orbit_compensation()
 
         if self.config.get("kly_phase", False) and self.is_running:
             # L1-4
-            if self.config.get("grp_L1_4", True):
+            if selected_klystrons(self.config, 1):
                 params = []
-                for i in range(1, 5):
+                for i in selected_klystrons(self.config, 1):
                     pv_write = f"CM{i}L:phaseWrite"
                     params.append((f"L{i}", pv_write, phase_step, phase_half))
                 self.log_signal.emit("--- GROUP_LBO: L1-4 ---")
                 self._lbo_group("L1-4", params)
 
             # L5-8
-            if self.is_running and self.config.get("grp_L5_8", True):
+            if self.is_running and selected_klystrons(self.config, 2):
                 params = []
-                for i in range(5, 9):
+                for i in selected_klystrons(self.config, 2):
                     pv_write = f"CM{i}L:phaseWrite"
                     params.append((f"L{i}", pv_write, phase_step, phase_half))
                 self.log_signal.emit("--- GROUP_LBO: L5-8 ---")
@@ -3190,6 +3341,7 @@ class OptimizationWorker(QThread):
 
         # Group order: GUN&SOLENOIDE&L0, L1-4, L5-8, Timing, QA, QM
         if self.config.get("gun_sol_l0_phase", False) and self.is_running:
+            self._begin_gun_orbit_compensation()
             self._emit_group_state("gun_sol_l0", "running")
             sol_lo = min(sol_min, sol_max)
             sol_hi = max(sol_min, sol_max)
@@ -3199,21 +3351,21 @@ class OptimizationWorker(QThread):
                 ("L0 phase", "CM0L:phaseWrite", l0_phase_step, l0_phase_half),
             ]
             self._group_bo_simultaneous(gun_group_name, params)
+            self._finish_gun_orbit_compensation()
             if self.is_running:
                 self._emit_group_state("gun_sol_l0", "done")
 
         if self.config.get("kly_phase", False) and self.is_running:
             self._emit_group_state("kly_phase", "running")
-            if self.config.get("grp_L1_4", True):
+            if selected_klystrons(self.config, 1):
                 self._emit_group_state("kly_group_1", "running")
-                params = [(f"L{i}", f"CM{i}L:phaseWrite", phase_step, phase_half) for i in range(1, 5)]
+                params = [(f"L{i}", f"CM{i}L:phaseWrite", phase_step, phase_half) for i in selected_klystrons(self.config, 1)]
                 self._group_bo_simultaneous("L1-4", params)
                 if self.is_running:
                     self._emit_group_state("kly_group_1", "done")
-            if self.config.get("grp_L5_8", True):
+            if self.is_running and selected_klystrons(self.config, 2):
                 self._emit_group_state("kly_group_2", "running")
-                params = [(f"L{i}", f"CM{i}L:phaseWrite", phase_step, phase_half) for i in range(5, 9)
-                          if not (i == 8 and self.config.get("correctors_l8", False))]
+                params = [(f"L{i}", f"CM{i}L:phaseWrite", phase_step, phase_half) for i in selected_klystrons(self.config, 2)]
                 self._group_bo_simultaneous("L5-8", params)
                 if self.is_running:
                     self._emit_group_state("kly_group_2", "done")
@@ -3404,7 +3556,10 @@ class MainWindow(QMainWindow):
 
         self.mode_box.currentTextChanged.connect(self._update_mode_ui)
         self.mode_box.currentTextChanged.connect(self._refresh_current_values)
+        self.chk_gun_sol_l0_phase.toggled.connect(self._update_mode_ui)
         self.chk_kly_phase.toggled.connect(self._update_mode_ui)
+        for box in [self.chk_kly_group1, self.chk_kly_group2, *self.kly_member_checks.values()]:
+            box.toggled.connect(self._on_kly_selection_changed)
         self.chk_timing_group.toggled.connect(self._update_mode_ui)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         for cb in (
@@ -3438,15 +3593,29 @@ class MainWindow(QMainWindow):
         self.chk_gun_sol_l0_phase = self._add_target_row(
             lay_t, "gun_sol_l0", TARGET_LABELS["gun_sol_l0"], checked=True, prominent=True
         )
+        self.chk_gun_orbit_compensation = QCheckBox("Auto restore ML8L / ML10L orbit (≥100 µm)")
+        self.chk_gun_orbit_compensation.setChecked(False)
+        self.chk_gun_orbit_compensation.setToolTip(
+            "After GUN / Solenoid / L0: compare three-sample BPM means with the pre-scan orbit. "
+            "X uses ZH1L/ZH2L, Y uses ZV1L/ZV2L; both use all four. "
+            "Measured response probes ±0.05 A; ≤0.1 A per iteration, ≤0.5 A total, at most 5 iterations.")
+        orbit_row = QHBoxLayout()
+        orbit_row.setContentsMargins(34, 0, 0, 0)
+        orbit_row.addWidget(self.chk_gun_orbit_compensation)
+        lay_t.addLayout(orbit_row)
         self.chk_kly_phase = self._add_target_row(
             lay_t, "kly_phase", TARGET_LABELS["kly_phase"], checked=True, prominent=True, show_value=False
         )
+        self.kly_member_checks = {}
+        self._kly_budget_dims = {1: 4, 2: 4}
         self.chk_kly_group1 = self._add_target_row(
             lay_t, "kly_group_1", TARGET_LABELS["kly_group_1"], checked=True, prominent=False, indent=34
         )
+        self._add_kly_member_row(lay_t, 1)
         self.chk_kly_group2 = self._add_target_row(
             lay_t, "kly_group_2", TARGET_LABELS["kly_group_2"], checked=True, prominent=False, indent=34
         )
+        self._add_kly_member_row(lay_t, 2)
         self.chk_timing_group = self._add_target_row(
             lay_t, "timing_group", TARGET_LABELS["timing_group"],
             checked=True, prominent=True, show_value=False)
@@ -3604,6 +3773,39 @@ class MainWindow(QMainWindow):
         self.result_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         monitor.addWidget(self.result_lbl)
         self._result_labels[RUN_PROFILE_MAIN] = self.result_lbl
+
+    def _add_kly_member_row(self, layout, group):
+        row = QHBoxLayout()
+        row.setContentsMargins(54, 0, 0, 0)
+        for number in (range(1, 5) if group == 1 else range(5, 9)):
+            box = QCheckBox(f"L{number}")
+            box.setChecked(True)
+            box.setToolTip(f"Include L{number} in Group {group} / sequential phase scan")
+            self.kly_member_checks[number] = box
+            row.addWidget(box)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+    def _kly_selection_config(self):
+        return {"kly_phase": self.chk_kly_phase.isChecked(), "mode": self.mode_box.currentText(),
+                "grp_L1_4": self.chk_kly_group1.isChecked(), "grp_L5_8": self.chk_kly_group2.isChecked(),
+                "correctors": self.chk_correctors.isChecked(), "correctors_l8": self.correctors_l8.isChecked(),
+                **{f"kly_group_{g}_members": [i for i in (range(1, 5) if g == 1 else range(5, 9))
+                                              if self.kly_member_checks[i].isChecked()] for g in (1, 2)}}
+
+    def _on_kly_selection_changed(self, *_args):
+        config = self._kly_selection_config()
+        preset = self.group_bo_budget_preset_box.currentData()
+        for group in (1, 2):
+            # Preserve an explicit max-eval override; otherwise follow dimension.
+            dim = len(selected_klystrons(config, group))
+            box = self.group_bo_max_eval_spinboxes[f"kly_group_{group}"]
+            old = self._kly_budget_dims[group]
+            if dim and box.value() == _recommended_group_bo_max_evals(old, preset):
+                box.setValue(_recommended_group_bo_max_evals(dim, preset))
+            self._kly_budget_dims[group] = dim
+        self._update_mode_ui()
+        self._refresh_group_bo_budget_labels()
 
     def _build_developer_tab(self):
         layout = QVBoxLayout(self.developer_tab)
@@ -4386,7 +4588,9 @@ class MainWindow(QMainWindow):
         for spec in GROUP_BO_MAX_EVAL_SPECS:
             spin = self.group_bo_max_eval_spinboxes[str(spec["config_id"])]
             spin.blockSignals(True)
-            spin.setValue(_recommended_group_bo_max_evals(int(spec["dim"]), preset))
+            spin.setValue(_recommended_group_bo_max_evals(
+                len(selected_klystrons(self._kly_selection_config(), int(spec["config_id"][-1])))
+                if str(spec["config_id"]).startswith("kly_group_") else int(spec["dim"]), preset))
             spin.blockSignals(False)
         self.corrector_budget_auto.setChecked(True)
         self._refresh_group_bo_budget_labels()
@@ -4407,7 +4611,9 @@ class MainWindow(QMainWindow):
             corrector_dim += 2
         for spec in GROUP_BO_MAX_EVAL_SPECS:
             config_id = str(spec["config_id"])
-            dim = corrector_dim if config_id == "correctors" else int(spec["dim"])
+            dim = (corrector_dim if config_id == "correctors" else
+                   len(selected_klystrons(self._kly_selection_config(), int(config_id[-1])))
+                   if config_id.startswith("kly_group_") else int(spec["dim"]))
             spin = self.group_bo_max_eval_spinboxes[config_id]
             if config_id == "correctors":
                 auto = self.corrector_budget_auto.isChecked()
@@ -4848,9 +5054,9 @@ class MainWindow(QMainWindow):
         if self.chk_kly_phase.isChecked():
             keys.append("kly_phase")
             if mode_text == "GROUP_BO":
-                if self.chk_kly_group1.isChecked():
+                if selected_klystrons(self._kly_selection_config(), 1):
                     keys.append("kly_group_1")
-                if self.chk_kly_group2.isChecked():
+                if selected_klystrons(self._kly_selection_config(), 2):
                     keys.append("kly_group_2")
         if self.chk_timing_group.isChecked():
             if self.chk_timing.isChecked() or self.chk_timing_fine.isChecked():
@@ -5258,6 +5464,9 @@ class MainWindow(QMainWindow):
             (self.total_progress if context == RUN_PROFILE_MAIN else self.dev_total_progress).update_progress(payload["overall_progress"])
         if "scan_progress" in payload:
             self._scan_progress_by_profile[context] = dict(payload["scan_progress"])
+        if kind == "orbit_compensation":
+            self._set_status("Status: RUNNING | " + str(payload.get("stage", "")), state="running", profile=context)
+            return
         if kind == "scan_progress":
             self._set_status(f"Status: RUNNING {self._run_mode} | {self._scan_progress_text(context)}",
                              state="running", profile=context)
@@ -5401,10 +5610,14 @@ class MainWindow(QMainWindow):
     def _update_mode_ui(self):
         is_seq = (self.mode_box.currentText() == "SEQUENTIAL")
         self.seq_method_box.setEnabled(is_seq)
+        self.chk_gun_orbit_compensation.setEnabled(self.chk_gun_sol_l0_phase.isChecked() and self.chk_gun_sol_l0_phase.isEnabled())
         self.grp_group_bo_budget.setEnabled(not is_seq)
-        enable_kly_subgroups = (self.mode_box.currentText() == "GROUP_BO") and self.chk_kly_phase.isChecked()
+        enable_kly_subgroups = self.chk_kly_phase.isChecked() and self.chk_kly_phase.isEnabled()
         self.chk_kly_group1.setEnabled(enable_kly_subgroups)
         self.chk_kly_group2.setEnabled(enable_kly_subgroups)
+        for i, box in self.kly_member_checks.items():
+            parent = self.chk_kly_group1 if i <= 4 else self.chk_kly_group2
+            box.setEnabled(enable_kly_subgroups and parent.isChecked())
         self.chk_timing.setEnabled(self.chk_timing_group.isChecked())
         self.chk_timing_fine.setEnabled(self.chk_timing_group.isChecked())
 
@@ -5731,7 +5944,11 @@ class MainWindow(QMainWindow):
         self.seq_method_box.setCurrentText(str(payload.get("seq_method", self.seq_method_box.currentText())))
         self.chk_gun_sol_l0_phase.setChecked(
             bool(payload.get("gun_sol_l0_phase", self.chk_gun_sol_l0_phase.isChecked())))
+        self.chk_gun_orbit_compensation.setChecked(bool(payload.get("gun_orbit_compensation", False)))
         self.chk_kly_phase.setChecked(bool(payload.get("kly_phase", self.chk_kly_phase.isChecked())))
+        for i, box in self.kly_member_checks.items():
+            group = 1 if i <= 4 else 2
+            box.setChecked(i in payload.get(f"kly_group_{group}_members", list(range(1, 5) if group == 1 else range(5, 9))))
         self.chk_kly_group1.setChecked(bool(payload.get("grp_L1_4", self.chk_kly_group1.isChecked())))
         self.chk_kly_group2.setChecked(bool(payload.get("grp_L5_8", self.chk_kly_group2.isChecked())))
         self.chk_timing_group.setChecked(bool(payload.get(
@@ -5785,7 +6002,9 @@ class MainWindow(QMainWindow):
             if box is None:
                 continue
             key = _group_bo_max_evals_config_key(str(spec["config_id"]))
-            box.setValue(int(payload.get(key, _recommended_group_bo_max_evals(int(spec["dim"]), preset))))
+            dim = (len(selected_klystrons(self._kly_selection_config(), int(spec["config_id"][-1])))
+                   if str(spec["config_id"]).startswith("kly_group_") else int(spec["dim"]))
+            box.setValue(int(payload.get(key, _recommended_group_bo_max_evals(dim, preset))))
         self._refresh_group_bo_budget_labels()
         self._update_mode_ui()
 
@@ -5952,7 +6171,7 @@ class MainWindow(QMainWindow):
         for w in [
             self.chk_gun_sol_l0_phase, self.chk_kly_phase, self.chk_kly_group1, self.chk_kly_group2,
             self.chk_timing_group, self.chk_timing, self.chk_timing_fine, self.chk_qa, self.chk_qm,
-            self.chk_correctors, self.objective_box,
+            self.chk_correctors, self.objective_box, self.chk_gun_orbit_compensation, *self.kly_member_checks.values(),
             self.mode_box, self.seq_method_box, self.btn_browse, self.cb_downstream_ict,
             self.resume_file_edit, self.resume_file_browse_btn, self.resume_file_clear_btn
         ]:
@@ -6189,6 +6408,7 @@ class MainWindow(QMainWindow):
             "gbo_correctors_auto": self.corrector_budget_auto.isChecked(),
             "reuse_initial_eval": True,
             "gun_sol_l0_phase": self.chk_gun_sol_l0_phase.isChecked(),
+            "gun_orbit_compensation": self.chk_gun_sol_l0_phase.isChecked() and self.chk_gun_orbit_compensation.isChecked(),
             "kly_phase": self.chk_kly_phase.isChecked(),
             "timing_group": self.chk_timing_group.isChecked(),
             "timing": self.chk_timing_group.isChecked() and self.chk_timing.isChecked() and not (self.correctors_l8.isChecked() and self.chk_correctors.isChecked()),
@@ -6203,6 +6423,8 @@ class MainWindow(QMainWindow):
             "intensity_source": ", ".join(intensity_sources(bpms)),
             "grp_L1_4": self.chk_kly_group1.isChecked(),
             "grp_L5_8": self.chk_kly_group2.isChecked(),
+            "kly_group_1_members": [i for i in range(1, 5) if self.kly_member_checks[i].isChecked()],
+            "kly_group_2_members": [i for i in range(5, 9) if self.kly_member_checks[i].isChecked()],
             # Sequential method + scan settings
             "seq_method": str(self.seq_method_box.currentText()),
             "gun_phase_half_range_deg": float(getattr(self, "sp_gun_phase_half").value()),
@@ -6236,11 +6458,18 @@ class MainWindow(QMainWindow):
         if not (config["gun_sol_l0_phase"] or config["kly_phase"] or config["timing"] or config["timing_fine"] or config["qa"] or config["qm"] or config["correctors"]):
             QMessageBox.warning(self, "Warning", "Please select at least one target.")
             return
-        if config["mode"] == "GROUP_BO" and config["kly_phase"] and not (config["grp_L1_4"] or config["grp_L5_8"]):
-            QMessageBox.warning(self, "Warning", "Please select Group 1 and/or Group 2 for Klystron phase.")
+        if config["kly_phase"] and not (selected_klystrons(config, 1) or selected_klystrons(config, 2)):
+            QMessageBox.warning(self, "Warning", "Select at least one L1–L8 checkbox in an enabled Klystron group.")
             return
         try:
             config["actuator_limits"], summary = self._checked_corrector_ranges(actuators)
+            if config["gun_orbit_compensation"]:
+                if resume_path_text:
+                    raise ValueError("Clear Resume CSV for gun orbit compensation; a fresh pre-scan reference is required.")
+                compensation_specs = [dict(_developer_actuator_spec(name), step=GUN_ORBIT_PROBE_A,
+                                           half_range=GUN_ORBIT_RANGE_A) for name in GUN_CORRECTORS]
+                config["gun_orbit_limits"], orbit_summary = self._checked_corrector_ranges(compensation_specs)
+                summary.extend(orbit_summary)
             if objective != DEVELOPER_OBJECTIVE_ICT or actuators:
                 groups = [label for key, label in [("gun_sol_l0_phase", "GUN / Solenoid / L0"),
                           ("kly_phase", "Klystron phase"), ("timing", "Timing"), ("timing_fine", "Timing fine tuning"), ("qa", "QA"), ("qm", "QM"),

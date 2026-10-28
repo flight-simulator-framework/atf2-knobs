@@ -93,6 +93,18 @@ class TransportTests(unittest.TestCase):
         b.on_value(pvname='test', value=1, timestamp=11, severity=2)
         self.assertTrue(math.isnan(b.sample('test').scalar()))
 
+    def test_ca_alarm_status_survives_callback_and_limits_use_udf_values(self):
+        b = EpicsTransport(pv_factory=FakePV).connect(timeout=0)
+        self.addCleanup(b.close)
+        for pv, value in [('ZV2L:parameter.A', -5.), ('ZV2L:parameter.B', 5.)]:
+            b._pvs[pv].callback(pvname=pv,value=value,timestamp=time.time(),status=17,severity=3)
+            self.assertEqual(b.sample(pv).alarm_status,17)
+        ready, errors = inspect(b, Config())
+        self.assertIn('ZV2L',ready)
+        self.assertEqual((ready['ZV2L'].lower,ready['ZV2L'].upper),(-5.,5.))
+        self.assertIn('UDF INVALID',ready['ZV2L'].limit_source)
+        self.assertFalse(FakePV.puts)
+
 
 class GuiTests(unittest.TestCase):
     @classmethod
@@ -233,6 +245,47 @@ class GuiTests(unittest.TestCase):
             w.show_pause_choices()
         runner.resume.assert_called_once()
         runner.save_and_end.assert_not_called()
+        w.worker = None
+
+    def test_progressive_configuration_and_ten_percent_default(self):
+        w = self.window
+        self.assertEqual(w.config().min_transmission_fraction, .10)
+        self.assertEqual(w.config().initial_radius_steps, 1)
+        self.assertEqual(w.config().max_step_steps, 1)
+        w.ratio_floor.setValue(15)
+        w.expand_points.setValue(60)
+        w.expand_coverage.setValue(3)
+        self.assertEqual(w.config().min_transmission_fraction, .15)
+        self.assertEqual(w.config().expansion_points, 60)
+        self.assertEqual(w.config().expansion_coverage, 3)
+
+    def test_quality_hold_close_never_resumes_or_writes_best(self):
+        w = self.window
+        runner = Mock(is_paused=True, quality_held=True, running=True)
+        w.worker = Mock(runner=runner)
+        with patch.object(QMessageBox, 'exec', return_value=0), patch.object(QMessageBox, 'clickedButton', return_value=None):
+            w.show_pause_choices()
+        runner.resume.assert_not_called()
+        runner.save_and_end.assert_not_called()
+        runner.stop.assert_not_called()
+        w.worker = None
+
+    def test_quality_recheck_requires_explicit_button(self):
+        w = self.window
+        runner = Mock(is_paused=True, quality_held=True, running=True)
+        w.worker = Mock(runner=runner)
+        original = QMessageBox.addButton
+        buttons = {}
+        def add(box, text, role):
+            button = original(box, text, role)
+            buttons[text] = button
+            return button
+        with patch.object(QMessageBox, 'addButton', add), patch.object(QMessageBox, 'exec', return_value=0), \
+             patch.object(QMessageBox, 'clickedButton', side_effect=lambda: buttons['Recheck after recovery']):
+            w.show_pause_choices()
+        runner.resume.assert_called_once()
+        runner.save_and_end.assert_not_called()
+        self.assertEqual(w.pause_button.text(), 'PAUSE')
         w.worker = None
 
     def test_pause_dialog_save_and_end_selects_best_action(self):

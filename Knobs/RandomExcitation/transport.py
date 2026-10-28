@@ -18,6 +18,7 @@ class Sample:
     sequence: int
     connected: bool = True
     severity: int = 0
+    alarm_status: int = 0
 
     def scalar(self):
         try:
@@ -35,7 +36,7 @@ class MonitorCache:
         self._closed = False
         self._sequence = 0
 
-    def on_value(self, pvname=None, value=None, timestamp=None, severity=0, **kwargs):
+    def on_value(self, pvname=None, value=None, timestamp=None, severity=0, status=0, **kwargs):
         with self._lock:
             if self._closed:
                 return
@@ -43,7 +44,7 @@ class MonitorCache:
             if isinstance(value, np.ndarray):
                 value = value.copy()
             sample = Sample(value, float(timestamp or 0), time.monotonic(), self._sequence,
-                            True, int(severity or 0))
+                            True, int(severity or 0), int(status or 0))
             self._samples[pvname] = sample
             history = self._history.setdefault(pvname, deque(maxlen=512 if pvname in ICT_PVS.values() else 2))
             history.append(sample)

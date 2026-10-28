@@ -232,7 +232,29 @@ class MainWindow(QMainWindow):
         self.phase_range.valueChanged.connect(self.reinspect)
         self.timing_mode.currentIndexChanged.connect(self.reinspect)
         p.addLayout(form)
-        label = QLabel("Phase: 1° grid / Current: 0.1 A grid\nCurrent limits: parameter.A/B.\nEdit Lower / Upper to narrow the range.")
+        progressive_box = QGroupBox("Progressive exploration")
+        pf = QFormLayout(progressive_box)
+        self.ratio_floor = self.spin(10, .1, 100, 1)
+        self.initial_radius = self.spin(1, 1, 1000)
+        self.expand_points = self.spin(40, 1, 100000)
+        self.expand_coverage = self.spin(2, 1, 1000)
+        self.max_step = self.spin(1, 1, 1000)
+        self.ict_age = self.spin(2, .1, 60, 1)
+        for label, widget in [("Min DR/LN0 [% initial]", self.ratio_floor),
+                              ("Initial radius [grid steps]", self.initial_radius),
+                              ("Pass points / stage", self.expand_points),
+                              ("Changes / control / stage", self.expand_coverage),
+                              ("Max command step [grid steps]", self.max_step),
+                              ("ICT max age [s]", self.ict_age)]:
+            pf.addRow(label, widget)
+        hint = QLabel("Radius doubles only after passed measurements and a reference check.\n"
+                      "10% means 0.1 × initial DR/LN0, not a 10% reduction.\n"
+                      "Quality hold stops commands; it DOES NOT inhibit the beam.\n"
+                      "These are exploration limits, not radiation protection.")
+        hint.setWordWrap(True)
+        pf.addRow(hint)
+        p.addWidget(progressive_box)
+        label = QLabel("Phase: 1° grid / Current: 0.1 A grid\nCurrent limits: parameter.A/B.\nLower / Upper are the FINAL expansion limits; narrow them before starting.")
         label.setWordWrap(True)
         p.addWidget(label)
         groups = QGroupBox("Actuator groups")
@@ -305,6 +327,9 @@ class MainWindow(QMainWindow):
         self.status.setMinimumHeight(62)
         self.status.setStyleSheet("background: #12324d; color: white; border-radius: 7px; padding: 10px; font-size: 19px; font-weight: 600;")
         layout.addWidget(self.status)
+        self.range_status = QLabel("Exploration starts at ±1 grid step around the initial settings.")
+        self.range_status.setWordWrap(True)
+        layout.addWidget(self.range_status)
         self.active_label = QLabel("Active controls: —")
         self.active_label.setWordWrap(True)
         layout.addWidget(self.active_label)
@@ -398,7 +423,10 @@ class MainWindow(QMainWindow):
             current_tolerance=self.current_tol.value(), max_changed=self.max_changed.value(),
             joint_every=self.joint_every.value(), reference_every=self.reference_every.value(), seed=self.seed.value(),
             score_ict=self.score_ict.currentText(), end_action=("initial", "best", "keep")[self.end_action.currentIndex()],
-            save_ict_summary=self.save_means.isChecked())
+            save_ict_summary=self.save_means.isChecked(),
+            initial_radius_steps=self.initial_radius.value(), expansion_points=self.expand_points.value(),
+            expansion_coverage=self.expand_coverage.value(), max_step_steps=self.max_step.value(),
+            min_transmission_fraction=self.ratio_floor.value()/100., ict_max_age=self.ict_age.value())
 
     def selected(self):
         return [a for a in CATALOG if self.table.item(self.row_by_name[a.name], 0).checkState() == Qt.CheckState.Checked]
@@ -551,6 +579,9 @@ class MainWindow(QMainWindow):
         if self._closing or not self.worker or not self.worker.runner.is_paused:
             return
         runner = self.worker.runner
+        if runner.quality_held is True:
+            self.show_quality_choices()
+            return
         box = QMessageBox(self)
         box.setWindowTitle("Pause Requested")
         box.setText("Current measurement finished. Settings and history are retained.\n\n"
@@ -571,6 +602,31 @@ class MainWindow(QMainWindow):
             runner.resume()
         self.pause_button.setText("PAUSE")
         self.pause_button.setEnabled(True)
+
+    def show_quality_choices(self):
+        if self._closing or not self.worker or not self.worker.runner.quality_held:
+            return
+        runner = self.worker.runner
+        box = QMessageBox(self)
+        box.setWindowTitle("Exploration quality hold — beam NOT inhibited")
+        box.setText("Command changes are suspended. The range was reduced and further expansion is disabled for this run.\n\n"
+                    "Check the beam using the facility procedures. This application does not stop the beam.\n\n"
+                    "After external recovery, Recheck verifies live ICTs before returning to the initial reference in limited steps. "
+                    "A low or missing signal keeps the run on hold.")
+        recheck = box.addButton("Recheck after recovery", QMessageBox.ButtonRole.ActionRole)
+        stay = box.addButton("Stay on hold", QMessageBox.ButtonRole.RejectRole)
+        end = box.addButton("End · keep settings", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(stay)
+        box.setEscapeButton(stay)
+        box.exec()
+        if not runner.running:
+            return
+        if box.clickedButton() is recheck:
+            runner.resume()
+            self.pause_button.setText("PAUSE")
+            self.status.setText("Rechecking live ICTs before returning to reference")
+        elif box.clickedButton() is end:
+            self.stop_run()
 
     def stop_run(self):
         if self.worker:
@@ -632,11 +688,26 @@ class MainWindow(QMainWindow):
             self.pause_button.setText("RESUME")
             self.pause_button.setEnabled(True)
             self.show_pause_choices()
+        elif state == "exploration_range":
+            radius = self.initial_radius.value() * 2 ** data['stage']
+            self.range_status.setText(f"Stage {data['stage']} · radius ≤±{radius:g} grid steps · "
+                                      f"minimum DR/LN0 = {number(data['minimum_ratio'])} · {data['reason']}")
+            self.log.appendPlainText(f"Exploration range: stage {data['stage']} / {data['reason']}")
+            for name, bounds in data['ranges'].items():
+                row = self.row_by_name[name]
+                for col in (4, 5):
+                    self.table.item(row, col).setToolTip(f"Current exploration interval: [{bounds[0]:g}, {bounds[1]:g}]")
+        elif state == "quality_hold":
+            self.status.setText("QUALITY HOLD · Commands suspended · Beam NOT inhibited\n" + data['reason'])
+            self.log.appendPlainText("Quality hold: " + data['reason'])
+            self.pause_button.setText("RECHECK / END")
+            self.pause_button.setEnabled(True)
+            self.show_quality_choices()
         elif state == "finished":
             self.active_names.clear()
             self._highlight()
             self.active_label.setText("No active commands")
-            self.status.setText({"complete": "Complete", "saved_best": "Finished at the best recorded settings", "stopped": "Stopped · Settings retained", "error": "Stopped on error · Check the journal"}[data["result"]])
+            self.status.setText({"complete": "Complete", "saved_best": "Finished at the best recorded settings", "stopped": "Stopped · Settings retained", "error": "Stopped on error · Check the journal", "quality_stopped": "No valid ICT reference · No exploration · Beam NOT inhibited"}[data["result"]])
             if data.get("error"):
                 self.log.appendPlainText(data["error"])
                 self.path_label.setText(data["error"] + "\nFolder: " + data.get("directory", ""))

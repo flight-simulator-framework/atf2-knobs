@@ -76,6 +76,52 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'inconsistent'):
             current_bounds(a, self.b)
 
+    def test_udf_invalid_configuration_limits_are_accepted_and_labelled(self):
+        a = BY_NAME['ZV2L']
+        for pv, value in zip(a.limit_pvs, (-5., 5.)):
+            self.b.on_value(pvname=pv, value=value, status=17, severity=3)
+            self.assertTrue(math.isnan(self.b.sample(pv).scalar()))
+        lo, hi, source = current_bounds(a, self.b)
+        self.assertEqual((lo, hi), (-5., 5.))
+        self.assertIn('UDF INVALID on A/B', source)
+        self.assertNotIn('unavailable', source)
+        self.b._metadata[a.writes[0]] = dict(lower_ctrl_limit=-2, upper_ctrl_limit=3)
+        self.assertEqual(current_bounds(a, self.b)[:2], (-2., 3.))
+        p = prepare(a, self.b, self.config)
+        p.validate_target(2., self.b)
+        with self.assertRaises(ValueError):
+            p.validate_target(4., self.b)
+
+    def test_udf_exception_rejects_nonfinite_disconnected_and_other_alarms(self):
+        a = BY_NAME['ZV2L']
+        self.b._metadata.clear()
+        self.b.on_value(pvname=a.limit_pvs[1], value=5., status=17, severity=3)
+        for value, status, severity in [(math.nan,17,3), (math.inf,17,3), ([-5.,-4.],17,3),
+                                        (-5.,1,3), (-5.,9,3), (-5.,17,2), (-5.,0,3)]:
+            with self.subTest(value=value, status=status, severity=severity):
+                self.b.on_value(pvname=a.limit_pvs[0], value=value, status=status, severity=severity)
+                with self.assertRaisesRegex(ValueError, 'unavailable'):
+                    current_bounds(a,self.b)
+        self.b.on_value(pvname=a.limit_pvs[0], value=-5., status=17, severity=3)
+        self.b.on_connection(pvname=a.limit_pvs[0], conn=False)
+        with self.assertRaisesRegex(ValueError, 'unavailable'):
+            current_bounds(a,self.b)
+
+    def test_udf_limits_still_require_order_and_valid_measured_readback(self):
+        a = BY_NAME['ZV2L']
+        for lo, hi in [(-5.,-5.), (5.,-5.)]:
+            for pv,value in zip(a.limit_pvs,(lo,hi)):
+                self.b.on_value(pvname=pv,value=value,status=17,severity=3)
+            with self.assertRaisesRegex(ValueError,'less than'):
+                current_bounds(a,self.b)
+        self.b.on_value(pvname=a.limit_pvs[0],value=-5.,status=17,severity=3)
+        self.b.on_value(pvname=a.limit_pvs[1],value=5.,status=17,severity=3)
+        self.b.on_value(pvname=a.read,value=0.,status=17,severity=3)
+        with self.assertRaisesRegex(ValueError,'No valid PV value'):
+            prepare(a,self.b,self.config)
+        self.b.on_value(pvname=ICT_PVS['DR'],value=8.,status=17,severity=3)
+        self.assertTrue(math.isnan(self.b.sample(ICT_PVS['DR']).scalar()))
+
     def test_quantization_ranges_and_exact_off_grid_restore(self):
         self.b.put('CM1L:phaseWrite', 12.37)
         self.b.put('QA1L:currentWrite', 3.037)
@@ -235,7 +281,7 @@ class CoreTests(unittest.TestCase):
         self.b._thread.join()
         r = self.runner()
         self.config.max_points = 1
-        self.assertEqual(r.run(), 'complete')
+        self.assertEqual(r.run(), 'quality_stopped')
         row = next(x for x in self.records(r) if x['event'] == 'measurement_window')
         self.assertEqual(row['quality'], 'incomplete_fresh_ICT_samples')
         self.assertEqual(set(row['sample_counts'].values()), {0})
@@ -249,7 +295,8 @@ class CoreTests(unittest.TestCase):
         self.config.max_points = 1
         self.config.save_ict_summary = True
         r = self.runner()
-        self.assertEqual(r.run(), 'complete')
+        self.assertEqual(r.run(), 'quality_stopped')
+        self.assertFalse(self.b.commands)
         row = next(x for x in self.records(r) if x['event'] == 'measurement_window')
         self.assertEqual(row['quality'], 'complete')
         self.assertEqual(set(row['ict_means'].values()), {0.})
@@ -296,7 +343,7 @@ class CoreTests(unittest.TestCase):
         count = len(self.b.commands)
         time.sleep(.03)
         self.assertEqual(len(self.b.commands), count)
-        self.b.put('CM1L:phaseWrite', 80)
+        self.b.put('CM1L:phaseWrite', 5)
         r.resume()
         thread.join(2)
         self.assertFalse(thread.is_alive())
