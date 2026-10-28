@@ -35,6 +35,31 @@ QSplitter::handle:hover { background: #93b9df; }
 TAB_STYLE = "QTabBar::tab { font-size: 14px; font-weight: 600; padding: 6px 16px; min-width: 72px; }"
 
 
+def run_button_style(role):
+    """Common LinacOpt run-control buttons for Main and Active Feedback."""
+    color = {"start": "#1f7a1f", "pause": "#a32020", "stop": "#585f66"}[role]
+    return ("QPushButton { font-size: 15px; font-weight: 700; padding: 6px 10px; min-height: 30px; "
+            f"background: {color}; color: white; }} "
+            "QPushButton:disabled { background: #edf1f5; color: #94a3b8; border-color: #dce3eb; }")
+
+
+def status_badge_style(state):
+    palette = {
+        "idle": ("#374151", "#e5e7eb", "#9ca3af"),
+        "running": ("#14532d", "#dcfce7", "#22c55e"),
+        "paused": ("#713f12", "#fef3c7", "#f59e0b"),
+        "warning": ("#7c2d12", "#ffedd5", "#fb923c"),
+        "error": ("#7f1d1d", "#fee2e2", "#ef4444"),
+        "success": ("#1e3a8a", "#dbeafe", "#3b82f6"),
+        "info": ("#1f2937", "#e5e7eb", "#9ca3af"),
+    }
+    fg, bg, bd = palette.get(str(state).lower(), palette["info"])
+    return ("QLabel#statusBadge {"
+            f"font-size: 17px; font-weight: 600; color: {fg}; "
+            f"background: {bg}; border: 2px solid {bd}; "
+            "border-radius: 6px; padding: 5px 8px; }")
+
+
 class OptimizerWorkspace(QWidget):
     """Scrollable controls at left; plots and optional logs at right."""
     def __init__(self, parent=None, *, controls_width=460):

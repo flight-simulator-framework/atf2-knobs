@@ -424,6 +424,66 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(events[-1]['result'], 'stopped')
         self.assertEqual(len(self.b.commands), count)
 
+    def test_restore_initial_unblocks_pause_and_returns_off_grid_in_limited_steps(self):
+        self.b.put('QA1L:currentWrite', 3.037)
+        r, thread, events = self.paused_runner()
+        visits = r.visits
+        # Include a manual displacement while paused to exercise multiple steps.
+        self.b.put('QA1L:currentWrite', 3.437)
+        r.restore_initial_and_end()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(events[-1]['result'], 'restored_initial')
+        self.assertEqual(r.visits, visits)
+        for n, p in r.items.items():
+            self.assertAlmostEqual(scalar(self.b, p.actuator.writes[0]), p.origin)
+        commands = [x for x in self.records(r) if x['event'] == 'command_intent'
+                    and x['kind'].startswith('stop_initial')]
+        self.assertGreaterEqual(len(commands), 4)
+        for x in commands:
+            self.assertLessEqual(abs(x['requested'] - x['before']), r.items[x['name']].step + 1e-8)
+        self.assertEqual(self.records(r)[-1]['status'], 'restored_initial')
+
+    def test_restore_request_during_measurement_finishes_it_then_ends(self):
+        r = self.runner()
+        events = []
+        def emit(data):
+            events.append(data)
+            if data['state'] == 'measuring' and r.visits == 1:
+                r.restore_initial_and_end()
+        r.emit = emit
+        self.assertEqual(r.run(), 'restored_initial')
+        self.assertEqual(r.visits, 2)
+        self.assertEqual(len([x for x in events if x['state'] == 'point']), 2)
+        for p in r.items.values():
+            self.assertAlmostEqual(scalar(self.b, p.actuator.writes[0]), p.origin)
+
+    def test_stop_can_interrupt_initial_return_without_more_writes(self):
+        r, thread, events = self.paused_runner()
+        self.b.put('QA1L:currentWrite', 3.4)
+        count = len(self.b.commands)
+        emit = r.emit
+        def stop_on_return(data):
+            emit(data)
+            if data['state'] == 'writing' and data['kind'].startswith('stop_initial'):
+                r.stop()
+        r.emit = stop_on_return
+        r.restore_initial_and_end()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(events[-1]['result'], 'stopped')
+        self.assertEqual(len(self.b.commands), count)
+
+    def test_initial_return_checks_current_limits_before_writing(self):
+        r, thread, events = self.paused_runner()
+        self.b.publish('QA1L:parameter.A', 3.2)
+        count = len(self.b.commands)
+        r.restore_initial_and_end()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(events[-1]['result'], 'error')
+        self.assertEqual(len(self.b.commands), count)
+
 
 if __name__ == '__main__':
     unittest.main()

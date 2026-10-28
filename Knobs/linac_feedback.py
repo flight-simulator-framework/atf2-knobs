@@ -6,6 +6,7 @@ All grids are relative to the initial setpoints (fractional origins preserved).
 from collections import deque
 from dataclasses import dataclass
 from itertools import product
+import time
 
 import numpy as np
 
@@ -18,12 +19,21 @@ PVS = (TIMING_PV, PHASE_PV) + CURRENT_PVS
 TIMING_STEP = 2.8
 PHASE_STEP = 0.5
 CURRENT_STEP = 0.01
+INITIAL_PROBE_A = 0.05
+
+
+class BeamLoss(RuntimeError):
+    """A nonpositive ICT measurement: unwind probes, then wait for the operator."""
+
+
+class OrbitDrift(RuntimeError):
+    """Switch to orbit recovery only after a temporary probe has been restored."""
 
 
 @dataclass(frozen=True)
 class FeedbackConfig:
     orbit_threshold_um: float = 100.
-    settle_sec: float = 5.
+    settle_sec: float = 2.
     interval_sec: float = 5.
     sample_timeout_sec: float = 15.
     timing_range_ns: float = 112.
@@ -33,6 +43,8 @@ class FeedbackConfig:
     max_search_steps: int = 100
     max_orbit_steps: int = 50
     downstream: str = "DR"
+    degradation_samples: int = 5
+    degradation_percent: float = 5.
 
     def __post_init__(self):
         for name in ("orbit_threshold_um", "sample_timeout_sec", "timing_range_ns",
@@ -48,6 +60,10 @@ class FeedbackConfig:
             raise ValueError("Iteration limits must be positive")
         if self.downstream not in ("DR", "LNE", "BTM", "BTE"):
             raise ValueError("Select DR, LNE, BTM or BTE transmission")
+        if not isinstance(self.degradation_samples, int) or not 1 <= self.degradation_samples <= 100:
+            raise ValueError("Transmission average must use 1–100 measurements")
+        if not np.isfinite(self.degradation_percent) or not 0 <= self.degradation_percent < 100:
+            raise ValueError("Transmission drop threshold must be in [0, 100) percent")
 
 
 class RecentResponse:
@@ -90,6 +106,8 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
         self.response = RecentResponse()
         self.cycle_number = 0
         self.state = "Idle"
+        self.orbit_alert = False
+        self.transmission_history = deque(maxlen=config.degradation_samples)
 
     def event(self, kind, **values):
         self.emit(dict(kind=kind, state=self.state, cycle=self.cycle_number, **values))
@@ -100,6 +118,8 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
 
     def transmission(self):
         value = float(self.io.transmission())
+        if np.isfinite(value) and value <= 0:
+            raise BeamLoss(f"Transmission dropped to {value:g}")
         if not np.isfinite(value) or not 0 <= value <= 1:
             raise ValueError("Invalid transmission measurement")
         self.event("transmission", transmission=value, settings=dict(self.current))
@@ -111,6 +131,27 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
             raise ValueError("Invalid three-sample orbit mean")
         self.event("orbit", orbit_mm=value.tolist())
         return value
+
+    def outside_orbit_threshold(self, value):
+        return bool(np.max(abs(value - self.reference)) >= self.config.orbit_threshold_um / 1000. - 1e-12)
+
+    def monitor_orbit(self, value):
+        # Latch alerts from the continuous monitor, including during probes.
+        # A fresh measurement at an accepted setting must confirm the alert.
+        if self.outside_orbit_threshold(value):
+            self.orbit_alert = True
+
+    def check_orbit(self, force=False):
+        if force or self.orbit_alert:
+            self.orbit_alert = False
+            orbit = self.orbit()
+            if self.outside_orbit_threshold(orbit):
+                raise OrbitDrift("ML8L / ML10L orbit exceeds the drift threshold")
+            self.orbit_alert = False
+
+    def settings_event(self):
+        self.event("settings", settings=dict(self.current), initial_settings=dict(self.origin),
+                   delta={pv: self.current[pv] - self.origin[pv] for pv in PVS})
 
     def initialize(self):
         self.set_state("Capturing reference")
@@ -130,9 +171,12 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
         self.initial_transmission = self.transmission()
         if self.initial_transmission <= 0:
             raise ValueError("Establish transmitted beam before starting feedback")
-        self.previous_peak = self.initial_transmission
         self.event("reference", orbit_mm=self.reference.tolist(), transmission=self.initial_transmission,
-                   settings=self.origin, limits=self.limits)
+                   settings=self.origin, limits=self.limits,
+                   degradation_threshold=self.initial_transmission * (1 - self.config.degradation_percent / 100))
+        self.settings_event()
+        if hasattr(self.io, "set_orbit_monitor"):
+            self.io.set_orbit_monitor(self.monitor_orbit)
 
     def write(self, values, restore=False):
         for pv, value in values.items():
@@ -141,8 +185,9 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
                 raise ValueError(f"Feedback target outside range: {pv}={value}")
         self.io.write(values, restore=restore)
         self.current.update(values)
+        self.settings_event()
 
-    def search(self, pv, step, label):
+    def search(self, pv, step, label, guard_orbit=True):
         """Re-measure both neighbours around each accepted centre; no old best.
 
 Bracket each neighbour with centre measurements to reject linear time drift.
@@ -153,6 +198,8 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
         lo, hi = self.limits[pv]
         for _ in range(self.config.max_search_steps):
             self.io.checkpoint()
+            if guard_orbit:
+                self.check_orbit()
             best_gain, best_value = self.config.min_gain, center
             missing_neighbor = False
             order = (-1, 1) if self.cycle_number % 2 else (1, -1)
@@ -168,6 +215,8 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
                 finally:
                     self.write({pv: center}, restore=True)
                 after = self.transmission()
+                if guard_orbit:
+                    self.check_orbit()  # Probe restored; orbit can take priority.
                 gain = trial - (before + after) / 2
                 self.event("probe", pv=pv, value=target, gain=gain)
                 if gain > best_gain + 1e-12:
@@ -206,11 +255,19 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
 
     def learn_response(self):
         self.set_state("Learning corrector response")
+        probe = INITIAL_PROBE_A if self.response.matrix() is None else CURRENT_STEP
+        self.event("response_probe_size", probe_A=probe)
         for index, pv in enumerate(CURRENT_PVS):
             self.io.checkpoint()
             current = self.current[pv]
             lo, hi = self.limits[pv]
-            delta = CURRENT_STEP if current + CURRENT_STEP <= hi + 1e-9 else -CURRENT_STEP
+            # Preserve the 0.01 A grid if a configured limit leaves less room
+            # than the initial 0.05 A calibration excursion.
+            room = max(hi - current, current - lo)
+            amplitude = min(probe, np.floor((room + 1e-9) / CURRENT_STEP) * CURRENT_STEP)
+            if amplitude < CURRENT_STEP - 1e-9:
+                raise RuntimeError(f"No 0.01 A probe headroom for {pv}")
+            delta = amplitude if current + amplitude <= hi + 1e-9 else -amplitude
             if current + delta < lo - 1e-9:
                 raise RuntimeError(f"No 0.01 A probe headroom for {pv}")
             before = self.orbit()
@@ -281,21 +338,82 @@ Probe order alternates between cycles. No move on ties or insignificant gain.
 
     def cycle(self):
         self.cycle_number += 1
-        peak = self.search(TIMING_PV, TIMING_STEP, "Timing tracking")
-        decreased = peak < self.previous_peak - self.config.min_gain
-        self.event("timing_result", transmission=peak, previous_peak=self.previous_peak, decreased=decreased)
-        orbit = self.orbit()
-        if decreased and np.max(abs(orbit - self.reference)) >= self.config.orbit_threshold_um / 1000. - 1e-12:
-            self.correct_orbit()
-            peak = self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction")
-        self.previous_peak = peak
-        if peak < self.initial_transmission - self.config.min_gain:
-            self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery")
-        self.set_state("Monitoring")
+        timing_label = "Timing tracking"
+        for _ in range(3):
+            try:
+                self.set_state("Checking orbit")
+                self.check_orbit(force=True)
+                self.search(TIMING_PV, TIMING_STEP, timing_label)
+                self.check_orbit(force=True)
+                # Compare five new operating-point measurements, never a mix of
+                # deliberate probe losses or obsolete timing/corrector settings.
+                self.transmission_history.clear()
+                self.set_state("Checking transmission after timing")
+                threshold = self.initial_transmission * (1 - self.config.degradation_percent / 100)
+                for index in range(self.config.degradation_samples):
+                    self.io.checkpoint()
+                    self.transmission_history.append(self.transmission())
+                    self.check_orbit()
+                    self.event("transmission_average", average=float(np.mean(self.transmission_history)),
+                               samples=index + 1, required=self.config.degradation_samples,
+                               threshold=threshold, complete=index + 1 == self.config.degradation_samples)
+                self.check_orbit(force=True)
+                average = float(np.mean(self.transmission_history))
+                degraded = average < threshold - 1e-12
+                self.event("degradation_decision", average=average, threshold=threshold, degraded=degraded,
+                           samples=list(self.transmission_history), orbit_normal=True)
+                if degraded:
+                    self.search(PHASE_PV, PHASE_STEP, "CM8L phase recovery")
+                    self.check_orbit(force=True)
+                self.set_state("Monitoring")
+                return
+            except OrbitDrift as exc:
+                self.event("orbit_priority", message=str(exc))
+                self.correct_orbit()
+                self.orbit_alert = False
+                if self.outside_orbit_threshold(self.orbit()):
+                    # Still retune timing, but never mistake an unresolved orbit
+                    # problem for a reason to scan phase.
+                    self.search(TIMING_PV, TIMING_STEP, "Timing after orbit correction", guard_orbit=False)
+                    self.event("phase_blocked", reason="Orbit remains outside threshold")
+                    self.set_state("Orbit outside threshold; phase recovery blocked")
+                    return
+                timing_label = "Timing after orbit correction"
+        self.set_state("Orbit recovery retry limit; monitoring before next cycle")
 
-    def run(self):
-        self.initialize()
+    def wait_cycle(self):
+        self.set_state("Waiting for next timing scan")
+        deadline = time.monotonic() + self.config.interval_sec
         while True:
             self.io.checkpoint()
-            self.cycle()
-            self.io.wait(self.config.interval_sec)
+            self.check_orbit()
+            remaining = max(0., deadline - time.monotonic())
+            self.event("waiting", remaining_sec=remaining, next_action="Timing scan", bpm_monitoring=True)
+            if remaining <= 0:
+                self.io.wait(0)
+                return
+            self.io.wait(min(1., remaining))
+
+    def run(self, pause_for_loss=None):
+        initialized = False
+        while True:
+            try:
+                self.io.checkpoint()
+                if not initialized:
+                    self.initialize()
+                    initialized = True
+                self.cycle()
+                self.wait_cycle()
+            except OrbitDrift:
+                self.event("orbit_priority", message="Orbit drift during wait; starting recovery now")
+            except BeamLoss as exc:
+                # Every probe/trial has already unwound its finally block.
+                # Keep the original reference and accepted machine settings;
+                # discard the interrupted search and the pre-fault model.
+                if pause_for_loss is None:
+                    raise
+                self.response = RecentResponse()
+                self.transmission_history.clear()
+                self.report_response()
+                self.event("beam_loss", message=str(exc), settings=dict(getattr(self, "current", {})))
+                pause_for_loss(str(exc))

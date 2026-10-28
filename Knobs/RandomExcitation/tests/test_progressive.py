@@ -162,6 +162,31 @@ class ProgressiveTests(unittest.TestCase):
         self.assertEqual(r.progressive.max_stage, 0)
         self.assertIn('quality_recovery', [x['kind'] for x in self.records(r) if x['event'] == 'measurement_window'])
 
+    def test_requested_initial_return_remains_held_until_quality_recovers(self):
+        r = self.runner()
+        holds = []
+        def emit(data):
+            if data['state'] == 'point' and r.visits == 2:
+                self.dr = .1
+                self.b._tick()
+                r.restore_initial_and_end()
+            if data['state'] == 'quality_hold':
+                holds.append(len(self.b.commands))
+                if len(holds) == 2:
+                    self.dr = 8.
+                    self.b._tick()
+                if len(holds) > 2:
+                    r.stop()
+                else:
+                    r.restore_initial_and_end()
+        r.emit = emit
+        self.assertEqual(r.run(), 'restored_initial')
+        self.assertEqual(r.visits, 2)
+        self.assertEqual(len(holds), 2)
+        self.assertEqual(holds[0], holds[1])
+        for p in r.items.values():
+            self.assertAlmostEqual(self.b.sample(p.actuator.writes[0]).scalar(), p.origin)
+
     def test_live_disconnect_stale_zero_and_low_values_trip_before_commands(self):
         r = self.runner()
         r.items = self.items()

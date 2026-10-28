@@ -106,15 +106,22 @@ def main():
                     window.output.setText(folder)
                     window.guard.setValue(.05)
                     window.samples.setValue(3)
-                    window.max_points.setValue(3)
+                    window.max_points.setValue(20)
                     window.connect_button.click()
                     pump_until(lambda: window.connector and not window.connector.isRunning())
                     assert window.transport is not None, window.status.text()
                     assert {a.name for a in window.selected()} == {'L1', 'QA1L'}
                     window.start_button.click()
+                    def request_initial(data):
+                        if data['state'] == 'point' and data['visits'] == 2:
+                            window.restore_button.click()
+                    window.worker.update.connect(request_initial)
                     pump_until(lambda: window.worker and not window.worker.isRunning())
-                    assert window.worker.runner.visits == 3
-                    assert window.status.text() == 'Complete', window.path_label.text()
+                    qt_measurements = window.worker.runner.visits
+                    assert 2 <= qt_measurements < 20
+                    assert window.status.text() == 'Finished · Initial settings restored', window.path_label.text()
+                    assert window.transport.sample('QA1L:currentRead').scalar() == 3
+                    assert window.transport.sample('CM1L:phaseRead').scalar() == 12
                 finally:
                     if window.worker and window.worker.isRunning():
                         window.worker.runner.stop()
@@ -123,7 +130,7 @@ def main():
                     app.processEvents()
                 print(json.dumps(dict(status=result, measured_points=len(points), commands=len(commands),
                                       current_limits=[p.lower, p.upper], dr_mode=1, dr_turn=7,
-                                      qt_worker_measurements=3,
+                                      qt_worker_measurements=qt_measurements, qt_initial_restored=True,
                                       transport='real PyEPICS / caproto / loopback only')))
             except Exception:
                 if backend:

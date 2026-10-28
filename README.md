@@ -24,37 +24,76 @@ LinacOpt also has an **Active Feedback** tab. It runs until Stop, with Main
 optimization and reset disabled while feedback owns the actuators. Start captures
 a fixed initial transmission and ML8L/ML10L orbit reference. Transmission is the
 selected downstream ICT (DR by default) divided by LN0, independently of Main's
-objective/weights. The fixed sequence is:
+objective/weights. Absolute ICT values are used only for the nonpositive-beam
+auto-pause guard. The normal feedback mode is timing tracking, with orbit recovery
+taking priority:
 
 1. Track a local transmission maximum on the relative 2.8 ns timing grid using
    `EVE_LINAC:OUT0:SetData`. Remeasure centre and neighbours every cycle; historical
    best scores are not reused. Centre measurements bracket each probe.
-2. If this timing maximum is below the previous timing maximum, check the latest
-   three new `LINAC:monitors` records. If any of ML8L.x, ML10L.x, ML8L.y or ML10L.y
+2. Continuously check timestamped `LINAC:monitors` records during acquisition,
+   settling and cycle waits, averaging the latest three distinct records.
+   If any of ML8L.x, ML10L.x, ML8L.y or ML10L.y
    differs from its initial three-record mean by at least the orbit threshold
    (100 µm by default, editable in the tab), restore the orbit with ZH1L, ZV1L,
    ZH2L and ZV2L. Every changed corrector moves by 0.01 A per step. The threshold
-   triggers correction; correction targets the initial orbit until no improving
-   grid move remains, a trial fails, or the iteration limit is reached.
-3. After orbit correction, repeat timing optimization. If the local maximum is
-   still below the fixed initial transmission (also checked when orbit correction
-   was not triggered), optimize CM8L phase in relative 0.5° steps.
+   triggers correction independently of transmission. Restore temporary probes
+   and confirm the drift using three fresh records at the accepted settings
+   before switching to correction. Correction targets the initial orbit until
+   no improving grid move remains, a trial fails, or the iteration limit is reached.
+3. After orbit correction, repeat timing optimization. Once timing has reached a
+   local optimum and the orbit is within tolerance, measure transmission five
+   times at that operating point. Phase recovery starts only when the mean of
+   these latest five measurements is **below initial transmission × 0.95** by
+   default. This is a relative 5% drop, not five percentage points. For example,
+   an initial transmission of 0.80 gives a recovery threshold of 0.76. Each
+   measurement uses three fresh ICT samples; deliberate timing/phase probe
+   measurements are excluded from the recovery average. The drop percentage and
+   averaging count are adjustable in the GUI. CM8L recovery uses 0.5° steps.
+   An unresolved orbit blocks phase recovery, even if transmission is low.
 4. Return to timing tracking and repeat. Pause retains accepted settings; Stop
    and closing the window remove temporary probes and retain accepted settings.
 
-The response matrix is measured internally with 0.01 A probes, refreshed in all
-four directions when orbit correction is triggered, and updated from measured
+The initial response matrix is measured internally with 0.05 A probes. Subsequent
+refresh probes and each actual correction step are 0.01 A. Probes respect the
+configured/IOC limits, using the opposite direction or a smaller grid excursion
+if necessary. The matrix is refreshed in all four directions when orbit
+correction is triggered and updated from measured
 correction results. A weighted fit uses at most 64 recent observations, giving
 newer data more weight. CM8L changes invalidate the old response. Horizontal and
 vertical cross-coupling is included; each orbit step evaluates all neighbouring
 current-grid combinations against the learned response.
 
-The tab exposes settling time, cycle interval, transmission comparison deadband
-(absolute ratio, default zero), and excursions from the starting values (defaults:
+The tab exposes settling time (default **2 s** after each write), cycle interval
+(default 5 s after a complete feedback loop, before the next timing search),
+local-search improvement deadband (absolute ratio, default zero/off), and
+excursions from the starting values (defaults:
 timing ±112 ns, CM8L ±8°, correctors ±0.5 A). Correctors additionally require valid
 IOC control limits and remain within ±5 A. Reaching a timing/phase search boundary
 stops with a range message rather than treating the boundary as a local maximum.
-The worker also stops on invalid/missing data or unconfirmed writes. No fresh
+Deadband is the minimum improvement required to accept a search step; 0.001
+means 0.1 percentage point of transmission (for example, 0.800 → 0.801).
+It does not change the separate 5% transmission-degradation criterion.
+Active Feedback shares Main's workspace, run-button styles and status colors.
+The log is available via **Show log**, leaving more space for live plots.
+The English status banner identifies the cycle and operation, shows acquisition
+and settling progress, and counts down **Next timing scan in N s** during cycle
+waits. BPM drift interrupts that wait immediately at the next monitoring check.
+**Parameter Changes from Start** lists the initial setting, current confirmed
+setting (including probes) and signed offset for timing, CM8L and all four
+correctors. The transmission plot shows the initial value, recovery threshold
+and operating-point average separately.
+If either LN0 or the selected downstream ICT is zero or negative, feedback
+automatically pauses after restoring temporary timing, phase or corrector probes.
+ICTs are checked during orbit acquisition, settling and the between-cycle wait,
+as well as during transmission measurement; a single detected nonpositive sample
+triggers the pause without waiting for a three-sample average. Restore commands
+are permitted during beam loss. Resume is manual: if the loss persists, feedback
+pauses again before further exploration. After recovery, timing tracking restarts
+with the original reference and accepted settings; the interrupted search and
+response model are discarded. An incomplete initial reference is acquired again
+on Resume. Other invalid/missing data or unconfirmed writes stop the worker.
+No fresh
 baseline is silently substituted. Measurements require three *new* IOC timestamps
 after an acquisition barrier, with a 15-second timeout; repeated cached records
 do not count. ICT pairs require both channels to advance but are not pulse-ID
@@ -64,7 +103,11 @@ matched. The BPM waveform is interpreted with the existing LINAC monitor map and
 Initial references, all commands, individual samples, accepted settings, response
 matrices and decisions are streamed to `events.jsonl`, alongside `config.json`,
 in a timestamped `ActiveFeedback` directory under the selected LinacOpt save
-location. Plots show transmission (including probes) and orbit deviations. This
+location. `operations.csv` records each command request and result with a
+timezone-qualified timestamp, stage, cycle, command ID, PV, previous value,
+requested value, confirmed readback, restoration flag and error/status. Both
+logs are flushed immediately; automatic pause, recovery and stop events appear
+in the detailed log. Plots show transmission (including probes) and orbit deviations. This
 is a background worker in the open GUI, not an independent service.
 
 Offline feedback regressions: `python -m unittest Knobs.tests.test_linac_feedback`.
@@ -154,7 +197,7 @@ scrolling; resizing the window or divider recalculates the grid. Machine
 setpoint details are in the left controls column.
 
 LinacOpt's **Config** contains Max eval and Correctors / BPMs selection.
-**Detail config** contains scan ranges/steps, scoring weights, the Corrector BO
+**Config → Detail config** is a subtab containing scan ranges/steps, scoring weights, the Corrector BO
 model, advanced options and the save location. All tabs remain browsable during
 acquisition; settings are locked until the run ends. The downstream ICT selector
 is beside Objective in Main → Run Control and appears when ICT is selected.

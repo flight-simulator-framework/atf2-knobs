@@ -175,8 +175,20 @@ class GuiTests(unittest.TestCase):
         self.window._connected(b, ready, errors)
         row = self.window.row_by_name[a.name]
         self.assertNotIn(a.name, errors)
-        self.assertNotIn('INVALID', self.window.table.item(row, 8).text())
-        self.assertIn('parameter.A / parameter.B', self.window.table.item(row, 8).text())
+        status = self.window.table.item(row, 8)
+        self.assertEqual(self.window.table.horizontalHeaderItem(8).text(), 'Status')
+        self.assertEqual(status.text(), 'connected')
+        self.assertEqual(status.foreground().color().name(), '#167b4c')
+        self.assertEqual(status.toolTip(), '')
+        b.on_connection(pvname=a.read, conn=False)
+        self.window.refresh_live()
+        self.assertTrue(status.text().startswith('error · '))
+        self.assertIn(a.read, status.text())
+        self.assertEqual(status.foreground().color().name(), '#b91c1c')
+        b.publish(a.read, .2)
+        self.window.refresh_live()
+        self.assertEqual(status.text(), 'connected')
+        self.assertEqual(status.foreground().color().name(), '#167b4c')
 
     def test_actual_start_button_runs_and_retains_configuration_lock_until_done(self):
         w = self.window
@@ -261,6 +273,55 @@ class GuiTests(unittest.TestCase):
         runner.resume.assert_called_once()
         runner.save_and_end.assert_not_called()
         w.worker = None
+
+    def test_restore_button_finishes_measurement_and_reports_initial_restored(self):
+        w = self.window
+        b = self.connect_demo()
+        for key, check in w.group_checks.items():
+            check.setChecked(key == 'qa')
+        w.output.setText(self.tmp.name)
+        w.guard.setValue(0)
+        w.samples.setValue(2)
+        w.max_points.setValue(20)
+        entered, release = threading.Event(), threading.Event()
+        measure = Runner._measure
+        def held_measure(runner, kind, targets):
+            if runner.visits == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError('Test did not release measurement')
+            return measure(runner, kind, targets)
+        with patch.object(Runner, '_measure', held_measure):
+            w.start_button.click()
+            try:
+                self.pump(entered.is_set)
+                self.assertTrue(w.restore_button.isEnabled())
+                w.restore_button.click()
+                self.assertFalse(w.restore_button.isEnabled())
+                self.assertTrue(w.stop_button.isEnabled())
+            finally:
+                release.set()
+            self.pump(lambda: not w.worker.isRunning())
+        self.assertEqual(w.status.text(), 'Finished · Initial settings restored')
+        self.assertEqual(w.worker.runner.visits, 2)
+        for p in w.worker.runner.items.values():
+            self.assertAlmostEqual(b.sample(p.actuator.writes[0]).scalar(), p.origin)
+        self.assertFalse(w.restore_button.isEnabled())
+
+    def test_pause_dialog_can_restore_initial_and_end(self):
+        w = self.window
+        runner = Mock(is_paused=True, running=True, quality_held=False, best={'score': 2})
+        w.worker = Mock(runner=runner)
+        def clicked(box):
+            return next(b for b in box.buttons() if b.text() == 'Restore initial and End')
+        try:
+            with patch.object(QMessageBox, 'exec', return_value=0), patch.object(QMessageBox, 'clickedButton', clicked):
+                w.show_pause_choices()
+            runner.restore_initial_and_end.assert_called_once()
+            runner.resume.assert_not_called()
+            runner.save_and_end.assert_not_called()
+        finally:
+            w.worker = None
 
     def test_progressive_configuration_and_ten_percent_default(self):
         w = self.window

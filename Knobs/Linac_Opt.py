@@ -64,6 +64,7 @@ from Knobs.linac_orbit_compensation import (
 from Knobs.current_value_monitor import CurrentValueMonitor
 from Knobs.timing_pv import TIMING_PV, validate_timing_pvs
 from Knobs.linac_feedback_gui import FeedbackPanel
+from Knobs.optimizer_workspace import run_button_style, status_badge_style
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
 INTENSITY_BPM_NAMES = tuple(DR_BPM_NAMES) + LINAC_BT_BPM_NAMES
@@ -3531,7 +3532,6 @@ class MainWindow(QMainWindow):
         self.developer_tab.hide()
         self.tabs.addTab(self.main_tab, "Main")
         self.tabs.addTab(self.config_tab, "Config")
-        self.tabs.addTab(self.detail_config_tab, "Detail config")
         self.feedback_panel = FeedbackPanel(lambda: self.save_path,
                                             lambda: self.worker is not None, self)
         self.tabs.addTab(self.feedback_panel, "Active Feedback")
@@ -3692,11 +3692,8 @@ class MainWindow(QMainWindow):
         self.btn_start.clicked.connect(self.start_optimization)
         self.btn_stop.clicked.connect(self.stop_optimization)
         self.reset_initial_btn.clicked.connect(self._on_reset_to_initial)
-        big_button_css = (
-            "QPushButton { font-size: 15px; font-weight: 700; padding: 6px 10px; min-height: 30px; }"
-        )
-        self.btn_start.setStyleSheet(big_button_css + " QPushButton { background: #1f7a1f; color: white; }")
-        self.btn_stop.setStyleSheet(big_button_css + " QPushButton { background: #a32020; color: white; }")
+        self.btn_start.setStyleSheet(run_button_style("start"))
+        self.btn_stop.setStyleSheet(run_button_style("pause"))
         self.reset_initial_btn.setStyleSheet(
             "QPushButton { font-size: 13px; font-weight: 700; padding: 6px 10px; min-height: 28px; background: #585f66; color: white; }"
         )
@@ -4231,6 +4228,7 @@ class MainWindow(QMainWindow):
         selection_scroll.setWidgetResizable(True)
         selection_scroll.setWidget(self.selection_page)
         self.config_sections.addTab(selection_scroll, "Correctors / BPMs")
+        self.config_sections.addTab(self.detail_config_tab, "Detail config")
         layout = QVBoxLayout(detail_page)
         layout.setSpacing(10)
         self.config_tab.setStyleSheet(WORKSPACE_STYLE)
@@ -5594,23 +5592,8 @@ class MainWindow(QMainWindow):
         target = self._status_labels.get(context)
         if target is None:
             return
-        palette = {
-            "idle": ("#374151", "#e5e7eb", "#9ca3af"),
-            "running": ("#14532d", "#dcfce7", "#22c55e"),
-            "paused": ("#713f12", "#fef3c7", "#f59e0b"),
-            "warning": ("#7c2d12", "#ffedd5", "#fb923c"),
-            "error": ("#7f1d1d", "#fee2e2", "#ef4444"),
-            "success": ("#1e3a8a", "#dbeafe", "#3b82f6"),
-            "info": ("#1f2937", "#e5e7eb", "#9ca3af"),
-        }
-        fg, bg, bd = palette.get(str(state).lower(), palette["info"])
         target.setText(text)
-        target.setStyleSheet(
-            "QLabel#statusBadge {"
-            f"font-size: 17px; font-weight: 600; color: {fg}; "
-            f"background: {bg}; border: 2px solid {bd}; "
-            "border-radius: 6px; padding: 5px 8px; }"
-        )
+        target.setStyleSheet(status_badge_style(state))
 
     def _update_mode_ui(self):
         is_seq = (self.mode_box.currentText() == "SEQUENTIAL")

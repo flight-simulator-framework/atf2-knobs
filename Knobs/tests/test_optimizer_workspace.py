@@ -91,7 +91,7 @@ class WorkspaceTests(unittest.TestCase):
             window._set_developer_run_controls_enabled(False)
             with patch.object(window, "_refresh_current_values") as main_read, patch.object(
                     window, "_refresh_developer_live_values") as developer_read:
-                for page in (window.config_tab, window.detail_config_tab, window.main_tab):
+                for page in (window.config_tab, window.feedback_panel, window.main_tab):
                     index = window.tabs.indexOf(page)
                     QTest.mouseClick(window.tabs.tabBar(), Qt.MouseButton.LeftButton,
                                      pos=window.tabs.tabBar().tabRect(index).center())

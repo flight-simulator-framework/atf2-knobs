@@ -343,6 +343,7 @@ class Runner:
         self.root, self.overrides = root, overrides or {}
         self.emit = emit or (lambda payload: None)
         self.cancel = threading.Event()
+        self.restore_requested = threading.Event()
         self._condition = threading.Condition()
         self.pause_requested = False
         self.is_paused = False
@@ -385,6 +386,16 @@ class Runner:
         self.cancel.set()
         with self._condition:
             self._condition.notify_all()
+
+    def restore_initial_and_end(self):
+        """Finish this measurement, then return through the usual checked path."""
+        with self._condition:
+            if not self.running or self.cancel.is_set():
+                return
+            self.restore_requested.set()
+            self.pause_requested = False
+            self._condition.notify_all()
+        self.event('restore_initial_requested')
 
     def _check_stop(self):
         if self.cancel.is_set():
@@ -599,7 +610,7 @@ class Runner:
         self.event("point", **{**payload, "ict_means": means, "settings": dict(self.state)})
 
     def _pause_checkpoint(self):
-        if not self.pause_requested:
+        if not self.pause_requested or self.restore_requested.is_set():
             return None
         with self._condition:
             self.is_paused = True
@@ -609,6 +620,8 @@ class Runner:
                 self._condition.wait(.2)
             self.is_paused = False
             self._check_stop()
+            if self.restore_requested.is_set():
+                return 'initial'
             action = self.pause_action
             self.journal.write("resumed" if action == "resume" else "save_and_end_requested", step_id=self.visits)
             return action
@@ -637,6 +650,13 @@ class Runner:
             while True:
                 try:
                     self._check_stop()
+                    if self.restore_requested.is_set():
+                        self.journal.write('restore_initial_requested', step_id=self.visits)
+                        self.event('restoring_initial')
+                        self._apply({n: p.origin for n, p in self.items.items()},
+                                    'stop_initial', exact_restore=True)
+                        status = 'restored_initial'
+                        break
                     self._point_changed = set()
                     self._apply(targets, kind, exact_restore=exact)
                     self._measure(kind, targets)
@@ -646,6 +666,8 @@ class Runner:
                     else:
                         self.progressive.observe(kind, self._point_changed)
                     action = self._pause_checkpoint()
+                    if self.restore_requested.is_set():
+                        continue
                     if action == "best":
                         self._apply(self.best["settings"], "save_and_end_best", exact_restore=True)
                         status = "saved_best"

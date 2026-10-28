@@ -4,6 +4,7 @@ Run separately before initializing CA. Requires caproto, pyepics and libca.
 No accelerator channels or default CA network discovery are used.
 """
 import json
+import csv
 import os
 from pathlib import Path
 import socket
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+from dataclasses import replace
 
 PREFIX = "LINACFBTEST:"
 
@@ -30,6 +33,7 @@ def serve():
         timing_target = pvproperty(name="test:timing_target", value=103.17)
         phase_target = pvproperty(name="test:phase_target", value=0.)
         drift = pvproperty(name="test:drift", value=0.)
+        beam = pvproperty(name="test:beam", value=1.)
         h1 = pvproperty(name="ZH1L:currentWrite", value=0., lower_ctrl_limit=-5., upper_ctrl_limit=5.)
         h1_read = pvproperty(name="ZH1L:currentRead", value=0., read_only=True)
         v1 = pvproperty(name="ZV1L:currentWrite", value=0., lower_ctrl_limit=-5., upper_ctrl_limit=5.)
@@ -61,7 +65,7 @@ def serve():
             phase = (scalar(self.phase) - scalar(self.phase_target)) / .5
             transmission = max(0., .95 - .001 * timing ** 2 - .003 * phase ** 2 - .3 * np.dot(residual, residual))
             await self.ln0.write(1.)
-            await self.dr.write(transmission)
+            await self.dr.write(transmission if scalar(self.beam) > 0 else 0.)
 
     run(IOC(prefix=PREFIX).pvdb, interfaces=["127.0.0.1"])
 
@@ -89,7 +93,7 @@ def main():
                     raise RuntimeError(log.read())
                 import numpy as np
                 from epics import PV
-                from Knobs.linac_feedback import FeedbackConfig, FeedbackController, TIMING_PV, PHASE_PV
+                from Knobs.linac_feedback import FeedbackConfig, FeedbackController, OrbitDrift, TIMING_PV, PHASE_PV
                 from Knobs.linac_feedback_io import FeedbackMachine
 
                 def factory(name, **kwargs):
@@ -105,11 +109,23 @@ def main():
                 controller.initialize()
                 controller.cycle()
                 assert abs(machine.read(TIMING_PV) - 103.17) < .001
-                for name, value in (("test:timing_target", 105.97), ("test:phase_target", 1.), ("test:drift", .2)):
+                for name, value in (("test:timing_target", 105.97), ("test:drift", .2)):
                     assert factory(name).put(value, wait=True) == 1
+                # Drift must wake the wait independently of the transmission test.
+                controller.config = replace(config, interval_sec=5.)
+                wait_start = time.monotonic()
+                try:
+                    controller.wait_cycle()
+                    raise AssertionError("BPM drift should interrupt the cycle wait")
+                except OrbitDrift:
+                    assert time.monotonic() - wait_start < 5.
+                assert factory("test:phase_target").put(2.5, wait=True) == 1
                 controller.cycle()
                 assert abs(machine.read(TIMING_PV) - 105.97) < .001
-                assert abs(machine.read(PHASE_PV) - 1.) < .001
+                assert abs(machine.read(PHASE_PV) - 2.5) < .001
+                decision = next(e for e in events if e["kind"] == "degradation_decision" and e["degraded"])
+                assert len(decision["samples"]) == 5 and decision["orbit_normal"]
+                assert abs(decision["threshold"] - controller.initial_transmission * .95) < 1e-9
                 residual = machine.orbit() - controller.reference
                 assert np.max(abs(residual)) < .02, residual
                 assert any(e["kind"] == "response" and e["observations"] > 4 for e in events)
@@ -132,9 +148,58 @@ def main():
                 except InterruptedError:
                     pass
                 assert abs(machine.scalar(TIMING_PV) - accepted_timing) < .001
+                # Exercise the real worker's automatic pause and CSV audit.
+                from Knobs.linac_feedback_gui import FeedbackWorker
+                beam = factory("test:beam")
+                paused, monitoring = threading.Event(), threading.Event()
+                injected = []
+                worker_events = []
+                def worker_machine(cfg, cancelled, checkpoint, emit):
+                    device = FeedbackMachine(cfg, cancelled, checkpoint, emit, factory)
+                    write = device.write
+                    def lose_beam_after_probe(values, restore=False):
+                        write(values, restore=restore)
+                        if not restore and TIMING_PV in values and not injected:
+                            injected.append(dict(values))
+                            assert beam.put(0., wait=True) == 1
+                            time.sleep(.05)
+                    device.write = lose_beam_after_probe
+                    return device
+                worker = FeedbackWorker(config, folder, worker_machine)
+                emit = worker.emit_event
+                def record(event):
+                    emit(event)
+                    worker_events.append(event)
+                    if event["kind"] == "auto_pause":
+                        paused.set()
+                    if event["kind"] == "state" and event.get("state") == "Monitoring":
+                        monitoring.set()
+                worker.emit_event = record
+                thread = threading.Thread(target=worker.run)
+                thread.start()
+                try:
+                    assert paused.wait(15), worker_events[-5:]
+                    assert abs(machine.scalar(TIMING_PV) - accepted_timing) < .001
+                    assert beam.put(1., wait=True) == 1
+                    time.sleep(.2)
+                    assert worker.paused.is_set(), "Must not automatically resume when beam returns"
+                    worker.paused.clear()  # operator Resume
+                    assert monitoring.wait(15), worker_events[-5:]
+                finally:
+                    worker.stop()
+                    thread.join(10)
+                assert not thread.is_alive()
+                assert sum(e["kind"] == "reference" for e in worker_events) == 1
+                assert not any(e["kind"] == "error" for e in worker_events), worker_events[-5:]
+                with (worker.run_dir / "operations.csv").open() as stream:
+                    operations = list(csv.DictReader(stream))
+                assert operations and all(row["TimestampISO"] and row["Before"] for row in operations)
+                assert any(row["Restore"] == "True" and row["Status"] == "confirmed" for row in operations)
                 print(json.dumps(dict(result="passed", timing_ns=accepted_timing,
                                       cm8l_phase_deg=machine.scalar(PHASE_PV),
-                                      residual_um=(residual * 1000).tolist(), events=len(events)), indent=2))
+                                      residual_um=(residual * 1000).tolist(), events=len(events),
+                                      auto_pause_resume="passed", continuous_bpm_wait="passed",
+                                      relative_five_point_threshold="passed", operation_rows=len(operations)), indent=2))
             finally:
                 if machine is not None:
                     machine.close()

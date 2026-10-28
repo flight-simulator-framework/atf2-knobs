@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 
 from Knobs.optimizer_workspace import OptimizerWorkspace, WORKSPACE_STYLE, TAB_STYLE
 from .catalog import CATALOG, GROUPS, ICT_PVS, DR_MONITORS, DR_MODE, DR_TURN, DR_BPM_NAMES, XSR_PVS
-from .core import Config, Runner, command_value, inspect
+from .core import Config, Runner, command_value, inspect, prepare
 from .transport import EpicsTransport, DemoTransport
 
 COLORS = ("#087f8c", "#2463bb", "#7157b4", "#c77814", "#cf5562", "#167b4c")
@@ -194,6 +194,11 @@ class MainWindow(QMainWindow):
         row.addWidget(self.start_button)
         row.addWidget(self.pause_button)
         box.addLayout(row)
+        self.restore_button = QPushButton("END · Restore initial settings")
+        self.restore_button.setToolTip("Finish the current measurement, then return to the START settings in limited steps and end.")
+        self.restore_button.setEnabled(False)
+        self.restore_button.clicked.connect(self.restore_initial_run)
+        box.addWidget(self.restore_button)
         self.stop_button = QPushButton("STOP · Keep current settings")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_run)
@@ -367,7 +372,7 @@ class MainWindow(QMainWindow):
         filters.addWidget(self.follow_active)
         pv_layout.addLayout(filters)
         self.table = QTableWidget(len(CATALOG), 9)
-        self.table.setHorizontalHeaderLabels(["Use", "Control", "Live", "Target", "Lower", "Upper", "Grid", "Unit", "Status / limit source"])
+        self.table.setHorizontalHeaderLabels(["Use", "Control", "Live", "Target", "Lower", "Upper", "Grid", "Unit", "Status"])
         self.table.verticalHeader().hide()
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -389,7 +394,7 @@ class MainWindow(QMainWindow):
             self.table.item(row, 1).setText(a.name)
             self.table.item(row, 1).setToolTip("\n".join(a.writes) + f"\nFeedback: {a.read or 'command echo'}")
             self.table.item(row, 7).setText(a.unit)
-            self.table.item(row, 8).setText("Not connected")
+            self._set_control_status(a.name, "Not connected")
         self.table.itemChanged.connect(self._update_selected)
         pv_layout.addWidget(self.table)
         self.tabs.addTab(page, "Controls")
@@ -506,6 +511,12 @@ class MainWindow(QMainWindow):
         self._populate_ranges(only_groups=("phase", "timing"))
         self._update_selected()
 
+    def _set_control_status(self, name, error=None):
+        item = self.table.item(self.row_by_name[name], 8)
+        item.setText(f"error · {error}" if error else "connected")
+        item.setForeground(QColor("#b91c1c" if error else "#167b4c"))
+        item.setToolTip(str(error) if error else "")
+
     def _populate_ranges(self, only_groups=None):
         self.table.blockSignals(True)
         for a in CATALOG:
@@ -520,11 +531,10 @@ class MainWindow(QMainWindow):
                     item = self.table.item(row, col)
                     item.setText(f"{value:.12g}")
                     item.setFlags(flags | (Qt.ItemFlag.ItemIsEditable if a.kind == "current" and col in (4, 5) else Qt.ItemFlag.NoItemFlags))
-                self.table.item(row, 8).setText(p.limit_source)
-                self.table.item(row, 8).setToolTip(p.actuator.feedback)
+                self._set_control_status(a.name)
             else:
                 self.table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)
-                self.table.item(row, 8).setText(self.errors.get(a.name, "Unavailable"))
+                self._set_control_status(a.name, self.errors.get(a.name, "Unavailable"))
         self.table.blockSignals(False)
 
     def start_run(self):
@@ -566,6 +576,7 @@ class MainWindow(QMainWindow):
         self.pause_button.setEnabled(running)
         self.pause_button.setText("PAUSE")
         self.stop_button.setEnabled(running)
+        self.restore_button.setEnabled(running)
 
     def pause_run(self):
         if self.worker and self.worker.isRunning():
@@ -586,17 +597,22 @@ class MainWindow(QMainWindow):
         box.setWindowTitle("Pause Requested")
         box.setText("Current measurement finished. Settings and history are retained.\n\n"
                     "Resume: remeasure this point and continue.\n"
+                    "Restore initial and End: return to the START settings and finish.\n"
                     "Save and End: apply the best recorded settings and finish.\n"
                     "Esc or closing this dialog resumes the run.")
         resume = box.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
         finish = box.addButton("Save and End", QMessageBox.ButtonRole.ActionRole)
+        restore = box.addButton("Restore initial and End", QMessageBox.ButtonRole.ActionRole)
         finish.setEnabled(runner.best is not None)
         box.setDefaultButton(resume)
         box.setEscapeButton(resume)
         box.exec()
         if not runner.running:
             return
-        if box.clickedButton() is finish:
+        if box.clickedButton() is restore:
+            self.restore_initial_run()
+            return
+        elif box.clickedButton() is finish:
             runner.save_and_end()
         else:
             runner.resume()
@@ -614,6 +630,7 @@ class MainWindow(QMainWindow):
                     "After external recovery, Recheck verifies live ICTs before returning to the initial reference in limited steps. "
                     "A low or missing signal keeps the run on hold.")
         recheck = box.addButton("Recheck after recovery", QMessageBox.ButtonRole.ActionRole)
+        restore = box.addButton("Recheck · Restore initial and End", QMessageBox.ButtonRole.ActionRole)
         stay = box.addButton("Stay on hold", QMessageBox.ButtonRole.RejectRole)
         end = box.addButton("End · keep settings", QMessageBox.ButtonRole.DestructiveRole)
         box.setDefaultButton(stay)
@@ -621,18 +638,29 @@ class MainWindow(QMainWindow):
         box.exec()
         if not runner.running:
             return
-        if box.clickedButton() is recheck:
+        if box.clickedButton() is restore:
+            self.restore_initial_run()
+        elif box.clickedButton() is recheck:
             runner.resume()
             self.pause_button.setText("PAUSE")
             self.status.setText("Rechecking live ICTs before returning to reference")
         elif box.clickedButton() is end:
             self.stop_run()
 
+    def restore_initial_run(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.runner.restore_initial_and_end()
+            self.restore_button.setEnabled(False)
+            self.pause_button.setEnabled(False)
+            self.status.setText("Return requested · Finish current measurement / recheck ICTs, then restore initial settings")
+
     def stop_run(self):
         if self.worker:
             self.worker.runner.stop()
             self.status.setText("Stopping · Retaining the applied settings")
             self.stop_button.setEnabled(False)
+            self.restore_button.setEnabled(False)
+            self.pause_button.setEnabled(False)
 
     def _on_update(self, data):
         state = data["state"]
@@ -650,6 +678,8 @@ class MainWindow(QMainWindow):
         elif state == "writing":
             self.active_names = set(data["targets"])
             kind = GROUPS.get(data["kind"], data["kind"])
+            if data['kind'].startswith('stop_initial'):
+                kind = 'Restoring initial settings'
             names = list(data["targets"])
             self.status.setText(f"{kind} · Writing settings")
             self.active_label.setText("Active: " + ", ".join(names[:10]) + (f" … {len(names)} controls" if len(names) > 10 else ""))
@@ -661,28 +691,24 @@ class MainWindow(QMainWindow):
                 visible = [self.row_by_name[n] for n in names if not self.table.isRowHidden(self.row_by_name[n])]
                 if visible:
                     self.table.scrollToItem(self.table.item(visible[0], 1))
-        elif state == "command":
-            self.table.item(self.row_by_name[data["name"]], 8).setText("Command sent · awaiting readback")
         elif state == "arrival":
             self.status.setText("Awaiting arrival · Checking readbacks against targets")
         elif state == "guard":
-            self.status.setText(f"At target · Confirming for {data['seconds']:g} s before measurement")
-            for name in self.active_names:
-                self.table.item(self.row_by_name[name], 8).setText("At target · confirming")
+            self.status.setText(f"At target · Confirming for {data['seconds']:g} s")
         elif state == "measuring":
             self.status.setText(f"Measuring · Collecting {data['samples']} fresh samples per ICT")
-            for name in self.active_names:
-                self.table.item(self.row_by_name[name], 8).setText("At target · measuring")
             self.refresh_live()
         elif state == "point":
             for key, value in data["ict_means"].items():
                 self._trend[key].append(value)
             self.trend.set_curves({k: list(v) for k, v in self._trend.items()})
-            for name in self.active_names:
-                self.table.item(self.row_by_name[name], 8).setText("Measured" if data["quality"] == "complete" else "Incomplete ICT samples")
             self.log.appendPlainText(f"Point {data['step_id']} · {data['kind']} · {data['quality']} · score={number(data['score'])}")
         elif state == "pause_requested":
             self.status.setText("Pause requested · Finishing the current measurement")
+        elif state == "restore_initial_requested":
+            self.status.setText("Return requested · Finish current measurement / recheck ICTs, then restore initial settings")
+        elif state == "restoring_initial":
+            self.status.setText("Restoring START settings in limited steps · STOP keeps current settings")
         elif state == "paused":
             self.status.setText("PAUSED · Settings, baseline and history retained")
             self.pause_button.setText("RESUME")
@@ -707,7 +733,7 @@ class MainWindow(QMainWindow):
             self.active_names.clear()
             self._highlight()
             self.active_label.setText("No active commands")
-            self.status.setText({"complete": "Complete", "saved_best": "Finished at the best recorded settings", "stopped": "Stopped · Settings retained", "error": "Stopped on error · Check the journal", "quality_stopped": "No valid ICT reference · No exploration · Beam NOT inhibited"}[data["result"]])
+            self.status.setText({"complete": "Complete", "restored_initial": "Finished · Initial settings restored", "saved_best": "Finished at the best recorded settings", "stopped": "Stopped · Settings retained", "error": "Stopped on error · Check the journal", "quality_stopped": "No valid ICT reference · No exploration · Beam NOT inhibited"}[data["result"]])
             if data.get("error"):
                 self.log.appendPlainText(data["error"])
                 self.path_label.setText(data["error"] + "\nFolder: " + data.get("directory", ""))
@@ -750,12 +776,19 @@ class MainWindow(QMainWindow):
         ratio = values["DR"] / values["LN0"] if values.get("LN0", 0) > 0 else math.nan
         self.diagnostic_status.setText(f"DR / LN0 = {number(ratio)} (diagnostic ratio) · Amber: no notification for >2s · Raw values")
         self.table.blockSignals(True)
+        config = self.config()
         for a in CATALOG:
             try:
                 value = (self.transport.sample(a.read).scalar() if a.read else command_value(a, self.transport))
             except ValueError:
                 value = math.nan
             self.table.item(self.row_by_name[a.name], 2).setText(number(value, 2))
+            # Validate cached monitor values and cached limits only; no CA GET.
+            try:
+                prepare(a, self.transport, config)
+                self._set_control_status(a.name)
+            except (ValueError, RuntimeError) as exc:
+                self._set_control_status(a.name, str(exc))
         self.table.blockSignals(False)
         sample = cache.get(DR_MONITORS)
         if sample and sample.connected:

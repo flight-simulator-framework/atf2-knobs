@@ -49,7 +49,8 @@ class IntensityTests(unittest.TestCase):
                         wheel(control, delta)
                         self.assertEqual(getter(), before, type(control).__name__)
                 area = window.detail_config_scroll
-                window.tabs.setCurrentWidget(window.detail_config_tab)
+                window.tabs.setCurrentWidget(window.config_tab)
+                window.config_sections.setCurrentWidget(window.detail_config_tab)
                 window.resize(1100, 700)
                 app.processEvents()
                 # Offscreen Qt expands this window to its large size hint;
@@ -1312,7 +1313,8 @@ class IntensityTests(unittest.TestCase):
                 self.assertEqual(window.dev_intensity_aggregation.currentData(), "raw_sum")
                 self.assertEqual(window._selected_developer_bpms(), ["MB1R"])
                 self.assertEqual(window.dev_refresh_btn.maximumWidth(), 240)
-                self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())], ["Main", "Config", "Detail config", "Active Feedback"])
+                self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())], ["Main", "Config", "Active Feedback"])
+                self.assertEqual(window.config_sections.tabText(window.config_sections.indexOf(window.detail_config_tab)), "Detail config")
                 self.assertIs(window.objective_box, window.dev_objective_box)
                 self.assertTrue(window.selection_page.isAncestorOf(window.dev_actuator_table))
                 window.chk_correctors.setChecked(True)
