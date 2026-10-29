@@ -54,12 +54,15 @@ With all targets enabled:
 1. Track a local transmission maximum on the relative 2.8 ns timing grid using
    `EVE_LINAC:OUT0:SetData`. At the start of a cycle, existing actionable BPM or
    transmission recovery conditions bypass timing writes. Otherwise, try one
-   neighbour at a time, bracketed by fresh centre measurements, and confirm the
-   first improving neighbour immediately. Follow that direction while improvements
-   are confirmed. On a non-improving probe, restore the centre and check recovery
-   conditions immediately; no full timing optimum is required before recovery.
-   Failed improvement confirmation ends this timing search instead of repeating
-   noisy candidates up to 100 times. Historical best scores are not reused.
+   neighbour at a time using an independent fresh 10-shot transmission mean at
+   each point. Keep an improvement greater than the deadband (default 0.05
+   percentage point) directly and continue in the same direction. The first
+   non-improving step after an ascent restores the last accepted point and ends
+   the search. If the very first step does not improve, restore the start,
+   measure it again, and try the opposite direction. If neither direction
+   improves, stay at the start. No extra acceptance confirmation or return to
+   the centre is performed between improving steps. The first direction
+   alternates with cycle parity. These rules also apply to the phase search.
 2. After timing finishes or yields, take one fresh 10-shot transmission
    measurement. If it is **below recovery baseline − 0.05**, run CM8L phase
    recovery in 0.5° steps before any orbit correction, even if BPM drift exceeds
@@ -81,7 +84,7 @@ With all targets enabled:
    no improving grid move remains, three trials fail consecutively, or the iteration limit is reached.
 4. After phase/orbit correction, give timing a fresh neighbour trial so it can
    still improve even if transmission remains low. Continue confirmed improvements;
-   a failed trial yields promptly when recovery is still needed. After orbit
+   after the directional search ends, check whether recovery is still needed. After orbit
    correction, evaluate transmission and run phase recovery if still degraded;
    an unresolved orbit does not block it. Orbit drift during the cycle wait starts
    another cycle with the same phase-before-orbit order.
@@ -91,12 +94,13 @@ With all targets enabled:
 Orbit correction also intervenes **during timing and phase searches** whenever
 Correctors is enabled. Monitoring latches drift continuously, and a fresh ten-shot
 BPM mean confirms it at a completed RF evaluation boundary. Correctors remain
-fixed throughout an RF before/probe/restored comparison and its acceptance
-confirmation. At the boundary, make at most one accepted 0.005 A correction step,
+fixed throughout an RF reference/probe comparison and any rollback.
+At the boundary, make at most one accepted 0.005 A correction step,
 then return to the RF search. Timing can also intervene after its first failed
 neighbour; a transmission drop still gives phase recovery priority there.
-An intervention discards pending RF comparisons so the next decision uses new
-ten-shot means at the corrected currents. Already accepted RF settings remain.
+An intervention restarts the directional search at the retained RF setting,
+discarding earlier comparisons and taking a fresh ten-shot reference mean at
+the corrected currents. Already accepted RF settings remain.
 This interleaving is disabled during dedicated response acquisition.
 
 RMS history and failed-attempt counts for interleaved correction belong to the
@@ -110,7 +114,7 @@ setting. `orbit_intervention` and `orbit_step` events record these actions.
 The recovery baseline starts at the initial transmission. It rises only after
 improvement is confirmed for **120 seconds and at least 3 complete operating-point
 means**, with timing at a local optimum and normal BPM readings. The new baseline
-does not advance from a timing search that yielded or failed confirmation.
+does not advance from a timing search that yielded before confirming a local optimum.
 The promoted value
 is the lowest confirmed mean during that interval, avoiding a transient maximum.
 The GUI's **Raise baseline after [s]** controls the duration. A confirmed mean at
@@ -330,6 +334,28 @@ contains the evaluation plots and the available BO figure arranged together.
 No separate plots or data files are copied to tempfiles. There is no confirmation
 dialog. NAS errors are reported without deleting the normal outputs. Export
 is skipped for an empty run, a failed run, or while closing the application.
+
+**Reset To Initial** restores only the parameters selected at **START**, even if
+the checkboxes have since changed. A timing-only run captures and restores only
+`EVE_LINAC:OUT0:SetData`; unselected phase and magnet channels are excluded.
+Selected klystron members and correctors are handled individually. Gun orbit
+auto restore includes the correctors it can change, and a combined Correctors/L8
+run includes its phase and timing parameters. Start snapshots read exact finite
+setpoints. On exceptions, missing values, or non-finite values, parameter reads
+retry the same PV at **0.5-second intervals, up to 5 attempts including the first**.
+This also applies to scan starting values, corrector range checks, gun orbit
+corrector readbacks, and current values read before Reset. Exhausting the retries
+stops the operation instead of substituting zero or another PV. A successfully
+read zero remains valid. Retry, recovery, and failure messages identify the PV
+and attempt count; worker retries honor Pause/Stop at each attempt.
+Reset validates all selected initial values before issuing any commands.
+
+Each reset appends to `ResetInitial.jsonl` in its run directory and lists the
+restored PVs in the GUI log. The file records timestamps, the requested parameter
+list, values before reset, initial targets, confirmed setpoint values, and the
+completed parameter list. A failed command stops the reset and records the
+failed PV and parameters already restored; it is not reported as a complete
+reset. Setpoint confirmation checks the command PV, not the physical response.
 
 LinacOpt exports use a fixed figure size independent of window geometry.
 Combined exports switch from two columns to a vertical stack for wide plots

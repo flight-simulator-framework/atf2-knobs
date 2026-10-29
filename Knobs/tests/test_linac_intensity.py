@@ -75,11 +75,11 @@ class IntensityTests(unittest.TestCase):
                     opt, "InterfaceATF2_LinacBT") as control:
                 # The ns setting is retained and a fractional center is accepted.
                 worker = opt.OptimizationWorker({"timing": True, "timing_step_ns": 11.2}, directory)
-                control.return_value.read_current.return_value = 1234.37
+                control.return_value.pv_get.return_value = 1234.37
                 with patch.object(worker, "perform_1d_scan") as scan:
                     getattr(worker, runner)()
-                control.return_value.read_current.assert_called_once_with(
-                    pv_write="EVE_LINAC:OUT0:SetData", pv_read=None, quantize_phase=True)
+                control.return_value.pv_get.assert_called_once_with(
+                    "EVE_LINAC:OUT0:SetData", default=np.nan)
                 self.assertEqual(scan.call_args.args[:2], ("Timing", "EVE_LINAC:OUT0:SetData"))
                 np.testing.assert_allclose(scan.call_args.args[2], 1234.37 + 11.2 * np.arange(-10, 11))
 
@@ -95,7 +95,7 @@ class IntensityTests(unittest.TestCase):
             worker = opt.OptimizationWorker({}, directory)
             for value in (float("nan"), float("inf")):
                 with self.subTest(value=value):
-                    control.return_value.read_current.return_value = value
+                    control.return_value.pv_get.return_value = value
                     with self.assertRaises(ValueError):
                         worker._read_current(opt.TIMING_PV)
                     with self.assertRaises(ValueError):
@@ -371,8 +371,8 @@ class IntensityTests(unittest.TestCase):
 
     def test_l8_phase_uses_search_range_without_ioc_limits(self):
         interface = Mock()
-        interface.read_current.return_value = 350.
-        window = SimpleNamespace(_ensure_interface=lambda: interface)
+        interface.pv_get.return_value = 350.
+        window = SimpleNamespace(_ensure_interface=lambda: interface, append_log=Mock())
         spec = {"name": "L8 phase", "pv_write": "CM8L:phaseWrite", "pv_read": "CM8L:phaseRead",
                 "unit": "deg", "step": 1., "half_range": 20.}
         with patch("epics.PV") as pv:
@@ -380,10 +380,10 @@ class IntensityTests(unittest.TestCase):
             self.assertEqual(limits, {"CM8L:phaseWrite": [330., 370.]})
             pv.assert_not_called()
             for value in (float("nan"), float("inf")):
-                interface.read_current.return_value = value
+                interface.pv_get.return_value = value
                 with self.assertRaises(ValueError):
                     opt.MainWindow._checked_corrector_ranges(window, [spec])
-            interface.read_current.return_value = 350.
+            interface.pv_get.return_value = 350.
             with self.assertRaises(ValueError):
                 opt.MainWindow._checked_corrector_ranges(window, [{**spec, "half_range": float("inf")}])
             pv.return_value.get_ctrlvars.return_value = {}
@@ -393,18 +393,18 @@ class IntensityTests(unittest.TestCase):
 
     def test_timing_uses_finite_configured_range_without_ioc_limits(self):
         interface = Mock()
-        interface.read_current.return_value = 1000.
-        window = SimpleNamespace(_ensure_interface=lambda: interface)
+        interface.pv_get.return_value = 1000.
+        window = SimpleNamespace(_ensure_interface=lambda: interface, append_log=Mock())
         spec = {"name": "Timing", "pv_write": "EVE_LINAC:OUT0:SetData", "pv_read": None,
                 "unit": "count", "step": 1, "half_range": 10}
         with patch("epics.PV") as pv:
             limits, _ = opt.MainWindow._checked_corrector_ranges(window, [spec])
             self.assertEqual(limits, {spec["pv_write"]: [990., 1010.]})
             for value in (float("nan"), float("inf")):
-                interface.read_current.return_value = value
+                interface.pv_get.return_value = value
                 with self.assertRaises(ValueError):
                     opt.MainWindow._checked_corrector_ranges(window, [spec])
-            interface.read_current.return_value = 1000.
+            interface.pv_get.return_value = 1000.
             for changes in ({"step": 0.}, {"half_range": float("inf")}, {"half_range": 0.}):
                 with self.assertRaises(ValueError):
                     opt.MainWindow._checked_corrector_ranges(window, [{**spec, **changes}])
@@ -1327,7 +1327,7 @@ class IntensityTests(unittest.TestCase):
                 window.dev_bpm_table.item(1, 0).setCheckState(opt.Qt.CheckState.Checked)
                 self.assertEqual(len(window._selected_developer_bpms()), 2)
                 fake = Mock()
-                fake.read_current.return_value = 0.
+                fake.pv_get.return_value = 0.
                 with patch.object(window, "_ensure_interface", return_value=fake), patch("epics.PV") as pv, patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No), patch.object(window, "_capture_machine_origin") as capture:
                     pv.return_value.get_ctrlvars.return_value = {"lower_ctrl_limit": -1., "upper_ctrl_limit": 1.}
                     window.start_optimization()

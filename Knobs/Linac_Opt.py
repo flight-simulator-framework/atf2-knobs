@@ -489,13 +489,57 @@ def timing_fine_scan(origin: float) -> List[Tuple[float, Dict[str, float]]]:
 
 
 def _restore_pvs_for_config(config: Dict[str, Any]) -> List[str]:
-    pvs = [str(pv) for pv in config.get("restore_pvs", RESTORE_PVS)]
-    if config.get("timing_fine", False):
-        pvs.append(TIMING_PV)
-    if config.get("gun_sol_l0_phase") and config.get("gun_orbit_compensation"):
-        pvs.extend(f"{name}:currentWrite" for name in GUN_CORRECTORS)
+    # Never let a legacy all-machine restore list broaden the run selection.
+    validate_timing_pvs(config.get("restore_pvs", []))
+    developer = str(config.get("run_profile", RUN_PROFILE_MAIN)).upper() == RUN_PROFILE_DEVELOPER
+    pvs = [] if developer else [spec[1] for spec in _main_run_delta_specs(config)]
+    if developer or config.get("correctors"):
+        pvs.extend(str(spec["pv_write"]) for spec in config.get("developer_actuators", []))
     validate_timing_pvs(pvs)
     return list(dict.fromkeys(pvs))
+
+
+PARAMETER_READ_ATTEMPTS = 5
+PARAMETER_READ_RETRY_SEC = 0.5
+
+
+def _read_parameter(interface, pv_write, pv_read=None, *, injected=False,
+                    quantize_phase=False, log_fn=None, checkpoint=None):
+    """Retry the requested channel; never substitute zero or another PV on failure."""
+    validate_timing_pvs((pv_write, pv_read))
+    pv = pv_read or pv_write
+    for attempt in range(1, PARAMETER_READ_ATTEMPTS + 1):
+        if checkpoint is not None:
+            checkpoint()
+        try:
+            value = (interface.read_current(pv_write, pv_read, quantize_phase=False) if injected
+                     else interface.pv_get(pv, default=np.nan))
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError("non-finite or unavailable value")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            if attempt == PARAMETER_READ_ATTEMPTS:
+                message = f"Cannot read parameter {pv} after {attempt} attempts: {exc}"
+                if log_fn is not None:
+                    log_fn(f"[READ FAILED] {message}")
+                raise ValueError(message) from exc
+            if log_fn is not None:
+                log_fn(f"[READ RETRY] {pv}: attempt {attempt}/{PARAMETER_READ_ATTEMPTS} failed ({exc}); "
+                       f"retry in {PARAMETER_READ_RETRY_SEC:g} s")
+            time.sleep(PARAMETER_READ_RETRY_SEC)
+            continue
+        if attempt > 1 and log_fn is not None:
+            log_fn(f"[READ RECOVERED] {pv}: attempt {attempt}/{PARAMETER_READ_ATTEMPTS}, value={value:.12g}")
+        return round(value / .5) * .5 if quantize_phase and "phase" in pv.lower() else value
+
+
+def _read_initial_setpoints(interface, pvs, *, injected=False, log_fn=None, checkpoint=None):
+    """Read exact selected setpoints, without the legacy failed-read zero fallback."""
+    validate_timing_pvs(pvs)
+    return {pv: _read_parameter(interface, pv, injected=injected, log_fn=log_fn, checkpoint=checkpoint)
+            for pv in pvs}
 
 
 def _format_machine_value(value: float, unit: str) -> str:
@@ -1343,10 +1387,9 @@ class OptimizationWorker(QThread):
         """Dump initial machine/config snapshot for reproducibility."""
         self._pause_checkpoint()
         snapshot_path = self.run_dir / f"InitialSnapshot_{self.run_tag}.json"
-        setpoints: Dict[str, float] = {}
         restore_pvs = _restore_pvs_for_config(self.config)
-        for pv in restore_pvs:
-            setpoints[pv] = float(self._read_current(pv, _default_readback_pv(pv)))
+        setpoints = _read_initial_setpoints(self.interface, restore_pvs, injected=self._interface_injected,
+                                            log_fn=self.log_signal.emit, checkpoint=self._pause_checkpoint)
 
         (
             initial_ict,
@@ -2626,7 +2669,8 @@ class OptimizationWorker(QThread):
         if pv_read is None:
             pv_read = _default_readback_pv(pv_write)
         validate_timing_pvs((pv_write, pv_read))
-        value = self.interface.read_current(pv_write=pv_write, pv_read=pv_read, quantize_phase=True)
+        value = _read_parameter(self.interface, pv_write, pv_read, injected=self._interface_injected,
+                                quantize_phase=True, log_fn=self.log_signal.emit, checkpoint=self._pause_checkpoint)
         return _timing_value(value) if pv_write == TIMING_PV else value
 
     def _lbo_group(self, group_name: str, params: List[tuple]):
@@ -2988,10 +3032,9 @@ class OptimizationWorker(QThread):
     def _gun_orbit_read_currents(self):
         values = []
         for name in GUN_CORRECTORS:
-            # Live reads must fail on disconnection rather than use read_current's
-            # legacy zero fallback. Injected simulators own their read semantics.
-            value = (self.interface.read_current(f"{name}:currentWrite", f"{name}:currentRead")
-                     if self._interface_injected else self.interface.pv_get(f"{name}:currentRead", default=np.nan))
+            value = _read_parameter(self.interface, f"{name}:currentWrite", f"{name}:currentRead",
+                                    injected=self._interface_injected, log_fn=self.log_signal.emit,
+                                    checkpoint=self._pause_checkpoint)
             values.append(float(value))
         if not np.isfinite(values).all():
             raise ValueError("Invalid gun corrector readback")
@@ -3693,6 +3736,7 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("START")
         self.btn_stop = QPushButton("PAUSE")
         self.reset_initial_btn = QPushButton("Reset To Initial")
+        self.reset_initial_btn.setToolTip("Restore only the parameters selected when START was pressed. Each restored PV is logged.")
         self.btn_stop.setEnabled(False)
         self.btn_start.clicked.connect(self.start_optimization)
         self.btn_stop.clicked.connect(self.stop_optimization)
@@ -3865,6 +3909,7 @@ class MainWindow(QMainWindow):
         self.dev_btn_start = QPushButton("START")
         self.dev_btn_stop = QPushButton("PAUSE")
         self.dev_reset_initial_btn = QPushButton("Reset To Initial")
+        self.dev_reset_initial_btn.setToolTip("Restore only the parameters selected when START was pressed. Each restored PV is logged.")
         self.dev_btn_stop.setEnabled(False)
         self.dev_btn_start.clicked.connect(self.start_developer_optimization)
         self.dev_btn_stop.clicked.connect(self.stop_optimization)
@@ -5626,10 +5671,7 @@ class MainWindow(QMainWindow):
     def _capture_machine_origin(self, config: Dict[str, Any]) -> Dict[str, Any]:
         interface = self._ensure_interface()
         restore_pvs = _restore_pvs_for_config(config)
-        setpoints = {
-            pv: float(interface.read_current(pv, _default_readback_pv(pv)))
-            for pv in restore_pvs
-        }
+        setpoints = _read_initial_setpoints(interface, restore_pvs, log_fn=self.append_log)
         if config.get("objective_type") == DEVELOPER_OBJECTIVE_INTENSITY:
             configure_dr_turns(self.dr_bpm_reader, config)
             if config["intensity_aggregation"] in ("turn_ratio", "turn_composite"):
@@ -5694,12 +5736,58 @@ class MainWindow(QMainWindow):
 
     def _apply_machine_origin(self, origin: Dict[str, Any]):
         setpoints = dict(origin.get("initial_setpoints", {}) or {})
-        if not setpoints:
-            raise ValueError("No initial setpoints were stored for this run.")
         validate_timing_pvs(setpoints)
+        # Use the start-time config, never today's checkbox state or surplus
+        # entries in an older snapshot. Validate the entire plan before writing.
+        pvs = _restore_pvs_for_config(dict(origin.get("config", {}) or {}))
+        if not pvs:
+            raise ValueError("No selected start-time parameters were stored for this run.")
+        targets = {}
+        for pv in pvs:
+            if pv not in setpoints or not np.isfinite(float(setpoints[pv])):
+                raise ValueError(f"Missing or invalid initial setpoint: {pv}")
+            targets[pv] = float(setpoints[pv])
         if self.feedback_panel.active:
             raise RuntimeError("Stop Active Feedback before restoring machine settings")
-        self._ensure_interface().pv_put_many({str(k): float(v) for k, v in setpoints.items()})
+        interface = self._ensure_interface()
+        profile = origin.get("config", {}).get("run_profile", RUN_PROFILE_MAIN)
+        before = _read_initial_setpoints(interface, pvs,
+                                        log_fn=lambda text: self._append_log_text(text, profile=profile))
+        log_path = Path(origin.get("reset_log_path") or self.save_path / "ResetInitial.jsonl")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        reset_id = uuid.uuid4().hex
+        # Open and flush the plan before any PUT. A partial failure retains a
+        # record of every completed command and the command that failed.
+        with log_path.open("a", encoding="utf-8") as stream:
+            def record(kind, **data):
+                stream.write(json.dumps(dict(timestamp=datetime.datetime.now().astimezone().isoformat(),
+                                             reset_id=reset_id, kind=kind, **data), allow_nan=False) + "\n")
+                stream.flush()
+            record("reset_requested", parameters=[dict(pv=pv, before=before[pv], target=targets[pv]) for pv in pvs])
+            restored = []
+            for pv, value in targets.items():
+                try:
+                    interface.pv_put_many({pv: value})
+                    deadline = time.monotonic() + 2.
+                    while True:
+                        actual = interface.pv_get(pv, default=np.nan)
+                        if actual is not None and np.isfinite(float(actual)) and np.isclose(
+                                float(actual), value, rtol=0, atol=1e-6):
+                            break
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError(f"Restored setpoint could not be confirmed: {pv}")
+                        time.sleep(.05)
+                except Exception as exc:
+                    record("reset_failed", pv=pv, before=before[pv], target=value,
+                           restored_parameters=restored, error=str(exc))
+                    self._append_log_text(f"[RESET INITIAL] Failed: {pv}; log={log_path}", profile=profile)
+                    raise
+                restored.append(pv)
+                record("setpoint_restored", pv=pv, before=before[pv], target=value, actual=float(actual))
+                self._append_log_text(f"[RESET INITIAL] {pv}: {before[pv]:.12g} -> {value:.12g}", profile=profile)
+            record("reset_completed", restored_parameters=restored)
+        self._append_log_text(f"[RESET INITIAL] Restored {len(restored)} parameters; log={log_path}", profile=profile)
+        return restored
 
     def _delta_specs_for_origin(self, origin: Dict[str, Any], profile: str) -> List[
         Tuple[str, str, Optional[str], str]]:
@@ -6154,16 +6242,16 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            self._apply_machine_origin(self.current_machine_origin)
+            restored = self._apply_machine_origin(self.current_machine_origin)
         except Exception as exc:
             self.append_log(f"Reset to initial failed: {exc}")
             QMessageBox.warning(self, "Reset failed", str(exc))
             return
         self._refresh_current_values()
         profile = RUN_PROFILE_DEVELOPER if self.tabs.currentWidget() is self.developer_tab else RUN_PROFILE_MAIN
-        self._set_status("Status: restored to initial machine state", state="success", profile=profile)
+        self._set_status("Status: selected parameters restored to initial", state="success", profile=profile)
         self.append_log(
-            f"Reset to initial completed: restored {len(self.current_machine_origin.get('initial_setpoints', {}))} channels")
+            f"Reset to initial completed: restored {len(restored)} channels")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Save Directory", str(self.save_path))
@@ -6243,7 +6331,7 @@ class MainWindow(QMainWindow):
                     raise ValueError(f"Cannot verify EPICS limits: {pv} [{unit}]. Check IOC configuration before running.")
             if unit == "A":
                 lo, hi = max(lo, STEER_CURRENT_MIN_A), min(hi, STEER_CURRENT_MAX_A)
-            current = float(interface.read_current(pv, spec["pv_read"]))
+            current = _read_parameter(interface, pv, spec["pv_read"], quantize_phase=True, log_fn=self.append_log)
             if pv == TIMING_PV:
                 current = _timing_value(current)
             if not np.isfinite(current) or not lo <= current <= hi or lo >= hi:
@@ -6321,6 +6409,7 @@ class MainWindow(QMainWindow):
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
+            self.current_machine_origin = None
             self.current_machine_origin = self._capture_machine_origin(config)
         except Exception as exc:
             QMessageBox.critical(self, "Machine readback error", str(exc))
@@ -6357,6 +6446,7 @@ class MainWindow(QMainWindow):
         self.resume_file_clear_btn.setEnabled(False)
 
         self.worker = OptimizationWorker(config, self.save_path)
+        self.current_machine_origin["reset_log_path"] = str(self.worker.run_dir / "ResetInitial.jsonl")
         self.current_measurements_csv_by_profile[RUN_PROFILE_DEVELOPER] = Path(self.worker.csv_path)
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self._on_worker_progress)
@@ -6454,7 +6544,6 @@ class MainWindow(QMainWindow):
             "timing_half_steps": int(getattr(self, "sp_timing_half_steps").value()),
             "run_profile": RUN_PROFILE_MAIN,
             "objective_type": objective,
-            "restore_pvs": list(RESTORE_PVS) + [spec["pv_write"] for spec in actuators],
             "resume_csv_path": str(Path(resume_path_text).expanduser().resolve()) if resume_path_text else "",
         }
         for spec in GROUP_BO_MAX_EVAL_SPECS:
@@ -6495,6 +6584,7 @@ class MainWindow(QMainWindow):
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                         QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                     return
+            self.current_machine_origin = None
             self.current_machine_origin = self._capture_machine_origin(config)
         except Exception as exc:
             QMessageBox.critical(self, "Machine readback error", str(exc))
@@ -6531,6 +6621,7 @@ class MainWindow(QMainWindow):
         self.resume_file_clear_btn.setEnabled(False)
 
         self.worker = OptimizationWorker(config, self.save_path)
+        self.current_machine_origin["reset_log_path"] = str(self.worker.run_dir / "ResetInitial.jsonl")
         self.current_measurements_csv_by_profile[RUN_PROFILE_MAIN] = Path(self.worker.csv_path)
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self._on_worker_progress)

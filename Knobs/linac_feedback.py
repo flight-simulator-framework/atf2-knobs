@@ -399,106 +399,81 @@ RF comparisons. Temporary RF offsets must already be restored or accepted.
         return context["attempts"] > attempts
 
     def search(self, pv, step, label, guard_orbit=True, check_recovery_at_start=True):
-        """Measure relative neighbours around the accepted centre; no old best.
+        """Walk in one improving direction using independent ten-shot means.
 
-Bracket each neighbour with centre measurements to reject linear time drift.
-Timing follows the first confirmed improving direction and yields on recovery
-conditions or an unconfirmed improvement. Phase compares both neighbours.
-The first probe direction alternates between cycles. No move on ties.
+Keep each improvement directly. A failed first step tries the opposite direction;
+a decline after an improvement restores the previous best and ends the search.
+Orbit intervention happens only at accepted/restored RF settings and starts a
+new comparison from a freshly measured current point.
 """
         self.set_state(label)
         center = self.current[pv]
         lo, hi = self.limits[pv]
         timing = pv == TIMING_PV
-        direction_hint = -1 if self.cycle_number % 2 else 1
+        direction = -1 if self.cycle_number % 2 else 1
+        progressed = opposite_tried = missing_neighbor = False
         if timing:
             self.timing_at_optimum = False
-            if check_recovery_at_start:
-                value = self.transmission()
-                if self.timing_recovery_needed(value):
-                    return value
+        self.checkpoint()
+        score = self.transmission()
+        if timing and check_recovery_at_start and self.timing_recovery_needed(score):
+            return score
         for _ in range(self.config.max_search_steps):
             self.checkpoint()
-            if guard_orbit and not timing:
-                self.check_orbit()
-            best_gain, best_value = self.config.min_gain, center
-            missing_neighbor = False
-            restart_comparison = False
-            order = (direction_hint, -direction_hint)
-            for direction in order:
-                target = center + direction * step
-                if not lo - 1e-9 <= target <= hi + 1e-9:
-                    missing_neighbor = True
+            target = center + direction * step
+            if not lo - 1e-9 <= target <= hi + 1e-9:
+                if not progressed and not opposite_tried:
+                    direction *= -1
+                    opposite_tried = missing_neighbor = True
                     continue
-                before = self.transmission()
-                try:
-                    self.write({pv: target})
-                    trial = self.transmission()
-                finally:
-                    self.write({pv: center}, restore=True)
-                after = self.transmission()
-                self.checkpoint()
-                if guard_orbit and not timing:
-                    self.check_orbit()  # Probe restored; orbit can take priority.
-                gain = trial - (before + after) / 2
-                self.event("probe", pv=pv, value=target, gain=gain)
-                if gain > best_gain + 1e-12:
-                    best_gain, best_value = gain, target
-                    if timing:
-                        # Confirm the first improving neighbour immediately;
-                        # keep following it while real improvements continue.
-                        break
-                elif timing:
-                    if self.interleave_orbit(label, after, phase_priority=True):
-                        restart_comparison = True
-                        break
-                    if self.timing_recovery_needed(after):
-                        return after
-            if restart_comparison:
-                continue
-            if best_value == center:
-                if self.interleave_orbit(label):
-                    continue
-                value = self.transmission()
-                # A range endpoint cannot establish an unconstrained local optimum.
-                if missing_neighbor:
-                    self.event("range_limit", pv=pv, value=center, transmission=value)
-                    raise RuntimeError(f"{label}: range boundary reached; expand the range and restart")
-                self.event("local_peak", pv=pv, value=center, transmission=value)
-                if timing:
-                    self.timing_at_optimum = True
-                return value
-            # Confirmation uses a fresh centre measurement; undo a failed move.
-            before = self.transmission()
+                self.event("range_limit", pv=pv, value=center, transmission=score)
+                raise RuntimeError(f"{label}: range boundary reached; expand the range and restart")
             accepted = False
             try:
-                self.write({pv: best_value})
-                after = self.transmission()
-                accepted = after > before + self.config.min_gain
+                self.write({pv: target})
+                measured = self.transmission()
+                gain = measured - score
+                self.event("probe", pv=pv, value=target, gain=gain,
+                           reference_value=center, reference_transmission=score, transmission=measured)
+                if gain > self.config.min_gain + 1e-12:
+                    self.event("accepted", pv=pv, value=target, transmission=measured)
+                    accepted = True
             finally:
                 if not accepted:
                     self.write({pv: center}, restore=True)
             if accepted:
-                if timing:
-                    direction_hint = 1 if best_value > center else -1
-                center = best_value
-                self.event("accepted", pv=pv, value=center, transmission=after)
+                center, score = target, measured
+                progressed, missing_neighbor = True, False
                 if pv == PHASE_PV:
                     self.report_response()
-                self.interleave_orbit(label)
             else:
-                if timing:
-                    # The trial has been restored. Do not repeat a noisy hint
-                    # up to max_search_steps or claim an unconfirmed optimum.
-                    value = self.transmission()
-                    if self.interleave_orbit(label, value, phase_priority=True):
-                        continue
-                    self.timing_recovery_needed(value)
-                    self.event("timing_stopped", reason="No confirmed timing improvement", transmission=value)
-                    return value
-                # A noisy probe is not evidence that a local maximum was reached.
-                self.event("retry", message="Unconfirmed neighbour improvement")
-                self.interleave_orbit(label)
+                # Rejected trials are undone before reading the retained point,
+                # considering recovery, or comparing the opposite direction.
+                score = self.transmission()
+            self.checkpoint()
+            if self.interleave_orbit(label, score, phase_priority=timing and not accepted):
+                center = self.current[pv]
+                score = self.transmission()
+                progressed = opposite_tried = missing_neighbor = False
+                self.event("scan_restarted", pv=pv, value=center, transmission=score,
+                           reason="Orbit intervention; fresh comparison reference")
+                continue
+            if accepted:
+                continue
+            if not progressed and not opposite_tried:
+                direction *= -1
+                opposite_tried = True
+                continue
+            if missing_neighbor:
+                self.event("range_limit", pv=pv, value=center, transmission=score)
+                raise RuntimeError(f"{label}: range boundary reached; expand the range and restart")
+            if timing and self.timing_recovery_needed(score):
+                return score
+            self.event("local_peak", pv=pv, value=center, transmission=score,
+                       reason="First non-improving step after ascent" if progressed else "Neither direction improved")
+            if timing:
+                self.timing_at_optimum = True
+            return score
         raise RuntimeError(f"{label}: no confirmed local maximum within iteration limit")
 
     def currents(self):

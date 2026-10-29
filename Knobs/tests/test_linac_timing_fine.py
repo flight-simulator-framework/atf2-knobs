@@ -233,7 +233,7 @@ class TimingFineTests(unittest.TestCase):
                 window._set_main_run_controls_enabled(False)
                 self.assertFalse(window.chk_timing_group.isEnabled())
                 self.assertFalse(window.chk_timing_fine.isEnabled())
-                self.assertEqual([p for p in opt._restore_pvs_for_config({}) if p.startswith("EVE_LINAC")], [opt.TIMING_PV])
+                self.assertEqual(opt._restore_pvs_for_config({}), [])
                 window._apply_config_to_ui({"timing_step": 2})
                 self.assertEqual(window.sp_timing_step.value(), 22.4)
                 window._apply_config_to_ui({"timing_step_ns": 11.2})

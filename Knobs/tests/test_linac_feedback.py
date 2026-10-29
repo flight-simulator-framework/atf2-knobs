@@ -85,14 +85,16 @@ class FeedbackTests(unittest.TestCase):
         return plant, controller, events
 
     def test_default_deadband_requires_more_than_005_percentage_point(self):
-        for gain, moves in ((.00025, False), (.0005, False), (.001, True)):
-            plant = Plant()
-            origin = plant.values[TIMING_PV]
-            target = origin + 2.8
-            plant.transmission = lambda: .9 - gain * ((plant.values[TIMING_PV] - target) / 2.8) ** 2
-            _, controller, _ = self.controller(plant, min_gain=FeedbackConfig().min_gain)
-            controller.search(TIMING_PV, 2.8, "Timing")
-            self.assertAlmostEqual(plant.values[TIMING_PV], target if moves else origin)
+        for pv, step in ((TIMING_PV, 2.8), (PHASE_PV, .5)):
+            for gain, moves in ((.00025, False), (.0005, False), (.001, True)):
+                with self.subTest(pv=pv, gain=gain):
+                    plant = Plant()
+                    origin = plant.values[pv]
+                    target = origin + step
+                    plant.transmission = lambda: .9 - gain * ((plant.values[pv] - target) / step) ** 2
+                    _, controller, _ = self.controller(plant, min_gain=FeedbackConfig().min_gain)
+                    controller.search(pv, step, "Scan")
+                    self.assertAlmostEqual(plant.values[pv], target if moves else origin)
 
     def test_adjustment_selection_only_writes_enabled_targets(self):
         for timing, phase, correctors, drift in product((False, True), repeat=4):
@@ -138,6 +140,7 @@ class FeedbackTests(unittest.TestCase):
                 selection = dict(adjust_timing=True, adjust_phase=True, adjust_correctors=True)
                 controller.target_provider = lambda: dict(selection)
                 original = dict(plant.values)
+                plant.target_timing = original[TIMING_PV]  # Reject the first RF trial.
                 def disable(values, restore):
                     if not restore:
                         selection.update(dict.fromkeys(selection, False))
@@ -157,6 +160,26 @@ class FeedbackTests(unittest.TestCase):
                 self.assertFalse(any((controller.config.adjust_timing, controller.config.adjust_phase,
                                       controller.config.adjust_correctors)))
                 self.assertEqual(events[-1]["kind"], "targets_changed")
+
+    def test_live_target_switch_retains_an_improving_rf_step(self):
+        for pv, step in ((TIMING_PV, 2.8), (PHASE_PV, .5)):
+            with self.subTest(pv=pv):
+                plant, controller, events = self.controller()
+                selection = dict(adjust_timing=True, adjust_phase=True, adjust_correctors=True)
+                controller.target_provider = lambda: dict(selection)
+                origin = plant.values[pv]
+                plant.target_phase = .5
+                def disable(values, restore):
+                    if not restore:
+                        selection.update(dict.fromkeys(selection, False))
+                plant.on_write = disable
+                with self.assertRaises(TargetsChanged):
+                    controller.search(pv, step, "Scan")
+                self.assertAlmostEqual(plant.values[pv], origin + step)
+                self.assertEqual(len(plant.writes), 1)
+                accepted = next(i for i, e in enumerate(events) if e["kind"] == "accepted")
+                changed = next(i for i, e in enumerate(events) if e["kind"] == "targets_changed")
+                self.assertLess(accepted, changed)
 
     def test_all_targets_off_waits_without_writes_and_resumes_on_selection(self):
         plant, controller, events = self.controller(adjust_timing=False, adjust_phase=False, adjust_correctors=False)
@@ -322,8 +345,11 @@ class FeedbackTests(unittest.TestCase):
         plant.drift[0], plant.loss = .3, .1
         controller.cycle()
         steps = [e for e in events if e["kind"] == "orbit_step"]
-        self.assertEqual(len(steps), 3)
-        self.assertEqual([e["consecutive_failures"] for e in steps], [1, 2, 3])
+        # A new accepted RF setting permits another correction attempt; each
+        # failed group must still restore its best and hand control back to RF.
+        self.assertGreaterEqual(len(steps), 3)
+        self.assertEqual(len(steps) % 3, 0)
+        self.assertEqual([e["consecutive_failures"] for e in steps], [1, 2, 3] * (len(steps) // 3))
         restored = next(i for i, e in enumerate(events) if e["kind"] == "orbit_best_restored")
         later = [e["state"] for e in events[restored + 1:] if e["kind"] == "state"]
         self.assertIn("CM8L phase recovery", later)
@@ -731,21 +757,34 @@ class FeedbackTests(unittest.TestCase):
         self.assertFalse(decision["degraded"])
         self.assertFalse(any(e["kind"] == "timing_yield" for e in events))
 
-    def test_timing_confirmation_failure_stops_without_repeated_noise_retries(self):
-        plant = Plant()
-        plant.transmission = lambda: .8
-        _, controller, events = self.controller(plant)
-        origin = plant.values[TIMING_PV]
-        readings = iter([.8, .8, .84, .8, .8, .8, .7])
-        plant.transmission = lambda: next(readings)
-        self.assertEqual(controller.search(TIMING_PV, 2.8, "Timing"), .7)
-        self.assertEqual(plant.values[TIMING_PV], origin)
-        self.assertEqual(len(plant.writes), 4)
-        self.assertTrue(plant.writes[-1][1])
-        self.assertFalse(controller.timing_at_optimum)
-        self.assertFalse(any(e["kind"] == "retry" for e in events))
-        self.assertEqual(sum(e["kind"] == "timing_stopped" for e in events), 1)
-        self.assertEqual(next(e["reason"] for e in events if e["kind"] == "timing_yield"), "Phase recovery needed")
+    def test_both_rf_scans_follow_first_improving_direction_until_decline(self):
+        for pv, step in ((TIMING_PV, 2.8), (PHASE_PV, .5)):
+            for direction in (1, -1):
+                for peak in (2, -2, 0):
+                    with self.subTest(pv=pv, direction=direction, peak=peak):
+                        plant, controller, events = self.controller(adjust_correctors=False)
+                        origin = plant.values[pv]
+                        controller.cycle_number = 0 if direction == 1 else 1
+                        samples = []
+                        def measurement():
+                            offset = (plant.values[pv] - origin) / step
+                            samples.append(offset)
+                            return .95 - .003 * (offset - direction * peak) ** 2
+                        plant.transmission = measurement
+                        result = controller.search(pv, step, "Scan")
+                        expected = {2: [1, 2, 3, 2], -2: [1, 0, -1, -2, -3, -2],
+                                    0: [1, 0, -1, 0]}[peak]
+                        np.testing.assert_allclose(
+                            [(values[pv] - origin) / step for values, _ in plant.writes],
+                            np.array(expected) * direction, atol=1e-12)
+                        np.testing.assert_allclose(samples, [0] + [x * direction for x in expected], atol=1e-12)
+                        self.assertAlmostEqual(result, .95)
+                        self.assertAlmostEqual(plant.values[pv], origin + direction * peak * step)
+                        self.assertEqual(sum(e["kind"] == "local_peak" for e in events), 1)
+                        self.assertEqual([restored for _, restored in plant.writes],
+                                         {2: [False, False, False, True],
+                                          -2: [False, True, False, False, False, True],
+                                          0: [False, True, False, True]}[peak])
 
     def test_improving_timing_continues_with_orbit_steps_between_confirmed_moves(self):
         plant = Plant()
@@ -815,9 +854,9 @@ class FeedbackTests(unittest.TestCase):
         later = events[intervention + 1:]
         next_probe = next(i for i, e in enumerate(later) if e["kind"] == "probe")
         samples = [e for e in later[:next_probe] if e["kind"] == "transmission"]
-        self.assertEqual(len(samples), 3)
+        self.assertEqual(len(samples), 2)
         self.assertTrue(all(e["settings"][CURRENT_PVS[0]] < 0 for e in samples))
-        self.assertEqual([e["settings"][TIMING_PV] for e in samples], [origin, origin + 2.8, origin])
+        self.assertEqual([e["settings"][TIMING_PV] for e in samples], [origin, origin + 2.8])
 
     def test_interleaved_failure_restores_best_at_same_rf_setting_then_defers(self):
         plant, controller, events = self.controller()
@@ -950,8 +989,8 @@ class FeedbackTests(unittest.TestCase):
                     controller.wait_cycle()
                     self.assertEqual([e["remaining_sec"] for e in events if e["kind"] == "waiting"], [5, 4, 3, 2, 1, 0])
 
-    def test_linear_intensity_drift_does_not_fake_neighbour_improvement(self):
-        plant, controller, _ = self.controller()
+    def test_scan_stops_at_first_decline_even_if_measurements_drift_in_time(self):
+        plant, controller, events = self.controller(adjust_phase=False, adjust_correctors=False)
         origin = plant.values[TIMING_PV]
         calls = 0
         def drifting_measurement():
@@ -960,7 +999,11 @@ class FeedbackTests(unittest.TestCase):
             return .8 - .001 * ((plant.values[TIMING_PV] - origin) / 2.8) ** 2 + .002 * calls
         plant.transmission = drifting_measurement
         controller.search(TIMING_PV, 2.8, "Timing")
-        self.assertEqual(plant.values[TIMING_PV], origin)
+        # Consecutive means can include temporal drift: the first step appears
+        # better, but the next decline must stop rather than chase more points.
+        self.assertAlmostEqual(plant.values[TIMING_PV], origin + 2.8)
+        self.assertEqual(calls, 4)
+        self.assertEqual(sum(e["kind"] == "probe" for e in events), 2)
 
 
 class MachineTests(unittest.TestCase):
