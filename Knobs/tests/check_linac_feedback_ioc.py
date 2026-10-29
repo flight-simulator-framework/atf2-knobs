@@ -36,7 +36,7 @@ def serve():
         beam = pvproperty(name="test:beam", value=1.)
         bpm_valid = pvproperty(name="test:bpm_valid", value=1.)
         rf_scale = pvproperty(name="test:rf_scale", value=[1.] * 9)
-        power0 = pvproperty(name="CM0L:poutPeakRead", value=100., read_only=True)
+        power0 = pvproperty(name="CM0L:poutReadPeak", value=100., read_only=True)
         power1 = pvproperty(name="CM1L:poutPeakRead", value=100., read_only=True)
         power2 = pvproperty(name="CM2L:poutPeakRead", value=100., read_only=True)
         power3 = pvproperty(name="CM3L:poutPeakRead", value=100., read_only=True)

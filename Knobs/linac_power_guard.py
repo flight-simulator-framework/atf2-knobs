@@ -4,7 +4,7 @@ import threading
 import time
 from collections import deque
 
-POWER_PVS = tuple(f"CM{i}L:poutPeakRead" for i in range(9))
+POWER_PVS = ("CM0L:poutReadPeak",) + tuple(f"CM{i}L:poutPeakRead" for i in range(1, 9))
 
 
 class KlystronPowerLoss(RuntimeError):
