@@ -309,13 +309,6 @@ class FeedbackPanel(QWidget):
                                          "gridline-color: #dce3eb; border: 1px solid #dce3eb; } "
                                          "QHeaderView::section { background: #ecf5ff; color: #172b4d; padding: 4px; border: none; }")
         response_layout.addWidget(self.response_table)
-        self.response_status = QLabel()
-        self.response_status.setWordWrap(True)
-        response_layout.addWidget(self.response_status)
-        self.response_path = QLabel()
-        self.response_path.setWordWrap(True)
-        self.response_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        response_layout.addWidget(self.response_path)
         self.reload_response_button = QPushButton("Reload saved response")
         self.reload_response_button.clicked.connect(self.load_saved_response)
         response_layout.addWidget(self.reload_response_button)
@@ -351,7 +344,7 @@ class FeedbackPanel(QWidget):
         # Another run/window or a changed save folder may have replaced the cache.
         self.load_saved_response()
 
-    def display_response(self, matrix, model, path):
+    def display_response(self, matrix, model):
         stamp = model.get("measured_at")
         try:
             measured = datetime.fromisoformat(stamp).strftime("%Y-%m-%d %H:%M:%S")
@@ -364,20 +357,6 @@ class FeedbackPanel(QWidget):
         for row, values in enumerate(matrix or []):
             for col, value in enumerate(values):
                 self.response_table.setItem(row, col, QTableWidgetItem(f"{value:.4g}"))
-        observations = len(model.get("samples", []))
-        if matrix is None:
-            status = (f"Incomplete response ({observations} observations). Measure response matrix at Start "
-                      "to obtain a full matrix, or continue learning from corrections.")
-        elif model.get("frozen", False):
-            status = ("Available · fixed matrix [mm/A]. Reused when Measure response matrix at Start is off. "
-                      "Remeasure if machine conditions have changed.")
-        else:
-            status = (f"Available · adaptive matrix [mm/A], {observations} observations. "
-                      "Reused and updated from correction results when startup measurement is off.")
-        if matrix is not None and measured == "measurement time unknown":
-            status += " Acquisition date is unknown; check whether remeasurement is needed."
-        self.response_status.setText(status)
-        self.response_path.setText(f"Cache: {path}")
 
     def load_saved_response(self):
         """Preview the same cache used by START, without machine I/O or writes."""
@@ -387,18 +366,11 @@ class FeedbackPanel(QWidget):
         try:
             model = RecentResponse.from_snapshot(json.loads(path.read_text()))
             matrix = model.matrix()
-        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
             self.response_table.clearContents()
             self.response_group.setTitle("Response matrix to use (unavailable)")
-            if isinstance(exc, FileNotFoundError):
-                message = "No saved response matrix in this folder."
-            else:
-                message = f"Saved response cannot be used: {exc}"
-            self.response_status.setText(message + " Measure response matrix at Start to acquire one, "
-                                         "or learn from corrections without a fixed matrix.")
-            self.response_path.setText(f"Cache: {path}")
             return
-        self.display_response(None if matrix is None else matrix.tolist(), model.snapshot(), path)
+        self.display_response(None if matrix is None else matrix.tolist(), model.snapshot())
 
     def set_status(self, text, state="running"):
         self.status.setText(text)
@@ -590,9 +562,7 @@ class FeedbackPanel(QWidget):
             drift = [1000 * (v - r) for v, r in zip(event["orbit_mm"], self.reference)]
             self.orbits.append((elapsed, drift))
         elif kind == "response":
-            path = (self.worker.response_cache if self.worker is not None
-                    else Path(self.save_dir()) / "active_feedback_response.json")
-            self.display_response(event["matrix_mm_per_A"], event.get("model", {}), path)
+            self.display_response(event["matrix_mm_per_A"], event.get("model", {}))
         if kind in ("transmission", "transmission_monitor", "transmission_average", "reference", "baseline_updated", "response_measured"):
             initial = f"{self.initial_transmission:.6f}" if self.initial_transmission is not None else "—"
             current = f"{self.latest_transmission:.6f}" if self.latest_transmission is not None else "—"

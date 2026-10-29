@@ -160,8 +160,8 @@ Legacy caches without a measurement timestamp show **measurement time unknown**;
 their file-save time is not substituted for an acquisition time.
 The latest cache in the selected save folder is also loaded when the GUI opens,
 before START and without connecting to the machine. The table shows the matrix
-in mm/A, its acquisition date, fixed/adaptive mode, and the cache path. Missing,
-incomplete or incompatible caches are shown explicitly instead of a blank table.
+in mm/A, with its acquisition date in the title. Missing, incomplete or incompatible
+caches are indicated in the title; no explanatory text or cache path appears below the table.
 Opening the Active Feedback tab, changing the save folder, or pressing
 **Reload saved response** refreshes this preview while idle; a running feedback
 keeps displaying its own model. A valid fixed cache can be reused with startup

@@ -1364,8 +1364,6 @@ class GuiTests(unittest.TestCase):
                     self.assertIsNone(panel.worker)
                     worker.assert_not_called()
                     self.assertIn('2026-10-28 14:35:20', panel.response_group.title())
-                    self.assertIn('Available · fixed', panel.response_status.text())
-                    self.assertIn(str(path), panel.response_path.text())
                     matrix = np.array([[float(panel.response_table.item(i,j).text()) for j in range(4)] for i in range(4)])
                     np.testing.assert_allclose(matrix, model.matrix(), rtol=1e-3)
                     self.assertFalse(panel.measure_response_check.isChecked())
@@ -1380,21 +1378,21 @@ class GuiTests(unittest.TestCase):
             path = Path(directory) / 'active_feedback_response.json'
             panel = FeedbackPanel(lambda: directory, lambda: False)
             try:
-                self.assertIn('No saved response', panel.response_status.text())
+                self.assertIn('unavailable', panel.response_group.title())
                 data = self.stored_response(frozen=False).snapshot()
                 data['samples'] = data['samples'][:1]
                 path.write_text(json.dumps(data))
                 panel.reload_response_button.click()
-                self.assertIn('Incomplete response (1 observations)', panel.response_status.text())
+                self.assertIn('not available yet', panel.response_group.title())
                 self.assertIsNone(panel.response_table.item(0,0))
                 data = self.stored_response(frozen=False).snapshot()
                 path.write_text(json.dumps(data))
                 panel.reload_response_button.click()
-                self.assertIn('Available · adaptive', panel.response_status.text())
+                self.assertIsNotNone(panel.response_table.item(0, 0))
                 for invalid in ('broken JSON', json.dumps(dict(data, units='wrong units'))):
                     path.write_text(invalid)
                     panel.reload_response_button.click()
-                    self.assertIn('cannot be used', panel.response_status.text())
+                    self.assertIn('unavailable', panel.response_group.title())
                     self.assertIsNone(panel.response_table.item(0,0))
                 self.assertFalse(panel.measure_response_check.isChecked())
             finally:
@@ -1412,16 +1410,14 @@ class GuiTests(unittest.TestCase):
             panel = FeedbackPanel(lambda: folder, lambda: False)
             try:
                 self.assertIn('measurement time unknown', panel.response_group.title())
-                self.assertIn('Acquisition date is unknown', panel.response_status.text())
                 folder = folder/'different-save-folder'
                 panel.showEvent(QShowEvent())
-                self.assertIn('No saved response', panel.response_status.text())
-                self.assertIn(str(folder), panel.response_path.text())
+                self.assertIn('unavailable', panel.response_group.title())
                 self.assertIsNone(panel.response_table.item(0,0))
                 panel.worker = Mock()
-                panel.response_status.setText('Live response')
+                panel.response_group.setTitle('Live response')
                 panel.load_saved_response()
-                self.assertEqual(panel.response_status.text(), 'Live response')
+                self.assertEqual(panel.response_group.title(), 'Live response')
             finally:
                 panel.worker = None
                 panel.close()
