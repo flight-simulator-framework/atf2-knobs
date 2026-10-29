@@ -366,8 +366,9 @@ or an excessively wide sheet, preserving each plot's aspect ratio.
 
 ## Optimizer workspace
 
-Main and Active Feedback automatically monitor `CM0L:poutReadPeak` and
-`CM1L:poutPeakRead` through `CM8L:poutPeakRead`, regardless of the selected tuning targets. Before the first
+Main and Active Feedback automatically monitor `CM0L:poutReadPeak`,
+`CM1L:poutPeakRead` through `CM4L:poutPeakRead`, and `CM5L:poutReadPeak` through
+`CM8L:poutReadPeak`, regardless of the selected tuning targets. Before the first
 adjustment, each channel's first valid post-start shot establishes its fixed RF
 power reference. Cached pre-start samples are ignored. Any subsequent single
 shot at **50% or less** of that channel's reference triggers an automatic pause,
