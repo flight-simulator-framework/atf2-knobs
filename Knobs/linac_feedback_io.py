@@ -10,10 +10,11 @@ from collections import deque
 import numpy as np
 
 from Knobs.linac_feedback import BeamLoss, CURRENT_PVS, PHASE_PV, PVS, TIMING_PV
+from Knobs.linac_power_guard import KlystronPowerGuard
 
 BPM_SHOTS = 10
 ICT_SHOTS = 10
-ICT_LOSS_SHOTS = 10
+ICT_LOSS_SHOTS = 20
 
 
 class FeedbackMachine:
@@ -24,6 +25,7 @@ class FeedbackMachine:
             pv_factory = PV
         self.config, self.cancelled, self._checkpoint, self.emit = config, cancelled, checkpoint, emit
         self.pv_factory, self.channels = pv_factory, {}
+        self.power_guard = None
         self.ict_pvs = ("BIM:LN0:nparticles", f"BIM:{config.downstream}:nparticles")
         self._last_beam_check = -float("inf")
         self._orbit_callback = None
@@ -51,6 +53,28 @@ class FeedbackMachine:
     def checkpoint(self):
         self._checkpoint()
         self.check_stop()
+        self.check_power()
+
+    def start_power_monitor(self):
+        self.power_guard = KlystronPowerGuard(self.pv_factory, self.emit)
+        self.power_guard.start()
+
+    def acknowledge_power_alarm(self):
+        if self.power_guard is not None:
+            self.power_guard.acknowledge()
+
+    def check_power(self):
+        if self.power_guard is None:
+            return
+        deadline = time.monotonic() + self.config.sample_timeout_sec
+        while True:
+            self.check_stop()
+            self.power_guard.check()
+            if self.power_guard.ready:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Waiting for first post-start RF power shot from Klystrons 0-8 timed out")
+            time.sleep(.05)
 
     def wait(self, seconds, restore=False, activity=None):
         deadline = time.monotonic() + seconds
@@ -173,14 +197,16 @@ class FeedbackMachine:
 
     def check_beam(self, force=False):
         """Monitor selected upstream/downstream ICTs even during orbit work/waits."""
+        self.check_power()
         if force or time.monotonic() - self._last_beam_check >= .2:
             deadline = None
             while True:
+                self.check_power()
                 records = [self.metadata(name) for name in self.ict_pvs]
-                if all(float(record["value"]) > 0 for record in records) and self.poll_orbit() is not False:
+                if (not self.config.ict_auto_pause or all(float(record["value"]) > 0 for record in records)) and self.poll_orbit() is not False:
                     break
                 # Do not issue a new command or consume no-beam BPM data while
-                # a drop is unconfirmed. Wait for recovery or ten new losses.
+                # a drop is unconfirmed. Wait for recovery or twenty new losses.
                 if deadline is None:
                     deadline = time.monotonic() + self.config.sample_timeout_sec
                 if time.monotonic() >= deadline:
@@ -254,6 +280,8 @@ class FeedbackMachine:
             return
         if not np.isfinite(float(value)):
             raise ValueError(f"Invalid ICT measurement: {name}")
+        if not self.config.ict_auto_pause:
+            return
         if timestamp > self._ict_timestamps[name]:
             self._ict_timestamps[name] = timestamp
             self._ict_loss_counts[name] = self._ict_loss_counts[name] + 1 if float(value) <= 0 else 0
@@ -289,14 +317,14 @@ use fresh_records after settling and never consume this monitor batch.
         if previous is not None and record["timestamp"] <= previous["timestamp"]:
             return
         self._live_ict_records[name] = record
-        if float(record["value"]) <= 0:
+        if self.invalid_ict_sample(name, float(record["value"])):
             self._live_ict_samples.clear()
             # Do not pair a recovered channel with a pre-loss sample.
             self._live_ict_stamps.update({pv: value["timestamp"] for pv, value in self._live_ict_records.items()})
             return
         if not all(pv in self._live_ict_records and
                    self._live_ict_records[pv]["timestamp"] > self._live_ict_stamps[pv] and
-                   float(self._live_ict_records[pv]["value"]) > 0 for pv in self.ict_pvs):
+                   not self.invalid_ict_sample(pv, float(self._live_ict_records[pv]["value"])) for pv in self.ict_pvs):
             return
         pair = [self._live_ict_records[pv] for pv in self.ict_pvs]
         self._live_ict_stamps = {pv: item["timestamp"] for pv, item in zip(self.ict_pvs, pair)}
@@ -308,6 +336,11 @@ use fresh_records after settling and never consume this monitor batch.
             if 0 <= transmission <= 1:
                 self.emit(dict(kind="transmission_monitor", transmission=transmission, shots=ICT_SHOTS,
                                ioc_timestamps=dict(self._live_ict_stamps)))
+
+    def invalid_ict_sample(self, name, value):
+        # A zero downstream measurement is valid zero transmission while the
+        # ICT interlock is disabled; a zero denominator cannot define a ratio.
+        return value <= 0 if self.config.ict_auto_pause or name == self.ict_pvs[0] else value < 0
 
     def fresh_records(self, names):
         # Establish a barrier AFTER settling. Every record must be newer.
@@ -327,8 +360,10 @@ use fresh_records after settling and never consume this monitor batch.
             if all(records[name]["timestamp"] > stamps[name] for name in names):
                 stamps = {name: records[name]["timestamp"] for name in names}
                 if any(not records[name].get("feedback_valid", True) or
-                       (name in self.ict_pvs and float(records[name]["value"]) <= 0) for name in names):
+                       (name in self.ict_pvs and self.invalid_ict_sample(name, float(records[name]["value"]))) for name in names):
                     samples.clear()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"{count} valid fresh measurements unavailable: {', '.join(names)}")
                     self.check_beam(force=True)
                 else:
                     samples.append(records)
@@ -355,7 +390,7 @@ use fresh_records after settling and never consume this monitor batch.
         values = np.array([[r[up]["value"], r[down]["value"]] for r in records], float)
         if values.shape != (ICT_SHOTS, 2) or not np.isfinite(values).all():
             raise ValueError("Invalid ICT measurement")
-        if np.any(values <= 0):
+        if np.any(values[:, 0] <= 0) or np.any(values[:, 1] <= 0 if self.config.ict_auto_pause else values[:, 1] < 0):
             raise ValueError("Nonpositive ICT sample in transmission average")
         result = float(values[:, 1].mean() / values[:, 0].mean())
         if not 0 <= result <= 1:
@@ -365,6 +400,8 @@ use fresh_records after settling and never consume this monitor batch.
         return result
 
     def close(self):
+        if self.power_guard is not None:
+            self.power_guard.close()
         # These PVs have no callbacks/automatic subscriptions. Do not disconnect
         # shared CA channels that may also be used by the Main display.
         self.channels.clear()

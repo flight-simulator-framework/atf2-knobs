@@ -37,6 +37,7 @@ class FeedbackWorker(QThread):
         self.pause_reason = ""
         self.stage, self.cycle_number = "Starting", 0
         self.on_pause = None
+        self.on_resume = None
         self._targets_lock = threading.Lock()
         self._requested_targets = {name: getattr(config, name) for name in
                                    ("adjust_timing", "adjust_phase", "adjust_correctors")}
@@ -63,6 +64,8 @@ class FeedbackWorker(QThread):
             while self.paused.is_set() and not self.cancelled.wait(.05):
                 pass
             if not self.cancelled.is_set():
+                if self.pause_reason.startswith("Klystron ") and self.on_resume is not None:
+                    self.on_resume()
                 self.pause_reason = ""
                 self.emit_event(dict(kind="state", state="Resuming"))
         if self.cancelled.is_set():
@@ -72,7 +75,7 @@ class FeedbackWorker(QThread):
         self.pause_reason = reason
         self.paused.set()
         self.emit_event(dict(kind="auto_pause", state="Auto-paused: " + reason,
-                             message="Temporary settings restored. Resolve the ICT beam loss, then press Resume."))
+                             message="Temporary settings restored. Resolve the fault, then press Resume."))
         self.checkpoint()
 
     def emit_event(self, event):
@@ -114,6 +117,9 @@ class FeedbackWorker(QThread):
             self.operations.flush()
             self.emit_event(dict(kind="log", message=f"Run data: {self.run_dir}"))
             machine = self.machine_factory(self.config, self.cancelled.is_set, self.checkpoint, self.emit_event)
+            if hasattr(machine, "start_power_monitor"):
+                machine.start_power_monitor()
+                self.on_resume = machine.acknowledge_power_alarm
             controller = FeedbackController(machine, self.config, machine.limits(), self.emit_event)
             controller.target_provider = self.target_selection
             self.on_pause = controller.reset_baseline_candidate
@@ -136,6 +142,7 @@ class FeedbackWorker(QThread):
                 self.event_signal.emit(dict(kind="error", message=str(exc)))
         finally:
             self.on_pause = None
+            self.on_resume = None
             try:
                 if machine is not None:
                     machine.close()
@@ -302,6 +309,16 @@ class FeedbackPanel(QWidget):
                                          "gridline-color: #dce3eb; border: 1px solid #dce3eb; } "
                                          "QHeaderView::section { background: #ecf5ff; color: #172b4d; padding: 4px; border: none; }")
         response_layout.addWidget(self.response_table)
+        self.response_status = QLabel()
+        self.response_status.setWordWrap(True)
+        response_layout.addWidget(self.response_status)
+        self.response_path = QLabel()
+        self.response_path.setWordWrap(True)
+        self.response_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        response_layout.addWidget(self.response_path)
+        self.reload_response_button = QPushButton("Reload saved response")
+        self.reload_response_button.clicked.connect(self.load_saved_response)
+        response_layout.addWidget(self.reload_response_button)
         left.addWidget(response_group)
         left.addStretch(1)
         plot_group = QGroupBox("Live Plots")
@@ -327,6 +344,61 @@ class FeedbackPanel(QWidget):
         self.plot_timer = QTimer(self)
         self.plot_timer.setInterval(500)
         self.plot_timer.timeout.connect(self.draw_plot)
+        self.load_saved_response()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Another run/window or a changed save folder may have replaced the cache.
+        self.load_saved_response()
+
+    def display_response(self, matrix, model, path):
+        stamp = model.get("measured_at")
+        try:
+            measured = datetime.fromisoformat(stamp).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            measured = "measurement time unknown"
+        if matrix is None:
+            measured = "not available yet"
+        self.response_group.setTitle(f"Response matrix to use ({measured})")
+        self.response_table.clearContents()
+        for row, values in enumerate(matrix or []):
+            for col, value in enumerate(values):
+                self.response_table.setItem(row, col, QTableWidgetItem(f"{value:.4g}"))
+        observations = len(model.get("samples", []))
+        if matrix is None:
+            status = (f"Incomplete response ({observations} observations). Measure response matrix at Start "
+                      "to obtain a full matrix, or continue learning from corrections.")
+        elif model.get("frozen", False):
+            status = ("Available · fixed matrix [mm/A]. Reused when Measure response matrix at Start is off. "
+                      "Remeasure if machine conditions have changed.")
+        else:
+            status = (f"Available · adaptive matrix [mm/A], {observations} observations. "
+                      "Reused and updated from correction results when startup measurement is off.")
+        if matrix is not None and measured == "measurement time unknown":
+            status += " Acquisition date is unknown; check whether remeasurement is needed."
+        self.response_status.setText(status)
+        self.response_path.setText(f"Cache: {path}")
+
+    def load_saved_response(self):
+        """Preview the same cache used by START, without machine I/O or writes."""
+        if self.active:
+            return
+        path = Path(self.save_dir()) / "active_feedback_response.json"
+        try:
+            model = RecentResponse.from_snapshot(json.loads(path.read_text()))
+            matrix = model.matrix()
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            self.response_table.clearContents()
+            self.response_group.setTitle("Response matrix to use (unavailable)")
+            if isinstance(exc, FileNotFoundError):
+                message = "No saved response matrix in this folder."
+            else:
+                message = f"Saved response cannot be used: {exc}"
+            self.response_status.setText(message + " Measure response matrix at Start to acquire one, "
+                                         "or learn from corrections without a fixed matrix.")
+            self.response_path.setText(f"Cache: {path}")
+            return
+        self.display_response(None if matrix is None else matrix.tolist(), model.snapshot(), path)
 
     def set_status(self, text, state="running"):
         self.status.setText(text)
@@ -352,6 +424,7 @@ class FeedbackPanel(QWidget):
         if self.active or self.main_busy():
             QMessageBox.warning(self, "Busy", "Stop the current optimizer/feedback run first.")
             return
+        self.load_saved_response()
         self.worker = FeedbackWorker(self.config(), self.save_dir())
         self.points.clear()
         self.plot_waiting = False
@@ -369,13 +442,12 @@ class FeedbackPanel(QWidget):
         self.degradation_threshold = self.latest_transmission = self.average_result = None
         self.dirty = True
         self.draw_plot()
-        self.response_table.clearContents()
-        self.response_group.setTitle("Response matrix to use (not measured)")
         self.log.clear()
         self.failed = False
         self.settings.setEnabled(False)
         self.targets.setEnabled(True)
         self.measure_response_check.setEnabled(True)
+        self.reload_response_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.stop_button.setEnabled(True)
@@ -423,6 +495,7 @@ class FeedbackPanel(QWidget):
         self.settings.setEnabled(True)
         self.targets.setEnabled(True)
         self.measure_response_check.setEnabled(True)
+        self.reload_response_button.setEnabled(True)
         self.start_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
@@ -517,18 +590,9 @@ class FeedbackPanel(QWidget):
             drift = [1000 * (v - r) for v, r in zip(event["orbit_mm"], self.reference)]
             self.orbits.append((elapsed, drift))
         elif kind == "response":
-            stamp = event.get("model", {}).get("measured_at")
-            try:
-                measured = datetime.fromisoformat(stamp).strftime("%Y-%m-%d %H:%M:%S")
-            except (TypeError, ValueError):
-                measured = "measurement time unknown"
-            if event["matrix_mm_per_A"] is None:
-                measured = "not available yet"
-            self.response_group.setTitle(f"Response matrix to use ({measured})")
-            self.response_table.clearContents()
-            for row, values in enumerate(event["matrix_mm_per_A"] or []):
-                for col, value in enumerate(values):
-                    self.response_table.setItem(row, col, QTableWidgetItem(f"{value:.4g}"))
+            path = (self.worker.response_cache if self.worker is not None
+                    else Path(self.save_dir()) / "active_feedback_response.json")
+            self.display_response(event["matrix_mm_per_A"], event.get("model", {}), path)
         if kind in ("transmission", "transmission_monitor", "transmission_average", "reference", "baseline_updated", "response_measured"):
             initial = f"{self.initial_transmission:.6f}" if self.initial_transmission is not None else "—"
             current = f"{self.latest_transmission:.6f}" if self.latest_transmission is not None else "—"

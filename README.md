@@ -29,12 +29,11 @@ When startup response measurement is enabled, its completion is followed by
 fresh 10-shot transmission and BPM measurements and a reread of all setpoints.
 These post-calibration values become the feedback Initial, recovery baseline,
 orbit reference and parameter origins; the transmission threshold is recalculated
-from the new baseline. Feedback cannot begin until this capture succeeds. An ICT
+from the new baseline. Feedback cannot begin until this capture succeeds. An RF power
 loss during capture pauses and retries capture on Resume without remeasuring
 the successfully acquired matrix. Transmission is the
 selected downstream ICT (DR by default) divided by LN0, independently of Main's
-objective/weights. Absolute ICT values are used only for the nonpositive-beam
-auto-pause guard. The normal feedback mode is timing tracking, with phase recovery
+objective/weights. ICT-triggered automatic pause is enabled after 20 consecutive nonpositive shots. The normal feedback mode is timing tracking, with phase recovery
 taking priority over orbit correction when transmission is degraded. Run Control selects **Timing**, **CM8L phase**, and **Correctors**
 (all on by default). These target checkboxes remain editable while running.
 Changes apply at accepted settings after any temporary probe has been restored;
@@ -42,7 +41,7 @@ disabled targets receive no new adjustment commands after the change is applied.
 Applied selections are recorded as `targets_changed` events. A changed selection
 wakes the cycle countdown and restarts dispatch with the new targets.
 All targets unchecked displays **WAITING | No adjustment targets selected**,
-retains the active run, and continues BPM/ICT monitoring and the ICT loss guard
+retains the active run, and continues BPM/ICT monitoring and the RF power guard
 without actuator writes or a scan countdown. Selecting a target resumes feedback
 automatically. If Correctors
 is off, timing and phase can still track even while the orbit
@@ -144,7 +143,7 @@ and after restoration. The response subtracts the average of the bracketing
 reference measurements to reduce drift. Trials obey the configured/IOC limits;
 if six attempts or the available current range cannot reach the target band,
 acquisition stops with an error and retains the previous matrix. Each trial is
-restored even on Stop, measurement failure or ICT loss. After ICT auto-pause and
+restored even on Stop, measurement failure or RF power loss. After RF auto-pause and
 Resume, the startup acquisition retries before feedback can begin.
 
 All four successful columns are committed together, with **H→y and V→x set to
@@ -159,6 +158,15 @@ The **Response matrix to use (YYYY-MM-DD HH:MM:SS)** heading shows the last
 measurement time, which is saved with the matrix and preserved on reload.
 Legacy caches without a measurement timestamp show **measurement time unknown**;
 their file-save time is not substituted for an acquisition time.
+The latest cache in the selected save folder is also loaded when the GUI opens,
+before START and without connecting to the machine. The table shows the matrix
+in mm/A, its acquisition date, fixed/adaptive mode, and the cache path. Missing,
+incomplete or incompatible caches are shown explicitly instead of a blank table.
+Opening the Active Feedback tab, changing the save folder, or pressing
+**Reload saved response** refreshes this preview while idle; a running feedback
+keeps displaying its own model. A valid fixed cache can be reused with startup
+measurement off, but changed machine conditions may warrant remeasurement.
+Previewing never modifies the cache or automatically enables response acquisition.
 
 A stored response proposes a 0.005 A grid correction. If no identifiable matrix
 is available or a proposal fails, individual +/-0.005 A candidates are tried.
@@ -230,23 +238,18 @@ Config averaging count defaults to 1 and can be increased explicitly. The
 operating-point result updates once per
 completed transmission check; it and the adaptive baseline remain in the summary
 and logs rather than adding curves to the plot. ICT pairing uses timestamp advancement, not pulse IDs.
-Only ICT loss triggers automatic pause: if either LN0 or the selected downstream
-ICT is zero or negative for **10 consecutive distinct shots**, feedback
-automatically pauses after restoring temporary timing, phase or corrector probes.
-ICTs are checked during orbit acquisition, settling and the between-cycle wait,
-as well as during transmission measurement. ICT counters are independent per
-channel. Normal readings reset
-the corresponding counter, and repeated cached timestamps never count again.
-During confirmation, new commands wait; invalid readings are excluded from
-averages. Invalid ML8L/ML10L records are logged and retried without automatic pause
-or manual Resume; BPM monitoring refills its 10-shot window after recovery.
-The existing acquisition timeout still applies when valid data remain unavailable.
-Restore commands
-are permitted during beam loss. Resume is manual: if the loss persists, feedback
-pauses again before further exploration. After recovery, timing tracking restarts
-with the original reference and accepted settings; the interrupted search is
-discarded and the response model is retained for updates from subsequent corrections. An incomplete initial reference is acquired again
-on Resume. Other invalid/missing data or unconfirmed writes stop the worker.
+RF power loss triggers automatic pause (see the shared Main/Active Feedback RF
+interlock below). **ICT-triggered automatic pause is also enabled**: if LN0 or
+the selected downstream ICT is zero or negative for **20 consecutive distinct
+shots**, temporary probes are restored and feedback pauses. Counters are separate
+for each channel, a positive shot resets its counter, and cached timestamps never
+count twice. Recovery still requires manual Resume. Transmission measurements
+continue to average 10 valid shots; unusable samples are excluded and remain
+subject to the acquisition timeout. This does not disable the transmission degradation
+threshold used to choose phase recovery. Invalid ML8L/ML10L records are logged
+and retried without automatic pause. Missing data or unconfirmed writes may still
+stop the worker with an error. Restore commands are permitted during RF loss;
+Resume remains manual and retains the response matrix and original references.
 Baseline promotions are explicit logged events. Measurements require 10 *new* BPM
 timestamps or ten *new* ICT timestamps
 after an acquisition barrier, with a 15-second timeout; repeated cached records
@@ -362,6 +365,24 @@ Combined exports switch from two columns to a vertical stack for wide plots
 or an excessively wide sheet, preserving each plot's aspect ratio.
 
 ## Optimizer workspace
+
+Main and Active Feedback automatically monitor `CM0L:poutPeakRead` through
+`CM8L:poutPeakRead`, regardless of the selected tuning targets. Before the first
+adjustment, each channel's first valid post-start shot establishes its fixed RF
+power reference. Cached pre-start samples are ignored. Any subsequent single
+shot at **50% or less** of that channel's reference triggers an automatic pause,
+for example: **Klystron 3 RF power is too low**. Short drops remain latched even
+if power recovers before the controller next checks. An unavailable baseline
+blocks startup; zero initial RF power pauses instead of becoming a usable reference.
+
+Power recovery does not resume either mode automatically. Resolve the fault and
+press **Resume**; a channel still below threshold pauses again. Main retains its
+settings, interrupts settling/acquisition at checkpoints, and discards averages
+that span a power pause. Closing its RF warning keeps it paused. Active Feedback
+restores temporary probes before pausing. Its ICT-triggered automatic pause is enabled after 20 consecutive nonpositive shots.
+RF references remain fixed across Resume and response-matrix measurement and are
+recaptured on a new Start. Main records reference/trip events in
+`KlystronPower.jsonl`; Active Feedback uses `events.jsonl`.
 
 LinacOpt and IPBSM place scrollable controls on the left and live plots,
 progress and results on the right. Drag the divider to adjust their widths;

@@ -35,6 +35,16 @@ def serve():
         drift = pvproperty(name="test:drift", value=0.)
         beam = pvproperty(name="test:beam", value=1.)
         bpm_valid = pvproperty(name="test:bpm_valid", value=1.)
+        rf_scale = pvproperty(name="test:rf_scale", value=[1.] * 9)
+        power0 = pvproperty(name="CM0L:poutPeakRead", value=100., read_only=True)
+        power1 = pvproperty(name="CM1L:poutPeakRead", value=100., read_only=True)
+        power2 = pvproperty(name="CM2L:poutPeakRead", value=100., read_only=True)
+        power3 = pvproperty(name="CM3L:poutPeakRead", value=100., read_only=True)
+        power4 = pvproperty(name="CM4L:poutPeakRead", value=100., read_only=True)
+        power5 = pvproperty(name="CM5L:poutPeakRead", value=100., read_only=True)
+        power6 = pvproperty(name="CM6L:poutPeakRead", value=100., read_only=True)
+        power7 = pvproperty(name="CM7L:poutPeakRead", value=100., read_only=True)
+        power8 = pvproperty(name="CM8L:poutPeakRead", value=100., read_only=True)
         h1 = pvproperty(name="ZH1L:currentWrite", value=0., lower_ctrl_limit=-5., upper_ctrl_limit=5.)
         h1_read = pvproperty(name="ZH1L:currentRead", value=0., read_only=True)
         v1 = pvproperty(name="ZV1L:currentWrite", value=0., lower_ctrl_limit=-5., upper_ctrl_limit=5.)
@@ -49,6 +59,8 @@ def serve():
 
         @monitors.scan(period=.02)
         async def monitors(self, instance, async_lib):
+            for i in range(9):
+                await getattr(self, f"power{i}").write(100. * self.rf_scale.value[i])
             currents = np.array([scalar(self.h1), scalar(self.v1), scalar(self.h2), scalar(self.v2)])
             matrix = np.array([[2., .1, .3, 0.], [.3, 0., 1.5, .1],
                                [.1, 1.8, 0., .2], [0., .4, .1, 1.6]])
@@ -106,6 +118,7 @@ def main():
                 stopped = False
                 config = FeedbackConfig(settle_sec=.03, interval_sec=0., min_gain=.00001)
                 machine = FeedbackMachine(config, lambda: stopped, lambda: None, events.append, factory)
+                machine.start_power_monitor()
                 controller = FeedbackController(machine, config, machine.limits(), events.append)
                 controller.initialize()
                 controller.measure_response()
@@ -207,12 +220,16 @@ def main():
                 thread = threading.Thread(target=worker.run)
                 thread.start()
                 try:
+                    deadline = time.monotonic() + 15
+                    while not injected and time.monotonic() < deadline:
+                        time.sleep(.05)
+                    assert injected, worker_events[-5:]
                     assert paused.wait(15), worker_events[-5:]
                     assert abs(machine.scalar(TIMING_PV) - accepted_timing) < .001
                     assert beam.put(1., wait=True) == 1
                     time.sleep(.2)
-                    assert worker.paused.is_set(), "Must not automatically resume when beam returns"
-                    worker.paused.clear()  # operator Resume
+                    assert worker.paused.is_set(), "ICT recovery must not automatically resume"
+                    worker.paused.clear()
                     assert monitoring.wait(15), worker_events[-5:]
                     paused.clear()
                     monitoring.clear()
@@ -220,11 +237,26 @@ def main():
                     assert bpm_invalid.wait(10), worker_events[-5:]
                     assert not paused.is_set() and not worker.paused.is_set(), "BPM invalid must not auto-pause"
                     losses = [e for e in worker_events if e["kind"] in ("beam_loss_pending", "beam_loss_detected")]
-                    assert [e["consecutive"] for e in losses] == list(range(1, 11)), losses
+                    assert [e["consecutive"] for e in losses] == list(range(1, 21)), losses
                     monitoring.clear()
                     assert factory("test:bpm_valid").put(1., wait=True) == 1
                     assert monitoring.wait(15), worker_events[-5:]
                     assert sum(e["kind"] == "auto_pause" for e in worker_events) == 1
+                    paused.clear()
+                    monitoring.clear()
+                    assert factory("test:rf_scale").put([1., 1., 1., .5, 1., 1., 1., 1., 1.], wait=True) == 1
+                    assert paused.wait(10), worker_events[-5:]
+                    power_pause = [e for e in worker_events if e["kind"] == "auto_pause"][-1]
+                    assert "Klystron 3" in power_pause["state"], power_pause
+                    assert factory("test:rf_scale").put([1.] * 9, wait=True) == 1
+                    time.sleep(.2)
+                    assert worker.paused.is_set(), "RF recovery must not automatically resume"
+                    monitoring.clear()
+                    worker.paused.clear()
+                    assert monitoring.wait(15), worker_events[-5:]
+                    assert sum(e["kind"] == "auto_pause" for e in worker_events) == 2
+                    references = [e for e in worker_events if e["kind"] == "klystron_power_reference"]
+                    assert len(references) == 9 and all(e["value"] == 100. for e in references)
                 finally:
                     worker.stop()
                     thread.join(10)
@@ -238,9 +270,10 @@ def main():
                 print(json.dumps(dict(result="passed", timing_ns=accepted_timing,
                                       cm8l_phase_deg=machine.scalar(PHASE_PV),
                                       residual_um=(residual * 1000).tolist(), events=len(events),
-                                      auto_pause_resume="passed", bpm_invalid_retry_without_pause="passed", continuous_bpm_wait="passed",
+                                      ict_twenty_shot_auto_pause_resume="passed", bpm_invalid_retry_without_pause="passed", continuous_bpm_wait="passed",
                                       live_transmission_during_wait="passed",
                                       startup_response_500um_and_fixed_matrix="passed",
+                                      klystron_power_auto_pause_resume="passed",
                                       absolute_five_point_threshold="passed", operation_rows=len(operations)), indent=2))
             finally:
                 if machine is not None:

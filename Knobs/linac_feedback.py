@@ -12,6 +12,7 @@ import time
 import numpy as np
 
 from Knobs.timing_pv import TIMING_PV
+from Knobs.linac_power_guard import KlystronPowerLoss
 
 PHASE_PV = "CM8L:phaseWrite"
 CORRECTORS = ("ZH1L", "ZV1L", "ZH2L", "ZV2L")
@@ -60,6 +61,7 @@ class FeedbackConfig:
     adjust_phase: bool = True
     adjust_correctors: bool = True
     measure_response_on_start: bool = False
+    ict_auto_pause: bool = True  # Twenty consecutive nonpositive shots; independent of RF power.
 
     def __post_init__(self):
         for name in ("orbit_threshold_um", "sample_timeout_sec", "timing_range_ns",
@@ -200,7 +202,7 @@ probes. checkpoint may pause ONLY when accepted settings are applied.
 
     def transmission(self):
         value = float(self.io.transmission())
-        if np.isfinite(value) and value <= 0:
+        if self.config.ict_auto_pause and np.isfinite(value) and value <= 0:
             raise BeamLoss(f"Transmission dropped to {value:g}")
         if not np.isfinite(value) or not 0 <= value <= 1:
             raise ValueError("Invalid transmission measurement")
@@ -759,7 +761,7 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
                 continue
             except OrbitDrift:
                 self.event("orbit_priority", message="Orbit drift during wait; starting cycle with phase priority")
-            except BeamLoss as exc:
+            except (BeamLoss, KlystronPowerLoss) as exc:
                 self._interleave_context = None
                 # Every probe/trial has already unwound its finally block.
                 # Keep the original reference and accepted machine settings;
@@ -767,8 +769,9 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
                 # and update them only through subsequent correction attempts.
                 if pause_for_loss is None:
                     raise
-                self.reset_baseline_candidate("Beam loss")
+                self.reset_baseline_candidate("RF power loss" if isinstance(exc, KlystronPowerLoss) else "Beam loss")
                 self.transmission_history.clear()
                 self.report_response()
-                self.event("beam_loss", message=str(exc), settings=dict(getattr(self, "current", {})))
+                self.event("klystron_power_pause" if isinstance(exc, KlystronPowerLoss) else "beam_loss",
+                           message=str(exc), settings=dict(getattr(self, "current", {})))
                 pause_for_loss(str(exc))

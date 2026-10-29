@@ -65,6 +65,7 @@ from Knobs.linac_orbit_compensation import (
 from Knobs.current_value_monitor import CurrentValueMonitor
 from Knobs.timing_pv import TIMING_PV, validate_timing_pvs
 from Knobs.linac_feedback_gui import FeedbackPanel
+from Knobs.linac_power_guard import KlystronPowerGuard, KlystronPowerLoss
 from Knobs.optimizer_workspace import run_button_style, status_badge_style
 
 LINAC_BT_BPM_NAMES = tuple(dict.fromkeys(name for name in BT_SEQUENCE if not name.lower().startswith("z")))
@@ -865,6 +866,7 @@ def _read_icts_with_retry(
         max_retries_per_sample: int = ICT_MAX_RETRIES_PER_SAMPLE_DEFAULT,
         retry_wait_s: float = ICT_RETRY_WAIT_S_DEFAULT,
         log_fn: Optional[Callable[[str], None]] = None,
+        checkpoint=None,
 ) -> Tuple[Dict[str, float], bool, str]:
     valid_samples: List[Dict[str, float]] = []
     samples_needed = max(1, int(sample_count))
@@ -875,6 +877,8 @@ def _read_icts_with_retry(
     for sample_idx in range(1, samples_needed + 1):
         accepted = False
         for attempt in range(1, retries_per_sample + 1):
+            if checkpoint is not None:
+                checkpoint()
             ict = interface.read_icts_for_optimizer(
                 downstream_key=normalized_downstream,
                 dr_samples=1,
@@ -1005,6 +1009,9 @@ class OptimizationWorker(QThread):
                                                                            ICT_MAX_RETRIES_PER_SAMPLE_DEFAULT))))
         self.ict_retry_wait_s = float(config.get("ict_retry_wait_s", ICT_RETRY_WAIT_S_DEFAULT))
         self._initial_snapshot = None
+        self.power_guard = None
+        self.pause_reason = ""
+        self._power_trip_count = 0
         self._initial_eval_consumed = False
         self._eval_counter = 0
         self._scan_progress = {}
@@ -1539,6 +1546,8 @@ class OptimizationWorker(QThread):
 
     def resume(self, remeasure_current_point=True):
         with self._pause_condition:
+            if self.pause_reason and self.power_guard is not None:
+                self.power_guard.acknowledge()
             self._remeasure_after_pause = bool(remeasure_current_point and self._pause_can_remeasure)
             self.pause_requested = False
             self._pause_condition.notify_all()
@@ -1580,12 +1589,13 @@ class OptimizationWorker(QThread):
                 json.dump(report, stream, indent=2)
 
     def _pause_checkpoint(self, remeasure=False):
+        self._check_power()
         with self._pause_condition:
-            if self.pause_requested and self.is_running:
+            while self.pause_requested and self.is_running:
                 self.is_paused = True
                 self._pause_can_remeasure = remeasure
                 self.log_signal.emit("[PAUSE] Paused; history, baseline and machine settings retained.")
-                self._emit_progress({"kind": "pause_state", "paused": True})
+                self._emit_progress({"kind": "pause_state", "paused": True, "reason": self.pause_reason})
                 try:
                     while self.pause_requested and self.is_running:
                         self._pause_condition.wait()
@@ -1595,16 +1605,69 @@ class OptimizationWorker(QThread):
                     self._save_and_end = False
                     raise SaveAndEndRequested()
                 if self.is_running:
+                    self._check_power()
+                    if self.pause_requested:
+                        continue
+                    self.pause_reason = ""
                     self.log_signal.emit("[RESUME] Continuing the same run.")
                     self._emit_progress({"kind": "pause_state", "paused": False})
             if not self.is_running:
                 raise InterruptedError("Optimization stopped")
+
+    def _start_power_monitor(self):
+        if self.run_profile != RUN_PROFILE_MAIN or self._interface_injected:
+            return
+        def report(event):
+            event = dict(event, timestamp=datetime.datetime.now().astimezone().isoformat())
+            with (self.run_dir / "KlystronPower.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, allow_nan=False) + "\n")
+            if event.get("message"):
+                self.log_signal.emit(event["message"])
+        self.power_guard = KlystronPowerGuard(emit=report)
+        self.power_guard.start()
+        deadline = time.monotonic() + 15.
+        while not self.power_guard.ready:
+            self._pause_checkpoint()
+            if self.power_guard.ready:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Waiting for first post-start RF power shot from Klystrons 0-8 timed out")
+            time.sleep(.05)
+
+    def _check_power(self):
+        if self.power_guard is None:
+            return
+        try:
+            self.power_guard.check()
+        except KlystronPowerLoss as exc:
+            if not self.pause_reason:
+                self._power_trip_count += 1
+                self.pause_reason = str(exc)
+                self.log_signal.emit("[AUTO PAUSE] " + self.pause_reason)
+            self.pause_requested = True
+
+    def _power_checkpoint(self):
+        # Manual Pause keeps its existing end-of-evaluation behavior. RF faults
+        # also interrupt settling and acquisition, before another command.
+        self._check_power()
+        if self.pause_reason:
+            self._pause_checkpoint()
 
     # ----------------------------
     # Measurement
     # ----------------------------
 
     def _read_icts(self) -> Tuple[Dict[str, float], bool, str]:
+        while True:
+            self._power_checkpoint()
+            generation = self._power_trip_count
+            result = self._read_icts_once()
+            self._power_checkpoint()
+            if generation == self._power_trip_count:
+                return result
+            self.log_signal.emit("[AUTO PAUSE] Discarding interrupted ICT average; acquiring fresh samples.")
+
+    def _read_icts_once(self):
         return _read_icts_with_retry(self.interface,
             downstream_key=self._downstream_ict_key,
             sample_count=self.ict_samples,
@@ -1612,6 +1675,7 @@ class OptimizationWorker(QThread):
             max_retries_per_sample=self.ict_max_retries_per_sample,
             retry_wait_s=self.ict_retry_wait_s,
             log_fn=self.log_signal.emit,
+            checkpoint=self._power_checkpoint,
         )
 
     def _downstream_value(self, ict: Dict[str, float]) -> float:
@@ -1663,6 +1727,16 @@ class OptimizationWorker(QThread):
         return float(metric) if used > 0 else float("nan")
 
     def _measure_objective(self) -> Tuple[Dict[str, float], float, float, str, float, bool, str]:
+        while True:
+            self._power_checkpoint()
+            generation = self._power_trip_count
+            result = self._measure_objective_once()
+            self._power_checkpoint()
+            if generation == self._power_trip_count:
+                return result
+            self.log_signal.emit("[AUTO PAUSE] Discarding interrupted measurement; acquiring fresh samples.")
+
+    def _measure_objective_once(self) -> Tuple[Dict[str, float], float, float, str, float, bool, str]:
         if self.objective_type == DEVELOPER_OBJECTIVE_INTENSITY:
             if self.intensity_aggregation in ("turn_ratio", "turn_composite"):
                 metric, _, self._last_intensities, self._last_bpm_snapshot, transmission, normalized = read_turn_objective(
@@ -1726,6 +1800,7 @@ class OptimizationWorker(QThread):
         # settle (requested: after change, wait a few seconds)
         t0 = time.time()
         while self.is_running and (time.time() - t0) < self.settle_sec:
+            self._power_checkpoint()
             time.sleep(0.1)
 
         ict, bpm_metric, objective_value, objective_label, score, measurement_ok, measurement_reason = self._measure_objective()
@@ -1771,6 +1846,7 @@ class OptimizationWorker(QThread):
         # Settle once
         t0 = time.time()
         while self.is_running and (time.time() - t0) < self.settle_sec:
+            self._power_checkpoint()
             time.sleep(0.1)
 
         ict, bpm_metric, objective_value, objective_label, score, measurement_ok, measurement_reason = self._measure_objective()
@@ -2740,6 +2816,7 @@ class OptimizationWorker(QThread):
             # settle
             t0 = time.time()
             while self.is_running and (time.time() - t0) < self.settle_sec:
+                self._power_checkpoint()
                 time.sleep(0.1)
             ict, measurement_ok, measurement_reason = self._read_icts()
             score = self._score(ict)
@@ -2846,6 +2923,7 @@ class OptimizationWorker(QThread):
             self._write_setpoints({pv_name: float(v) for pv_name, v in zip(pvs, best_x)})
             t0 = time.time()
             while self.is_running and (time.time() - t0) < self.settle_sec:
+                self._power_checkpoint()
                 time.sleep(0.1)
             _ = eval_vec(best_x, note="LBO_FINAL")
 
@@ -2855,6 +2933,7 @@ class OptimizationWorker(QThread):
     def run(self):
         self.log_signal.emit(f"=== Optimization Started (profile={self.run_profile}, mode={self.mode}) ===")
         try:
+            self._start_power_monitor()
             self._emit_progress({"kind": "overall_progress"})
             self._dump_initial_snapshot()
             if self.run_profile == RUN_PROFILE_DEVELOPER:
@@ -2892,6 +2971,8 @@ class OptimizationWorker(QThread):
             self._emit_progress({"kind": "run_error", "message": str(e)})
             self.log_signal.emit(f"Error: {str(e)}")
         finally:
+            if self.power_guard is not None:
+                self.power_guard.close()
             if self._gun_orbit_report:
                 if self._gun_orbit_report.get("status") in {"starting", "reference_captured"}:
                     self._gun_orbit_report["status"] = "interrupted_before_correction"
@@ -5572,7 +5653,8 @@ class MainWindow(QMainWindow):
             for button in (self.btn_stop, self.dev_btn_stop):
                 button.setText("RESUME" if paused else "PAUSE")
                 button.setEnabled(True)
-            self._set_status(("Status: PAUSED — settings retained" if paused else "Status: RUNNING")
+            reason = str(payload.get("reason", ""))
+            self._set_status((("Status: AUTO-PAUSED | " + reason if reason else "Status: PAUSED — settings retained") if paused else "Status: RUNNING")
                              + f" | {self._scan_progress_text(context)}",
                              state="paused" if paused else "running", profile=context)
             if paused:
@@ -6257,6 +6339,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Save Directory", str(self.save_path))
         if folder:
             self.save_path = Path(folder)
+            self.feedback_panel.load_saved_response()
             self.lbl_path.setText(str(self.save_path))
 
     def _set_main_run_controls_enabled(self, enabled: bool):
@@ -6631,6 +6714,19 @@ class MainWindow(QMainWindow):
     def _show_pause_choices(self):
         worker = self.worker
         if worker is None or not worker.is_paused or not worker.is_running:
+            return
+        if getattr(worker, "pause_reason", ""):
+            box = QMessageBox(self)
+            box.setWindowTitle("RF Power Auto Pause")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(worker.pause_reason + "\n\nResolve the RF fault, then press Resume. Closing this message keeps the optimizer paused.")
+            resume_button = box.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
+            keep_button = box.addButton("Keep Paused", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(keep_button)
+            box.setEscapeButton(keep_button)
+            box.exec()
+            if self.worker is worker and worker.is_running and box.clickedButton() is resume_button:
+                worker.resume()
             return
         best = worker._best_recorded
         box = QMessageBox(self)

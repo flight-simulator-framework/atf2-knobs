@@ -114,6 +114,7 @@ class IntensityTests(unittest.TestCase):
                 worker._current_pv_values = {"CM7L:phaseWrite": 0., "CM8L:phaseWrite": 0.}
                 worker._remember_best(1., True)
             worker._dump_initial_snapshot = initial
+            worker._start_power_monitor = Mock()
             measurements = iter([10., 2.])
             def measure():
                 score = next(measurements)
@@ -280,6 +281,7 @@ class IntensityTests(unittest.TestCase):
                     for value in (1., 2.):
                         results.append(worker._evaluate_point("L8", "CM8L:phaseWrite", value, "GROUP_BO", "test"))
                 worker._dump_initial_snapshot = Mock()
+                worker._start_power_monitor = Mock()  # RF subscriptions are tested with a separate fake IOC.
                 worker._measure_objective = Mock(side_effect=measure)
                 worker._emit_progress = emit
                 worker._run_group_bo = optimize
@@ -315,6 +317,7 @@ class IntensityTests(unittest.TestCase):
     def test_stop_wakes_pause_without_error_or_new_pv_writes(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(opt, "InterfaceATF2_LinacBT") as control:
             worker = opt.OptimizationWorker({"mode": "GROUP_BO"}, directory)
+            worker._start_power_monitor = Mock()
             paused = threading.Event()
             progress = []
             def emit(payload):
@@ -1248,6 +1251,7 @@ class IntensityTests(unittest.TestCase):
                 worker = opt.OptimizationWorker(cfg, directory)
                 worker._dump_initial_snapshot = Mock()
                 worker._read_current = Mock(return_value=0.)
+                worker._start_power_monitor = Mock()  # Never connect RF channels in this routing-only test.
                 seen = []
                 def scan(label, pv, *args, **kwargs):
                     seen.append(pv)

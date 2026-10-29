@@ -1077,6 +1077,7 @@ class MachineTests(unittest.TestCase):
 
     def test_live_transmission_uses_ten_distinct_pairs_and_restarts_after_loss(self):
         machine = self.machine(Mock())
+        machine.config = replace(machine.config, ict_auto_pause=True)
         events = []
         machine.emit = events.append
         up, down = machine.ict_pvs
@@ -1191,19 +1192,19 @@ class MachineTests(unittest.TestCase):
     def test_nonpositive_ict_is_detected_before_averaging_even_with_alarm(self):
         for value in (0., -1.):
             stamps = iter(range(100))
-            machine = FeedbackMachine(FeedbackConfig(), lambda: False, lambda: None, Mock(),
+            machine = FeedbackMachine(FeedbackConfig(ict_auto_pause=True), lambda: False, lambda: None, Mock(),
                                       lambda *a, **kw: Mock(get_with_metadata=Mock(side_effect=lambda **kw:
                                           dict(value=value, timestamp=next(stamps), severity=3))))
-            with self.assertRaisesRegex(BeamLoss, "10 consecutive"):
+            with self.assertRaisesRegex(BeamLoss, "20 consecutive"):
                 machine.transmission()
             losses = [c.args[0] for c in machine.emit.call_args_list if c.args[0]["pv"] == machine.ict_pvs[0]]
-            self.assertEqual([e["consecutive"] for e in losses], list(range(1, 11)))
+            self.assertEqual([e["consecutive"] for e in losses], list(range(1, 21)))
             self.assertEqual(losses[-1]["kind"], "beam_loss_detected")
 
     def test_loss_during_orbit_acquisition_and_wait(self):
         for operation in (lambda m: m.orbit(), lambda m: m.wait(.5), lambda m: m.write({TIMING_PV: 1.})):
             stamps = iter(range(100))
-            machine = FeedbackMachine(FeedbackConfig(), lambda: False, lambda: None, Mock(),
+            machine = FeedbackMachine(FeedbackConfig(ict_auto_pause=True), lambda: False, lambda: None, Mock(),
                                       lambda *a, **kw: Mock(get_with_metadata=Mock(side_effect=lambda **kw:
                                           dict(value=0., timestamp=next(stamps)))))
             with self.assertRaises(BeamLoss):
@@ -1211,23 +1212,24 @@ class MachineTests(unittest.TestCase):
 
     def test_ict_loss_counts_distinct_shots_per_channel_and_resets_on_recovery(self):
         machine = self.machine(Mock())
+        machine.config = replace(machine.config, ict_auto_pause=True)
         up, down = machine.ict_pvs
         for stamp, value in ((1, 0), (1, 0), (2, -1), (3, 1), (4, 0), (4, 0), (5, 0)):
             machine.check_ict(down, value, stamp)
             machine.check_ict(up, 1., stamp)
         self.assertEqual(machine._ict_loss_counts[down], 2)
-        for stamp in range(6, 13):
+        for stamp in range(6, 23):
             machine.check_ict(down, 0., stamp)
             machine.check_ict(down, 0., stamp)  # Cached rereads do not count.
             machine.check_ict(up, 1., stamp)
-        self.assertEqual(machine._ict_loss_counts[down], 9)
-        with self.assertRaisesRegex(BeamLoss, "10 consecutive"):
-            machine.check_ict(down, 0., 13)
-        machine.check_ict(down, 1., 14)
+        self.assertEqual(machine._ict_loss_counts[down], 19)
+        with self.assertRaisesRegex(BeamLoss, "20 consecutive"):
+            machine.check_ict(down, 0., 23)
+        machine.check_ict(down, 1., 24)
         self.assertEqual(machine._ict_loss_counts[down], 0)
 
     def test_stale_bad_ict_times_out_instead_of_counting_same_shot_repeatedly(self):
-        machine = FeedbackMachine(FeedbackConfig(sample_timeout_sec=.01), lambda: False, lambda: None, Mock(),
+        machine = FeedbackMachine(FeedbackConfig(sample_timeout_sec=.01, ict_auto_pause=True), lambda: False, lambda: None, Mock(),
                                   lambda *a, **kw: Mock(get_with_metadata=Mock(return_value=dict(value=0., timestamp=1.))))
         with self.assertRaises(TimeoutError):
             machine.check_beam(force=True)
@@ -1243,7 +1245,7 @@ class MachineTests(unittest.TestCase):
                 return dict(value=value, timestamp=stamp)
             return Mock(get_with_metadata=read)
         events = []
-        machine = FeedbackMachine(FeedbackConfig(), lambda: False, lambda: None, events.append, factory)
+        machine = FeedbackMachine(FeedbackConfig(ict_auto_pause=True), lambda: False, lambda: None, events.append, factory)
         self.assertEqual(machine.transmission(), .5)
         self.assertFalse(any(e["kind"] == "beam_loss_detected" for e in events))
         sample = next(e for e in events if e["kind"] == "ict_samples")
@@ -1336,6 +1338,113 @@ class GuiTests(unittest.TestCase):
         global _APP
         from PyQt6.QtWidgets import QApplication
         _APP = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def stored_response(frozen=True):
+        model = RecentResponse()
+        response = Plant().response
+        for i in range(4):
+            model.add(np.eye(4)[i] * .1, response[:, i] * .1)
+        model.frozen = frozen
+        model.measured_at = "2026-10-28T14:35:20+09:00"
+        return model
+
+    def test_saved_response_is_visible_before_start_without_machine_io_or_cache_write(self):
+        from Knobs.linac_feedback_gui import FeedbackPanel
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'active_feedback_response.json'
+            model = self.stored_response()
+            raw = json.dumps(dict(model.snapshot(), saved_at='2026-10-29T12:00:00+09:00'))
+            path.write_text(raw)
+            before = path.stat().st_mtime_ns
+            with patch('epics.PV', side_effect=AssertionError('Startup must not connect')), \
+                 patch('Knobs.linac_feedback_gui.FeedbackWorker') as worker:
+                panel = FeedbackPanel(lambda: directory, lambda: False)
+                try:
+                    self.assertIsNone(panel.worker)
+                    worker.assert_not_called()
+                    self.assertIn('2026-10-28 14:35:20', panel.response_group.title())
+                    self.assertIn('Available · fixed', panel.response_status.text())
+                    self.assertIn(str(path), panel.response_path.text())
+                    matrix = np.array([[float(panel.response_table.item(i,j).text()) for j in range(4)] for i in range(4)])
+                    np.testing.assert_allclose(matrix, model.matrix(), rtol=1e-3)
+                    self.assertFalse(panel.measure_response_check.isChecked())
+                    self.assertEqual(path.read_text(), raw)
+                    self.assertEqual(path.stat().st_mtime_ns, before)
+                finally:
+                    panel.close()
+
+    def test_response_preview_distinguishes_missing_partial_adaptive_and_invalid(self):
+        from Knobs.linac_feedback_gui import FeedbackPanel
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'active_feedback_response.json'
+            panel = FeedbackPanel(lambda: directory, lambda: False)
+            try:
+                self.assertIn('No saved response', panel.response_status.text())
+                data = self.stored_response(frozen=False).snapshot()
+                data['samples'] = data['samples'][:1]
+                path.write_text(json.dumps(data))
+                panel.reload_response_button.click()
+                self.assertIn('Incomplete response (1 observations)', panel.response_status.text())
+                self.assertIsNone(panel.response_table.item(0,0))
+                data = self.stored_response(frozen=False).snapshot()
+                path.write_text(json.dumps(data))
+                panel.reload_response_button.click()
+                self.assertIn('Available · adaptive', panel.response_status.text())
+                for invalid in ('broken JSON', json.dumps(dict(data, units='wrong units'))):
+                    path.write_text(invalid)
+                    panel.reload_response_button.click()
+                    self.assertIn('cannot be used', panel.response_status.text())
+                    self.assertIsNone(panel.response_table.item(0,0))
+                self.assertFalse(panel.measure_response_check.isChecked())
+            finally:
+                panel.close()
+
+    def test_response_preview_uses_new_save_folder_and_unknown_measurement_date(self):
+        from PyQt6.QtGui import QShowEvent
+        from Knobs.linac_feedback_gui import FeedbackPanel
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            data = self.stored_response().snapshot()
+            data.pop('measured_at')
+            data['saved_at'] = '2026-10-29T12:00:00+09:00'
+            (folder/'active_feedback_response.json').write_text(json.dumps(data))
+            panel = FeedbackPanel(lambda: folder, lambda: False)
+            try:
+                self.assertIn('measurement time unknown', panel.response_group.title())
+                self.assertIn('Acquisition date is unknown', panel.response_status.text())
+                folder = folder/'different-save-folder'
+                panel.showEvent(QShowEvent())
+                self.assertIn('No saved response', panel.response_status.text())
+                self.assertIn(str(folder), panel.response_path.text())
+                self.assertIsNone(panel.response_table.item(0,0))
+                panel.worker = Mock()
+                panel.response_status.setText('Live response')
+                panel.load_saved_response()
+                self.assertEqual(panel.response_status.text(), 'Live response')
+            finally:
+                panel.worker = None
+                panel.close()
+
+    def test_start_preserves_saved_response_display_and_disables_reload(self):
+        from Knobs.linac_feedback_gui import FeedbackPanel
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'active_feedback_response.json'
+            path.write_text(json.dumps(self.stored_response().snapshot()))
+            panel = FeedbackPanel(lambda: directory, lambda: False)
+            try:
+                with patch('Knobs.linac_feedback_gui.FeedbackWorker') as worker:
+                    panel.start()
+                    worker.return_value.start.assert_called_once()
+                    self.assertIn('2026-10-28 14:35:20', panel.response_group.title())
+                    self.assertIsNotNone(panel.response_table.item(0,0))
+                    self.assertFalse(panel.reload_response_button.isEnabled())
+                    panel.finished()
+                    self.assertTrue(panel.reload_response_button.isEnabled())
+            finally:
+                panel.worker = None
+                panel.plot_timer.stop()
+                panel.close()
 
     def test_bpm_monitor_updates_during_all_scans_and_ict_updates_during_orbit_work(self):
         from Knobs.linac_feedback_gui import FeedbackPanel
