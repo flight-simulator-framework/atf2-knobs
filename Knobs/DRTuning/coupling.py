@@ -106,6 +106,7 @@ class CouplingService:
 
     def prepare(self,target,opt,model_options,progress=lambda *_:None):
         opt.validate();self.backend.validate_mode('orbit');self.check()
+        baseline=self.backend.snapshot()
         model=self.reader.model_manager.prepare(model_options,self.check,progress)
         _,valid=self.orbit(opt)
         indices=np.array([self.backend.bpm_names.index(n) for n in model.bpm_names],int)
@@ -122,7 +123,10 @@ class CouplingService:
                         internal_indices=indices[np.asarray(geometry['internal_indices'],int)],
                         bpm_names=list(self.backend.bpm_names),positions_m=positions,
                         model_bpm_names=list(model.bpm_names))
-        geometry['baseline']=self.backend.snapshot();geometry['options']=asdict(opt)
+        if not self.backend.same_settings(self.backend.snapshot(),baseline):
+            raise ValueError('Machine settings changed during bump selection; select again')
+        if geometry.get('model_settings'):verify_inputs(self.backend,geometry['model_settings'])
+        geometry['baseline']=baseline;geometry['options']=asdict(opt)
         geometry['model_match_tunes']=bool(model_options.model_match_tunes)
         progress(100,'BPMs and correctors selected; no magnet changed')
         return geometry
@@ -130,7 +134,7 @@ class CouplingService:
     def select(self,model,target,valid,opt,model_options,table=None):
         kwargs=dict(excluded=model_options.excluded_bpms,fixed=model_options.fixed_actuators,
                     max_step_A=opt.max_step_A,preferred=bump_preset(target) if opt.use_presets else None,
-                    min_width_mm=opt.amplitude_mm,table=table)
+                    min_width_mm=opt.amplitude_mm,table=table,outside_max_mm=opt.outside_max_mm)
         try:
             geometry=select_geometry(model,target,valid,amplitude_mm=opt.amplitude_mm,**kwargs)
             geometry['selection_half_range_mm']=opt.amplitude_mm
@@ -145,8 +149,9 @@ class CouplingService:
     def available_targets(self,opt,model_options,progress=lambda *_:None):
         """Read-only eligibility; nonlinear closure is checked during calibration/scan."""
         opt.validate();self.backend.validate_mode('orbit');self.check()
+        baseline=self.backend.snapshot()
         model=self.reader.model_manager.prepare(model_options,self.check,lambda p,s:progress(p*.2,s))
-        baseline=self.backend.snapshot();_,valid=self.orbit(opt)
+        _,valid=self.orbit(opt)
         indices=np.array([self.backend.bpm_names.index(n) for n in model.bpm_names],int)
         targets=bump_targets();present=[t for t in targets if t in model.elements]
         table=transfer_table(model,present[0],other_targets=present[1:]) if present else None

@@ -59,6 +59,7 @@ class ModelPanel(QWidget):
     def inputs_changed(self):
         self.config();self.result=None;self.manager.model=None;self.manager.optics=None
         for panel in self.window.panels.values():panel.invalidate(clear_model_response=True)
+        if hasattr(self.window,'coupling_panel'):self.window.coupling_panel.settings_changed()
         self.status.setText('Model inputs changed; rebuild or CALC before use.')
     def load_lattice(self):
         path,_=QFileDialog.getOpenFileName(self,'Generated ATF lattice export','','JSON (*.json)')
@@ -89,6 +90,7 @@ class ModelPanel(QWidget):
         for panel in self.window.panels.values():
             panel.options.excluded_bpms=tuple(sorted(set(panel.options.excluded_bpms)|set(missing)))
             panel.options.fixed_actuators=tuple(sorted(set(panel.options.fixed_actuators)|set(magnets)));panel.invalidate()
+        if hasattr(self.window,'coupling_panel'):self.window.coupling_panel.settings_changed()
         self.status.setText('Excluded BPMs: '+(', '.join(missing) or 'none')+'; fixed unmapped magnets: '+(', '.join(magnets) or 'none'))
     def build(self):
         self.config();options=copy.deepcopy(self.window.panels['orbit'].options);options.model_match_tunes=self.match.isChecked()

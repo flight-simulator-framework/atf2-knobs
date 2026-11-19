@@ -83,7 +83,7 @@ class BumpGeometryUnavailable(ValueError):
     """Healthy acquisition, but no usable local geometry within the bounds."""
 
 
-def select_geometry(model,target,valid,*,excluded=(),fixed=(),amplitude_mm=.4,max_step_A=1.,preferred=None,table=None,min_width_mm=0.):
+def select_geometry(model,target,valid,*,excluded=(),fixed=(),amplitude_mm=.4,max_step_A=1.,preferred=None,table=None,min_width_mm=0.,outside_max_mm=.01):
     """Choose local correctors around an observable, kick-free BPM interval.
 
     Two H and two V correctors on each side allow four-dimensional closure.
@@ -131,8 +131,8 @@ def select_geometry(model,target,valid,*,excluded=(),fixed=(),amplitude_mm=.4,ma
         try:
             knob=constrained_step(response[outrows],np.zeros(len(outrows)),reconstruction@response,
                                   [0,0,1,0],-margin,margin)
-            if np.max(abs(response[outrows]@knob))*amplitude_mm>.01:
-                raise BumpGeometryUnavailable('Predicted outside COD exceeds 0.01 mm')
+            if np.max(abs(response[outrows]@knob))*amplitude_mm>outside_max_mm:
+                raise BumpGeometryUnavailable(f'Predicted outside COD exceeds {outside_max_mm:g} mm')
         except ValueError as exc:
             raise BumpGeometryUnavailable(str(exc)) from exc
         predicted_range=None
@@ -146,7 +146,7 @@ def select_geometry(model,target,valid,*,excluded=(),fixed=(),amplitude_mm=.4,ma
             objective=np.r_[np.zeros(len(selected)),1.];ends_feasible=[]
             for sign in (1.,-1.):
                 fit=linprog(sign*objective,A_eq=equality,b_eq=np.zeros(4),
-                    A_ub=np.r_[leakage,-leakage],b_ub=np.full(2*len(outrows),.01),bounds=bounds,method='highs')
+                    A_ub=np.r_[leakage,-leakage],b_ub=np.full(2*len(outrows),outside_max_mm),bounds=bounds,method='highs')
                 if not fit.success:raise BumpGeometryUnavailable('Cannot determine a bounded scan interval from model/current limits')
                 ends_feasible.append(float(fit.x[-1]))
             predicted_range=ends_feasible

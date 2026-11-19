@@ -280,7 +280,7 @@ class TuningSession(DRCorrectionWindow):
                 self.tool_actions[key]=action
     def correction_selection_changed(self):
         self.qm_dispersion.invalidate()
-        self.coupling_panel.invalidate()
+        self.coupling_panel.settings_changed()
 
     def open_tool(self,key):
         if self.task and self.task.isRunning():

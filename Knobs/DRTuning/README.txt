@@ -241,6 +241,25 @@ Vertical dispersion:
   after-SET dispersion and COD, not only the predicted residual.
 
 Bump / XSR coupling:
+  The 68 SD/SF positions default to the BPM/corrector names verified in the
+  2026-11-19 nominal RFTrack audit (4 A change budget, saved BPM validity mask).
+  Names are bundled in bump_presets.json; simulated currents, matrices and
+  scan ranges are NOT reused as machine measurements. Presets are rechecked
+  using current optics, BPM health, exclusions and supply bounds. An unusable
+  preset falls back to automatic local selection, with the reason recorded.
+  "Check BPMs / current limits" reads current settings without writing magnets
+  and checks all positions using one shared model linearization. Unavailable
+  entries are gray and disabled; the table and item tooltip show the reason.
+  Eligibility requires a bidirectional calibration probe and a model-predicted
+  interval wide enough for the fallback scan (default full width 0.4 mm).
+  That interval allows a shifted center and is bounded by parameter A/B,
+  max change from baseline and predicted outside COD. It does not guarantee
+  nonlinear closure: calibration and measured scan-range checks still run.
+  Recheck after machine settings change. Editing local options or shared device
+  exclusions clears eligibility; communication/model preparation failures stop
+  the check instead of marking all positions as physically unavailable.
+  Before selection the default names are shown; afterward the actual selected
+  names, preset/automatic source and any fallback reason are shown and saved.
   1. Rank SD/SF by |trim current| reads the individual skew trim supplies and
      lists SD1R/SF1R by descending absolute current, displaying the signed value.
      Failed readbacks are listed separately and never ranked as zero current.
