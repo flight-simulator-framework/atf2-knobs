@@ -46,6 +46,7 @@ class CorrectionTool(QWidget):
     def add_button(self,label,slot):
         button=QPushButton(label);button.clicked.connect(slot);self.buttons.addWidget(button);return button
     def set_table(self,headers,rows):
+        rows=list(rows)
         self.table.setColumnCount(len(headers));self.table.setHorizontalHeaderLabels(headers);self.table.setRowCount(len(rows))
         for i,row in enumerate(rows):
             for j,value in enumerate(row):self.table.setItem(i,j,QTableWidgetItem(str(value)))

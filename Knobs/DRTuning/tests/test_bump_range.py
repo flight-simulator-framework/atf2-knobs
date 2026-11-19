@@ -130,6 +130,16 @@ class BumpRangeGuiTests(unittest.TestCase):
                 options=calibrate.call_args.args[2]
                 self.assertFalse(options.model_match_tunes)
                 self.assertEqual(options.fixed_actuators,('unmapped',));self.assertTrue(shared.model_match_tunes)
+                result=dict(target='SD1R.1',actuators=[f'ZV{i}' for i in range(8)],
+                            centers=np.arange(8.)/10,knob_A_per_mm=np.arange(8.)/100)
+                # Exercise the actual completion callback: it passes zip rows
+                # to the table after calibration has already finished.
+                start.call_args.args[1](result)
+                self.assertIs(panel.calibration,result)
+                self.assertTrue(panel.scan_button.isEnabled())
+                self.assertEqual(panel.table.rowCount(),8)
+                self.assertEqual(panel.table.item(7,0).text(),'ZV7')
+                self.assertEqual(panel.table.item(7,2).text(),'0.07')
         finally:window.close();app.processEvents()
 
     def test_full_width_control_and_selected_range_are_explicit(self):
