@@ -6,7 +6,7 @@ from unittest.mock import patch
 import numpy as np
 from Knobs.DRCorrection.core import Options
 from Knobs.DRTuning.bump_maps import select_geometry,BumpGeometryUnavailable
-from Knobs.DRTuning.bump_presets import bump_preset,bump_targets
+from Knobs.DRTuning.bump_presets import bump_preset,bump_targets,preset_geometry,_catalog,_responses
 from Knobs.DRTuning.coupling import CouplingService,BumpOptions
 from Knobs.DRTuning.tests.test_bump_dispersion import BumpFixture,DispersionFixture
 
@@ -70,23 +70,78 @@ class PositionEligibilityTests(unittest.TestCase):
         self.targets=['SD1R.1','SF1R.1']
         self.model=SimpleNamespace(bpm_names=self.backend.bpm_names,elements=dict.fromkeys(self.targets),settings={})
     def run_check(self,selection):
-        with patch.object(self.service.reader.model_manager,'prepare',return_value=self.model),\
-             patch('Knobs.DRTuning.coupling.transfer_table',return_value={}) as table,\
+        with patch('Knobs.DRTuning.model.ModelManager.prepare',side_effect=AssertionError('No RFTrack')) as model,\
              patch('Knobs.DRTuning.coupling.bump_targets',return_value=self.targets),\
-             patch.object(self.service,'select',side_effect=selection):
+             patch('Knobs.DRTuning.coupling.preset_geometry',side_effect=selection):
             result=self.service.available_targets(BumpOptions(),Options(model_match_tunes=False))
-            table.assert_called_once()
+            model.assert_not_called()
         self.assertEqual(self.backend.commands,[])
         return result
     def test_failed_geometry_disables_only_that_position(self):
-        report=self.run_check([BumpGeometryUnavailable('BPMs unavailable'),self.backend.geometry()])
+        report=self.run_check([BumpGeometryUnavailable('BPMs unavailable'),dict(self.backend.geometry(),selection={'method':'preset'},predicted_range_mm=[-.4,.4])])
         self.assertFalse(report['rows'][0]['available']);self.assertTrue(report['rows'][1]['available'])
         self.assertEqual(report['rows'][0]['reason'],'BPMs unavailable')
     def test_io_failure_is_not_misreported_as_unavailable_geometry(self):
         with self.assertRaisesRegex(TimeoutError,'offline'):self.run_check(TimeoutError('offline'))
     def test_changed_settings_discard_availability(self):
-        def changed(*args):self.backend.offset+=1;return self.backend.geometry()
+        def changed(*args):
+            self.backend.offset+=1
+            return dict(self.backend.geometry(),selection={'method':'preset'},predicted_range_mm=[-.4,.4])
         with self.assertRaisesRegex(ValueError,'settings changed'):self.run_check(changed)
+
+
+class PresetBackend(BumpFixture):
+    """A linear fixture with real device names and saved response, no RFTrack."""
+    def __init__(self,target='SF1R.2'):
+        super().__init__()
+        from Knobs.DRTuning.hardware import load_hardware_profile
+        profile=load_hardware_profile();data=_catalog()
+        # Reverse acquisition order and add an unmapped channel to test binding.
+        self.bpm_names=list(reversed(data['bpm_names']))+['UNMAPPED']
+        self.positions_m=np.r_[list(reversed(data['positions_m'])),0.]
+        self.hcorrectors=profile['hcorrectors'];self.vcorrectors=profile['vcorrectors']
+        self.currents=dict.fromkeys(self.hcorrectors+self.vcorrectors,0.)
+        n=len(self.bpm_names);saved_n=len(data['bpm_names']);preset=bump_preset(target)
+        response=_responses()[target];self.response=np.zeros((2*n,len(self.currents)))
+        columns=[list(self.currents).index(label) for label in preset['actuators']]
+        for j,label in enumerate(data['bpm_names']):
+            i=self.bpm_names.index(label)
+            self.response[np.ix_([i,i+n],columns)]=response[[j,j+saved_n]]
+        self.valid=np.ones(n,bool);self.valid[-1]=False
+    def orbit(self):
+        v=self.response@self.read('correctors',self.hcorrectors+self.vcorrectors);n=len(self.bpm_names)
+        self.acquisitions+=1
+        return dict(names=self.bpm_names,x=v[:n],y=v[n:],tmit=np.ones(n),valid=self.valid.copy(),position_unit='mm')
+
+
+class SavedTransportTests(unittest.TestCase):
+    def test_all_presets_check_and_target_calibrates_with_rftrack_forbidden(self):
+        b=PresetBackend();service=CouplingService(b,threading.Event());opt=BumpOptions(settle_s=0.)
+        baseline=b.snapshot()
+        with patch('Knobs.DRTuning.model.ModelManager.prepare',side_effect=AssertionError('RFTrack forbidden')) as model,\
+             patch('Knobs.DRTuning.bump_maps.transfer_table',side_effect=AssertionError('Tracking forbidden')) as tracking:
+            report=service.available_targets(opt,Options(model_match_tunes=True))
+            self.assertEqual(len(report['rows']),68);self.assertTrue(all(r['available'] for r in report['rows']))
+            self.assertEqual(b.commands,[])
+            result=service.calibrate_target('SF1R.2',opt,Options(model_match_tunes=True))
+            self.assertTrue(result['calibrated']);self.assertFalse(result['model_match_tunes'])
+            self.assertEqual(result['selection']['method'],'preset')
+            self.assertEqual(b.snapshot(),baseline)
+            model.assert_not_called();tracking.assert_not_called()
+    def test_binding_preserves_reordered_bpm_transport_and_excludes_unmapped_channel(self):
+        b=PresetBackend();g=preset_geometry(b,'SF1R.2',b.valid,BumpOptions(),Options())
+        p=bump_preset('SF1R.2');n=len(b.bpm_names);i,j=g['internal_indices']
+        np.testing.assert_array_equal(g['reconstruction'][:,[i,i+n,j,j+n]],p['reconstruction'])
+        self.assertNotIn(n-1,g['outside_indices'])
+        np.testing.assert_allclose(g['reconstruction']@g['model_response']@g['model_knob_A_per_mm'],[0,0,1,0],atol=1.e-6)
+    def test_missing_bpm_and_current_margin_disable_preset_without_reselection(self):
+        b=PresetBackend();opt=BumpOptions();options=Options()
+        b.valid[b.bpm_names.index(bump_preset('SF1R.2')['internal_bpms'][0])]=False
+        with self.assertRaisesRegex(BumpGeometryUnavailable,'Required preset BPM'):
+            preset_geometry(b,'SF1R.2',b.valid,opt,options)
+        b.valid[:]=True;magnet=bump_preset('SF1R.2')['actuators'][0];b.currents[magnet]=5.
+        with self.assertRaisesRegex(BumpGeometryUnavailable,'current margin'):
+            preset_geometry(b,'SF1R.2',b.valid,opt,options)
 
 
 class PositionEligibilityGuiTests(unittest.TestCase):
@@ -106,10 +161,10 @@ class PositionEligibilityGuiTests(unittest.TestCase):
             self.assertEqual(panel.target.currentText(),'SF1R.1')
             panel.target.setCurrentIndex(0)
             with patch.object(window,'error') as error,patch.object(window,'start') as start:
-                panel.prepare();error.assert_called_once();start.assert_not_called()
+                panel.calibrate();error.assert_called_once();start.assert_not_called()
             panel.step.setValue(3.)
             self.assertIsNone(panel.availability);self.assertTrue(panel.target.model().item(0).isEnabled())
             panel.positions_checked(dict(rows=[]))
-            self.assertEqual(panel.target.currentIndex(),-1);self.assertFalse(panel.select_button.isEnabled())
+            self.assertEqual(panel.target.currentIndex(),-1);self.assertFalse(panel.calibrate_button.isEnabled())
             self.assertEqual(window.backend.commands,[])
         finally:window.close();app.processEvents()

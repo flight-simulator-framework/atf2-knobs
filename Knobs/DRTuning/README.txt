@@ -241,56 +241,33 @@ Vertical dispersion:
   after-SET dispersion and COD, not only the predicted residual.
 
 Bump / XSR coupling:
-  The 68 SD/SF positions default to the BPM/corrector names verified in the
-  2026-11-19 nominal RFTrack audit (4 A change budget, saved BPM validity mask).
-  Names are bundled in bump_presets.json; simulated currents, matrices and
-  scan ranges are NOT reused as machine measurements. Presets are rechecked
-  using current optics, BPM health, exclusions and supply bounds. An unusable
-  preset falls back to automatic local selection, with the reason recorded.
-  "Check BPMs / current limits" reads current settings without writing magnets
-  and checks all positions using one shared model linearization. Unavailable
-  entries are gray and disabled; the table and item tooltip show the reason.
-  Eligibility requires a bidirectional calibration probe and a model-predicted
-  interval wide enough for the fallback scan (default full width 0.4 mm).
-  That interval allows a shifted center and is bounded by parameter A/B,
-  max change from baseline and predicted outside COD. It does not guarantee
-  nonlinear closure: calibration and measured scan-range checks still run.
-  Recheck after machine settings change. Editing local options or shared device
-  exclusions clears eligibility; communication/model preparation failures stop
-  the check instead of marking all positions as physically unavailable.
-  Before selection the default names are shown; afterward the actual selected
-  names, preset/automatic source and any fallback reason are shown and saved.
-  1. Rank SD/SF by |trim current| reads the individual skew trim supplies and
-     lists SD1R/SF1R by descending absolute current, displaying the signed value.
-     Failed readbacks are listed separately and never ranked as zero current.
-  2. Select a target and Select BPMs / correctors. Recorded-settings optics are
-     prepared with "Match model tunes (optional)" OFF by default on this page.
-     This skips QF1R/QF2R tune matching only; initial model stability remains
-     required. This Bump setting is independent of the Dispersion/model page
-     tune-match switches. Changing it requires selection and calibration again.
-     The selected setting is recorded as model_match_tunes in Bump data.
-     Unmatched model transport still predicts the target displacement; measured
-     calibration and outside COD checks do not validate its absolute scale.
-     Recorded-settings optics are
-     linearized once; periodic responses solve (I-M)z=kick. Local element kick
-     derivatives retain RFTrack's actual electron sign/coordinate convention.
-     Two healthy BPMs bracket the target in a corrector-free interval. Two V
-     and two H correctors on each side (8 total) provide four-dimensional
-     closure; H correctors suppress horizontal leakage from coupling. Physical
-     ring order, wrap-around, rank, enabled BPMs/magnets and current margins are
-     checked. The selected names and model currents are shown before calibration.
-     A poor/unavailable local geometry is rejected, not replaced with a global
-     bump. Target mm and angle are inferred from internal BPMs using model
-     transport; no direct position monitor at the sextupole is implied.
-  3. Calibrate and close bump measures both X/Y response columns with 10-update
-     BPM averages, then fits outside COD with exact internal position/angle
-     constraints and bounded currents. Both signs are tested; baseline currents
-     are restored after calibration. Default max baseline current change is
-     4 A, outside max .01 mm and outside RMS .005 mm. Tolerances are editable.
-     Calibration requires the small +/-0.1 mm probe, not proof that the full
-     requested scan already closes. If full-range model selection fails, a
-     geometry feasible at the calibration amplitude is tried before giving up.
-  4. Scan width [mm] is the FULL width, default 0.8 mm. Scan -> fit -> set optimum
+  Choose a bump position to use its saved BPM/corrector combination directly.
+  There is no Select BPMs / correctors step and no runtime RFTrack model
+  preparation, lattice matching or QF tune matching in the Bump path.
+  The 68 presets bundle the nominal 2026-11-19 audit's device names and
+  internal-BPM transport in bump_presets.json, plus nominal response arrays
+  in bump_preset_responses.npz. Saved currents/limits are never applied.
+  Target mm is inferred from saved nominal transport; it is not a direct
+  sextupole position measurement. Actual corrector responses are measured
+  during every calibration, and actual COD closure is required before scanning.
+  "Check BPMs / current limits" optionally refreshes availability for all
+  positions without magnet writes. Missing/invalid required BPMs, insufficient
+  outside BPMs, excluded/missing correctors and inadequate current budget make
+  a position gray and unselectable, with the reason in the table and tooltip.
+  Presets do not silently switch to another combination or invoke RFTrack.
+  Eligibility uses current readbacks, parameter A/B and max change from
+  baseline, with nominal response only to estimate the reachable interval.
+  A shifted interval with the fallback width (default 0.4 mm) is sufficient;
+  the bidirectional calibration probe must also fit. Measured closure still
+  determines the actual scan interval. Recheck after machine settings change.
+  Rank SD/SF by |trim current| optionally sorts positions by signed current's
+  absolute value; failed readbacks are listed separately.
+  1. Calibrate and close bump automatically checks the selected preset against
+     current BPMs and limits, then measures X/Y corrector response columns with
+     10-update BPM averages. Both signs are tested and baseline currents are
+     restored. Default max baseline current change is 4 A, outside max .01 mm
+     and outside RMS .005 mm. Calibration uses the small +/-0.1 mm probe.
+  2. Scan width [mm] is the FULL width, default 0.8 mm. Scan -> fit -> set optimum
      first checks COD closure for a centered [-0.4,+0.4] mm window. If unavailable,
      it tries shifted windows of the same 0.8 mm width, nearest zero first with
      0.1 mm center increments. All windows contain the original zero, so the

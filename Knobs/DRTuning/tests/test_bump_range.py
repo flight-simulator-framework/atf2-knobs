@@ -104,41 +104,32 @@ class AdaptiveBumpRangeTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.s.scan(self.g,self.opt)
         self.assertEqual(self.b.snapshot(),self.baseline);self.assertFalse(self.s.last_result['applied'])
 
-    def test_selection_can_use_calibration_range_if_full_symmetric_range_is_infeasible(self):
-        from types import SimpleNamespace
-        from Knobs.DRCorrection.core import Options
-        model=SimpleNamespace(bpm_names=self.b.bpm_names)
-        candidate=copy.deepcopy(self.b.geometry());candidate['model_response']=self.b.response.copy()
-        with patch.object(self.s.reader.model_manager,'prepare',return_value=model),\
-             patch('Knobs.DRTuning.coupling.select_geometry',side_effect=[
-                 ValueError('No observable, bounded local bump geometry: full range unavailable'),candidate]) as select:
-            geometry=self.s.prepare('SF1R.1',self.opt,Options())
-        self.assertEqual([c.kwargs['amplitude_mm'] for c in select.call_args_list],[.4,.1])
-        self.assertEqual(geometry['selection_half_range_mm'],.1)
-        self.assertEqual(self.b.commands,[])
+    def test_prepare_uses_saved_preset_without_model_preparation(self):
+        candidate=copy.deepcopy(self.b.geometry())
+        with patch('Knobs.DRTuning.model.ModelManager.prepare',side_effect=AssertionError('RFTrack must not run')) as model,\
+             patch('Knobs.DRTuning.coupling.preset_geometry',return_value=candidate) as preset:
+            geometry=self.s.prepare('SF1R.1',self.opt)
+        model.assert_not_called();preset.assert_called_once()
+        self.assertEqual(geometry['baseline'],self.b.snapshot());self.assertEqual(self.b.commands,[])
 
 
 class BumpRangeGuiTests(unittest.TestCase):
-    def test_bump_tune_matching_is_optional_and_independent(self):
-        from PyQt6.QtWidgets import QApplication
+    def test_bump_calibrates_directly_without_selection_or_tune_controls(self):
+        from PyQt6.QtWidgets import QApplication,QPushButton
         from Knobs.DRTuning.gui import TuningSession
         from Knobs.DRTuning.tests.test_bump_dispersion import DispersionFixture
         app=QApplication.instance() or QApplication([]);window=TuningSession(DispersionFixture())
         try:
             panel=window.coupling_panel;shared=window.panels['dispersion'].options
             shared.model_match_tunes=True;shared.fixed_actuators=('unmapped',)
-            with patch.object(window,'start') as start,patch.object(panel.service,'prepare') as prepare:
-                panel.prepare();start.call_args.args[0](lambda *_:None)
-                options=prepare.call_args.args[2]
+            self.assertFalse(hasattr(panel,'match_tunes'));self.assertFalse(hasattr(panel,'select_button'))
+            self.assertFalse(any('Select BPMs' in b.text() for b in panel.findChildren(QPushButton)))
+            self.assertTrue(panel.calibrate_button.isEnabled())
+            with patch.object(window,'start') as start,patch.object(panel.service,'calibrate_target') as calibrate:
+                panel.calibrate();start.call_args.args[0](lambda *_:None)
+                options=calibrate.call_args.args[2]
                 self.assertFalse(options.model_match_tunes)
-                self.assertEqual(options.fixed_actuators,('unmapped',))
-                self.assertTrue(shared.model_match_tunes)
-                panel.geometry={};panel.calibration={};panel.scan_button.setEnabled(True)
-                panel.match_tunes.setChecked(True)
-                self.assertIsNone(panel.geometry);self.assertIsNone(panel.calibration)
-                self.assertFalse(panel.scan_button.isEnabled())
-                panel.prepare();start.call_args.args[0](lambda *_:None)
-                self.assertTrue(prepare.call_args.args[2].model_match_tunes)
+                self.assertEqual(options.fixed_actuators,('unmapped',));self.assertTrue(shared.model_match_tunes)
         finally:window.close();app.processEvents()
 
     def test_full_width_control_and_selected_range_are_explicit(self):

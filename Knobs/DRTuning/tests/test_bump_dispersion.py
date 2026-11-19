@@ -154,19 +154,13 @@ class CouplingTests(unittest.TestCase):
     def test_flat_size_fit_rejected(self):
         points=[dict(amplitude_mm=a,xsr=dict(mean=10.,sem=.01)) for a in np.linspace(-.4,.4,5)]
         with self.assertRaisesRegex(ValueError,'curvature'):fit_size(points,.4)
-    def test_excluded_model_bpms_are_lifted_to_acquisition_order(self):
-        from types import SimpleNamespace
-        keep=np.array([0,1,2,4,5,6,7]);rows=np.r_[keep,keep+8];g=self.b.geometry()
-        g.update(bpm_names=[self.b.bpm_names[i] for i in keep],positions_m=keep.astype(float),
-                 reconstruction=self.b.reconstruction[:,rows],model_response=self.b.response[rows],
-                 outside_indices=np.arange(2,7),outside_rows=np.r_[np.arange(2,7),np.arange(9,14)])
-        model=SimpleNamespace(bpm_names=g['bpm_names'])
-        with patch.object(self.s.reader.model_manager,'prepare',return_value=model),patch('Knobs.DRTuning.coupling.select_geometry',return_value=g) as select:
-            result=self.s.prepare('SF1R.1',self.o,Options(excluded_bpms=('B3',)))
-        self.assertEqual(len(select.call_args.args[2]),7)
-        self.assertEqual(result['bpm_names'],self.b.bpm_names)
-        np.testing.assert_allclose(result['reconstruction'],self.b.reconstruction)
-        self.assertNotIn(3,result['outside_indices']);np.testing.assert_allclose(result['model_response'][3],0.)
+    def test_prepare_passes_shared_exclusions_to_preset_binding_without_model(self):
+        candidate=self.b.geometry();options=Options(excluded_bpms=('B3',))
+        with patch('Knobs.DRTuning.model.ModelManager.prepare',side_effect=AssertionError('No RFTrack')) as model,\
+             patch('Knobs.DRTuning.coupling.preset_geometry',return_value=candidate) as preset:
+            result=self.s.prepare('SF1R.1',self.o,options)
+        model.assert_not_called();self.assertIs(preset.call_args.args[4],options)
+        self.assertEqual(result['bpm_names'],self.b.bpm_names);self.assertEqual(self.b.commands,[])
 
 
 class DispersionFixture(DemoBackend):
