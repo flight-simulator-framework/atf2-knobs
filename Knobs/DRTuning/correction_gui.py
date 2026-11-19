@@ -180,16 +180,22 @@ class QMDispersionPanel(CorrectionTool):
         self.excluded.setText(', '.join(defaults.fixed_actuators))
         self.excluded.setToolTip('Comma-separated physical QM trim names');self.form.addRow('Exclude QM trims',self.excluded)
         self.maximum=control(self.form,'Greedy maximum trims',8,1,16,0)
-        self.probe=control(self.form,'QM probe ± [A]',defaults.probe_A,.001,1.)
+        self.probe=control(self.form,'Initial QM probe width [A]',defaults.probe_A,.001,1.)
+        self.probe.setToolTip('Normally current +/- this width. At a limit, clip each endpoint independently.\n'
+                             'A one-sided pair is allowed; response uses the actual readback difference.')
         self.adaptive=QCheckBox('Adapt QM probe to target response / noise');self.adaptive.setChecked(defaults.adaptive_probe)
         self.form.addRow(self.adaptive)
         self.probe_limit=control(self.form,'Probe absolute current limit ± [A]',defaults.probe_current_limit_A,.001,3.)
+        self.probe_limit.setToolTip('Intersect [-limit,+limit] with supply parameter.A (lower) / parameter.B (upper).\n'
+                                   'Probe endpoints are automatically clipped to this range.')
         self.target_snr=control(self.form,'Target response / noise',defaults.target_snr,1.,100.,1)
-        self.target_snr.setToolTip('Straight-section RMS horizontal dispersion change between QM +/- probes.\n'
+        self.target_snr.setToolTip('Straight-section RMS horizontal dispersion change between the measured QM current pair.\n'
             'Target = this factor × uncertainty estimated from the valid BPM samples.\n'
             'Response and target are displayed as RF orbit differences in micrometres.\n'
             'Probe width doubles between pairs; each pair restores the baseline current.')
         self.step=control(self.form,'QM correction limit ± [A]',defaults.step_A,.001,2.)
+        self.step.setToolTip('Maximum Apply change from the CALC baseline. This does not limit the probe width.\n'
+                             'The solver also enforces each supply current limit. Apply gain is 1.')
         self.rf=control(self.form,'RF full span [kHz]',defaults.frequency_change_khz,.01,10.)
         self.measure_tunes=QCheckBox('Measure / constrain H and V tunes');self.measure_tunes.setChecked(defaults.measure_tunes)
         self.form.addRow(self.measure_tunes)

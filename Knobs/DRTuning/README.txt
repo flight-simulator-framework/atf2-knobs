@@ -33,16 +33,40 @@ QM dispersion:
   QM1R–QM4R and QM20R–QM23R, both .1/.2 (16 individually mapped trims, including
   QM2). QM2R.1 and QM2R.2 are excluded by default (14 active candidates); the
   Exclude QM trims field contains these actual selections, not placeholder text.
-  Defaults: QM probes +/-0.1 A, correction step bound +/-2 A from the baseline,
+  Defaults: initial QM probe width .01 A, correction step bound +/-2 A from the baseline,
   and RF full span 4 kHz (baseline +/-2 kHz). Absolute supply limits still apply.
   The existing confirmed site mappings, coil calibration, current limits
   and readback checks are used. Explicit exclusions are available in the panel.
-  CALC measures each +/- current response, normalizing by actual readback span.
+  CALC measures a two-current response, normalizing by actual readback span.
+  The probe uses the intersection of parameter.A (lower) / parameter.B (upper)
+  with the absolute probe current cap [-3,+3] A. Parameter PVs take precedence
+  over static limits when both are configured; limits are reread before each
+  pair and validated again by the live backend before each write.
+  Each endpoint is automatically clipped, independently. At a 0 A lower limit,
+  a requested [-.01,+.01] A pair becomes [0,+.01] A. Near a limit the pair may
+  be asymmetric; at a limit it is one-sided. The actual measured current span,
+  not twice the nominal probe width, is always used in the response derivative.
+  A baseline already outside the allowed probe range, or an unresolved span,
+  is reported with the magnet/current/limits instead of moving it silently.
+  QM correction limit applies to the final correction, not to the probe range.
+  Adaptive QM probing is ON by default: double the width between restored pairs
+  until the straight horizontal dispersion change reaches target S/N=5, or the
+  current range / 12-pair maximum is reached. The target uses RMS uncertainty
+  from valid-sample SEM of the four RF +/- orbit means in the QM current pair.
+  Log/table values convert the dispersion change to an RF orbit difference in
+  micrometres: target = 5 * measured uncertainty, not a fixed displacement.
+  This estimate does not account for slow drift, systematic errors or correlated
+  PV updates. Zero observed scatter is shown explicitly, not as a finite S/N.
+  New invalid BPMs during adaptive probing stop further growth and restore the
+  original current. At the width/attempt limit, weak responses are retained in
+  the record but omitted from the adaptive-mode correction solver. If none are
+  usable, no correction proposal is produced. S/N is adjustable in the panel.
   Each dispersion observation measures nominal COD plus symmetric RF offsets,
   with 10 BPM updates at each setting; RF and temporary currents are restored.
-  With the default 14 active trims: 29 dispersion observations, 87 COD settings,
+  With one pair per default 14 active trims: 29 dispersion observations, 87 COD settings,
   870 BPM frames. Enabling all 16 gives 33 observations / 99 settings / 990 frames.
-  This can take several minutes with live settling.
+  Each extra adaptive pair adds 6 COD settings / 60 BPM updates. This can take
+  several minutes with live settling.
   "Lost all common valid straight-section BPMs" means no enabled straight BPM
   remained usable through every accepted observation, not necessarily that all
   BPMs failed simultaneously. QM dispersion excludes a BPM after FIVE consecutive
@@ -64,10 +88,11 @@ QM dispersion:
   Arc Dx, Dy and COD target their measured baselines. These are named physical
   BPM regions, not an assumption that the entire ring has zero dispersion.
   The default uses all enabled trims in bounded regularized SVD; Greedy chooses
-  the best response columns up to the selected maximum. COD linear constraints
-  apply in both modes (default |delta COD| <= .05 mm). This is a hard maximum
-  at every enabled valid BPM in BOTH planes, not an RMS limit. It is also
-  checked against actual before/after COD after SET, with rollback on excess.
+  the best response columns up to the selected maximum. At the operator's
+  request, the COD hard limit is OFF by default for probing, solving and SET.
+  COD remains a weighted objective targeting its measured baseline. Enabling
+  Enforce max COD change restores the .05 mm maximum in both planes (not RMS),
+  including probe checks and measured post-SET rollback on excess.
   This extra .05 mm guard is not present in legacy drhdispbyq.n; coddispersion.n
   includes COD as a weighted fit objective instead. Its factor1=.05 is a
   dispersion weight, not a .05 mm COD limit. Appropriate tolerance depends on
@@ -84,8 +109,10 @@ QM dispersion:
   check Measure / constrain H and V tunes, then run a fresh CALC. Tune-enabled
   operation constrains |delta tune| <= .002 by default. Q-modulation beta scans
   keep their separate tune measurement requirements.
-  SET verifies actual dispersion improvement and COD (also tunes when enabled), restoring the
-  changed trims if measurement fails or a tolerance is exceeded. The graph
+  Apply gain is 1: I_set = I_baseline + proposed delta_I. The solver already
+  bounds delta_I by +/-2 A and by the absolute supply limits. SET verifies
+  actual dispersion improvement, and COD/tunes only when their constraints
+  are enabled. Failed measurements or enabled checks restore changed trims. The graph
   shows measured before, predicted, target, and measured after, for Dx/Dy/X/Y.
   To exclude a suspect BPM after CALC: BPM selection > uncheck it > OK >
   Recalculate (measured response). This uses the measured baseline and response
@@ -97,6 +124,28 @@ QM dispersion:
   enabling tune constraints requires a measured tune response. After SET,
   restore original QM currents or run a new CALC before recalculating. Apply
   still verifies the live settings match the original CALC baseline.
+  CALC automatically writes qm_scan_*.checkpoint.json under ~/DRTuning/results/
+  (or the chosen save folder). Baseline and each completed QM pair are saved;
+  adaptive attempts and available raw frames are also recorded. A pair is
+  committed only after both observations and current restoration succeed.
+  Writes use a temporary file, flush/fsync, and atomic replacement so an
+  interrupted write preserves the previous checkpoint. Saving failure stops
+  the scan after restoration; it does not continue accumulating unsaved pairs.
+  Resume unfinished QM scan uses the current partial result, or first choose
+  Load QM scan checkpoint after restarting the GUI. Completed response columns
+  are reused; the unfinished QM starts again from the current initial width
+  (default .01 A). Loading an older .1 A scan never changes that field back.
+  Resume checks machine identity/profile, BPM order, acquisition RF/tune
+  settings, QM selection, supply limits and original machine settings before
+  any probe. It remeasures the baseline (30 BPM updates), resets invalid streaks,
+  and uses that current baseline as the fit target while retaining prior columns.
+  Baseline history and interrupted frames remain in the saved data. GUI resume
+  creates a new checkpoint file, preserving the loaded original.
+  If a crash left a QM or RF offset applied, Resume refuses to move anything.
+  Restore original QM / RF settings explicitly restores those scan settings;
+  any changed correctors/skews must separately match the saved baseline.
+  Automatic scan resume does not resume or automatically perform Apply.
+  Old files without committed scan state cannot recover partial responses.
   Successful Apply automatically saves JSON and PNG to ~/DRTuning/results/,
   with unique timestamped names and the actual before/after measurements,
   fit options, original acquisition options, response and applied currents.

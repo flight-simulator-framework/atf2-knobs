@@ -59,8 +59,26 @@ def straight_bpms(names):
 
 def quad_limits(backend,n):
     p=backend.quadrupoles[n]
+    if p.get('lower_limit_pv') and p.get('upper_limit_pv'):
+        return float(backend.get(p['lower_limit_pv'])),float(backend.get(p['upper_limit_pv']))
     if 'limits_A' in p:return tuple(map(float,p['limits_A']))
-    return float(backend.get(p['lower_limit_pv'])),float(backend.get(p['upper_limit_pv']))
+    raise ValueError('No QM supply limits configured: '+n)
+
+
+def probe_pair(magnet,center,limits,opt,width):
+    """Clip the two probe points, allowing one-sided differences at a limit."""
+    if not np.isfinite(limits).all() or limits[0]>=limits[1]:
+        raise ValueError(f'Invalid QM supply limits for {magnet}: {limits}')
+    lower=max(float(limits[0]),-opt.probe_current_limit_A)
+    upper=min(float(limits[1]),opt.probe_current_limit_A)
+    detail=(f'{magnet}: current={center:+.6g} A; supply=[{limits[0]:+.6g}, {limits[1]:+.6g}] A; '
+            f'probe absolute limit=+/-{opt.probe_current_limit_A:g} A; allowed=[{lower:+.6g}, {upper:+.6g}] A')
+    if not lower<=center<=upper:
+        raise ValueError('QM current outside the allowed probe range. '+detail+
+                         '. QM correction limit controls Apply only; exclude this QM or review the current / probe limits.')
+    targets=np.array([max(lower,center-width),min(upper,center+width)])
+    if targets[1]-targets[0]<=1.e-6:raise ValueError('No resolved QM probe range. '+detail)
+    return targets,max(center-lower,upper-center)
 
 
 def restore_quads(backend,names,values):
@@ -180,7 +198,7 @@ class DispersionService:
             target_snr=opt.target_snr,usable=bool(signal>1.e-12 and signal>=opt.target_snr*noise),
             orbit_response_rms_mm=signal*abs(dp),orbit_noise_rms_mm=noise*abs(dp),
             target_change_mm=opt.target_snr*noise*abs(dp),bpm_count=int(mask.sum()),
-            definition='RMS straight Dx change between QM +/- probes; uncertainty from valid-sample SEM at RF +/- offsets')
+            definition='RMS straight Dx change between the two measured QM currents; uncertainty from valid-sample SEM at RF +/- offsets')
 
     def calculate(self,opt,progress=lambda *_:None,event=lambda *_:None,checkpoint_path=None):
         opt.validate();self.check();b=self.backend;b.validate_mode('dispersion')
@@ -194,11 +212,9 @@ class DispersionService:
         if not np.any(straight&enabled):raise ValueError('No enabled BPM in MB19R–MB31R / MB66R–MB80R')
         centers=np.array([b.quadrupole_current(n) for n in names]);limits=np.array([quad_limits(b,n) for n in names]).T
         if not np.isfinite(np.r_[centers,limits.ravel()]).all() or np.any(limits[0]>=limits[1]):raise ValueError('Invalid QM limits / current')
-        probe_margin=np.minimum(centers-np.maximum(limits[0],-opt.probe_current_limit_A),
-                                np.minimum(limits[1],opt.probe_current_limit_A)-centers)
-        spans=np.minimum(opt.probe_A,probe_margin)
-        if np.any(spans<=1.e-6):raise ValueError('No symmetric QM probe margin; exclude the limited trim')
-        for n,c,h in zip(names,centers,spans):b.validate_quadrupole_targets(n,[c-h,c,c+h])
+        for j,(n,c) in enumerate(zip(names,centers)):
+            targets,_=probe_pair(n,c,limits[:,j],opt,opt.probe_A)
+            b.validate_quadrupole_targets(n,[targets[0],c,targets[1]])
         if checkpoint_path is not None:prepare_destination(checkpoint_path)
         baseline=b.snapshot();self.reader.reset_sampling()
         measured,valid,tunes,tune_evidence=self.signal(opt)
@@ -230,23 +246,24 @@ class DispersionService:
             self.checkpoint(data,checkpoint_path,event)
             for j in range(state['completed'],len(names)):
                 self.check();n=names[j];c=centers[j]
-                margin=min(c-max(limits[0,j],-opt.probe_current_limit_A),min(limits[1,j],opt.probe_current_limit_A)-c)
-                if margin<=1.e-6:raise ValueError('No symmetric QM probe margin inside absolute current limit: '+n)
-                h=min(opt.probe_A,margin);state['active_magnet']=n
+                h=opt.probe_A;state['active_magnet']=n
                 for attempt in range(opt.maximum_probe_pairs if opt.adaptive_probe else 1):
+                    limits[:,j]=quad_limits(b,n);data['limits']=limits.copy()
+                    # Read parameter.A/B again before each pair; the live backend also validates each write.
+                    targets,margin=probe_pair(n,c,limits[:,j],opt,h)
                     frames=[];qs=[];variances=[];readbacks=[];pair_valid=valid.copy()
                     state['status']='probing';data['restored']=False
                     self.checkpoint(data,checkpoint_path,event)
-                    for target in (c-h,c,c+h):b.validate_quadrupole_targets(n,[target])
+                    for target in (targets[0],c,targets[1]):b.validate_quadrupole_targets(n,[target])
                     try:
-                        for sign in (-1,1):
-                            self.check();b.set_quadrupole_current(n,c+sign*h)
+                        for target in targets:
+                            self.check();b.set_quadrupole_current(n,float(target))
                             reading=float(b.quadrupole_current(n))
                             if not np.isfinite(reading):raise ValueError('Invalid QM current readback: '+n)
                             readbacks.append(reading);start=len(self.reader.orbit_measurements)
                             frame,mask,q,evidence=self.signal(opt)
                             diagnostic=self.validity_report(mask,pair_valid,enabled,straight,start,
-                                f'{n} probe {sign*h:+g} A (readback {reading:+g} A)',opt)
+                                f'{n} probe {target-c:+g} A (readback {reading:+g} A)',opt)
                             data['validity_history'].append(diagnostic);pair_valid &= mask;data['valid']=pair_valid&enabled
                             progress(round(90*j/len(names)),diagnostic['message'])
                             if not np.any(pair_valid&enabled&straight):
@@ -259,17 +276,17 @@ class DispersionService:
                                 raise ValueError('Measured COD change exceeds QM probe tolerance; restored')
                             frames.append(frame);variances.append(self.signal_variance.copy())
                             if opt.measure_tunes:
-                                qs.append(q);data['scan_tunes'].append(dict(magnet=n,current_A=c+sign*h,measurement=evidence))
+                                qs.append(q);data['scan_tunes'].append(dict(magnet=n,current_A=target,measurement=evidence))
                     finally:
                         try:restore_quads(b,[n],[c]);data['restored']=True
                         except BaseException as exc:data['restoration_error']=str(exc);raise
                     measured_span=readbacks[1]-readbacks[0]
-                    if measured_span<=max(1.e-6,h*.2):raise ValueError('No resolved QM current probe: '+n)
+                    if measured_span<=max(1.e-6,(targets[1]-targets[0])*.1):raise ValueError('No resolved QM current probe: '+n)
                     quality=self.probe_quality(frames,variances,pair_valid&enabled&straight,opt)
                     finished=(not opt.adaptive_probe or quality['usable'] or h>=margin-1.e-12 or attempt+1==opt.maximum_probe_pairs)
-                    data['probe_attempts'].append(dict(magnet=n,half_span_A=h,requested=[c-h,c+h],actual=readbacks,
+                    data['probe_attempts'].append(dict(magnet=n,half_span_A=h,requested=targets.copy(),actual=readbacks,
                         quality=quality,accepted=finished,signal_frames=frames,signal_variances=variances))
-                    progress(round(90*j/len(names)),f"QM probe: {n} +/-{h:g} A; response {quality['orbit_response_rms_mm']*1000:.3g} um / "
+                    progress(round(90*j/len(names)),f"QM probe: {n} [{targets[0]:+g}, {targets[1]:+g}] A; response {quality['orbit_response_rms_mm']*1000:.3g} um / "
                         f"target {quality['target_change_mm']*1000:.3g} um; "+('accepted' if quality['usable'] else 'below target'))
                     if finished:break
                     self.checkpoint(data,checkpoint_path,event)
@@ -278,7 +295,8 @@ class DispersionService:
                 columns.append(((frames[1]-frames[0])/measured_span).ravel())
                 if opt.measure_tunes:qcolumns.append(((qs[1]-qs[0]+.5)%1-.5)/measured_span)
                 data['probe_quality'].append(quality)
-                data['probe_readbacks'].append(dict(magnet=n,requested=[c-h,c+h],actual=readbacks))
+                data['probe_readbacks'].append(dict(magnet=n,requested=targets.copy(),actual=readbacks,
+                    scheme='symmetric' if np.isclose(c-targets[0],targets[1]-c,rtol=0,atol=1.e-12) else 'asymmetric / one-sided'))
                 state.update(completed=j+1,columns=columns.copy(),tune_columns=qcolumns.copy(),common_valid=valid.copy(),
                              active_magnet=None,status='running')
                 self.checkpoint(data,checkpoint_path,event)
