@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
+from .bump_presets import bump_preset
 from .dispersion import DispersionService,DispersionOptions,QM_PROBE_PRESETS_A
 from .qm_checkpoint import load_checkpoint
 
@@ -71,8 +72,11 @@ class CouplingPanel(CorrectionTool):
     def __init__(self,window):
         super().__init__(window);self.service=CouplingService(window.backend,window.service.cancel)
         self.geometry=None;self.calibration=None;self.points=[];self.samples={};self.fits=[];self.last_orbit=None
+        self.availability=None
         self.target=QComboBox();self.target.addItems([f'{f}.{i}' for f in ('SD1R','SF1R') for i in range(1,35)])
         self.form.addRow('SD / SF bump position',self.target)
+        self.use_presets=QCheckBox('Prefer locally verified BPMs / correctors');self.use_presets.setChecked(True)
+        self.form.addRow(self.use_presets)
         self.match_tunes=QCheckBox('Match model tunes (optional)')
         self.match_tunes.setChecked(False)
         self.match_tunes.setToolTip('Off: use imported model strengths without QF1R/QF2R tune matching. Model stability is still required. Target displacement remains a model estimate; measured bump calibration and outside COD checks are required.')
@@ -88,41 +92,89 @@ class CouplingPanel(CorrectionTool):
         self.controls.insertWidget(0,QLabel('BPM: 10 updates / XSR: 10 updates\nXSR:PROJ_V_SIGMA — vertical size [µm]'))
         self.range_status=QLabel('Requested width 0.800 mm; fallback 0.400 mm. Center may shift.')
         self.range_status.setWordWrap(True);self.controls.insertWidget(1,self.range_status)
+        self.preset_status=QLabel();self.preset_status.setWordWrap(True);self.controls.insertWidget(2,self.preset_status)
+        self.availability_status=QLabel('Positions not checked against current BPMs / currents.');self.availability_status.setWordWrap(True)
+        self.controls.insertWidget(3,self.availability_status)
         self.add_button('Rank SD/SF by |trim current|',self.rank)
-        self.add_button('1. Select BPMs / correctors',self.prepare)
+        self.add_button('Check BPMs / current limits',self.check_positions)
+        self.select_button=self.add_button('1. Select BPMs / correctors',self.prepare)
         self.calibrate_button=self.add_button('2. Calibrate and close bump',self.calibrate)
         self.scan_button=self.add_button('3. Scan → fit → set optimum',self.scan)
         self.reset_button=self.add_button('Restore baseline currents',self.reset)
         self.calibrate_button.setEnabled(False);self.scan_button.setEnabled(False);self.reset_button.setEnabled(False)
-        for widget in (self.amplitude,self.refine,self.probe,self.step,self.leak,self.rms,self.settle):widget.valueChanged.connect(self.invalidate)
+        for widget in (self.amplitude,self.refine,self.probe,self.step,self.leak,self.rms,self.settle):widget.valueChanged.connect(self.settings_changed)
         self.target.currentIndexChanged.connect(self.invalidate)
-        self.match_tunes.toggled.connect(self.invalidate)
+        self.match_tunes.toggled.connect(self.settings_changed)
+        self.use_presets.toggled.connect(self.settings_changed)
         self.status.setText('Select a target, then inspect the automatically selected BPMs and correctors.\nTarget mm is reconstructed from local BPMs using model transport.')
-        self.redraw()
+        self.preview_preset();self.redraw()
     def options(self):
         return BumpOptions(amplitude_mm=self.amplitude.value()/2,refine_mm=self.refine.value(),
             calibration_mm=min(.1,self.amplitude.value()/2),probe_A=self.probe.value(),max_step_A=self.step.value(),
-            outside_max_mm=self.leak.value(),outside_rms_mm=self.rms.value(),settle_s=self.settle.value())
+            outside_max_mm=self.leak.value(),outside_rms_mm=self.rms.value(),settle_s=self.settle.value(),use_presets=self.use_presets.isChecked())
+    def model_options(self):
+        options=copy.deepcopy(self.window.panels['dispersion'].options)
+        options.model_match_tunes=self.match_tunes.isChecked()
+        return options
+    def preview_preset(self):
+        target=self.target.currentData() or self.target.currentText()
+        preset=bump_preset(target) if self.use_presets.isChecked() else None
+        self.preset_status.setText('Default BPMs: '+', '.join(preset['internal_bpms'])+'\nDefault correctors: '+', '.join(preset['actuators'])+
+            '\nNominal simulation preset; current-machine checks required.' if preset else 'Automatic BPM / corrector selection.')
+    def clear_availability(self):
+        self.availability=None
+        for i in range(self.target.count()):
+            item=self.target.model().item(i);item.setEnabled(True);item.setToolTip('Not checked against current BPMs / currents')
+        self.availability_status.setText('Positions not checked against current BPMs / currents.')
+        self.select_button.setEnabled(self.target.count()>0)
+        if self.target.currentIndex()<0 and self.target.count():self.target.setCurrentIndex(0)
+    def settings_changed(self,*_):
+        self.clear_availability();self.invalidate()
     def invalidate(self,*_):
         self.geometry=None;self.calibration=None;self.calibrate_button.setEnabled(False);self.scan_button.setEnabled(False)
         self.range_status.setText(f'Requested width {self.amplitude.value():.3f} mm; fallback {self.amplitude.value()/2:.3f} mm. Center may shift.')
+        self.preview_preset()
+    def check_positions(self):
+        opt=self.options();model_options=self.model_options()
+        self.clear_availability();self.invalidate()
+        self.run(lambda p:self.service.available_targets(opt,model_options,p),self.positions_checked,'Check bump positions (read-only)')
+    def positions_checked(self,report):
+        self.invalidate();self.availability=report
+        rows={row['target']:row for row in report['rows']};enabled=[]
+        self.target.blockSignals(True)
+        for i in range(self.target.count()):
+            target=self.target.itemData(i) or self.target.itemText(i);row=rows.get(target)
+            item=self.target.model().item(i);available=bool(row and row['available']);item.setEnabled(available)
+            if available:
+                enabled.append(i);item.setToolTip('Available at last check; BPMs: '+', '.join(row['internal_bpms']))
+            else:item.setToolTip(row.get('reason','Not checked') if row else 'Not checked')
+        if self.target.currentIndex() not in enabled:self.target.setCurrentIndex(enabled[0] if enabled else -1)
+        self.target.blockSignals(False);self.select_button.setEnabled(bool(enabled));self.preview_preset()
+        self.availability_status.setText(f'Last check: {len(enabled)}/{self.target.count()} positions available. Gray = unavailable.\nRecheck after machine settings change; scan width still requires measured closure.')
+        self.set_table(['Target','Available','Reason / BPMs'],[(r['target'],'Yes' if r['available'] else 'No',
+            ', '.join(r['internal_bpms']) if r['available'] else r['reason']) for r in report['rows']])
+        self.status.setText('BPMs, model geometry and current budget checked. Minimum predicted scan width '+f'{self.options().amplitude_mm:.3f} mm. No magnet changed.')
     def rank(self):
         def done(rows):
-            self.invalidate();self.target.blockSignals(True);self.target.clear()
+            self.clear_availability();self.invalidate();self.target.blockSignals(True);self.target.clear()
             for row in rows:
                 if row['available']:self.target.addItem(f"{row['name']}   {row['current_A']:+.4f} A",row['name'])
             self.target.blockSignals(False)
+            self.preview_preset();self.select_button.setEnabled(self.target.count()>0)
             self.set_table(['Trim','Readback [A]','Status'],[(r['name'],r['current_A'],r.get('error','Available')) for r in rows])
             self.status.setText('Sorted by absolute trim readback current, descending; signed currents shown.')
         self.run(lambda _:self.service.ranked_targets(),done,'Read SD/SF trim currents')
     def prepare(self):
+        if self.target.currentIndex()<0 or not self.target.model().item(self.target.currentIndex()).isEnabled():
+            self.window.error('Choose an available bump position; recheck BPMs / current limits');return
         target=self.target.currentData() or self.target.currentText();opt=self.options()
-        model_options=copy.deepcopy(self.window.panels['dispersion'].options)
-        model_options.model_match_tunes=self.match_tunes.isChecked()
+        model_options=self.model_options()
         def done(g):
             self.geometry=g;self.calibration=None;self.result=g;self.calibrate_button.setEnabled(True);self.scan_button.setEnabled(False)
             self.set_table(['Corrector','Baseline [A]','Model knob [A/mm]'],zip(g['actuators'],g['centers'],g['model_knob_A_per_mm']))
-            self.status.setText('Target '+g['target']+'\nInternal BPMs: '+', '.join(g['internal_bpms'])+
+            selection=g.get('selection',{});method='Verified preset' if selection.get('method')=='preset' else 'Automatic selection'
+            reason=selection.get('preset_rejection')
+            self.status.setText(method+(' (preset unavailable: '+reason+')' if reason else '')+'\nTarget '+g['target']+'\nInternal BPMs: '+', '.join(g['internal_bpms'])+
                 f"\nOutside: {len(g['outside_indices'])} BPMs, X and Y.\n4 V + 4 H correctors selected to close both planes.")
         self.run(lambda p:self.service.prepare(target,opt,model_options,p),done,'Select local bump geometry')
     def calibrate(self):

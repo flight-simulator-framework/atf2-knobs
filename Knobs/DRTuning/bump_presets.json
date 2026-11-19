@@ -1,0 +1,1369 @@
+{
+  "schema": "dr-bump-presets-1",
+  "id": "nominal-20261119-4A",
+  "source": "report/bump-selection-20261119/four_amp_tracking.json + adaptive_range.json",
+  "source_sha256": "c7f594b4db5a0aeb1d9f936e8ac80c0b7f3ef43284765a49cf6b76bb922bd4e7",
+  "validation": "Nominal RFTrack, saved BPM validity mask, zero corrector baseline, simulated +/-5 A supplies, 4 A change limit. No live-machine validation. Names only are reused; optics, validity and limits must be checked again.",
+  "presets": {
+    "SD1R.1": {
+      "internal_bpms": [
+        "MB1R",
+        "MB3R"
+      ],
+      "actuators": [
+        "ZV51R",
+        "ZV50R",
+        "ZV2R",
+        "ZV3R",
+        "ZH48R",
+        "ZH47R",
+        "ZH2R",
+        "ZH3R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.2,
+        0.2
+      ]
+    },
+    "SD1R.2": {
+      "internal_bpms": [
+        "MB4R",
+        "MB3R"
+      ],
+      "actuators": [
+        "ZV1R",
+        "ZV51R",
+        "ZV2R",
+        "ZV3R",
+        "ZH1R",
+        "ZH48R",
+        "ZH2R",
+        "ZH3R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.3": {
+      "internal_bpms": [
+        "MB7R",
+        "MB4R"
+      ],
+      "actuators": [
+        "ZV1R",
+        "ZV51R",
+        "ZV4R",
+        "ZV5R",
+        "ZH1R",
+        "ZH48R",
+        "ZH4R",
+        "ZH5R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.4": {
+      "internal_bpms": [
+        "MB8R",
+        "MB7R"
+      ],
+      "actuators": [
+        "ZV3R",
+        "ZV2R",
+        "ZV4R",
+        "ZV5R",
+        "ZH3R",
+        "ZH2R",
+        "ZH4R",
+        "ZH5R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.5": {
+      "internal_bpms": [
+        "MB10R",
+        "MB9R"
+      ],
+      "actuators": [
+        "ZV4R",
+        "ZV3R",
+        "ZV5R",
+        "ZV6R",
+        "ZH4R",
+        "ZH3R",
+        "ZH5R",
+        "ZH6R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.6": {
+      "internal_bpms": [
+        "MB12R",
+        "MB11R"
+      ],
+      "actuators": [
+        "ZV5R",
+        "ZV4R",
+        "ZV6R",
+        "ZV7R",
+        "ZH5R",
+        "ZH4R",
+        "ZH6R",
+        "ZH7R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.7": {
+      "internal_bpms": [
+        "MB13R",
+        "MB15R"
+      ],
+      "actuators": [
+        "ZV6R",
+        "ZV5R",
+        "ZV8R",
+        "ZV9R",
+        "ZH6R",
+        "ZH5R",
+        "ZH8R",
+        "ZH9R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.8": {
+      "internal_bpms": [
+        "MB16R",
+        "MB15R"
+      ],
+      "actuators": [
+        "ZV7R",
+        "ZV6R",
+        "ZV8R",
+        "ZV9R",
+        "ZH7R",
+        "ZH6R",
+        "ZH8R",
+        "ZH9R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.9": {
+      "internal_bpms": [
+        "MB18R",
+        "MB16R"
+      ],
+      "actuators": [
+        "ZV7R",
+        "ZV6R",
+        "ZV9R",
+        "ZV10R",
+        "ZH7R",
+        "ZH6R",
+        "ZH9R",
+        "ZH10R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.10": {
+      "internal_bpms": [
+        "MB32R",
+        "MB34R"
+      ],
+      "actuators": [
+        "ZV15R",
+        "ZV14R",
+        "ZV18R",
+        "ZV19R",
+        "ZH14R",
+        "ZH13R",
+        "ZH17R",
+        "ZH18R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.11": {
+      "internal_bpms": [
+        "MB35R",
+        "MB34R"
+      ],
+      "actuators": [
+        "ZV17R",
+        "ZV15R",
+        "ZV19R",
+        "ZV20R",
+        "ZH16R",
+        "ZH14R",
+        "ZH17R",
+        "ZH18R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.2,
+        0.2
+      ]
+    },
+    "SD1R.12": {
+      "internal_bpms": [
+        "MB37R",
+        "MB36R"
+      ],
+      "actuators": [
+        "ZV18R",
+        "ZV17R",
+        "ZV19R",
+        "ZV20R",
+        "ZH17R",
+        "ZH16R",
+        "ZH18R",
+        "ZH19R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.13": {
+      "internal_bpms": [
+        "MB39R",
+        "MB38R"
+      ],
+      "actuators": [
+        "ZV19R",
+        "ZV18R",
+        "ZV20R",
+        "ZV21R",
+        "ZH18R",
+        "ZH17R",
+        "ZH19R",
+        "ZH20R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.14": {
+      "internal_bpms": [
+        "MB41R",
+        "MB39R"
+      ],
+      "actuators": [
+        "ZV19R",
+        "ZV18R",
+        "ZV21R",
+        "ZV22R",
+        "ZH18R",
+        "ZH17R",
+        "ZH20R",
+        "ZH21R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.15": {
+      "internal_bpms": [
+        "MB43R",
+        "MB42R"
+      ],
+      "actuators": [
+        "ZV21R",
+        "ZV20R",
+        "ZV22R",
+        "ZV23R",
+        "ZH20R",
+        "ZH19R",
+        "ZH21R",
+        "ZH22R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.16": {
+      "internal_bpms": [
+        "MB45R",
+        "MB44R"
+      ],
+      "actuators": [
+        "ZV22R",
+        "ZV21R",
+        "ZV23R",
+        "ZV24R",
+        "ZH21R",
+        "ZH20R",
+        "ZH22R",
+        "ZH23R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.17": {
+      "internal_bpms": [
+        "MB46R",
+        "MB48R"
+      ],
+      "actuators": [
+        "ZV23R",
+        "ZV22R",
+        "ZV25R",
+        "ZV26R",
+        "ZH22R",
+        "ZH21R",
+        "ZH24R",
+        "ZH25R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.18": {
+      "internal_bpms": [
+        "MB49R",
+        "MB48R"
+      ],
+      "actuators": [
+        "ZV24R",
+        "ZV23R",
+        "ZV25R",
+        "ZV26R",
+        "ZH23R",
+        "ZH22R",
+        "ZH24R",
+        "ZH25R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.19": {
+      "internal_bpms": [
+        "MB51R",
+        "MB50R"
+      ],
+      "actuators": [
+        "ZV25R",
+        "ZV24R",
+        "ZV26R",
+        "ZV27R",
+        "ZH24R",
+        "ZH23R",
+        "ZH25R",
+        "ZH26R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.20": {
+      "internal_bpms": [
+        "MB53R",
+        "MB52R"
+      ],
+      "actuators": [
+        "ZV26R",
+        "ZV25R",
+        "ZV27R",
+        "ZV28R",
+        "ZH25R",
+        "ZH24R",
+        "ZH26R",
+        "ZH27R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.21": {
+      "internal_bpms": [
+        "MB55R",
+        "MB54R"
+      ],
+      "actuators": [
+        "ZV27R",
+        "ZV26R",
+        "ZV28R",
+        "ZV29R",
+        "ZH26R",
+        "ZH25R",
+        "ZH27R",
+        "ZH28R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.22": {
+      "internal_bpms": [
+        "MB55R",
+        "MB59R"
+      ],
+      "actuators": [
+        "ZV27R",
+        "ZV26R",
+        "ZV30R",
+        "ZV31R",
+        "ZH26R",
+        "ZH25R",
+        "ZH29R",
+        "ZH30R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.2,
+        0.2
+      ]
+    },
+    "SD1R.23": {
+      "internal_bpms": [
+        "MB59R",
+        "MB55R"
+      ],
+      "actuators": [
+        "ZV27R",
+        "ZV26R",
+        "ZV30R",
+        "ZV31R",
+        "ZH26R",
+        "ZH25R",
+        "ZH29R",
+        "ZH30R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.24": {
+      "internal_bpms": [
+        "MB61R",
+        "MB60R"
+      ],
+      "actuators": [
+        "ZV30R",
+        "ZV29R",
+        "ZV31R",
+        "ZV32R",
+        "ZH29R",
+        "ZH28R",
+        "ZH30R",
+        "ZH31R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.25": {
+      "internal_bpms": [
+        "MB63R",
+        "MB62R"
+      ],
+      "actuators": [
+        "ZV31R",
+        "ZV30R",
+        "ZV32R",
+        "ZV33R",
+        "ZH30R",
+        "ZH29R",
+        "ZH31R",
+        "ZH32R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.26": {
+      "internal_bpms": [
+        "MB65R",
+        "MB63R"
+      ],
+      "actuators": [
+        "ZV31R",
+        "ZV30R",
+        "ZV33R",
+        "ZV34R",
+        "ZH30R",
+        "ZH29R",
+        "ZH32R",
+        "ZH33R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.27": {
+      "internal_bpms": [
+        "MB82R",
+        "MB81R"
+      ],
+      "actuators": [
+        "ZV43R",
+        "ZV41R",
+        "ZV44R",
+        "ZV45R",
+        "ZH40R",
+        "ZH38R",
+        "ZH41R",
+        "ZH42R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.28": {
+      "internal_bpms": [
+        "MB84R",
+        "MB83R"
+      ],
+      "actuators": [
+        "ZV44R",
+        "ZV43R",
+        "ZV46R",
+        "ZV47R",
+        "ZH41R",
+        "ZH40R",
+        "ZH42R",
+        "ZH43R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.29": {
+      "internal_bpms": [
+        "MB86R",
+        "MB85R"
+      ],
+      "actuators": [
+        "ZV45R",
+        "ZV44R",
+        "ZV46R",
+        "ZV47R",
+        "ZH42R",
+        "ZH41R",
+        "ZH43R",
+        "ZH44R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.30": {
+      "internal_bpms": [
+        "MB89R",
+        "MB86R"
+      ],
+      "actuators": [
+        "ZV45R",
+        "ZV44R",
+        "ZV48R",
+        "ZV49R",
+        "ZH42R",
+        "ZH41R",
+        "ZH45R",
+        "ZH46R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.31": {
+      "internal_bpms": [
+        "MB90R",
+        "MB89R"
+      ],
+      "actuators": [
+        "ZV47R",
+        "ZV46R",
+        "ZV48R",
+        "ZV49R",
+        "ZH44R",
+        "ZH43R",
+        "ZH45R",
+        "ZH46R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.32": {
+      "internal_bpms": [
+        "MB92R",
+        "MB91R"
+      ],
+      "actuators": [
+        "ZV48R",
+        "ZV47R",
+        "ZV49R",
+        "ZV50R",
+        "ZH45R",
+        "ZH44R",
+        "ZH46R",
+        "ZH47R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.33": {
+      "internal_bpms": [
+        "MB94R",
+        "MB93R"
+      ],
+      "actuators": [
+        "ZV49R",
+        "ZV48R",
+        "ZV50R",
+        "ZV51R",
+        "ZH46R",
+        "ZH45R",
+        "ZH47R",
+        "ZH48R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SD1R.34": {
+      "internal_bpms": [
+        "MB96R",
+        "MB95R"
+      ],
+      "actuators": [
+        "ZV50R",
+        "ZV49R",
+        "ZV51R",
+        "ZV1R",
+        "ZH47R",
+        "ZH46R",
+        "ZH48R",
+        "ZH1R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.1": {
+      "internal_bpms": [
+        "MB1R",
+        "MB3R"
+      ],
+      "actuators": [
+        "ZV51R",
+        "ZV50R",
+        "ZV2R",
+        "ZV3R",
+        "ZH48R",
+        "ZH47R",
+        "ZH2R",
+        "ZH3R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.2,
+        0.2
+      ]
+    },
+    "SF1R.2": {
+      "internal_bpms": [
+        "MB3R",
+        "MB4R"
+      ],
+      "actuators": [
+        "ZV1R",
+        "ZV51R",
+        "ZV2R",
+        "ZV3R",
+        "ZH1R",
+        "ZH48R",
+        "ZH2R",
+        "ZH3R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.3": {
+      "internal_bpms": [
+        "MB4R",
+        "MB7R"
+      ],
+      "actuators": [
+        "ZV1R",
+        "ZV51R",
+        "ZV4R",
+        "ZV5R",
+        "ZH1R",
+        "ZH48R",
+        "ZH4R",
+        "ZH5R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.4": {
+      "internal_bpms": [
+        "MB7R",
+        "MB8R"
+      ],
+      "actuators": [
+        "ZV3R",
+        "ZV2R",
+        "ZV4R",
+        "ZV5R",
+        "ZH3R",
+        "ZH2R",
+        "ZH4R",
+        "ZH5R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.5": {
+      "internal_bpms": [
+        "MB9R",
+        "MB10R"
+      ],
+      "actuators": [
+        "ZV4R",
+        "ZV3R",
+        "ZV5R",
+        "ZV6R",
+        "ZH4R",
+        "ZH3R",
+        "ZH5R",
+        "ZH6R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.6": {
+      "internal_bpms": [
+        "MB11R",
+        "MB12R"
+      ],
+      "actuators": [
+        "ZV5R",
+        "ZV4R",
+        "ZV6R",
+        "ZV7R",
+        "ZH5R",
+        "ZH4R",
+        "ZH6R",
+        "ZH7R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.7": {
+      "internal_bpms": [
+        "MB13R",
+        "MB15R"
+      ],
+      "actuators": [
+        "ZV6R",
+        "ZV5R",
+        "ZV8R",
+        "ZV9R",
+        "ZH6R",
+        "ZH5R",
+        "ZH8R",
+        "ZH9R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.8": {
+      "internal_bpms": [
+        "MB15R",
+        "MB16R"
+      ],
+      "actuators": [
+        "ZV7R",
+        "ZV6R",
+        "ZV8R",
+        "ZV9R",
+        "ZH7R",
+        "ZH6R",
+        "ZH8R",
+        "ZH9R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.9": {
+      "internal_bpms": [
+        "MB18R",
+        "MB16R"
+      ],
+      "actuators": [
+        "ZV7R",
+        "ZV6R",
+        "ZV9R",
+        "ZV10R",
+        "ZH7R",
+        "ZH6R",
+        "ZH9R",
+        "ZH10R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.10": {
+      "internal_bpms": [
+        "MB32R",
+        "MB34R"
+      ],
+      "actuators": [
+        "ZV15R",
+        "ZV14R",
+        "ZV18R",
+        "ZV19R",
+        "ZH14R",
+        "ZH13R",
+        "ZH17R",
+        "ZH18R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.11": {
+      "internal_bpms": [
+        "MB34R",
+        "MB35R"
+      ],
+      "actuators": [
+        "ZV17R",
+        "ZV15R",
+        "ZV19R",
+        "ZV20R",
+        "ZH16R",
+        "ZH14R",
+        "ZH17R",
+        "ZH18R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.2,
+        0.2
+      ]
+    },
+    "SF1R.12": {
+      "internal_bpms": [
+        "MB36R",
+        "MB37R"
+      ],
+      "actuators": [
+        "ZV18R",
+        "ZV17R",
+        "ZV19R",
+        "ZV20R",
+        "ZH17R",
+        "ZH16R",
+        "ZH18R",
+        "ZH19R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.13": {
+      "internal_bpms": [
+        "MB38R",
+        "MB39R"
+      ],
+      "actuators": [
+        "ZV19R",
+        "ZV18R",
+        "ZV20R",
+        "ZV21R",
+        "ZH18R",
+        "ZH17R",
+        "ZH19R",
+        "ZH20R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.14": {
+      "internal_bpms": [
+        "MB41R",
+        "MB39R"
+      ],
+      "actuators": [
+        "ZV19R",
+        "ZV18R",
+        "ZV21R",
+        "ZV22R",
+        "ZH18R",
+        "ZH17R",
+        "ZH20R",
+        "ZH21R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.15": {
+      "internal_bpms": [
+        "MB42R",
+        "MB43R"
+      ],
+      "actuators": [
+        "ZV21R",
+        "ZV20R",
+        "ZV22R",
+        "ZV23R",
+        "ZH20R",
+        "ZH19R",
+        "ZH21R",
+        "ZH22R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.16": {
+      "internal_bpms": [
+        "MB44R",
+        "MB45R"
+      ],
+      "actuators": [
+        "ZV22R",
+        "ZV21R",
+        "ZV23R",
+        "ZV24R",
+        "ZH21R",
+        "ZH20R",
+        "ZH22R",
+        "ZH23R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.17": {
+      "internal_bpms": [
+        "MB46R",
+        "MB48R"
+      ],
+      "actuators": [
+        "ZV23R",
+        "ZV22R",
+        "ZV25R",
+        "ZV26R",
+        "ZH22R",
+        "ZH21R",
+        "ZH24R",
+        "ZH25R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.18": {
+      "internal_bpms": [
+        "MB48R",
+        "MB49R"
+      ],
+      "actuators": [
+        "ZV24R",
+        "ZV23R",
+        "ZV25R",
+        "ZV26R",
+        "ZH23R",
+        "ZH22R",
+        "ZH24R",
+        "ZH25R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.19": {
+      "internal_bpms": [
+        "MB50R",
+        "MB51R"
+      ],
+      "actuators": [
+        "ZV25R",
+        "ZV24R",
+        "ZV26R",
+        "ZV27R",
+        "ZH24R",
+        "ZH23R",
+        "ZH25R",
+        "ZH26R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.20": {
+      "internal_bpms": [
+        "MB52R",
+        "MB53R"
+      ],
+      "actuators": [
+        "ZV26R",
+        "ZV25R",
+        "ZV27R",
+        "ZV28R",
+        "ZH25R",
+        "ZH24R",
+        "ZH26R",
+        "ZH27R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.21": {
+      "internal_bpms": [
+        "MB54R",
+        "MB55R"
+      ],
+      "actuators": [
+        "ZV27R",
+        "ZV26R",
+        "ZV28R",
+        "ZV29R",
+        "ZH26R",
+        "ZH25R",
+        "ZH27R",
+        "ZH28R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.22": {
+      "internal_bpms": [
+        "MB55R",
+        "MB59R"
+      ],
+      "actuators": [
+        "ZV27R",
+        "ZV26R",
+        "ZV30R",
+        "ZV31R",
+        "ZH26R",
+        "ZH25R",
+        "ZH29R",
+        "ZH30R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.2,
+        0.2
+      ]
+    },
+    "SF1R.23": {
+      "internal_bpms": [
+        "MB59R",
+        "MB55R"
+      ],
+      "actuators": [
+        "ZV27R",
+        "ZV26R",
+        "ZV30R",
+        "ZV31R",
+        "ZH26R",
+        "ZH25R",
+        "ZH29R",
+        "ZH30R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.24": {
+      "internal_bpms": [
+        "MB60R",
+        "MB61R"
+      ],
+      "actuators": [
+        "ZV30R",
+        "ZV29R",
+        "ZV31R",
+        "ZV32R",
+        "ZH29R",
+        "ZH28R",
+        "ZH30R",
+        "ZH31R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.25": {
+      "internal_bpms": [
+        "MB62R",
+        "MB63R"
+      ],
+      "actuators": [
+        "ZV31R",
+        "ZV30R",
+        "ZV32R",
+        "ZV33R",
+        "ZH30R",
+        "ZH29R",
+        "ZH31R",
+        "ZH32R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.26": {
+      "internal_bpms": [
+        "MB65R",
+        "MB63R"
+      ],
+      "actuators": [
+        "ZV31R",
+        "ZV30R",
+        "ZV33R",
+        "ZV34R",
+        "ZH30R",
+        "ZH29R",
+        "ZH32R",
+        "ZH33R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.27": {
+      "internal_bpms": [
+        "MB81R",
+        "MB82R"
+      ],
+      "actuators": [
+        "ZV43R",
+        "ZV41R",
+        "ZV44R",
+        "ZV45R",
+        "ZH40R",
+        "ZH38R",
+        "ZH41R",
+        "ZH42R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.28": {
+      "internal_bpms": [
+        "MB83R",
+        "MB84R"
+      ],
+      "actuators": [
+        "ZV44R",
+        "ZV43R",
+        "ZV46R",
+        "ZV47R",
+        "ZH41R",
+        "ZH40R",
+        "ZH42R",
+        "ZH43R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.29": {
+      "internal_bpms": [
+        "MB85R",
+        "MB86R"
+      ],
+      "actuators": [
+        "ZV45R",
+        "ZV44R",
+        "ZV46R",
+        "ZV47R",
+        "ZH42R",
+        "ZH41R",
+        "ZH43R",
+        "ZH44R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.30": {
+      "internal_bpms": [
+        "MB86R",
+        "MB89R"
+      ],
+      "actuators": [
+        "ZV45R",
+        "ZV44R",
+        "ZV48R",
+        "ZV49R",
+        "ZH42R",
+        "ZH41R",
+        "ZH45R",
+        "ZH46R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.31": {
+      "internal_bpms": [
+        "MB89R",
+        "MB90R"
+      ],
+      "actuators": [
+        "ZV47R",
+        "ZV46R",
+        "ZV48R",
+        "ZV49R",
+        "ZH44R",
+        "ZH43R",
+        "ZH45R",
+        "ZH46R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.32": {
+      "internal_bpms": [
+        "MB91R",
+        "MB92R"
+      ],
+      "actuators": [
+        "ZV48R",
+        "ZV47R",
+        "ZV49R",
+        "ZV50R",
+        "ZH45R",
+        "ZH44R",
+        "ZH46R",
+        "ZH47R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.33": {
+      "internal_bpms": [
+        "MB93R",
+        "MB94R"
+      ],
+      "actuators": [
+        "ZV49R",
+        "ZV48R",
+        "ZV50R",
+        "ZV51R",
+        "ZH46R",
+        "ZH45R",
+        "ZH47R",
+        "ZH48R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    },
+    "SF1R.34": {
+      "internal_bpms": [
+        "MB95R",
+        "MB96R"
+      ],
+      "actuators": [
+        "ZV50R",
+        "ZV49R",
+        "ZV51R",
+        "ZV1R",
+        "ZH47R",
+        "ZH46R",
+        "ZH48R",
+        "ZH1R"
+      ],
+      "nominal_verified_bounds_mm": [
+        -0.4,
+        0.4
+      ]
+    }
+  }
+}

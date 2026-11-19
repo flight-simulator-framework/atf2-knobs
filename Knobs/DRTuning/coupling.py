@@ -4,7 +4,8 @@ import copy
 import time
 import numpy as np
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
-from .bump_maps import constrained_step,select_geometry
+from .bump_maps import constrained_step,select_geometry,transfer_table,BumpGeometryUnavailable
+from .bump_presets import bump_preset,bump_targets
 from .model import name,verify_inputs
 
 
@@ -23,9 +24,11 @@ class BumpOptions:
     bpm_samples: int = 10
     xsr_samples: int = 10
     settle_s: float = 1.
+    use_presets: bool = True
 
     def validate(self):
         for key,value in asdict(self).items():
+            if key=='use_presets':continue
             if not np.isfinite(value) or value<0 or (key!='settle_s' and value==0):
                 raise ValueError('Invalid bump option: '+key)
         if self.bpm_samples!=10 or self.xsr_samples!=10:raise ValueError('BPM and XSR acquisition require 10 updates')
@@ -106,17 +109,7 @@ class CouplingService:
         model=self.reader.model_manager.prepare(model_options,self.check,progress)
         _,valid=self.orbit(opt)
         indices=np.array([self.backend.bpm_names.index(n) for n in model.bpm_names],int)
-        try:
-            geometry=select_geometry(model,target,valid[indices],excluded=model_options.excluded_bpms,
-                                     fixed=model_options.fixed_actuators,amplitude_mm=opt.amplitude_mm,max_step_A=opt.max_step_A)
-            geometry['selection_half_range_mm']=opt.amplitude_mm
-        except ValueError as exc:
-            if not str(exc).startswith('No observable, bounded local bump geometry'):raise
-            # Geometry/calibration need only a small bidirectional probe. The
-            # measured scan-range search below verifies the larger displacements.
-            geometry=select_geometry(model,target,valid[indices],excluded=model_options.excluded_bpms,
-                                     fixed=model_options.fixed_actuators,amplitude_mm=opt.calibration_mm,max_step_A=opt.max_step_A)
-            geometry['selection_half_range_mm']=opt.calibration_mm
+        geometry=self.select(model,target,valid[indices],opt,model_options)
         # The model may omit explicitly excluded / unmapped BPMs. Lift its
         # matrices to the acquisition order, keeping excluded columns zero.
         total=len(self.backend.bpm_names);mapping=np.r_[indices,indices+total]
@@ -133,6 +126,46 @@ class CouplingService:
         geometry['model_match_tunes']=bool(model_options.model_match_tunes)
         progress(100,'BPMs and correctors selected; no magnet changed')
         return geometry
+
+    def select(self,model,target,valid,opt,model_options,table=None):
+        kwargs=dict(excluded=model_options.excluded_bpms,fixed=model_options.fixed_actuators,
+                    max_step_A=opt.max_step_A,preferred=bump_preset(target) if opt.use_presets else None,
+                    min_width_mm=opt.amplitude_mm,table=table)
+        try:
+            geometry=select_geometry(model,target,valid,amplitude_mm=opt.amplitude_mm,**kwargs)
+            geometry['selection_half_range_mm']=opt.amplitude_mm
+        except ValueError as exc:
+            if not str(exc).startswith('No observable, bounded local bump geometry'):raise
+            # Geometry/calibration need only a small bidirectional probe. The
+            # measured scan-range search below verifies the larger displacements.
+            geometry=select_geometry(model,target,valid,amplitude_mm=opt.calibration_mm,**kwargs)
+            geometry['selection_half_range_mm']=opt.calibration_mm
+        return geometry
+
+    def available_targets(self,opt,model_options,progress=lambda *_:None):
+        """Read-only eligibility; nonlinear closure is checked during calibration/scan."""
+        opt.validate();self.backend.validate_mode('orbit');self.check()
+        model=self.reader.model_manager.prepare(model_options,self.check,lambda p,s:progress(p*.2,s))
+        baseline=self.backend.snapshot();_,valid=self.orbit(opt)
+        indices=np.array([self.backend.bpm_names.index(n) for n in model.bpm_names],int)
+        targets=bump_targets();present=[t for t in targets if t in model.elements]
+        table=transfer_table(model,present[0],other_targets=present[1:]) if present else None
+        results=[]
+        for i,target in enumerate(targets):
+            self.check();progress(20+79*i/len(targets),'Checking BPMs / current budget: '+target)
+            try:
+                if target not in present:raise BumpGeometryUnavailable('Target absent from model')
+                g=self.select(model,target,valid[indices],opt,model_options,table)
+                results.append(dict(target=target,available=True,internal_bpms=g['internal_bpms'],
+                    actuators=g['actuators'],selection=g.get('selection'),predicted_range_mm=g.get('predicted_range_mm')))
+            except BumpGeometryUnavailable as exc:
+                results.append(dict(target=target,available=False,reason=str(exc)))
+        if not self.backend.same_settings(self.backend.snapshot(),baseline):
+            raise ValueError('Machine settings changed during position check; check again')
+        verify_inputs(self.backend,model.settings)
+        progress(100,'Bump positions checked; no magnet changed')
+        return dict(rows=results,baseline=baseline,options=asdict(opt),checked_unix_s=time.time(),
+                    model_match_tunes=bool(model_options.model_match_tunes))
 
     def verify_geometry(self,geometry):
         if list(self.backend.bpm_names)!=list(geometry['bpm_names']):raise ValueError('BPM mapping changed')
