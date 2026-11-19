@@ -15,6 +15,7 @@ from Knobs.DRTuning.coupling import CouplingService,BumpOptions,fit_size
 from Knobs.DRTuning.dispersion import DispersionService,DispersionOptions,QM_CANDIDATES,straight_bpms
 from Knobs.DRTuning.bump_maps import constrained_step
 from Knobs.DRTuning.epics import LiveBackend
+from Knobs.DRTuning.qm_checkpoint import load_checkpoint,save_checkpoint
 
 
 class FreshTests(unittest.TestCase):
@@ -195,10 +196,12 @@ class DispersionFixture(DemoBackend):
 class DispersionTests(unittest.TestCase):
     def setUp(self):
         self.b=DispersionFixture();self.cancel=threading.Event();self.s=DispersionService(self.b,self.cancel)
-        self.o=DispersionOptions(regularization=0.,fixed_actuators=(),measure_tunes=True,step_A=.1)
+        self.o=DispersionOptions(regularization=0.,fixed_actuators=(),measure_tunes=True,step_A=.1,adaptive_probe=False)
     def test_requested_defaults_skip_tunes_through_calc_set_reset_and_exclude_qm2(self):
         opt=DispersionOptions();initial=self.b.snapshot()
-        self.assertEqual((opt.probe_A,opt.step_A,opt.frequency_change_khz),(.1,2.,4.))
+        self.assertEqual((opt.probe_A,opt.step_A,opt.frequency_change_khz),(.01,2.,4.))
+        self.assertTrue(opt.adaptive_probe);self.assertEqual(opt.probe_current_limit_A,3.)
+        self.assertEqual(opt.target_snr,5.);self.assertFalse(opt.constrain_cod)
         self.assertEqual(opt.fixed_actuators,('QM2R.1','QM2R.2'))
         with patch.object(self.b,'measure_tunes',side_effect=AssertionError('Tune read must be skipped')) as tunes,\
              patch.object(self.b,'validate_tune_measurement',create=True,side_effect=AssertionError('Tune preflight must be skipped')) as validate,\
@@ -208,7 +211,7 @@ class DispersionTests(unittest.TestCase):
             self.assertEqual(len(data['orbit_measurements']),87)
             for key in ('initial_tunes','tune_response','predicted_tune_change'):self.assertIsNone(data[key])
             self.assertEqual(data['scan_tunes'],[]);self.assertIn('skipped',data['solver'])
-            for probe in data['probe_readbacks']:np.testing.assert_allclose(probe['requested'],[-.1,.1])
+            for probe in data['probe_readbacks']:np.testing.assert_allclose(probe['requested'],[-.01,.01])
             self.s.apply(data);self.assertTrue(data['applied']);self.assertFalse(data['tune_check_performed'])
             self.assertIsNone(data['after_tunes']);self.s.reset(data)
             tunes.assert_not_called();validate.assert_not_called()
@@ -216,7 +219,7 @@ class DispersionTests(unittest.TestCase):
         self.assertEqual(self.b.snapshot(),initial)
         self.assertTrue(set(n for n,_ in self.b.commands).isdisjoint(opt.fixed_actuators))
     def test_skipping_tunes_retains_cod_verification_and_restoration(self):
-        data=self.s.calculate(DispersionOptions());initial=self.b.snapshot();original=self.b.orbit
+        data=self.s.calculate(DispersionOptions(constrain_cod=True));initial=self.b.snapshot();original=self.b.orbit
         def shifted():
             result=original();result['x']+=.2;return result
         self.b.orbit=shifted
@@ -323,7 +326,7 @@ class DispersionTests(unittest.TestCase):
                 self.s.calculate(self.o,lambda _,message:progress.append(message))
         data=self.s.last_result;report=data['validity_history'][-1]
         self.assertEqual(self.b.snapshot(),initial);self.assertNotIn('response',data)
-        self.assertIn('QM1R.1 probe +0.1 A',str(failure.exception))
+        self.assertIn('QM1R.1 probe +0.01 A',str(failure.exception))
         self.assertGreater(report['current_straight'],0);self.assertGreater(report['previous_common'],0)
         self.assertEqual(report['common_straight'],0);self.assertFalse(np.any(data['valid']&data['straight']))
         self.assertEqual(report['lost_bpms'],[self.b.bpm_names[i] for i in second])
@@ -477,7 +480,7 @@ class CorrectionGuiTests(unittest.TestCase):
         b=DispersionFixture();w=TuningSession(b)
         try:
             panel=w.qm_dispersion;defaults=panel.options()
-            self.assertEqual((panel.probe.value(),panel.step.value(),panel.rf.value()),(.1,2.,4.))
+            self.assertEqual((panel.probe.value(),panel.step.value(),panel.rf.value()),(.01,2.,4.))
             self.assertEqual(set(defaults.fixed_actuators),{'QM2R.1','QM2R.2'})
             self.assertFalse(defaults.measure_tunes);self.assertFalse(panel.tune.isEnabled())
             data=panel.service.calculate(defaults)

@@ -1,23 +1,32 @@
 """Measured straight-section horizontal dispersion correction with QM trims."""
 from dataclasses import dataclass,asdict
+from datetime import datetime,timezone
 import copy
+import hashlib
+import json
 import re
 import numpy as np
 from scipy.optimize import minimize,LinearConstraint
-from Knobs.DRCorrection.core import CorrectionService,Options
+from Knobs.DRCorrection.core import CorrectionService,Options,serial
 from .model import name
+from .qm_checkpoint import prepare_destination,save_checkpoint
 
 QM_CANDIDATES=tuple(f'QM{i}R.{j}' for j in (1,2) for i in (1,2,3,4,20,21,22,23))
 
 
 @dataclass
 class DispersionOptions:
-    probe_A: float = .1
+    probe_A: float = .01
+    adaptive_probe: bool = True
+    probe_current_limit_A: float = 3.
+    target_snr: float = 5.
+    maximum_probe_pairs: int = 12
     step_A: float = 2.
     frequency_change_khz: float = 4.
     momentum_compaction: float = .0021
     measure_tunes: bool = False
     tune_tolerance: float = .002
+    constrain_cod: bool = False
     orbit_tolerance_mm: float = .05
     dispersion_weight: float = .05
     regularization: float = .01
@@ -28,9 +37,12 @@ class DispersionOptions:
     fixed_actuators: tuple = ('QM2R.1','QM2R.2')
 
     def validate(self):
-        for k in ('probe_A','step_A','frequency_change_khz','momentum_compaction','orbit_tolerance_mm','dispersion_weight'):
+        for k in ('probe_A','probe_current_limit_A','target_snr','step_A','frequency_change_khz','momentum_compaction','orbit_tolerance_mm','dispersion_weight'):
             if not np.isfinite(getattr(self,k)) or getattr(self,k)<=0:raise ValueError('Invalid '+k)
         if not isinstance(self.measure_tunes,bool):raise ValueError('Invalid measure_tunes option')
+        if not isinstance(self.constrain_cod,bool):raise ValueError('Invalid constrain_cod option')
+        if not isinstance(self.adaptive_probe,bool) or int(self.maximum_probe_pairs)!=self.maximum_probe_pairs or not 1<=self.maximum_probe_pairs<=20:
+            raise ValueError('Invalid adaptive QM probe options')
         if self.measure_tunes and (not np.isfinite(self.tune_tolerance) or self.tune_tolerance<=0):raise ValueError('Invalid tune_tolerance')
         if (not np.isfinite([self.regularization,self.svd_cut]).all() or self.regularization<0 or
                 not 0<=self.svd_cut<1 or self.selection not in ('all','greedy') or
@@ -101,6 +113,14 @@ class DispersionService:
         o=Options(plane='x',bpm_samples=10,frequency_change_khz=opt.frequency_change_khz,
                   momentum_compaction=opt.momentum_compaction)
         _,valid=self.reader._signal('dispersion',o)
+        nominal,minus,plus=self.reader.orbit_measurements[-3:]
+        def variance(frame,axis):
+            count=np.asarray(frame['valid_sample_count'])
+            return np.divide(np.asarray(frame['std'+axis])**2,count,
+                             out=np.full(count.shape,np.nan),where=count>0)
+        dp=opt.frequency_change_khz*1000/(self.backend.nominal_frequency_hz*opt.momentum_compaction)
+        self.signal_variance=np.array([(variance(minus,a)+variance(plus,a))/dp**2 for a in ('x','y')]+
+                                      [variance(nominal,a) for a in ('x','y')])
         if not opt.measure_tunes:
             return self.reader.full_signal.copy(),valid,None,dict(source='skipped',readback_update_verified=False,
                 acquisition_quality='Tune acquisition and tune constraints disabled by option')
@@ -139,7 +159,30 @@ class DispersionService:
             +settings+'. Lost: '+(', '.join(lost) or 'none'))
         return record
 
-    def calculate(self,opt,progress=lambda *_:None,event=lambda *_:None):
+    def profile_signature(self):
+        encoded=json.dumps(serial(getattr(self.backend,'profile',{})),sort_keys=True,allow_nan=False)
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def checkpoint(self,data,path,event):
+        data['orbit_measurements']=copy.deepcopy(self.reader.orbit_measurements)
+        if path is None:return
+        data['checkpoint_file']=str(path)
+        data['checkpoint_saved_at']=datetime.now(timezone.utc).isoformat()
+        save_checkpoint(path,data)
+        event(dict(kind='checkpoint',path=str(path),completed=data['scan_state']['completed'],total=len(data['actuators'])))
+
+    def probe_quality(self,frames,variances,mask,opt):
+        dx=(frames[1]-frames[0])[0,mask];noise2=(variances[1]+variances[0])[0,mask]
+        signal=float(np.sqrt(np.mean(dx**2)));noise=float(np.sqrt(np.mean(noise2)))
+        if not np.isfinite([signal,noise]).all():raise ValueError('Invalid QM response noise estimate')
+        dp=opt.frequency_change_khz*1000/(self.backend.nominal_frequency_hz*opt.momentum_compaction)
+        return dict(signal_rms=signal,noise_rms=noise,snr=signal/noise if noise>0 else None,
+            target_snr=opt.target_snr,usable=bool(signal>1.e-12 and signal>=opt.target_snr*noise),
+            orbit_response_rms_mm=signal*abs(dp),orbit_noise_rms_mm=noise*abs(dp),
+            target_change_mm=opt.target_snr*noise*abs(dp),bpm_count=int(mask.sum()),
+            definition='RMS straight Dx change between QM +/- probes; uncertainty from valid-sample SEM at RF +/- offsets')
+
+    def calculate(self,opt,progress=lambda *_:None,event=lambda *_:None,checkpoint_path=None):
         opt.validate();self.check();b=self.backend;b.validate_mode('dispersion')
         if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
         if not opt.measure_tunes:progress(0,'Tune acquisition / tune constraints skipped; measuring dispersion and COD')
@@ -151,9 +194,12 @@ class DispersionService:
         if not np.any(straight&enabled):raise ValueError('No enabled BPM in MB19R–MB31R / MB66R–MB80R')
         centers=np.array([b.quadrupole_current(n) for n in names]);limits=np.array([quad_limits(b,n) for n in names]).T
         if not np.isfinite(np.r_[centers,limits.ravel()]).all() or np.any(limits[0]>=limits[1]):raise ValueError('Invalid QM limits / current')
-        spans=np.minimum(opt.probe_A,np.minimum(centers-limits[0],limits[1]-centers))
+        probe_margin=np.minimum(centers-np.maximum(limits[0],-opt.probe_current_limit_A),
+                                np.minimum(limits[1],opt.probe_current_limit_A)-centers)
+        spans=np.minimum(opt.probe_A,probe_margin)
         if np.any(spans<=1.e-6):raise ValueError('No symmetric QM probe margin; exclude the limited trim')
         for n,c,h in zip(names,centers,spans):b.validate_quadrupole_targets(n,[c-h,c,c+h])
+        if checkpoint_path is not None:prepare_destination(checkpoint_path)
         baseline=b.snapshot();self.reader.reset_sampling()
         measured,valid,tunes,tune_evidence=self.signal(opt)
         data=dict(schema='dr-qm-dispersion-1',mode='dispersion',backend_id=b.identity,
@@ -162,54 +208,169 @@ class DispersionService:
                   straight=straight,initial_tunes=tunes,initial_tune_evidence=tune_evidence,options=asdict(opt),applied=False,
                   full_signal_labels=['Dispersion X','Dispersion Y','COD X','COD Y'],scan_tunes=[],probe_readbacks=[],
                   tune_measurement_enabled=opt.measure_tunes,acquisition_options=asdict(opt),validity_history=[],
-                  bpm_invalid_streak_limit=self.reader.invalid_streak_limit)
+                  bpm_invalid_streak_limit=self.reader.invalid_streak_limit,
+                  checkpoint_schema='dr-qm-scan-1',profile_signature=self.profile_signature(),
+                  created_at=datetime.now(timezone.utc).isoformat(),probe_quality=[],probe_attempts=[],
+                  scan_state=dict(completed=0,columns=[],tune_columns=[],common_valid=valid.copy(),
+                                  status='running',active_magnet=None))
         self.last_result=data;event(dict(kind='dispersion',data=copy.deepcopy(data)))
-        columns=[];qcolumns=[]
+        diagnostic=self.validity_report(valid,np.ones_like(valid),enabled,straight,0,'Initial baseline',opt)
+        data['validity_history'].append(diagnostic);progress(0,diagnostic['message'])
+        return self.measure_remaining(data,opt,progress,event,checkpoint_path)
+
+    def measure_remaining(self,data,opt,progress,event,checkpoint_path):
+        b=self.backend;names=data['actuators'];centers=np.asarray(data['centers']);limits=np.asarray(data['limits'])
+        enabled=np.array([n not in opt.excluded_bpms for n in data['names']]);straight=np.asarray(data['straight'],bool)
+        state=data['scan_state'];valid=np.asarray(state['common_valid'],bool).copy()
+        columns=[np.asarray(c,float) for c in state['columns']];qcolumns=[np.asarray(c,float) for c in state['tune_columns']]
+        data['options']=asdict(opt);state['status']='running'
         try:
-            diagnostic=self.validity_report(valid,np.ones_like(valid),enabled,straight,0,'Initial baseline',opt)
-            data['validity_history'].append(diagnostic);progress(0,diagnostic['message'])
             if not np.any(valid&enabled&straight):
-                raise ValueError('No valid straight-section BPM before QM probes. '+diagnostic['message'])
-            for j,(n,c,h) in enumerate(zip(names,centers,spans)):
-                frames=[];qs=[];readbacks=[]
-                try:
-                    for sign in (-1,1):
-                        self.check();b.set_quadrupole_current(n,c+sign*h)
-                        reading=float(b.quadrupole_current(n))
-                        if not np.isfinite(reading):raise ValueError('Invalid QM current readback: '+n)
-                        readbacks.append(reading)
-                        start=len(self.reader.orbit_measurements)
-                        frame,mask,q,evidence=self.signal(opt)
-                        diagnostic=self.validity_report(mask,valid,enabled,straight,start,
-                            f'{n} probe {sign*h:+g} A (readback {reading:+g} A)',opt)
-                        data['validity_history'].append(diagnostic);valid &= mask;data['valid']=valid&enabled
-                        progress(round(90*j/len(names)),diagnostic['message'])
-                        if not np.any(valid&enabled&straight):
-                            raise ValueError('Lost all common valid straight-section BPMs. '+diagnostic['message']+
-                                '. A BPM is excluded after 5 consecutive invalid updates; averages use valid samples only. '
-                                'Common BPMs must remain usable at every RF setting and QM probe; '
-                                'individual observations may still contain valid BPMs. No correction applied.')
-                        frames.append(frame)
-                        if opt.measure_tunes:
-                            qs.append(q);data['scan_tunes'].append(dict(magnet=n,current_A=c+sign*h,measurement=evidence))
-                finally:restore_quads(b,[n],[c])
-                measured_span=readbacks[1]-readbacks[0]
-                if measured_span<=max(1.e-6,h*.2):raise ValueError('No resolved QM current probe: '+n)
+                raise ValueError('No valid straight-section BPM before QM probes. '+data['validity_history'][-1]['message'])
+            self.checkpoint(data,checkpoint_path,event)
+            for j in range(state['completed'],len(names)):
+                self.check();n=names[j];c=centers[j]
+                margin=min(c-max(limits[0,j],-opt.probe_current_limit_A),min(limits[1,j],opt.probe_current_limit_A)-c)
+                if margin<=1.e-6:raise ValueError('No symmetric QM probe margin inside absolute current limit: '+n)
+                h=min(opt.probe_A,margin);state['active_magnet']=n
+                for attempt in range(opt.maximum_probe_pairs if opt.adaptive_probe else 1):
+                    frames=[];qs=[];variances=[];readbacks=[];pair_valid=valid.copy()
+                    state['status']='probing';data['restored']=False
+                    self.checkpoint(data,checkpoint_path,event)
+                    for target in (c-h,c,c+h):b.validate_quadrupole_targets(n,[target])
+                    try:
+                        for sign in (-1,1):
+                            self.check();b.set_quadrupole_current(n,c+sign*h)
+                            reading=float(b.quadrupole_current(n))
+                            if not np.isfinite(reading):raise ValueError('Invalid QM current readback: '+n)
+                            readbacks.append(reading);start=len(self.reader.orbit_measurements)
+                            frame,mask,q,evidence=self.signal(opt)
+                            diagnostic=self.validity_report(mask,pair_valid,enabled,straight,start,
+                                f'{n} probe {sign*h:+g} A (readback {reading:+g} A)',opt)
+                            data['validity_history'].append(diagnostic);pair_valid &= mask;data['valid']=pair_valid&enabled
+                            progress(round(90*j/len(names)),diagnostic['message'])
+                            if not np.any(pair_valid&enabled&straight):
+                                raise ValueError('Lost all common valid straight-section BPMs. '+diagnostic['message']+
+                                    '. A BPM is excluded after 5 consecutive invalid updates; averages use valid samples only. '
+                                    'Common BPMs must remain usable at every RF setting and QM probe; no correction applied.')
+                            if opt.adaptive_probe and np.any(valid&enabled&~mask):
+                                raise ValueError('New invalid BPMs during adaptive QM probe; restored without further increase. '+diagnostic['message'])
+                            if opt.constrain_cod and np.max(abs(frame[2:,pair_valid&enabled]-np.asarray(data['full_measured'])[2:,pair_valid&enabled]))>opt.orbit_tolerance_mm:
+                                raise ValueError('Measured COD change exceeds QM probe tolerance; restored')
+                            frames.append(frame);variances.append(self.signal_variance.copy())
+                            if opt.measure_tunes:
+                                qs.append(q);data['scan_tunes'].append(dict(magnet=n,current_A=c+sign*h,measurement=evidence))
+                    finally:
+                        try:restore_quads(b,[n],[c]);data['restored']=True
+                        except BaseException as exc:data['restoration_error']=str(exc);raise
+                    measured_span=readbacks[1]-readbacks[0]
+                    if measured_span<=max(1.e-6,h*.2):raise ValueError('No resolved QM current probe: '+n)
+                    quality=self.probe_quality(frames,variances,pair_valid&enabled&straight,opt)
+                    finished=(not opt.adaptive_probe or quality['usable'] or h>=margin-1.e-12 or attempt+1==opt.maximum_probe_pairs)
+                    data['probe_attempts'].append(dict(magnet=n,half_span_A=h,requested=[c-h,c+h],actual=readbacks,
+                        quality=quality,accepted=finished,signal_frames=frames,signal_variances=variances))
+                    progress(round(90*j/len(names)),f"QM probe: {n} +/-{h:g} A; response {quality['orbit_response_rms_mm']*1000:.3g} um / "
+                        f"target {quality['target_change_mm']*1000:.3g} um; "+('accepted' if quality['usable'] else 'below target'))
+                    if finished:break
+                    self.checkpoint(data,checkpoint_path,event)
+                    h=min(2*h,margin)
+                valid=pair_valid
                 columns.append(((frames[1]-frames[0])/measured_span).ravel())
                 if opt.measure_tunes:qcolumns.append(((qs[1]-qs[0]+.5)%1-.5)/measured_span)
+                data['probe_quality'].append(quality)
                 data['probe_readbacks'].append(dict(magnet=n,requested=[c-h,c+h],actual=readbacks))
+                state.update(completed=j+1,columns=columns.copy(),tune_columns=qcolumns.copy(),common_valid=valid.copy(),
+                             active_magnet=None,status='running')
+                self.checkpoint(data,checkpoint_path,event)
                 progress(round(90*(j+1)/len(names)),f'QM dispersion response {n} ({j+1}/{len(names)})')
             self.check()
-            if not b.same_settings(b.snapshot(),baseline):raise ValueError('Settings changed during QM response scan; calculate again')
+            if not b.same_settings(b.snapshot(),data['baseline']):raise ValueError('Settings changed during QM response scan; calculate again')
             data.update(response=np.column_stack(columns),tune_response=np.column_stack(qcolumns) if opt.measure_tunes else None,
                         acquisition_valid=valid.copy(),valid=valid&enabled,
                         orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
-            self.solve(data,opt);event(dict(kind='dispersion',data=copy.deepcopy(data)))
+            self.solve(data,opt);state['status']='complete';data.pop('restored',None)
+            self.checkpoint(data,checkpoint_path,event);event(dict(kind='dispersion',data=copy.deepcopy(data)))
             progress(100,'QM proposal ready; all diagnostic currents and RF restored')
             return data
         except BaseException as exc:
-            data['error']=str(exc);data['orbit_measurements']=copy.deepcopy(self.reader.orbit_measurements)
+            data['error']=str(exc);state['status']='interrupted'
+            try:data['restored']=bool(b.same_settings(b.snapshot(),data['baseline']))
+            except Exception as restoration_error:data['restoration_error']=str(restoration_error);data['restored']=False
+            try:self.checkpoint(data,checkpoint_path,event)
+            except Exception as save_error:data['checkpoint_error']=str(save_error)
             raise
+
+    def validate_checkpoint(self,data):
+        """Validate stored columns before offering resume; performs no hardware IO."""
+        if data.get('checkpoint_schema')!='dr-qm-scan-1':raise ValueError('No resumable QM scan state in this file')
+        try:
+            state=data['scan_state'];names=data['actuators'];n=len(data['names']);m=len(names);done=state['completed']
+            if type(done) is not int or not 0<=done<=m or not m or len(set(names))!=m or not set(names)<=set(QM_CANDIDATES):
+                raise ValueError('Invalid completed QM count / names')
+            if state['status'] not in ('running','probing','interrupted','complete'):raise ValueError('Invalid scan status')
+            if len(state['columns'])!=done or len(data['probe_quality'])!=done or len(data['probe_readbacks'])!=done:
+                raise ValueError('Incomplete committed QM columns')
+            for column in state['columns']:
+                if np.asarray(column,float).shape!=(4*n,):raise ValueError('Invalid response column shape')
+            for key,shape in [('full_measured',(4,n)),('centers',(m,)),('limits',(2,m)),('straight',(n,)),('valid',(n,))]:
+                if np.asarray(data[key]).shape!=shape:raise ValueError('Invalid checkpoint '+key)
+            if np.asarray(state['common_valid']).shape!=(n,):raise ValueError('Invalid checkpoint BPM mask')
+            if not np.isfinite(np.r_[np.asarray(data['centers']),np.asarray(data['limits']).ravel()]).all():
+                raise ValueError('Nonfinite checkpoint currents / limits')
+            acquired=DispersionOptions(**data['acquisition_options']);acquired.validate()
+            if len(state['tune_columns'])!=(done if acquired.measure_tunes else 0):raise ValueError('Incomplete tune response')
+            if any(np.asarray(column).shape!=(2,) for column in state['tune_columns']):raise ValueError('Invalid tune response shape')
+            if len(data['orbit_measurements'])<3+6*done:raise ValueError('Missing raw measurements')
+            if state['status']=='complete' and done!=m:raise ValueError('Incomplete scan marked complete')
+        except (KeyError,TypeError,IndexError) as exc:raise ValueError('Malformed QM scan checkpoint: '+str(exc)) from exc
+        return data
+
+    def resume(self,saved,opt,progress=lambda *_:None,event=lambda *_:None,checkpoint_path=None):
+        opt.validate();self.check();self.validate_checkpoint(saved)
+        if saved.get('applied'):raise ValueError('Cannot resume an applied QM scan')
+        b=self.backend;acquired=saved['acquisition_options'];names=saved['actuators']
+        if saved['backend_id']!=b.identity or saved['names']!=list(b.bpm_names) or saved['profile_signature']!=self.profile_signature():
+            raise ValueError('Machine / BPM order / hardware profile differs from the saved scan')
+        for key in ('frequency_change_khz','momentum_compaction','measure_tunes'):
+            if getattr(opt,key)!=acquired[key]:raise ValueError(key+' differs from the saved acquisition; restore the option or CALC again')
+        if names!=[n for n in QM_CANDIDATES if n not in opt.fixed_actuators]:
+            raise ValueError('QM selection differs from the saved scan; restore the selection or CALC again')
+        if saved.get('bpm_invalid_streak_limit')!=self.reader.invalid_streak_limit:
+            raise ValueError('BPM validity policy differs from the saved scan; CALC again')
+        b.validate_mode('dispersion')
+        if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
+        if not b.same_settings(b.snapshot(),saved['baseline']):
+            raise ValueError('Settings differ from the scan baseline. Restore original QM currents / RF and other changed settings before Resume.')
+        centers=np.asarray(saved['centers'],float)
+        tolerance=getattr(b,'profile',{}).get('current_tolerance_A',1.e-6)
+        if not np.allclose([b.quadrupole_current(n) for n in names],centers,rtol=0,atol=tolerance):
+            raise ValueError('QM currents differ from the saved scan baseline')
+        limits=np.asarray([quad_limits(b,n) for n in names]).T
+        if not np.array_equal(limits,np.asarray(saved['limits'])):raise ValueError('QM supply limits changed; CALC again')
+        if checkpoint_path is not None:prepare_destination(checkpoint_path)
+        data=copy.deepcopy(saved);self.last_result=data
+        data['resumed_from']=saved.get('checkpoint_file');data.setdefault('initial_scan_measured',copy.deepcopy(data['full_measured']))
+        self.reader.reset_sampling();self.reader.orbit_measurements=copy.deepcopy(data['orbit_measurements'])
+        for key in ('error','restoration_error','checkpoint_error','delta','full_predicted','full_target'):
+            data.pop(key,None)
+        try:
+            progress(0,f"Resume: {data['scan_state']['completed']}/{len(names)} QM responses retained; remeasuring baseline")
+            frame,mask,tunes,evidence=self.signal(opt)
+            valid=np.asarray(data['scan_state']['common_valid'],bool)&mask
+            enabled=np.array([n not in opt.excluded_bpms for n in data['names']])
+            if not np.any(valid&enabled&np.asarray(data['straight'],bool)):raise ValueError('No common valid straight BPM at resume baseline')
+            data.setdefault('resume_checks',[]).append(dict(timestamp=datetime.now(timezone.utc).isoformat(),
+                full_measured=frame,valid=mask,tunes=tunes,tune_evidence=evidence,options=asdict(opt),
+                change_from_previous=frame-np.asarray(data['full_measured']),completed=data['scan_state']['completed']))
+            # Use the current baseline as the fit target; retained columns were measured at the same magnet/RF settings.
+            data.update(full_measured=frame,initial_tunes=tunes,initial_tune_evidence=evidence,valid=valid&enabled,restored=True)
+            data['scan_state']['common_valid']=valid.copy()
+        except BaseException as exc:
+            data['error']=str(exc);data['scan_state']['status']='interrupted'
+            try:self.checkpoint(data,checkpoint_path,event)
+            except Exception as save_error:data['checkpoint_error']=str(save_error)
+            raise
+        return self.measure_remaining(data,opt,progress,event,checkpoint_path)
 
     def recalculate(self,data,opt,progress=lambda *_:None):
         """Refit a complete response without reading or writing any machine setting."""
@@ -244,8 +405,8 @@ class DispersionService:
         a=(response*weights[:,None])[mask];residual=((measured-target).ravel()*weights)[mask]
         c=np.asarray(data['centers']);lo,hi=np.asarray(data['limits'])
         lower=np.maximum(lo-c,-opt.step_A);upper=np.minimum(hi-c,opt.step_A)
-        constraints=response[2*len(valid):][np.tile(valid,2)]
-        tolerance=np.full(2*valid.sum(),opt.orbit_tolerance_mm)
+        constraints=response[2*len(valid):][np.tile(valid,2)] if opt.constrain_cod else np.empty((0,len(c)))
+        tolerance=np.full(len(constraints),opt.orbit_tolerance_mm)
         if opt.measure_tunes:
             tune_response=np.asarray(data.get('tune_response'),float)
             if tune_response.shape!=(2,len(c)):raise ValueError('No measured tune response; CALC with tune acquisition enabled first')
@@ -260,15 +421,18 @@ class DispersionService:
             h=(reduced.T@reduced+(opt.regularization*s[0])**2*np.eye(len(indices)))/s[0]**2
             g=reduced.T@rhs/s[0]**2;cm=constraints[:,indices]/tolerance[:,None]
             result=minimize(lambda x:.5*x@h@x+g@x,np.zeros(len(indices)),jac=lambda x:h@x+g,
-                bounds=list(zip(lower[indices],upper[indices])),constraints=LinearConstraint(cm,-1.,1.),
+                bounds=list(zip(lower[indices],upper[indices])),constraints=LinearConstraint(cm,-1.,1.) if len(cm) else (),
                 method='SLSQP',options=dict(ftol=1.e-12,maxiter=500))
-            if not result.success or np.max(abs(cm@result.x))>1+1.e-6:raise ValueError('Bounded QM solve failed: '+result.message)
+            if not result.success or (len(cm) and np.max(abs(cm@result.x))>1+1.e-6):raise ValueError('Bounded QM solve failed: '+result.message)
             return result.x,float(np.linalg.norm(matrix@result.x+residual)),s
         available=list(range(len(c)));selected=[]
+        if opt.adaptive_probe and data.get('probe_quality'):
+            available=[i for i,q in enumerate(data['probe_quality']) if q['signal_rms']>1.e-12 and q['signal_rms']>=opt.target_snr*q['noise_rms']]
+        if not available:raise ValueError('No QM response reaches the target signal/noise ratio; review probe quality / limits')
         if opt.selection=='all':selected=available;step,_,singular=fit(selected)
         else:
             score=float(np.linalg.norm(residual));step=np.zeros(0);singular=np.zeros(0)
-            for _ in range(min(opt.maximum,len(c))):
+            for _ in range(min(opt.maximum,len(available))):
                 choices=[]
                 for j in available:
                     x,norm,s=fit(selected+[j]);choices.append((norm,j,x,s))
@@ -278,8 +442,9 @@ class DispersionService:
         delta=np.zeros(len(c));delta[selected]=step
         data.update(options=asdict(opt),valid=valid,delta=delta,full_target=target,full_predicted=measured+(response@delta).reshape(measured.shape),
                     predicted_tune_change=tune_response@delta if opt.measure_tunes else None,selected=[data['actuators'][i] for i in selected],
-                    singular_values=singular,solver='bounded regularized SVD + '+
-                    ('tune/COD constraints; ' if opt.measure_tunes else 'COD constraints; tune acquisition / constraints skipped; ')+opt.selection)
+                    singular_values=singular,solver='bounded regularized SVD; '+
+                    ('COD constraints; ' if opt.constrain_cod else 'COD hard limit disabled; ')+
+                    ('tune constraints; ' if opt.measure_tunes else 'tune acquisition / tune constraints skipped; ')+opt.selection)
         return data
 
     def apply(self,data,progress=lambda *_:None,event=lambda *_:None):
@@ -305,13 +470,13 @@ class DispersionService:
                         after_orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
             if opt.measure_tunes and np.max(abs(dt))>opt.tune_tolerance:
                 raise ValueError('Measured tune change exceeds QM correction tolerance; restored')
-            if np.max(abs(orbit_change))>opt.orbit_tolerance_mm:
+            if opt.constrain_cod and np.max(abs(orbit_change))>opt.orbit_tolerance_mm:
                 raise ValueError('Measured COD change exceeds QM correction tolerance; restored')
             straight=mask&np.asarray(data['straight'],bool)
             if np.linalg.norm(after[0,straight])>np.linalg.norm(np.asarray(data['full_measured'])[0,straight]):
                 raise ValueError('Measured horizontal straight dispersion did not improve; restored')
             self.check();data['applied_currents_A']=[b.quadrupole_current(n) for n in names]
-            data['applied']=True;event(dict(kind='dispersion',data=copy.deepcopy(data)))
+            data['applied']=True;data.pop('restored',None);event(dict(kind='dispersion',data=copy.deepcopy(data)))
             progress(100,'QM correction set; actual dispersion and COD remeasured; '+
                      ('tunes remeasured' if opt.measure_tunes else 'tune acquisition / constraints skipped'))
         except BaseException as exc:
@@ -324,5 +489,14 @@ class DispersionService:
         return data
 
     def reset(self,data):
-        restore_quads(self.backend,data['actuators'],data['centers']);data['applied']=False;data['restored']=True
+        self.last_result=data;errors=[]
+        try:restore_quads(self.backend,data['actuators'],data['centers'])
+        except Exception as exc:errors.append(str(exc))
+        if data.get('checkpoint_schema'):
+            try:self.backend.restore_frequency(data['baseline'].get('ramp_state',data['baseline']['frequency']))
+            except Exception as exc:errors.append(str(exc))
+        if errors:
+            data.update(restored=False,restoration_error='; '.join(errors))
+            raise RuntimeError(data['restoration_error'])
+        data['applied']=False;data['restored']=True
         data.pop('restoration_error',None)
