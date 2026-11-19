@@ -100,16 +100,25 @@ class CouplingService:
             except Exception as exc:rows.append(dict(name=name(n),current_A=None,available=False,error=str(exc)))
         return sorted(rows,key=lambda r:(not r['available'],-abs(r['current_A'] or 0.)))
 
-    def orbit(self,opt):
-        x,y,valid=self.reader._orbit(Options(bpm_samples=10))
+    def orbit(self,opt,on_sample=None):
+        x,y,valid=self.reader._orbit(Options(bpm_samples=10),on_sample=on_sample)
         return np.r_[x,y],valid
 
-    def prepare(self,target,opt,model_options=None,progress=lambda *_:None):
+    @staticmethod
+    def status(event,stage,message,**details):
+        event(dict(kind='status',stage=stage,message=message,**details))
+
+    def acquisition_status(self,event,stage,message,**details):
+        self.status(event,stage,message,samples=0,total=10,**details)
+        return lambda count,total:self.status(event,stage,message,samples=count,total=total,**details)
+
+    def prepare(self,target,opt,model_options=None,progress=lambda *_:None,event=lambda *_:None):
         """Bind saved transport to current readings; no model or tune preparation."""
         opt.validate();self.backend.validate_mode('orbit');self.check();self.last_result=None
         options=model_options or Options(model_match_tunes=False)
+        self.status(event,'check',f'1/5 {target}: Checking preset and current settings')
         baseline=self.backend.snapshot();progress(0,'Checking preset BPMs and current budget')
-        _,valid=self.orbit(opt)
+        _,valid=self.orbit(opt,self.acquisition_status(event,'check',f'1/5 {target}: Checking BPM validity'))
         geometry=preset_geometry(self.backend,target,valid,opt,options)
         if not self.backend.same_settings(self.backend.snapshot(),baseline):
             raise ValueError('Machine settings changed during preset check; calibrate again')
@@ -118,7 +127,8 @@ class CouplingService:
         return geometry
 
     def calibrate_target(self,target,opt,options=None,progress=lambda *_:None,event=lambda *_:None):
-        geometry=self.prepare(target,opt,options,lambda p,s:progress(round(p*.1),s))
+        geometry=self.prepare(target,opt,options,lambda p,s:progress(round(p*.1),s),event)
+        event(dict(kind='geometry',data=copy.deepcopy(geometry)))
         return self.calibrate(geometry,opt,lambda p,s:progress(10+round(p*.9),s),event)
 
     def available_targets(self,opt,model_options=None,progress=lambda *_:None):
@@ -155,8 +165,8 @@ class CouplingService:
         if self.cancel.wait(opt.settle_s):self.check()
         return actual
 
-    def observe(self,g,baseline,opt):
-        orbit,valid=self.orbit(opt)
+    def observe(self,g,baseline,opt,on_sample=None):
+        orbit,valid=self.orbit(opt,on_sample)
         required=np.unique(np.r_[g['outside_indices'],g['internal_indices']])
         if not valid[required].all():raise ValueError('Required bump BPM lost beam / validity')
         delta=np.where(np.tile(valid,2),np.nan_to_num(orbit-baseline,nan=0.,posinf=0.,neginf=0.),0.)
@@ -180,9 +190,12 @@ class CouplingService:
         command=np.clip(command,lower,upper)  # Roundoff only, after the strict physical-bound check.
         constraint=np.asarray(g['reconstruction'])@response;desired=np.array([0.,0.,amplitude,0.])
         for iteration in range(opt.max_iterations+1):
+            label=f"{g['target']}: Y {amplitude:+.3f} mm / "+('Initial setting' if iteration==0 else f'Closure correction {iteration}/{opt.max_iterations}')
+            details=dict(magnets=list(names),command_A=command.copy(),baseline_A=centers.copy(),amplitude_mm=float(amplitude),iteration=iteration)
+            self.status(event,'closure',label+f' — Setting currents; settling {opt.settle_s:g} s',**details)
             currents=self.move(names,command,opt)
-            observed=self.observe(g,baseline,opt)
-            observed.update(amplitude_mm=float(amplitude),iteration=iteration,currents_A=currents.copy())
+            observed=self.observe(g,baseline,opt,self.acquisition_status(event,'closure',label+' — Measuring outside COD and target position',readback_A=currents.copy(),**details))
+            observed.update(amplitude_mm=float(amplitude),iteration=iteration,currents_A=currents.copy(),closed=self.closed(observed,amplitude,opt))
             event(dict(kind='orbit',**observed))
             if self.closed(observed,amplitude,opt):return observed
             if iteration==opt.max_iterations:break
@@ -198,7 +211,7 @@ class CouplingService:
         opt.validate();self.backend.validate_mode('orbit');self.verify_geometry(geometry);g=copy.deepcopy(geometry);names=g['actuators']
         self.last_result=g
         centers=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
-        baseline,valid=self.orbit(opt);columns=[];self.reader.orbit_measurements=[]
+        baseline,valid=self.orbit(opt,self.acquisition_status(event,'baseline',f"1/5 {g['target']}: Measuring baseline orbit"));columns=[];self.reader.orbit_measurements=[]
         required=np.unique(np.r_[g['outside_indices'],g['internal_indices']])
         if not valid[required].all():raise ValueError('Required BPM invalid before calibration')
         spans=np.minimum(min(opt.probe_A,opt.max_step_A),np.minimum(centers-lower,upper-centers))
@@ -208,22 +221,31 @@ class CouplingService:
                 values=[];readbacks=[]
                 try:
                     for sign in (-1,1):
+                        details=dict(magnets=[n],command_A=[float(center+sign*span)],baseline_A=[float(center)],magnet_index=j+1,magnet_count=len(names))
+                        label=f'2/5 Response {j+1}/{len(names)}: {n} / delta {sign*span:+.4f} A'
+                        self.status(event,'probe',label+f' — Setting currents; settling {opt.settle_s:g} s',**details)
                         readbacks.append(float(self.move([n],np.array([center+sign*span]),opt)[0]))
-                        orbit,mask=self.orbit(opt)
+                        orbit,mask=self.orbit(opt,self.acquisition_status(event,'probe',label+' — Acquiring BPM updates',readback_A=[readbacks[-1]],**details))
                         if not mask[required].all():raise ValueError('Required BPM invalid during corrector probe')
                         values.append(np.where(np.tile(mask,2),orbit,0.))
-                finally:restore_correctors(self.backend,[n],[center])
+                finally:
+                    self.status(event,'restore_probe',f'2/5 {n}: Sending restore command {center:+.4f} A')
+                    restore_correctors(self.backend,[n],[center])
                 measured_span=readbacks[1]-readbacks[0]
                 if measured_span<=max(1.e-6,span*.2):raise ValueError('No resolved corrector current probe: '+n)
                 columns.append((values[1]-values[0])/measured_span)
                 g.setdefault('probe_readbacks',[]).append(dict(magnet=n,requested=[center-span,center+span],actual=readbacks))
                 progress(round(70*(j+1)/len(names)),f'Measured bump response {n} ({j+1}/{len(names)})')
             response=np.column_stack(columns)
+            self.status(event,'solve','3/5 Solving Y bump currents from measured response; constraining X, angles and outside COD')
+            progress(72,'Calculating Y bump currents from measured response')
             margin=np.minimum(opt.max_step_A,np.minimum(centers-lower,upper-centers))/opt.calibration_mm
             knob=constrained_step(response[np.asarray(g['outside_rows'],int)],np.zeros(len(g['outside_rows'])),
                                   np.asarray(g['reconstruction'])@response,[0,0,1,0],-margin,margin)
             checks=[]
             for amplitude in (opt.calibration_mm,-opt.calibration_mm):
+                self.status(event,'closure',f'4/5 Checking closure at Y {amplitude:+.3f} mm')
+                progress(76 if amplitude>0 else 86,f'Closing calibration bump Y {amplitude:+.3f} mm')
                 observed=self.close_at(g,response,knob,baseline,amplitude,opt,event);checks.append(observed)
                 # Keep a common linear knob. Scan points still verify actual closure.
                 if amplitude>0:knob=(observed['currents_A']-centers)/amplitude
@@ -236,11 +258,15 @@ class CouplingService:
             raise
         finally:
             g['orbit_measurements']=copy.deepcopy(self.reader.orbit_measurements)
+            self.status(event,'restore','5/5 Sending baseline-current restore commands to all correctors',magnets=list(names),command_A=centers.copy(),baseline_A=centers.copy())
             try:restore_correctors(self.backend,names,centers);g['restored']=True
             except BaseException as exc:
                 g.update(restoration_error=str(exc),restored=False,calibrated=False)
+                self.status(event,'restore_failed','Restoration failed: '+str(exc))
                 raise
+        self.status(event,'restore_verify','5/5 Restore commands sent — Verifying baseline readbacks')
         self.check();self.verify_geometry(geometry);g['calibrated']=True;self.last_result=g
+        self.status(event,'complete',f"{g['target']}: Calibration complete; baseline currents verified. Ready to scan.")
         progress(100,'Measured bump calibrated in both signs; baseline currents restored')
         return g
 

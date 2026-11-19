@@ -8,7 +8,7 @@ from uuid import uuid4
 import numpy as np
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy)
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar)
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
@@ -73,6 +73,17 @@ class CouplingPanel(CorrectionTool):
     def __init__(self,window):
         super().__init__(window);self.service=CouplingService(window.backend,window.service.cancel)
         self.geometry=None;self.calibration=None;self.points=[];self.samples={};self.fits=[];self.last_orbit=None
+        self.last_stage_message=None
+        activity=QGroupBox('Current operation');activity_layout=QVBoxLayout(activity)
+        self.activity_label=QLabel('Idle — Choose a bump position, then calibrate.')
+        self.activity_label.setWordWrap(True);self.activity_label.setStyleSheet('font-size:15px;font-weight:bold;')
+        self.activity_currents=QLabel();self.activity_currents.setWordWrap(True)
+        self.acquisition_progress=QProgressBar();self.acquisition_progress.setRange(0,10)
+        self.acquisition_progress.setFormat('BPM acquisition: idle');self.acquisition_progress.setValue(0)
+        self.closure_status=QLabel('Calibration: 1 Baseline → 2 Measure 8 correctors → 3 Solve currents → 4 Close ±Y bumps → 5 Restore')
+        self.closure_status.setWordWrap(True)
+        for widget in (self.activity_label,self.activity_currents,self.acquisition_progress,self.closure_status):activity_layout.addWidget(widget)
+        self.right.insertWidget(0,activity)
         self.availability=None
         self.target=QComboBox();self.target.addItems([f'{f}.{i}' for f in ('SD1R','SF1R') for i in range(1,35)])
         self.form.addRow('SD / SF bump position',self.target)
@@ -127,9 +138,14 @@ class CouplingPanel(CorrectionTool):
         self.calibrate_button.setEnabled(index>=0 and self.target.model().item(index).isEnabled())
         self.range_status.setText(f'Requested width {self.amplitude.value():.3f} mm; fallback {self.amplitude.value()/2:.3f} mm. Center may shift.')
         self.preview_preset()
+        target=self.target.currentData() or self.target.currentText()
+        self.activity_label.setText('Idle — '+target+' preset ready for calibration.' if index>=0 else 'No available bump position.')
+        self.activity_currents.clear();self.acquisition_progress.setValue(0);self.acquisition_progress.setFormat('BPM acquisition: idle')
+        self.closure_status.setText('Calibration: 1 Baseline → 2 Measure response → 3 Solve currents → 4 Close ±Y → 5 Restore')
     def check_positions(self):
         opt=self.options();model_options=self.model_options()
         self.clear_availability();self.invalidate()
+        self.activity_label.setText('Checking BPMs and current margins for all positions; no magnet writes')
         self.run(lambda p:self.service.available_targets(opt,model_options,p),self.positions_checked,'Check bump positions (read-only)')
     def positions_checked(self,report):
         self.invalidate();self.availability=report
@@ -156,16 +172,22 @@ class CouplingPanel(CorrectionTool):
             self.invalidate()
             self.set_table(['Trim','Readback [A]','Status'],[(r['name'],r['current_A'],r.get('error','Available')) for r in rows])
             self.status.setText('Sorted by absolute trim readback current, descending; signed currents shown.')
+        self.activity_label.setText('Reading SD/SF currents and ranking by magnitude; no magnet writes')
         self.run(lambda _:self.service.ranked_targets(),done,'Read SD/SF trim currents')
     def calibrate(self):
         if self.target.currentIndex()<0 or not self.target.model().item(self.target.currentIndex()).isEnabled():
             self.window.error('Choose an available bump position; recheck BPMs / current limits');return
         target=self.target.currentData() or self.target.currentText();opt=self.options();options=self.model_options()
         self.geometry=None;self.calibration=None;self.scan_button.setEnabled(False)
+        self.last_orbit=None;self.last_stage_message=None
+        self.activity_label.setText(target+': Starting calibration — Checking preset and BPMs.')
+        self.activity_currents.clear();self.acquisition_progress.setValue(0)
+        self.closure_status.setText('Single-corrector probes also move outside COD. Y bump closure follows response measurement.')
         def done(value):
             self.geometry=value;self.calibration=value;self.result=value;self.scan_button.setEnabled(True)
             self.set_table(['Corrector','Baseline [A]','Measured knob [A/mm]'],zip(value['actuators'],value['centers'],value['knob_A_per_mm']))
             self.status.setText('Preset '+value['target']+' calibrated in both signs; original currents restored. Ready for XSR scan.')
+            self.activity_label.setText(value['target']+': Calibration complete; baseline currents verified. Ready to scan.')
         self.run(lambda p:self.service.calibrate_target(target,opt,options,p,self.update.emit),done,'Calibrate preset bump')
     def scan(self):
         if self.calibration is None:return
@@ -174,21 +196,55 @@ class CouplingPanel(CorrectionTool):
         def done(value):
             self.result=value;self.scan_button.setEnabled(False);self.calibrate_button.setEnabled(False);self.reset_button.setEnabled(True)
             self.status.setText(f"Set {value['final_amplitude_mm']:+.4f} mm; XSR {value['final']['xsr']['mean']:.3f} µm.\nFinal XSR and outside COD verified. Calibrate again before another scan.")
+            self.activity_label.setText(f"Scan complete — Optimum Y {value['final_amplitude_mm']:+.4f} mm applied; currents remain at the optimum.")
         self.run(lambda p:self.service.scan(g,opt,p,self.update.emit),done,'Local bump / XSR minimization')
     def reset(self):
         if self.result is None:return
         data=self.result
         def done(_):
             self.invalidate();self.reset_button.setEnabled(False);self.status.setText('Baseline currents restored. Calibrate again.')
+            self.activity_label.setText('Baseline restore commands sent. Ready to recalibrate.')
+        self.activity_label.setText('Sending baseline-current restore commands to all correctors')
         self.run(lambda _:self.service.reset(data),done,'Restore local bump currents')
     def on_update(self,event):
         kind=event['kind']
+        if kind=='status':
+            self.activity_label.setText(event['message'])
+            if 'samples' in event:
+                self.acquisition_progress.setRange(0,event['total']);self.acquisition_progress.setValue(event['samples'])
+                self.acquisition_progress.setFormat(f"BPM updates: {event['samples']}/{event['total']}")
+            else:
+                self.acquisition_progress.setRange(0,10);self.acquisition_progress.setValue(0)
+                self.acquisition_progress.setFormat('BPM acquisition: idle')
+            if 'magnets' in event:
+                currents=[];readbacks=event.get('readback_A')
+                for i,(n,base,command) in enumerate(zip(event['magnets'],event['baseline_A'],event['command_A'])):
+                    text=f'{n}: baseline {base:+.4f} → command {command:+.4f} A'
+                    if readbacks is not None:text+=f' / readback {readbacks[i]:+.4f} A'
+                    currents.append(text)
+                self.activity_currents.setText('\n'.join(currents))
+            else:self.activity_currents.clear()
+            marker=(event['stage'],event['message'])
+            if marker!=self.last_stage_message:
+                self.window.log(event['message']);self.last_stage_message=marker
+            return
+        if kind=='geometry':
+            self.geometry=event['data'];return
         if kind=='sample':
             self.samples[(event['phase'],event['amplitude_mm'])]=event['xsr']
             self.status.setText(f"{event['phase']}: {event['amplitude_mm']:+.4f} mm\nXSR updates {event['xsr']['count']}/10; mean {event['xsr']['mean']:.3f} µm")
+            self.activity_label.setText(f"Acquiring XSR: {event['phase']} / Y {event['amplitude_mm']:+.4f} mm")
+            self.acquisition_progress.setRange(0,10);self.acquisition_progress.setValue(event['xsr']['count'])
+            self.acquisition_progress.setFormat(f"XSR updates: {event['xsr']['count']}/10")
         elif kind=='point':self.points.append(event['point'])
         elif kind=='fit':self.fits.append(event['fit'])
-        elif kind=='orbit':self.last_orbit=event
+        elif kind=='orbit':
+            self.last_orbit=event
+            state=event['state'];closed='Closure passed' if event.get('closed') else 'Checking / correcting closure'
+            self.closure_status.setText(f"{closed} / correction {event['iteration']}\n"
+                f"Estimated delta Y {state[2]:+.4f} mm (target {event['amplitude_mm']:+.4f}) / delta X {state[0]:+.4f} mm\n"
+                f"Outside COD: max {event['outside_max_mm']*1000:.2f} µm (limit {self.leak.value()*1000:g}) / "
+                f"RMS {event['outside_rms_mm']*1000:.2f} µm (limit {self.rms.value()*1000:g})")
         elif kind=='range':
             selected=event['scan_range'];low,high=selected['bounds_mm']
             self.range_status.setText(f'Scan range {low:+.3f} to {high:+.3f} mm; width {selected["width_mm"]:.3f} mm'+
@@ -199,6 +255,12 @@ class CouplingPanel(CorrectionTool):
             if self.result is not None:self.reset_button.setEnabled(bool(self.result.get('restoration_error')))
             self.status.setText('Operation failed / cancelled. See restoration status in the detailed log; acquired data can be saved.')
             self.range_status.setText('Scan stopped. See saved range checks and restoration status.')
+            data=event.get('data') or {}
+            restoration=('Restoration failed: '+data['restoration_error'] if data.get('restoration_error') else
+                         'Baseline restore commands sent' if data.get('restored') else 'Check detailed log for restoration status')
+            previous=self.activity_label.text()
+            self.activity_label.setText('Stopped / '+restoration+'\nLast operation: '+previous+('\n'+str(data['error']) if data.get('error') else ''))
+            self.acquisition_progress.setFormat('Acquisition stopped')
         self.redraw()
     def redraw(self):
         figure=self.plot.figure;figure.clear();ax,orbit=figure.subplots(2,1)

@@ -241,6 +241,14 @@ Vertical dispersion:
   after-SET dispersion and COD, not only the predicted residual.
 
 Bump / XSR coupling:
+  The "Current operation" panel above the plots shows calibration stages, active
+  corrector and baseline/command/readback currents, settling, actual BPM update
+  counts, target Y, closure iteration, and outside COD max/RMS versus limits.
+  Stage transitions also appear in the detailed log. The BPM counter advances
+  only after each acquired update; it is not an estimated timer. Restoration
+  commands and readback verification are displayed separately. Completion is
+  shown only after verification; cancellation/failure retains the last stage
+  and reports restoration status. XSR update counts appear during the scan.
   Choose a bump position to use its saved BPM/corrector combination directly.
   There is no Select BPMs / correctors step and no runtime RFTrack model
   preparation, lattice matching or QF tune matching in the Bump path.

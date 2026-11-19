@@ -164,7 +164,7 @@ class CorrectionService:
                     valid=np.all(arrays['valid'],axis=0),
                     stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0))
 
-    def _orbit(self,opt):
+    def _orbit(self,opt,on_sample=None):
         count=opt.bpm_samples;interval=opt.bpm_interval_s
         validate_bpm_sampling(opt)
         samples=[];diagnostics=[];timestamps=[];fresh=[]
@@ -181,6 +181,7 @@ class CorrectionService:
             samples.append(dict(x=x.copy(),y=y.copy(),tmit=np.asarray(result['tmit'],float).copy(),valid=valid.copy()))
             diagnostics.append(result.get('validity_diagnostics',{}))
             timestamps.append(result.get('timestamps',{}));fresh.append(result.get('freshness_verified',False))
+            if on_sample is not None:on_sample(len(samples),int(count))
         arrays={key:np.stack([s[key] for s in samples]) for key in ('x','y','tmit','valid')}
         summary=self.summarize_orbit(arrays)
         self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**summary,
