@@ -22,6 +22,12 @@ def control(form,label,value,minimum,maximum,decimals=3):
     form.addRow(label,spin);return spin
 
 
+def probe_quality_text(quality):
+    if not quality:return ''
+    if quality.get('skipped'):return 'Skipped: '+quality['reason']
+    return f"{quality['orbit_response_rms_mm']*1000:.3g} / {quality['target_change_mm']*1000:.3g}"
+
+
 class CorrectionTool(QWidget):
     update=pyqtSignal(object)
     def __init__(self,window):
@@ -187,7 +193,8 @@ class QMDispersionPanel(CorrectionTool):
         self.form.addRow(self.adaptive)
         self.probe_limit=control(self.form,'Probe absolute current limit ± [A]',defaults.probe_current_limit_A,.001,3.)
         self.probe_limit.setToolTip('Intersect [-limit,+limit] with supply parameter.A (lower) / parameter.B (upper).\n'
-                                   'Probe endpoints are automatically clipped to this range.')
+                                   'Probe reference and endpoints are automatically moved inside this range.\n'
+                                   'If no usable pair can be measured and restored, skip that QM and continue.')
         self.target_snr=control(self.form,'Target response / noise',defaults.target_snr,1.,100.,1)
         self.target_snr.setToolTip('Straight-section RMS horizontal dispersion change between the measured QM current pair.\n'
             'Target = this factor × uncertainty estimated from the valid BPM samples.\n'
@@ -305,7 +312,7 @@ class QMDispersionPanel(CorrectionTool):
         self.run(lambda _:self.service.reset(data),done,'Restore QM currents')
     def on_update(self,event):
         if event['kind']=='checkpoint':
-            self.save_status.setText(f"Scan checkpoint: {event['completed']}/{event['total']} QMs complete\n"+event['path'])
+            self.save_status.setText(f"Scan checkpoint: {event['completed']}/{event['total']} QMs processed; {event.get('skipped',0)} skipped\n"+event['path'])
             return
         if event.get('data') is not None:self.display(event['data'])
         if event['kind']=='failure':self.set_button.setEnabled(False)
@@ -329,8 +336,8 @@ class QMDispersionPanel(CorrectionTool):
             rows=[]
             for i,(n,c,d) in enumerate(zip(data['actuators'],data['centers'],data['delta'])):
                 q=data.get('probe_quality',[]);q=q[i] if i<len(q) else None
-                quality=f"{q['orbit_response_rms_mm']*1000:.3g} / {q['target_change_mm']*1000:.3g}" if q else ''
-                snr=(f"{q['snr']:.2f}" if q['snr'] is not None else 'No measured scatter') if q else ''
+                quality=probe_quality_text(q)
+                snr=('Not measured' if q.get('skipped') else f"{q['snr']:.2f}" if q['snr'] is not None else 'No measured scatter') if q else ''
                 rows.append((n,f'{c:.5f}',f'{d:+.5f}',f'{c+d:.5f}',quality,snr))
             self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]','Response / target [µm]','S/N'],rows)
             self.set_button.setEnabled(bool(not data.get('applied') and not data.get('error') and
@@ -343,14 +350,16 @@ class QMDispersionPanel(CorrectionTool):
         else:
             self.set_button.setEnabled(False)
             state=data.get('scan_state',{});done=state.get('completed',0)
-            self.status.setText(f"QM response scan: {done}/{len(data['actuators'])} complete.\nResume retains completed pairs; the unfinished QM is measured again.")
+            self.status.setText(f"QM response scan: {done}/{len(data['actuators'])} processed.\nResume retains completed pairs; the unfinished QM is measured again.")
             qualities=data.get('probe_quality',[])
             self.set_table(['QM trim','Scan','Response / target [µm]'],
-                [(n,'Complete' if i<done else 'Pending',
-                  f"{qualities[i]['orbit_response_rms_mm']*1000:.3g} / {qualities[i]['target_change_mm']*1000:.3g}" if i<len(qualities) else '')
+                [(n,('Skipped' if qualities[i].get('skipped') else 'Complete') if i<done else 'Pending',
+                  probe_quality_text(qualities[i]) if i<len(qualities) else '')
                  for i,n in enumerate(data['actuators'])])
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
+        if data.get('skipped_qms'):
+            self.status.setText(self.status.text()+'\nSkipped QM: '+', '.join(r['magnet'] for r in data['skipped_qms']))
         state=data.get('scan_state',{})
         self.resume_button.setEnabled(bool(state and state.get('status')!='complete' and not data.get('applied')))
         self.reset_button.setEnabled(bool(data.get('applied') or data.get('error') or state.get('active_magnet')))

@@ -65,20 +65,25 @@ def quad_limits(backend,n):
     raise ValueError('No QM supply limits configured: '+n)
 
 
+class ProbeRangeUnavailable(ValueError):
+    """A QM cannot be probed within its limits and restored to its baseline."""
+
+
 def probe_pair(magnet,center,limits,opt,width):
-    """Clip the two probe points, allowing one-sided differences at a limit."""
+    """Move the probe reference inside the allowed range, then clip the endpoints."""
     if not np.isfinite(limits).all() or limits[0]>=limits[1]:
         raise ValueError(f'Invalid QM supply limits for {magnet}: {limits}')
     lower=max(float(limits[0]),-opt.probe_current_limit_A)
     upper=min(float(limits[1]),opt.probe_current_limit_A)
     detail=(f'{magnet}: current={center:+.6g} A; supply=[{limits[0]:+.6g}, {limits[1]:+.6g}] A; '
             f'probe absolute limit=+/-{opt.probe_current_limit_A:g} A; allowed=[{lower:+.6g}, {upper:+.6g}] A')
-    if not lower<=center<=upper:
-        raise ValueError('QM current outside the allowed probe range. '+detail+
-                         '. QM correction limit controls Apply only; exclude this QM or review the current / probe limits.')
-    targets=np.array([max(lower,center-width),min(upper,center+width)])
-    if targets[1]-targets[0]<=1.e-6:raise ValueError('No resolved QM probe range. '+detail)
-    return targets,max(center-lower,upper-center)
+    if not limits[0]<=center<=limits[1]:
+        raise ProbeRangeUnavailable('Original current is outside supply limits; cannot guarantee restoration. '+detail)
+    if upper-lower<=1.e-6:raise ProbeRangeUnavailable('No resolved QM probe range. '+detail)
+    reference=float(np.clip(center,lower,upper))
+    targets=np.array([max(lower,reference-width),min(upper,reference+width)])
+    if targets[1]-targets[0]<=1.e-6:raise ProbeRangeUnavailable('No resolved QM probe range. '+detail)
+    return targets,max(reference-lower,upper-reference)
 
 
 def restore_quads(backend,names,values):
@@ -188,7 +193,8 @@ class DispersionService:
         data['checkpoint_file']=str(path)
         data['checkpoint_saved_at']=datetime.now(timezone.utc).isoformat()
         save_checkpoint(path,data)
-        event(dict(kind='checkpoint',path=str(path),completed=data['scan_state']['completed'],total=len(data['actuators'])))
+        event(dict(kind='checkpoint',path=str(path),completed=data['scan_state']['completed'],total=len(data['actuators']),
+                   skipped=len(data.get('skipped_qms',[]))))
 
     def probe_quality(self,frames,variances,mask,opt):
         dx=(frames[1]-frames[0])[0,mask];noise2=(variances[1]+variances[0])[0,mask]
@@ -214,7 +220,8 @@ class DispersionService:
         centers=np.array([b.quadrupole_current(n) for n in names]);limits=np.array([quad_limits(b,n) for n in names]).T
         if not np.isfinite(np.r_[centers,limits.ravel()]).all() or np.any(limits[0]>=limits[1]):raise ValueError('Invalid QM limits / current')
         for j,(n,c) in enumerate(zip(names,centers)):
-            targets,_=probe_pair(n,c,limits[:,j],opt,opt.probe_A)
+            try:targets,_=probe_pair(n,c,limits[:,j],opt,opt.probe_A)
+            except ProbeRangeUnavailable:continue
             b.validate_quadrupole_targets(n,[targets[0],c,targets[1]])
         if checkpoint_path is not None:prepare_destination(checkpoint_path)
         baseline=b.snapshot();self.reader.reset_sampling()
@@ -227,7 +234,7 @@ class DispersionService:
                   tune_measurement_enabled=opt.measure_tunes,acquisition_options=asdict(opt),validity_history=[],
                   bpm_invalid_streak_limit=self.reader.invalid_streak_limit,
                   checkpoint_schema='dr-qm-scan-1',profile_signature=self.profile_signature(),
-                  created_at=datetime.now(timezone.utc).isoformat(),probe_quality=[],probe_attempts=[],
+                  created_at=datetime.now(timezone.utc).isoformat(),probe_quality=[],probe_attempts=[],skipped_qms=[],
                   scan_state=dict(completed=0,columns=[],tune_columns=[],common_valid=valid.copy(),
                                   status='running',active_magnet=None))
         self.last_result=data;event(dict(kind='dispersion',data=copy.deepcopy(data)))
@@ -247,11 +254,13 @@ class DispersionService:
             self.checkpoint(data,checkpoint_path,event)
             for j in range(state['completed'],len(names)):
                 self.check();n=names[j];c=centers[j]
-                h=opt.probe_A;state['active_magnet']=n
+                h=opt.probe_A;state['active_magnet']=n;skip_reason=None
                 for attempt in range(opt.maximum_probe_pairs if opt.adaptive_probe else 1):
                     limits[:,j]=quad_limits(b,n);data['limits']=limits.copy()
                     # Read parameter.A/B again before each pair; the live backend also validates each write.
-                    targets,margin=probe_pair(n,c,limits[:,j],opt,h)
+                    try:targets,margin=probe_pair(n,c,limits[:,j],opt,h)
+                    except ProbeRangeUnavailable as exc:
+                        skip_reason=str(exc);break
                     frames=[];qs=[];variances=[];readbacks=[];pair_valid=valid.copy()
                     state['status']='probing';data['restored']=False
                     self.checkpoint(data,checkpoint_path,event)
@@ -292,12 +301,23 @@ class DispersionService:
                     if finished:break
                     self.checkpoint(data,checkpoint_path,event)
                     h=min(2*h,margin)
-                valid=pair_valid
-                columns.append(((frames[1]-frames[0])/measured_span).ravel())
-                if opt.measure_tunes:qcolumns.append(((qs[1]-qs[0]+.5)%1-.5)/measured_span)
-                data['probe_quality'].append(quality)
-                data['probe_readbacks'].append(dict(magnet=n,requested=targets.copy(),actual=readbacks,
-                    scheme='symmetric' if np.isclose(c-targets[0],targets[1]-c,rtol=0,atol=1.e-12) else 'asymmetric / one-sided'))
+                if skip_reason is not None:
+                    # Alignment placeholders only: explicitly unmeasured and always excluded from the solver.
+                    columns.append(np.zeros(4*len(valid)))
+                    if opt.measure_tunes:qcolumns.append(np.zeros(2))
+                    data.setdefault('skipped_qms',[]).append(dict(magnet=n,reason=skip_reason))
+                    data['probe_quality'].append(dict(skipped=True,measured=False,usable=False,reason=skip_reason,
+                        signal_rms=None,noise_rms=None,snr=None,orbit_response_rms_mm=None,orbit_noise_rms_mm=None,target_change_mm=None))
+                    data['probe_readbacks'].append(dict(magnet=n,requested=[],actual=[],skipped=True,reason=skip_reason,scheme='skipped'))
+                    progress(round(90*(j+1)/len(names)),'SKIP QM probe: '+skip_reason)
+                else:
+                    valid=pair_valid
+                    columns.append(((frames[1]-frames[0])/measured_span).ravel())
+                    if opt.measure_tunes:qcolumns.append(((qs[1]-qs[0]+.5)%1-.5)/measured_span)
+                    data['probe_quality'].append(quality)
+                    scheme=('shifted inside probe range' if c<targets[0] or c>targets[1] else
+                            'symmetric' if np.isclose(c-targets[0],targets[1]-c,rtol=0,atol=1.e-12) else 'asymmetric / one-sided')
+                    data['probe_readbacks'].append(dict(magnet=n,requested=targets.copy(),actual=readbacks,scheme=scheme))
                 state.update(completed=j+1,columns=columns.copy(),tune_columns=qcolumns.copy(),common_valid=valid.copy(),
                              active_magnet=None,status='running')
                 self.checkpoint(data,checkpoint_path,event)
@@ -306,6 +326,7 @@ class DispersionService:
             if not b.same_settings(b.snapshot(),data['baseline']):raise ValueError('Settings changed during QM response scan; calculate again')
             data.update(response=np.column_stack(columns),tune_response=np.column_stack(qcolumns) if opt.measure_tunes else None,
                         acquisition_valid=valid.copy(),valid=valid&enabled,
+                        response_column_measured=[not r.get('skipped',False) for r in data['probe_readbacks']],
                         orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
             self.solve(data,opt);state['status']='complete';data.pop('restored',None)
             self.checkpoint(data,checkpoint_path,event);event(dict(kind='dispersion',data=copy.deepcopy(data)))
@@ -339,7 +360,8 @@ class DispersionService:
             acquired=DispersionOptions(**data['acquisition_options']);acquired.validate()
             if len(state['tune_columns'])!=(done if acquired.measure_tunes else 0):raise ValueError('Incomplete tune response')
             if any(np.asarray(column).shape!=(2,) for column in state['tune_columns']):raise ValueError('Invalid tune response shape')
-            if len(data['orbit_measurements'])<3+6*done:raise ValueError('Missing raw measurements')
+            measured=sum(not r.get('skipped') for r in data['probe_readbacks'])
+            if len(data['orbit_measurements'])<3+6*measured:raise ValueError('Missing raw measurements')
             if state['status']=='complete' and done!=m:raise ValueError('Incomplete scan marked complete')
         except (KeyError,TypeError,IndexError) as exc:raise ValueError('Malformed QM scan checkpoint: '+str(exc)) from exc
         return data
@@ -444,9 +466,14 @@ class DispersionService:
                 method='SLSQP',options=dict(ftol=1.e-12,maxiter=500))
             if not result.success or (len(cm) and np.max(abs(cm@result.x))>1+1.e-6):raise ValueError('Bounded QM solve failed: '+result.message)
             return result.x,float(np.linalg.norm(matrix@result.x+residual)),s
-        available=list(range(len(c)));selected=[]
+        skipped={i for i,r in enumerate(data.get('probe_readbacks',[])) if r.get('skipped')}
+        available=[i for i in range(len(c)) if i not in skipped];selected=[]
+        if not available:
+            raise ValueError('No measurable QM response after automatic range adjustment. '+
+                             '; '.join(r['reason'] for r in data.get('skipped_qms',[])))
         if opt.adaptive_probe and data.get('probe_quality'):
-            available=[i for i,q in enumerate(data['probe_quality']) if q['signal_rms']>1.e-12 and q['signal_rms']>=opt.target_snr*q['noise_rms']]
+            available=[i for i in available if data['probe_quality'][i]['signal_rms']>1.e-12 and
+                       data['probe_quality'][i]['signal_rms']>=opt.target_snr*data['probe_quality'][i]['noise_rms']]
         if not available:raise ValueError('No QM response reaches the target signal/noise ratio; review probe quality / limits')
         if opt.selection=='all':selected=available;step,_,singular=fit(selected)
         else:
@@ -509,7 +536,9 @@ class DispersionService:
 
     def reset(self,data):
         self.last_result=data;errors=[]
-        try:restore_quads(self.backend,data['actuators'],data['centers'])
+        skipped={r['magnet'] for r in data.get('probe_readbacks',[]) if r.get('skipped')}
+        restore=[(n,c) for n,c in zip(data['actuators'],data['centers']) if n not in skipped]
+        try:restore_quads(self.backend,[n for n,_ in restore],[c for _,c in restore])
         except Exception as exc:errors.append(str(exc))
         if data.get('checkpoint_schema'):
             try:self.backend.restore_frequency(data['baseline'].get('ramp_state',data['baseline']['frequency']))

@@ -46,8 +46,21 @@ QM dispersion:
   a requested [-.01,+.01] A pair becomes [0,+.01] A. Near a limit the pair may
   be asymmetric; at a limit it is one-sided. The actual measured current span,
   not twice the nominal probe width, is always used in the response derivative.
-  A baseline already outside the allowed probe range, or an unresolved span,
-  is reported with the magnet/current/limits instead of moving it silently.
+  If the baseline is outside the probe cap but inside the supply range, the
+  probe reference is moved to the nearest permitted boundary. For example,
+  baseline 3.2 A with a +/-3 A probe cap starts with [2.99,3.00] A, then restores
+  the original 3.2 A. The recorded current pair and scheme identify this shift;
+  its response was measured away from the original operating point and may
+  differ if the optics are nonlinear. Actual dispersion is verified after Apply.
+  If the ranges do not overlap, the span is unresolved, or the original current
+  cannot be restored within supply limits, skip that QM without commanding it
+  and continue with the others. Skipped QMs are always omitted from the solver,
+  even in fixed-probe mode, and are not written by Apply or Restore. The UI/log
+  records the name and reason. Checkpoints retain skipped status; zero column
+  placeholders are explicitly marked unmeasured by response_column_measured,
+  with null quality metrics rather than invented zero-signal measurements.
+  If every QM is skipped, stop without a correction proposal. Nonfinite/reversed
+  supply limits still fail validation instead of being treated as a usable range.
   QM correction limit applies to the final correction, not to the probe range.
   Adaptive QM probing is ON by default: double the width between restored pairs
   until the straight horizontal dispersion change reaches target S/N=5, or the
