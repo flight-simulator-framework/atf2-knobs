@@ -38,10 +38,10 @@ QM dispersion:
                  QM1R QM3R QM4R QM20R QM21R QM22R QM23R
              .1  .16  .34  .13   .62   .50   .28   .16
              .2  .22  .21  .18   .47   .28   .20   .29
-  No checkpoint load is required. Start with per-QM widths is ON by default.
+  No checkpoint load is required. The GUI always uses per-QM starting widths.
   These are widths around the current allowed reference, not absolute currents.
-  The uniform/fallback width is 3 A (used for QM2R if explicitly enabled, or
-  when presets are disabled and no matching previous response is reused).
+  The fallback width is 0.1 A, used for a QM without an individual width
+  (QM2R if explicitly enabled). It is editable in Measurement.
   Shared absolute QM current limit is +/-3 A and RF full span is 4 kHz
   (baseline +/-2 kHz). Absolute supply limits still apply.
   The existing confirmed site mappings, coil calibration, current limits
@@ -56,7 +56,7 @@ QM dispersion:
   be asymmetric; at a limit it is one-sided. The actual measured current span,
   not twice the nominal probe width, is always used in the response derivative.
   Probe widths and commanded probe endpoints use a .01 A grid; narrower ranges
-  are skipped. The initial width is editable, with .01 A as the minimum.
+  are skipped. The fallback width is editable, with .01 A as the minimum.
   If the baseline is outside the probe cap but inside the supply range, the
   probe reference is moved to the nearest permitted boundary. For example,
   baseline 3.2 A with a +/-3 A cap and a .01 A width uses [2.99,3.00] A, then restores
@@ -75,24 +75,21 @@ QM dispersion:
   There is one current-limit control for probing and correction; the old
   separate +/-2 A correction increment bound is removed. The legacy step_A
   saved-file field is accepted for compatibility but does not constrain QM fits.
-  Adaptive probing is ON; First pass: one valid pair per QM is OFF by default.
+  The QM GUI has no checkboxes: per-QM starting widths, adaptive probing and
+  reuse of matching measured estimates are always enabled. Tune acquisition
+  and COD hard constraints remain disabled. Measurement and Correction groups
+  contain the relevant numeric settings; CALC and Apply are followed by BPM
+  selection/recalculation, Load/Resume and Restore. Data shows the save folder.
   Start each QM at its preset, remeasure at a rescaled width in the same CALC
   if S/N is insufficient, and shrink/retry invalid probes. Matching estimates
-  from subsequent scans take priority over presets. The preset selection is
-  included in the reuse context so older uniform-scan estimates cannot silently
-  override the new starting widths.
-  If First pass is explicitly enabled, first collect one valid pair per QM
-  (invalid probes still shrink/retry), then save a QM-specific target-width
-  estimate from its response/noise. S/N<5 columns are not used in correction.
-  If all measured responses are weak, calibration finishes without an Apply
-  proposal; run CALC again to use the estimates. It does not auto-apply or start
-  another scan. The table shows Next probe [A].
-  Later scans start at each estimated width when machine/profile, baseline
-  settings, RF options, initial-width setting and BPM exclusions match. The
-  estimates are retained in the session and checkpoints; loading a checkpoint
-  restores them. Disable Use widths estimated from previous responses to force
-  the preset widths; also disable Start with per-QM widths to use the uniform
-  initial width instead.
+  from subsequent scans take priority over presets. S/N<5 columns are not used
+  in correction. Low-quality saved scans show that CALC must remeasure before
+  Apply is possible. Legacy first-pass and fixed-probe options remain readable
+  in checkpoints and available to programmatic callers, but have no GUI toggle.
+  Later scans reuse estimates when machine/profile, baseline settings, RF
+  options, fallback setting and BPM exclusions match. Estimates remain in the
+  session and checkpoints; loading a checkpoint restores them. The table shows
+  Next probe [A].
   For a weak response, estimate the next span from target/measured S/N with 30%
   headroom, convert it to the necessary width including clipped/one-sided
   geometry, and round UP to .01 A. Growth is capped at 3x per trial by default,
@@ -179,7 +176,7 @@ QM dispersion:
   enabling tune constraints requires a measured tune response. After SET,
   restore original QM currents or run a new CALC before recalculating. Apply
   still verifies the live settings match the original CALC baseline.
-  CALC automatically writes qm_scan_*.checkpoint.json under ~/DRTuning/results/
+  CALC automatically writes qm_scan_*.checkpoint.json under /atf/data/flight-simulator/DRTuning/<year>/
   (or the chosen save folder). Baseline and each completed QM pair are saved;
   adaptive attempts and available raw frames are also recorded. A pair is
   committed only after both observations and current restoration succeed.
@@ -202,10 +199,11 @@ QM dispersion:
   any changed correctors/skews must separately match the saved baseline.
   Automatic scan resume does not resume or automatically perform Apply.
   Old files without committed scan state cannot recover partial responses.
-  Successful Apply automatically saves JSON and PNG to ~/DRTuning/results/,
-  with unique timestamped names and the actual before/after measurements,
+  Successful Apply automatically saves JSON and PNG to /atf/data/flight-simulator/DRTuning/<year>/,
+  matching the LinacOpt output-root/year convention, with unique timestamped
+  names and the actual before/after measurements,
   fit options, original acquisition options, response and applied currents.
-  Choose automatic save folder changes the destination for this session;
+  Change folder changes the destination for this session;
   the saved path is shown in the panel and log. Saving never changes hardware:
   a file error leaves SET applied and reports that manual saving is needed.
   Save data + plot remains available for manual saving, including failed SET

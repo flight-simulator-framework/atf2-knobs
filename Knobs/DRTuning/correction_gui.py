@@ -8,7 +8,7 @@ from uuid import uuid4
 import numpy as np
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea)
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy)
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
@@ -32,7 +32,7 @@ class CorrectionTool(QWidget):
     update=pyqtSignal(object)
     def __init__(self,window):
         super().__init__();self.window=window;self.result=None
-        layout=QVBoxLayout(self);split=QSplitter();layout.addWidget(split)
+        layout=QVBoxLayout(self);split=QSplitter();self.splitter=split;layout.addWidget(split)
         left=QWidget();self.controls=QVBoxLayout(left);self.form=QFormLayout();self.controls.addLayout(self.form)
         right=QWidget();self.right=QVBoxLayout(right);self.plot=Plot();self.right.addWidget(self.plot,1)
         self.table=QTableWidget();self.table.setMaximumHeight(170);self.right.addWidget(self.table)
@@ -59,7 +59,7 @@ class CorrectionTool(QWidget):
     def save(self):
         data=self.result
         if data is None:self.window.error('No acquired data to save');return
-        path,_=QFileDialog.getSaveFileName(self,'Save correction measurements','','JSON (*.json)')
+        path,_=QFileDialog.getSaveFileName(self,'Save correction measurements',str(getattr(self,'autosave_directory','')),'JSON (*.json)')
         if path:
             try:
                 dest=Path(path).with_suffix('.json');dest.write_text(json.dumps(serial(data),indent=2,allow_nan=False))
@@ -180,10 +180,12 @@ class QMDispersionPanel(CorrectionTool):
     def __init__(self,window):
         super().__init__(window);self.service=DispersionService(window.backend,window.service.cancel)
         defaults=DispersionOptions()
-        self.controls.setSpacing(10)
+        self.controls.setSpacing(6)
+        self.splitter.setSizes([380,900]);self.splitter.setStretchFactor(0,0);self.splitter.setStretchFactor(1,1)
+        self.splitter.widget(0).setMinimumWidth(340)
         def section(title):
             box=QGroupBox(title);form=QFormLayout(box)
-            form.setVerticalSpacing(8);self.form.addRow(box);return form
+            form.setVerticalSpacing(5);self.form.addRow(box);return form
         measurement=section('Measurement')
         self.rf=control(measurement,'RF span [kHz]',defaults.frequency_change_khz,.01,10.)
         self.target_snr=control(measurement,'Target S/N',defaults.target_snr,1.,100.,1)
@@ -220,8 +222,11 @@ class QMDispersionPanel(CorrectionTool):
         storage=QGroupBox('Data');storage_layout=QVBoxLayout(storage)
         self.autosave_directory=Path('/atf/data/flight-simulator/DRTuning')/datetime.now().strftime('%Y')
         self.save_directory=QLabel(str(self.autosave_directory));self.save_directory.setWordWrap(True)
+        self.save_directory.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        self.save_directory.setToolTip(str(self.autosave_directory))
         storage_layout.addWidget(self.save_directory)
         self.save_status=QLabel('Measurements and applied results save automatically.');self.save_status.setWordWrap(True)
+        self.save_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         storage_layout.addWidget(self.save_status)
         row=QHBoxLayout();storage_layout.addLayout(row)
         self.folder_button=QPushButton('Change folder…');self.folder_button.clicked.connect(self.choose_autosave_directory)
@@ -232,7 +237,8 @@ class QMDispersionPanel(CorrectionTool):
         self.table.setMaximumHeight(260)
         self.set_table(['QM trim','Initial probe [A]'],
             [(name,f'{width:.2f}') for name,width in QM_PROBE_PRESETS_A.items()])
-        for w in (self.maximum,self.probe,self.probe_limit,self.target_snr,self.rf,self.ridge):w.valueChanged.connect(self.invalidate)
+        for w in (self.maximum,self.probe,self.probe_limit,self.target_snr,self.rf,self.ridge):
+            w.setMaximumWidth(105);w.valueChanged.connect(self.invalidate)
         self.selection.currentIndexChanged.connect(lambda _:correction.setRowVisible(self.maximum,self.selection.currentData()=='greedy'))
         self.selection.currentIndexChanged.connect(self.invalidate)
         self.excluded.textChanged.connect(self.invalidate)
@@ -249,7 +255,8 @@ class QMDispersionPanel(CorrectionTool):
     def choose_autosave_directory(self):
         path=QFileDialog.getExistingDirectory(self,'Automatic save folder',str(self.autosave_directory))
         if path:
-            self.autosave_directory=Path(path);self.save_directory.setText(path);self.save_status.setText('Save folder updated.')
+            self.autosave_directory=Path(path);self.save_directory.setText(path);self.save_directory.setToolTip(path)
+            self.save_status.setText('Save folder updated.')
     def new_checkpoint_path(self):
         stamp=datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')
         return Path(self.autosave_directory)/('qm_scan_'+stamp+'_'+uuid4().hex[:8]+'.checkpoint.json')
@@ -338,7 +345,7 @@ class QMDispersionPanel(CorrectionTool):
             for i,(n,c,d) in enumerate(zip(data['actuators'],data['centers'],data['delta'])):
                 q=data.get('probe_quality',[]);q=q[i] if i<len(q) else None
                 quality=probe_quality_text(q)
-                snr=('Not measured' if q.get('skipped') else f"{q['snr']:.2f}" if q['snr'] is not None else 'No measured scatter') if q else ''
+                snr=('Not measured' if q.get('skipped') else f"{q['snr']:.3g}" if q['snr'] is not None else 'No measured scatter') if q else ''
                 estimate=data.get('successful_probe_widths',{}).get(n,{}).get('width_A')
                 rows.append((n,f'{c:.5f}',f'{d:+.5f}',f'{c+d:.5f}',quality,snr,f'{estimate:.2f}' if estimate is not None else ''))
             self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]','Response / target [µm]','S/N','Next probe [A]'],rows)
