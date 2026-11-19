@@ -191,19 +191,29 @@ class LiveBackend(EpicsBackend):
         p=self.profile.get('qmod_tunes',{})
         if p.get('mode')=='pvs':
             self.validate_tune_measurement()
+            if cancel is not None and cancel.is_set():raise RuntimeError('Tune acquisition cancelled')
             initial=[self.metadata(p[a]) for a in ('x','y')];deadline=time.monotonic()+float(p['timeout_s'])
             while True:
                 if cancel is not None and cancel.is_set():raise RuntimeError('Tune acquisition cancelled')
                 readings=[self.metadata(p[a]) for a in ('x','y')]
                 stamps=[r['timestamp'] for r in readings];values=[float(r['value']) for r in readings]
-                if (all(stamps[i]>initial[i]['timestamp'] for i in range(2)) and
-                    abs(stamps[0]-stamps[1])<=p['max_timestamp_skew_s'] and
-                    np.isfinite(values).all() and all(0<v<1 for v in values)):
+                updated=[stamps[i]>initial[i]['timestamp'] for i in range(2)]
+                valid=[bool(np.isfinite(v) and 0<v<1) for v in values]
+                skew=abs(stamps[0]-stamps[1])
+                if all(updated) and skew<=p['max_timestamp_skew_s'] and all(valid):
                     return dict(tunes=values,source='existing TuneDR PVs',pvs=[p['x'],p['y']],timestamps=stamps,
+                        initial_timestamps=[r['timestamp'] for r in initial],timestamp_skew_s=skew,
                         same_shot_verified=False,readback_update_verified=True,
                         acquisition_quality='both tune readbacks updated after request; common shot ID unavailable')
-                if time.monotonic()>deadline:raise TimeoutError('No fresh H/V tune pair')
-                time.sleep(.02)
+                if time.monotonic()>deadline:
+                    details='; '.join(f'{axis} {p[key]}: value={values[i]:.9g}, updated={updated[i]}, '
+                        f'valid_0_to_1={valid[i]}, timestamp={stamps[i]:.6f}, initial={initial[i]["timestamp"]:.6f}'
+                        for i,(axis,key) in enumerate((('H','x'),('V','y'))))
+                    raise TimeoutError(f'No fresh H/V tune pair after {p["timeout_s"]:g} s; {details}; '
+                        f'H/V timestamp skew={skew:.6g} s (limit {p["max_timestamp_skew_s"]:g} s). '
+                        'Check TuneDR acquisition/reader and H/V FFT peak results; BPM COD updates alone do not update tune PVs.')
+                if cancel is None:time.sleep(.02)
+                elif cancel.wait(.02):raise RuntimeError('Tune acquisition cancelled')
         wave=self.tbt_acquire(1024,cancel=cancel)
         fit=analyze_tbt(wave,start_turn=wave['turns'][0])
         if not all(fit['planes'][a].get('valid') for a in ('x','y')):

@@ -190,7 +190,37 @@ class DispersionFixture(DemoBackend):
 
 class DispersionTests(unittest.TestCase):
     def setUp(self):
-        self.b=DispersionFixture();self.cancel=threading.Event();self.s=DispersionService(self.b,self.cancel);self.o=DispersionOptions(regularization=0.)
+        self.b=DispersionFixture();self.cancel=threading.Event();self.s=DispersionService(self.b,self.cancel)
+        self.o=DispersionOptions(regularization=0.,fixed_actuators=(),measure_tunes=True,step_A=.1)
+    def test_requested_defaults_skip_tunes_through_calc_set_reset_and_exclude_qm2(self):
+        opt=DispersionOptions();initial=self.b.snapshot()
+        self.assertEqual((opt.probe_A,opt.step_A,opt.frequency_change_khz),(.1,2.,4.))
+        self.assertEqual(opt.fixed_actuators,('QM2R.1','QM2R.2'))
+        with patch.object(self.b,'measure_tunes',side_effect=AssertionError('Tune read must be skipped')) as tunes,\
+             patch.object(self.b,'validate_tune_measurement',create=True,side_effect=AssertionError('Tune preflight must be skipped')) as validate,\
+             patch.object(self.b,'set_frequency',wraps=self.b.set_frequency) as frequency:
+            data=self.s.calculate(opt)
+            self.assertEqual(self.b.snapshot(),initial);self.assertEqual(len(data['actuators']),14)
+            self.assertEqual(len(data['orbit_measurements']),87)
+            for key in ('initial_tunes','tune_response','predicted_tune_change'):self.assertIsNone(data[key])
+            self.assertEqual(data['scan_tunes'],[]);self.assertIn('skipped',data['solver'])
+            for probe in data['probe_readbacks']:np.testing.assert_allclose(probe['requested'],[-.1,.1])
+            self.s.apply(data);self.assertTrue(data['applied']);self.assertFalse(data['tune_check_performed'])
+            self.assertIsNone(data['after_tunes']);self.s.reset(data)
+            tunes.assert_not_called();validate.assert_not_called()
+            self.assertEqual({call.args[0] for call in frequency.call_args_list},{-2000.,0.,2000.})
+        self.assertEqual(self.b.snapshot(),initial)
+        self.assertTrue(set(n for n,_ in self.b.commands).isdisjoint(opt.fixed_actuators))
+    def test_skipping_tunes_retains_cod_verification_and_restoration(self):
+        data=self.s.calculate(DispersionOptions());initial=self.b.snapshot();original=self.b.orbit
+        def shifted():
+            result=original();result['x']+=.2;return result
+        self.b.orbit=shifted
+        with self.assertRaisesRegex(ValueError,'COD change exceeds'):self.s.apply(data)
+        self.assertEqual(self.b.snapshot(),initial);self.assertTrue(data['restored'])
+    def test_enabling_tune_constraints_requires_a_measured_response(self):
+        opt=DispersionOptions();data=self.s.calculate(opt);opt.measure_tunes=True
+        with self.assertRaisesRegex(ValueError,'No measured tune response'):self.s.solve(data,opt)
     def test_16_qm_measured_response_and_actual_after_plot_data(self):
         initial=self.b.snapshot();data=self.s.calculate(self.o)
         self.assertEqual(self.b.snapshot(),initial);self.assertEqual(len(data['actuators']),16)
@@ -241,8 +271,14 @@ class CorrectionGuiTests(unittest.TestCase):
         from Knobs.DRTuning.gui import TuningSession
         b=DispersionFixture();w=TuningSession(b)
         try:
-            panel=w.qm_dispersion;data=panel.service.calculate(DispersionOptions(regularization=0.))
+            panel=w.qm_dispersion;defaults=panel.options()
+            self.assertEqual((panel.probe.value(),panel.step.value(),panel.rf.value()),(.1,2.,4.))
+            self.assertEqual(set(defaults.fixed_actuators),{'QM2R.1','QM2R.2'})
+            self.assertFalse(defaults.measure_tunes);self.assertFalse(panel.tune.isEnabled())
+            data=panel.service.calculate(defaults)
             panel.service.apply(data);panel.display(data)
+            self.assertIn('tune constraints skipped',panel.status.text())
+            panel.measure_tunes.setChecked(True);self.assertTrue(panel.options().measure_tunes);self.assertTrue(panel.tune.isEnabled())
             self.assertEqual(len(panel.plot.figure.axes),4)
             self.assertTrue(all('Measured after SET' in ax.get_legend_handles_labels()[1] for ax in panel.plot.figure.axes))
             w.open_tool('qm_dispersion');self.assertIs(w.tabs.currentWidget(),panel)

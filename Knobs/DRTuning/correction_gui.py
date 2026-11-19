@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit)
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QCheckBox)
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
@@ -168,29 +168,37 @@ class CouplingPanel(CorrectionTool):
 class QMDispersionPanel(CorrectionTool):
     def __init__(self,window):
         super().__init__(window);self.service=DispersionService(window.backend,window.service.cancel)
-        self.selection=QComboBox();self.selection.addItem('All 16 / regularized bounded SVD','all');self.selection.addItem('Greedy / best columns','greedy')
+        defaults=DispersionOptions()
+        self.selection=QComboBox();self.selection.addItem('All enabled / regularized SVD','all');self.selection.addItem('Greedy / best columns','greedy')
         self.selection.setMaximumWidth(230);self.form.addRow('Solver',self.selection)
         self.excluded=QLineEdit();self.excluded.setMaximumWidth(150);self.excluded.setPlaceholderText('QM2R.1, QM2R.2')
+        self.excluded.setText(', '.join(defaults.fixed_actuators))
         self.excluded.setToolTip('Comma-separated physical QM trim names');self.form.addRow('Exclude QM trims',self.excluded)
         self.maximum=control(self.form,'Greedy maximum trims',8,1,16,0)
-        self.probe=control(self.form,'QM probe ± [A]',.05,.001,1.)
-        self.step=control(self.form,'QM correction limit ± [A]',.1,.001,2.)
-        self.rf=control(self.form,'RF full span [kHz]',2.,.01,10.)
+        self.probe=control(self.form,'QM probe ± [A]',defaults.probe_A,.001,1.)
+        self.step=control(self.form,'QM correction limit ± [A]',defaults.step_A,.001,2.)
+        self.rf=control(self.form,'RF full span [kHz]',defaults.frequency_change_khz,.01,10.)
+        self.measure_tunes=QCheckBox('Measure / constrain H and V tunes');self.measure_tunes.setChecked(defaults.measure_tunes)
+        self.form.addRow(self.measure_tunes)
         self.tune=control(self.form,'Max tune change',.002,.00001,.1,5)
+        self.tune.setEnabled(defaults.measure_tunes)
         self.cod=control(self.form,'Max COD change [mm]',.05,.001,1.)
         self.ridge=control(self.form,'Relative regularization',.01,0.,1.,4)
         self.add_button('1. Measure response / CALC',self.calculate)
         self.set_button=self.add_button('2. Apply / remeasure dispersion',self.apply)
         self.reset_button=self.add_button('Restore original QM currents',self.reset)
         self.set_button.setEnabled(False);self.reset_button.setEnabled(False)
-        self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 trims).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy, COD and tunes.\n10 updated BPM frames at each RF setting.')
+        self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 candidates; QM2R.1/.2 excluded by default).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy and COD.\n10 updated BPM frames per RF setting. Tune acquisition / constraints optional; off by default.')
         for w in (self.maximum,self.probe,self.step,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(lambda *_:self.set_button.setEnabled(False))
         self.selection.currentIndexChanged.connect(lambda *_:self.set_button.setEnabled(False))
         self.excluded.textChanged.connect(lambda *_:self.set_button.setEnabled(False))
+        self.measure_tunes.toggled.connect(self.tune.setEnabled)
+        self.measure_tunes.toggled.connect(lambda *_:self.set_button.setEnabled(False))
     def options(self):
         shared=self.window.panels['dispersion'].options
         return DispersionOptions(probe_A=self.probe.value(),step_A=self.step.value(),frequency_change_khz=self.rf.value(),
-            momentum_compaction=shared.momentum_compaction,tune_tolerance=self.tune.value(),orbit_tolerance_mm=self.cod.value(),
+            momentum_compaction=shared.momentum_compaction,measure_tunes=self.measure_tunes.isChecked(),
+            tune_tolerance=self.tune.value(),orbit_tolerance_mm=self.cod.value(),
             regularization=self.ridge.value(),selection=self.selection.currentData(),maximum=int(self.maximum.value()),
             excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()}))
     def calculate(self):
@@ -228,8 +236,10 @@ class QMDispersionPanel(CorrectionTool):
             self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]'],
                 [(n,f'{c:.5f}',f'{d:+.5f}',f'{c+d:.5f}') for n,c,d in zip(data['actuators'],data['centers'],data['delta'])])
             self.set_button.setEnabled(not data.get('applied') and not data.get('error') and np.any(abs(np.asarray(data['delta']))>1.e-12))
+            tune_status=('Predicted tune change: '+str(np.round(data['predicted_tune_change'],6))
+                         if data.get('predicted_tune_change') is not None else 'Tune acquisition / tune constraints skipped.')
             self.status.setText(('SET applied; dispersion remeasured.' if data.get('applied') else 'CALC ready; probe currents restored.')+
-                '\n'+data['solver']+'\nPredicted tune change: '+str(np.round(data['predicted_tune_change'],6)))
+                '\n'+data['solver']+'\n'+tune_status)
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
         self.reset_button.setEnabled(bool(data.get('applied') or data.get('error')))

@@ -584,7 +584,22 @@ class TunePVTests(unittest.TestCase):
     def test_stale_tune_values_rejected(self):
         b,_=LiveQuadTests().setup_backend();b.profile['qmod_tunes']=dict(mode='pvs',x='tx',y='ty',timeout_s=.03,max_timestamp_skew_s=.01)
         b.metadata=lambda pv:dict(value=.2,timestamp=1.)
-        with self.assertRaises(TimeoutError):b.measure_tunes()
+        with self.assertRaises(TimeoutError) as caught:b.measure_tunes()
+        self.assertIn('H tx: value=0.2, updated=False, valid_0_to_1=True',str(caught.exception))
+        self.assertIn('V ty: value=0.2, updated=False, valid_0_to_1=True',str(caught.exception))
+    def test_tune_timeout_distinguishes_invalid_values_and_timestamp_skew(self):
+        for invalid in (True,False):
+            with self.subTest(invalid=invalid):
+                b,_=LiveQuadTests().setup_backend();b.profile['qmod_tunes']=dict(mode='pvs',x='tx',y='ty',timeout_s=.001,max_timestamp_skew_s=.1)
+                calls=[]
+                def metadata(pv):
+                    calls.append(pv)
+                    return dict(value=0. if invalid else .2,
+                        timestamp=1. if len(calls)<=2 else 2. if pv=='tx' or invalid else 3.)
+                b.metadata=metadata
+                with self.assertRaises(TimeoutError) as caught:b.measure_tunes()
+                text=str(caught.exception);self.assertIn('updated=True',text)
+                self.assertIn('valid_0_to_1=False' if invalid else 'H/V timestamp skew=1 s (limit 0.1 s)',text)
     def test_unconfigured_quads_do_not_break_other_tools(self):
         b,c=LiveQuadTests().setup_backend()
         from Knobs.DRTuning.epics import LiveBackend

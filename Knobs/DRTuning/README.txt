@@ -31,23 +31,47 @@ QM dispersion:
   Use QM dispersion > Measure response / CALC, inspect the current table and
   before/predicted curves, then Apply / remeasure dispersion. Candidates are
   QM1R–QM4R and QM20R–QM23R, both .1/.2 (16 individually mapped trims, including
-  QM2). The existing confirmed site mappings, coil calibration, current limits
+  QM2). QM2R.1 and QM2R.2 are excluded by default (14 active candidates); the
+  Exclude QM trims field contains these actual selections, not placeholder text.
+  Defaults: QM probes +/-0.1 A, correction step bound +/-2 A from the baseline,
+  and RF full span 4 kHz (baseline +/-2 kHz). Absolute supply limits still apply.
+  The existing confirmed site mappings, coil calibration, current limits
   and readback checks are used. Explicit exclusions are available in the panel.
   CALC measures each +/- current response, normalizing by actual readback span.
   Each dispersion observation measures nominal COD plus symmetric RF offsets,
   with 10 BPM updates at each setting; RF and temporary currents are restored.
-  With all 16 trims: 33 dispersion observations, 99 COD settings, 990 BPM frames,
-  plus 33 tune measurements. This can take several minutes with live settling.
+  With the default 14 active trims: 29 dispersion observations, 87 COD settings,
+  870 BPM frames. Enabling all 16 gives 33 observations / 99 settings / 990 frames.
+  This can take several minutes with live settling.
   Dx is targeted to zero at legacy straight BPMs MB19R–MB31R / MB66R–MB80R.
   Arc Dx, Dy and COD target their measured baselines. These are named physical
   BPM regions, not an assumption that the entire ring has zero dispersion.
-  The default uses all trims in bounded regularized SVD; Greedy chooses the
-  best response columns up to the selected maximum. Tune/COD linear constraints
-  apply in both modes (defaults |delta tune| <= .002, |delta COD| <= .05 mm).
-  SET verifies actual dispersion improvement, tunes and COD, restoring the
+  The default uses all enabled trims in bounded regularized SVD; Greedy chooses
+  the best response columns up to the selected maximum. COD linear constraints
+  apply in both modes (default |delta COD| <= .05 mm).
+  At the operator's request, tune acquisition and tune constraints are OFF by
+  default. CALC and SET do not validate, wait for or read tune PVs in this mode.
+  The UI/log/data state that tunes are skipped; missing tune values, responses
+  and predictions are stored as null, not as zero tune changes. To re-enable,
+  check Measure / constrain H and V tunes, then run a fresh CALC. Tune-enabled
+  operation constrains |delta tune| <= .002 by default. Q-modulation beta scans
+  keep their separate tune measurement requirements.
+  SET verifies actual dispersion improvement and COD (also tunes when enabled), restoring the
   changed trims if measurement fails or a tolerance is exceeded. The graph
   shows measured before, predicted, target, and measured after, for Dx/Dy/X/Y.
   Save data + plot writes JSON and PNG, including failed SET measurements.
+
+  When tune acquisition is enabled, "No fresh H/V tune pair" means the PV tune
+  mode could not acquire TBT:TUNE:H and TBT:TUNE:V;
+  it does not start TuneDR acquisition. COD BPM updates do not advance these
+  tune PVs. Check the op-base TuneDR reader/acquisition and H/V FFT peak results.
+  Both timestamps must advance, their difference must be <= .5 s, and both
+  fractional tunes must be finite and between 0 and 1 (default timeout 10 s).
+  Timeout diagnostics now show each PV value, initial/latest timestamp, update
+  and validity flags, and the H/V time difference. This distinguishes stopped
+  acquisition from invalid FFT results or mismatched update times. Stale tunes
+  are not treated as zero tune response: QM tune constraints require measured
+  changes. The temporary DeltaFRamp readback bypass does not bypass this check.
 
 Vertical dispersion:
   Continue to use Dispersion > V with vertical correctors. Response / limits /
