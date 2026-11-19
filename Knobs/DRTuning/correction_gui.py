@@ -186,13 +186,17 @@ class QMDispersionPanel(CorrectionTool):
         self.excluded.setText(', '.join(defaults.fixed_actuators))
         self.excluded.setToolTip('Comma-separated physical QM trim names');self.form.addRow('Exclude QM trims',self.excluded)
         self.maximum=control(self.form,'Greedy maximum trims',8,1,16,0)
-        self.probe=control(self.form,'Initial QM probe width [A]',defaults.probe_A,.01,1.,2);self.probe.setSingleStep(.01)
+        self.probe=control(self.form,'Initial QM probe width [A]',defaults.probe_A,.01,3.,2);self.probe.setSingleStep(.01)
         self.probe.setToolTip('Normally current +/- this width. At a limit, clip each endpoint independently.\n'
                              'A one-sided pair is allowed; response uses the actual readback difference.')
         self.adaptive=QCheckBox('Adapt QM probe to target response / noise');self.adaptive.setChecked(defaults.adaptive_probe)
         self.form.addRow(self.adaptive)
-        self.reuse_widths=QCheckBox('Reuse previous successful QM widths');self.reuse_widths.setChecked(defaults.reuse_probe_widths)
+        self.reuse_widths=QCheckBox('Use widths estimated from previous responses');self.reuse_widths.setChecked(defaults.reuse_probe_widths)
         self.form.addRow(self.reuse_widths)
+        self.first_pass=QCheckBox('First pass: one valid pair per QM');self.first_pass.setChecked(defaults.characterize_first_scan)
+        self.first_pass.setToolTip('Without a matching saved response, collect one valid pair and estimate the next scan width.\n'
+                                  'Invalid probes still restore and shrink. Weak responses are not used for correction.')
+        self.form.addRow(self.first_pass)
         self.growth=control(self.form,'Maximum probe growth factor',defaults.probe_max_growth,1.1,10.,1)
         self.probe_limit=control(self.form,'QM current limit ± [A] (probe / Apply)',defaults.probe_current_limit_A,.01,3.,2)
         self.probe_limit.setSingleStep(.01)
@@ -237,6 +241,7 @@ class QMDispersionPanel(CorrectionTool):
         for w in (self.maximum,self.probe,self.probe_limit,self.growth,self.target_snr,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(self.invalidate)
         self.adaptive.toggled.connect(self.invalidate)
         self.reuse_widths.toggled.connect(self.invalidate)
+        self.first_pass.toggled.connect(self.invalidate)
         self.constrain_cod.toggled.connect(self.cod.setEnabled);self.constrain_cod.toggled.connect(self.invalidate)
         self.selection.currentIndexChanged.connect(self.invalidate)
         self.excluded.textChanged.connect(self.invalidate)
@@ -293,6 +298,7 @@ class QMDispersionPanel(CorrectionTool):
         return DispersionOptions(probe_A=self.probe.value(),step_A=self.probe_limit.value(),frequency_change_khz=self.rf.value(),
             adaptive_probe=self.adaptive.isChecked(),probe_current_limit_A=self.probe_limit.value(),target_snr=self.target_snr.value(),
             probe_max_growth=self.growth.value(),reuse_probe_widths=self.reuse_widths.isChecked(),
+            characterize_first_scan=self.first_pass.isChecked(),
             momentum_compaction=shared.momentum_compaction,measure_tunes=self.measure_tunes.isChecked(),
             tune_tolerance=self.tune.value(),constrain_cod=self.constrain_cod.isChecked(),orbit_tolerance_mm=self.cod.value(),
             regularization=self.ridge.value(),selection=self.selection.currentData(),maximum=int(self.maximum.value()),
@@ -363,6 +369,7 @@ class QMDispersionPanel(CorrectionTool):
                  for i,n in enumerate(data['actuators'])])
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
+        elif data.get('proposal_unavailable_reason'):self.status.setText(data['proposal_unavailable_reason'])
         if data.get('skipped_qms'):
             self.status.setText(self.status.text()+'\nSkipped QM: '+', '.join(r['magnet'] for r in data['skipped_qms']))
         state=data.get('scan_state',{})

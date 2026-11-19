@@ -18,7 +18,7 @@ ACTIVE=('QM1R.1','QM3R.1','QM4R.1')
 class QMResumeTests(unittest.TestCase):
     def setUp(self):
         self.b=DispersionFixture();self.cancel=threading.Event();self.s=DispersionService(self.b,self.cancel)
-        self.opt=DispersionOptions(fixed_actuators=tuple(n for n in QM_CANDIDATES if n not in ACTIVE),adaptive_probe=False)
+        self.opt=DispersionOptions(probe_A=.01,fixed_actuators=tuple(n for n in QM_CANDIDATES if n not in ACTIVE),adaptive_probe=False)
 
     def interrupt_after_first(self,path):
         def progress(_,message):
@@ -103,7 +103,7 @@ class QMResumeTests(unittest.TestCase):
 class QMAdaptiveTests(unittest.TestCase):
     def setUp(self):
         self.b=DispersionFixture();self.s=DispersionService(self.b,threading.Event())
-        self.opt=DispersionOptions(fixed_actuators=tuple(n for n in QM_CANDIDATES if n not in ACTIVE[:2]))
+        self.opt=DispersionOptions(probe_A=.01,fixed_actuators=tuple(n for n in QM_CANDIDATES if n not in ACTIVE[:2]))
         original=self.b.orbit
         def noisy():
             frame=original();frame['x']+=.0002*(1 if self.b.acquisitions%2 else -1);return frame
@@ -116,8 +116,11 @@ class QMAdaptiveTests(unittest.TestCase):
         for name in result['actuators']:
             attempts=[a for a in result['probe_attempts'] if a['magnet']==name]
             self.assertEqual(attempts[0]['half_span_A'],.01)
-            for a,b in zip(attempts,attempts[1:]):self.assertEqual(b['half_span_A'],a['half_span_A']*2)
+            for a,b in zip(attempts,attempts[1:]):
+                self.assertLessEqual(b['half_span_A'],a['half_span_A']*self.opt.probe_max_growth+1.e-9)
+                self.assertAlmostEqual(b['half_span_A']/.01,round(b['half_span_A']/.01))
             self.assertTrue(attempts[-1]['quality']['usable'])
+        self.assertEqual(result['probe_attempts'][1]['half_span_A'],.03)
         self.assertTrue(all(q['snr']>=5 for q in result['probe_quality']))
         for q in result['probe_quality']:
             self.assertAlmostEqual(q['target_change_mm'],5*q['orbit_noise_rms_mm'])
@@ -141,16 +144,21 @@ class QMAdaptiveTests(unittest.TestCase):
         self.assertAlmostEqual(max(commands),3.);self.assertAlmostEqual(min(commands),-3.)
         self.assertAlmostEqual(self.b.q[ACTIVE[0]],2.9)
 
-    def test_new_invalid_bpm_stops_growth_and_restores_current(self):
+    def test_new_invalid_bpm_shrinks_and_does_not_revisit_failed_width(self):
         original=self.b.orbit
         def drops():
             frame=original()
             if abs(self.b.q[ACTIVE[0]])>=.02:frame['valid'][20]=False
             return frame
         self.b.orbit=drops
-        with self.assertRaisesRegex(ValueError,'New invalid BPMs'):self.s.calculate(self.opt)
+        result=self.s.calculate(self.opt)
         self.assertEqual(self.b.q[ACTIVE[0]],0.)
-        self.assertLessEqual(max(abs(v) for _,v in self.b.commands),.02)
+        attempts=[a for a in result['probe_attempts'] if a['magnet']==ACTIVE[0]]
+        failures=[(i,a) for i,a in enumerate(attempts) if a.get('rejected')]
+        self.assertTrue(failures)
+        for i,a in failures:
+            for later in attempts[i+1:]:self.assertLess(later['half_span_A'],a['half_span_A'])
+        self.assertNotIn(ACTIVE[0],result['selected'])
 
     def test_one_sided_probe_at_supply_limit_matches_known_response(self):
         self.opt.adaptive_probe=False;self.opt.step_A=.001
@@ -172,18 +180,18 @@ class QMAdaptiveTests(unittest.TestCase):
             limits=quad_limits(self.b,name)
         self.assertEqual(limits,(0.,.015));self.assertEqual(get.call_count,2)
         targets,_=probe_pair(name,.009,limits,self.opt,.01)
-        np.testing.assert_allclose(targets,[0.,.015])
+        np.testing.assert_allclose(targets,[0.,.01])
 
-    def test_probe_rereads_changed_parameter_limits_and_uses_clipped_span(self):
+    def test_probe_rereads_changed_parameter_limits_and_skips_sub_resolution_range(self):
         self.opt.adaptive_probe=False;original=quad_limits;reads={}
         def limits(backend,name):
             reads[name]=reads.get(name,0)+1
             if name==ACTIVE[0] and reads[name]>1:return 0.,.006
             return original(backend,name)
         with patch('Knobs.DRTuning.dispersion.quad_limits',side_effect=limits):result=self.s.calculate(self.opt)
-        np.testing.assert_allclose(result['probe_readbacks'][0]['requested'],[0.,.006])
-        np.testing.assert_allclose(result['response'][:len(self.b.bpm_names),0],self.b.dr[:,0],atol=1.e-10)
-        self.assertTrue(all(0<=v<=.006 for name,v in self.b.commands if name==ACTIVE[0]))
+        self.assertTrue(result['probe_readbacks'][0]['skipped'])
+        self.assertFalse(result['response_column_measured'][0])
+        self.assertNotIn(ACTIVE[0],[n for n,_ in self.b.commands])
 
     def test_unrestorable_current_is_skipped_in_scan_solve_apply_and_reset(self):
         self.b.q[ACTIVE[0]]=2.1
@@ -254,6 +262,101 @@ class QMAdaptiveTests(unittest.TestCase):
         self.assertTrue(result['applied']);self.assertFalse(result['options']['constrain_cod'])
         self.assertGreater(np.max(abs(result['full_after'][2:]-result['full_measured'][2:])),.05)
 
+    def test_invalid_probe_halves_on_hundredth_amp_grid_then_accepts_first_good_pair(self):
+        for initial,expected in [(1.,[1.,.5,.25,.12,.06,.03,.01]),(.05,[.05,.02,.01])]:
+            with self.subTest(initial=initial):
+                self.opt.probe_A=initial;self.s.successful_widths={};self.b.commands=[]
+                def orbit():
+                    frame=DispersionFixture.orbit(self.b)
+                    frame['x']+=.00001*(1 if self.b.acquisitions%2 else -1)
+                    if abs(self.b.q[ACTIVE[0]])>.010001:frame['valid'][20]=False
+                    return frame
+                self.b.orbit=orbit
+                result=self.s.calculate(self.opt)
+                attempts=[a for a in result['probe_attempts'] if a['magnet']==ACTIVE[0]]
+                self.assertEqual([a['half_span_A'] for a in attempts],expected)
+                self.assertTrue(attempts[-1]['quality']['usable']);self.assertTrue(attempts[-1]['accepted'])
+                self.assertTrue(result['valid'][20]);self.assertEqual(self.b.q[ACTIVE[0]],0.)
+                currents=[v for n,v in self.b.commands if n==ACTIVE[0]]
+                self.assertEqual(currents, [v for h in expected[:-1] for v in (-h,0.)]+[-.01,.01,0.])
+
+    def test_invalid_at_minimum_is_skipped_without_sub_resolution_commands(self):
+        self.opt.probe_A=.05
+        def orbit():
+            frame=DispersionFixture.orbit(self.b)
+            if self.b.q[ACTIVE[0]]!=0:frame['valid'][20]=False
+            return frame
+        self.b.orbit=orbit;result=self.s.calculate(self.opt)
+        attempts=[a for a in result['probe_attempts'] if a['magnet']==ACTIVE[0]]
+        self.assertEqual([a['half_span_A'] for a in attempts],[.05,.02,.01])
+        self.assertTrue(result['probe_readbacks'][0]['skipped']);self.assertNotIn(ACTIVE[0],result['selected'])
+        self.assertTrue(all(v==0 or abs(v)>=.01 for _,v in self.b.commands))
+
+    def test_cancel_during_shrink_stops_before_retry(self):
+        self.opt.probe_A=.05
+        original=self.b.orbit
+        def orbit():
+            frame=original()
+            if self.b.q[ACTIVE[0]]!=0:frame['valid'][20]=False
+            return frame
+        self.b.orbit=orbit
+        def progress(_,message):
+            if 'rejected at' in message:self.s.reader.cancel.set()
+        with self.assertRaises(Cancelled):self.s.calculate(self.opt,progress)
+        self.assertEqual(self.b.commands,[(ACTIVE[0],-.05),(ACTIVE[0],0.)])
+
+    def test_restore_failure_is_not_treated_as_a_retriable_invalid_probe(self):
+        self.opt.probe_A=.05;original=self.b.orbit;write=self.b.set_quadrupole_current
+        def orbit():
+            frame=original()
+            if self.b.q[ACTIVE[0]]!=0:frame['valid'][20]=False
+            return frame
+        def failing_restore(n,value):
+            if n==ACTIVE[0] and value==0:raise RuntimeError('restore failed')
+            return write(n,value)
+        self.b.orbit=orbit
+        with patch.object(self.b,'set_quadrupole_current',side_effect=failing_restore):
+            with self.assertRaisesRegex(RuntimeError,'restore failed'):self.s.calculate(self.opt)
+        self.assertEqual(self.b.commands,[(ACTIVE[0],-.05)])
+        self.assertIn('restoration_error',self.s.last_result)
+
+    def test_successful_widths_reused_only_with_matching_settings_and_user_option(self):
+        first=self.s.calculate(self.opt)
+        self.assertGreater(len(first['probe_attempts']),2)
+        second=self.s.calculate(self.opt)
+        self.assertEqual(len(second['probe_attempts']),2)
+        for a in second['probe_attempts']:
+            self.assertEqual(a['half_span_A'],first['successful_probe_widths'][a['magnet']]['width_A'])
+        self.opt.reuse_probe_widths=False
+        fresh=self.s.calculate(self.opt)
+        self.assertEqual(fresh['probe_attempts'][0]['half_span_A'],.01);self.assertGreater(len(fresh['probe_attempts']),2)
+        self.opt.reuse_probe_widths=True
+        self.b.currents[self.b.hcorrectors[0]]+=.01
+        changed=self.s.calculate(self.opt)
+        self.assertEqual(changed['probe_attempts'][0]['half_span_A'],.01)
+
+    def test_successful_width_cache_round_trips_through_checkpoint(self):
+        first=self.s.calculate(self.opt)
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'scan.json';save_checkpoint(path,first)
+            service=DispersionService(self.b,threading.Event());service.restore_width_cache(load_checkpoint(path))
+            result=service.calculate(self.opt)
+        self.assertEqual(len(result['probe_attempts']),2)
+
+    def test_shared_absolute_limit_bounds_probe_and_apply_without_legacy_delta_limit(self):
+        self.opt.fixed_actuators=tuple(n for n in QM_CANDIDATES if n!=ACTIVE[0])
+        self.opt.probe_current_limit_A=.3;self.opt.step_A=.001
+        for sign in (-1,1):
+            with self.subTest(sign=sign):
+                self.b.q[ACTIVE[0]]=sign*.2;self.b.d0=-self.b.dr[:,0]*(sign*.5);self.b.commands=[]
+                result=self.s.calculate(self.opt)
+                self.assertAlmostEqual(result['centers'][0]+result['delta'][0],sign*.3,places=6)
+                self.assertGreater(abs(result['delta'][0]),self.opt.step_A)
+                self.s.apply(result)
+                self.assertAlmostEqual(self.b.q[ACTIVE[0]],sign*.3,places=6)
+                self.assertTrue(all(abs(v)<=.3+1.e-9 for _,v in self.b.commands))
+                self.s.reset(result)
+
 
 class QMCheckpointGuiTests(unittest.TestCase):
     @classmethod
@@ -261,12 +364,12 @@ class QMCheckpointGuiTests(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
 
-    def test_load_resume_buttons_preserve_small_probe_and_save_new_checkpoint(self):
+    def test_load_resume_buttons_preserve_current_initial_setting_and_save_new_checkpoint(self):
         from Knobs.DRTuning.gui import TuningSession
         from Knobs.DRTuning.correction_gui import QFileDialog
         window=TuningSession(DispersionFixture());panel=window.qm_dispersion
         try:
-            self.assertEqual(panel.probe.value(),.01);self.assertEqual(panel.probe_limit.value(),3.)
+            self.assertEqual(panel.probe.value(),1.);self.assertEqual(panel.probe_limit.value(),3.)
             self.assertFalse(panel.constrain_cod.isChecked());self.assertFalse(panel.cod.isEnabled())
             with tempfile.TemporaryDirectory() as directory:
                 panel.autosave_directory=Path(directory)
@@ -276,13 +379,13 @@ class QMCheckpointGuiTests(unittest.TestCase):
                     if message.startswith('QM dispersion response') and '(1/3)' in message:window.service.cancel.set()
                 with self.assertRaises(Cancelled):panel.service.calculate(opt,progress,checkpoint_path=path)
                 with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'JSON')):panel.load_scan()
-                self.assertEqual(panel.probe.value(),.01);self.assertTrue(panel.resume_button.isEnabled())
+                self.assertEqual(panel.probe.value(),1.);self.assertTrue(panel.resume_button.isEnabled())
                 self.assertFalse(panel.set_button.isEnabled());window.service.cancel.clear()
                 with patch.object(window,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):panel.resume_scan()
                 self.assertFalse(panel.resume_button.isEnabled());self.assertTrue(panel.set_button.isEnabled())
                 self.assertEqual(len(list(Path(directory).glob('*.checkpoint.json'))),2)
                 self.assertIn('Scan checkpoint: 3/3',panel.save_status.text())
-                for probe in panel.result['probe_readbacks'][1:]:np.testing.assert_allclose(probe['requested'],[-.01,.01])
+                for probe in panel.result['probe_readbacks'][1:]:np.testing.assert_allclose(probe['requested'],[-1.,1.])
         finally:window.close();self.app.processEvents()
 
     def test_skipped_qm_is_visible_in_partial_and_complete_tables(self):

@@ -17,13 +17,14 @@ PROBE_INCREMENT_A=.01
 
 @dataclass
 class DispersionOptions:
-    probe_A: float = .05
+    probe_A: float = 3.
     adaptive_probe: bool = True
     probe_current_limit_A: float = 3.
     target_snr: float = 5.
     maximum_probe_pairs: int = 12
     probe_max_growth: float = 3.
     reuse_probe_widths: bool = True
+    characterize_first_scan: bool = True
     step_A: float = 3.  # Legacy saved-file field; the shared absolute current limit controls the solver.
     frequency_change_khz: float = 4.
     momentum_compaction: float = .0021
@@ -50,6 +51,7 @@ class DispersionOptions:
             raise ValueError('Initial QM probe width must be a multiple of 0.01 A, minimum 0.01 A')
         if not np.isfinite(self.probe_max_growth) or self.probe_max_growth<=1 or not isinstance(self.reuse_probe_widths,bool):
             raise ValueError('Invalid QM growth / width reuse options')
+        if not isinstance(self.characterize_first_scan,bool):raise ValueError('Invalid first-pass option')
         if self.measure_tunes and (not np.isfinite(self.tune_tolerance) or self.tune_tolerance<=0):raise ValueError('Invalid tune_tolerance')
         if (not np.isfinite([self.regularization,self.svd_cut]).all() or self.regularization<0 or
                 not 0<=self.svd_cut<1 or self.selection not in ('all','greedy') or
@@ -78,6 +80,10 @@ class ProbeRangeUnavailable(ValueError):
 
 class ProbeSignalRejected(ValueError):
     """A restored probe may be retried at a smaller width; hardware errors are not caught here."""
+
+
+class InsufficientProbeQuality(ValueError):
+    pass
 
 
 def probe_floor(value):return round(np.floor(value/PROBE_INCREMENT_A+1.e-10)*PROBE_INCREMENT_A,12)
@@ -109,15 +115,23 @@ def probe_pair(magnet,center,limits,opt,width):
     return targets,max(reference-lower,upper-reference)
 
 
-def next_probe_width(width,center,limits,measured_span,quality,opt,failed_width=None):
-    """Estimate the needed span from S/N, accounting for clipped/one-sided pairs."""
+def estimated_probe_width(center,limits,measured_span,quality,opt):
+    """Infer a target width from measured span and S/N, including clipped pairs."""
     lo,hi=probe_bounds(limits,opt);reference=float(np.clip(center,lo,hi))
     near=min(reference-lo,hi-reference);far=max(reference-lo,hi-reference)
     snr=quality['snr']
+    if snr is None or snr<=0:return None
     # A small headroom avoids repeated measurements just below the target.
-    ratio=1.1*opt.target_snr/snr if snr is not None and snr>0 else opt.probe_max_growth
-    wanted_span=measured_span*ratio
+    wanted_span=measured_span*1.1*opt.target_snr/snr
     estimate=wanted_span/2 if wanted_span<=2*near else wanted_span-near
+    return min(probe_ceil(far),max(PROBE_INCREMENT_A,probe_ceil(estimate)))
+
+
+def next_probe_width(width,center,limits,measured_span,quality,opt,failed_width=None):
+    """Use S/N feedback with a growth cap and a remembered failed-width ceiling."""
+    estimate=estimated_probe_width(center,limits,measured_span,quality,opt)
+    _,far=probe_pair('',center,limits,opt,width)
+    if estimate is None:estimate=width*opt.probe_max_growth
     ceiling=probe_floor(width*opt.probe_max_growth)
     ceiling=min(ceiling,probe_ceil(far))
     if failed_width is not None:ceiling=min(ceiling,round(failed_width-PROBE_INCREMENT_A,12))
@@ -253,7 +267,7 @@ class DispersionService:
     def initial_width(self,n,data,opt):
         entry=self.successful_widths.get(n)
         if opt.adaptive_probe and opt.reuse_probe_widths and entry and entry['context']==self.width_context(data,opt):
-            if self.backend.same_settings(data['baseline'],entry['baseline']):return probe_floor(entry['width_A']),'previous successful width'
+            if self.backend.same_settings(data['baseline'],entry['baseline']):return probe_floor(entry['width_A']),'previous response S/N estimate'
         return opt.probe_A,'initial setting'
 
     def probe_quality(self,frames,variances,mask,opt):
@@ -316,8 +330,10 @@ class DispersionService:
                 self.check();n=names[j];c=centers[j]
                 h,width_source=self.initial_width(n,data,opt)
                 progress(round(90*j/len(names)),f'QM probe: {n} starting width {h:g} A ({width_source})')
+                characterize=opt.adaptive_probe and opt.characterize_first_scan and width_source=='initial setting'
                 state['active_magnet']=n;skip_reason=None;failed_width=None
                 for attempt in range(opt.maximum_probe_pairs if opt.adaptive_probe else 1):
+                    self.check()
                     limits[:,j]=quad_limits(b,n);data['limits']=limits.copy()
                     # Read parameter.A/B again before each pair; the live backend also validates each write.
                     try:targets,margin=probe_pair(n,c,limits[:,j],opt,h)
@@ -371,7 +387,7 @@ class DispersionService:
                         break
                     quality=self.probe_quality(frames,variances,pair_valid&enabled&straight,opt)
                     next_width=next_probe_width(h,c,limits[:,j],measured_span,quality,opt,failed_width) if opt.adaptive_probe and not quality['usable'] else None
-                    finished=(not opt.adaptive_probe or quality['usable'] or next_width is None or attempt+1==opt.maximum_probe_pairs)
+                    finished=(not opt.adaptive_probe or characterize or quality['usable'] or next_width is None or attempt+1==opt.maximum_probe_pairs)
                     data['probe_attempts'].append(dict(magnet=n,half_span_A=h,requested=targets.copy(),actual=readbacks,
                         quality=quality,accepted=finished,signal_frames=frames,signal_variances=variances,
                         next_width_A=next_width if not finished else None))
@@ -397,8 +413,14 @@ class DispersionService:
                     scheme=('shifted inside probe range' if c<targets[0] or c>targets[1] else
                             'symmetric' if np.isclose(c-targets[0],targets[1]-c,rtol=0,atol=1.e-12) else 'asymmetric / one-sided')
                     data['probe_readbacks'].append(dict(magnet=n,requested=targets.copy(),actual=readbacks,scheme=scheme))
-                    if quality['usable']:
-                        self.successful_widths[n]=dict(width_A=h,context=self.width_context(data,opt),baseline=copy.deepcopy(data['baseline']))
+                    if quality['signal_rms']>1.e-12:
+                        estimate=estimated_probe_width(c,limits[:,j],measured_span,quality,opt)
+                        estimate=h if estimate is None else min(estimate,probe_floor(h*opt.probe_max_growth))
+                        if quality['usable']:estimate=min(estimate,h)
+                        if failed_width is not None:estimate=min(estimate,round(failed_width-PROBE_INCREMENT_A,12))
+                        self.successful_widths[n]=dict(width_A=estimate,measured_width_A=h,quality=copy.deepcopy(quality),
+                            context=self.width_context(data,opt),baseline=copy.deepcopy(data['baseline']))
+                    else:self.successful_widths.pop(n,None)
                 state.update(completed=j+1,columns=columns.copy(),tune_columns=qcolumns.copy(),common_valid=valid.copy(),
                              active_magnet=None,status='running')
                 self.checkpoint(data,checkpoint_path,event)
@@ -409,9 +431,13 @@ class DispersionService:
                         acquisition_valid=valid.copy(),valid=valid&enabled,
                         response_column_measured=[not r.get('skipped',False) for r in data['probe_readbacks']],
                         orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
-            self.solve(data,opt);state['status']='complete';data.pop('restored',None)
+            try:self.solve(data,opt)
+            except InsufficientProbeQuality as exc:
+                if not opt.characterize_first_scan:raise
+                data['proposal_unavailable_reason']=str(exc)+'; response calibration saved. CALC again to use estimated widths.'
+            state['status']='complete';data.pop('restored',None)
             self.checkpoint(data,checkpoint_path,event);event(dict(kind='dispersion',data=copy.deepcopy(data)))
-            progress(100,'QM proposal ready; all diagnostic currents and RF restored')
+            progress(100,data.get('proposal_unavailable_reason','QM proposal ready; all diagnostic currents and RF restored'))
             return data
         except BaseException as exc:
             data['error']=str(exc);state['status']='interrupted'
@@ -556,7 +582,7 @@ class DispersionService:
         if opt.adaptive_probe and data.get('probe_quality'):
             available=[i for i in available if data['probe_quality'][i]['signal_rms']>1.e-12 and
                        data['probe_quality'][i]['signal_rms']>=opt.target_snr*data['probe_quality'][i]['noise_rms']]
-        if not available:raise ValueError('No QM response reaches the target signal/noise ratio; review probe quality / limits')
+        if not available:raise InsufficientProbeQuality('No QM response reaches the target signal/noise ratio; review probe quality / limits')
         if opt.selection=='all':selected=available;step,_,singular=fit(selected)
         else:
             score=float(np.linalg.norm(residual));step=np.zeros(0);singular=np.zeros(0)
