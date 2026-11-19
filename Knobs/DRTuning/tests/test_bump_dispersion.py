@@ -309,6 +309,87 @@ class DispersionTests(unittest.TestCase):
         self.b.orbit=invalid
         with self.assertRaisesRegex(ValueError,'No valid straight'):self.s.calculate(self.o)
         self.assertEqual(self.b.commands,[]);self.assertEqual(self.b.offset,0.)
+        self.assertEqual(self.s.last_result['validity_history'][0]['common_straight'],0)
+    def test_common_bpm_failure_reports_accumulated_loss_and_restores_probe(self):
+        initial=self.b.snapshot();straight=np.flatnonzero(straight_bpms(self.b.bpm_names))
+        first,second=np.array_split(straight,2);original=self.b.orbit;progress=[]
+        def alternating():
+            frame=original();current=self.b.q['QM1R.1']
+            if current<0:frame['valid'][first]=False
+            if current>0:frame['valid'][second]=False
+            return frame
+        with patch.object(self.b,'orbit',side_effect=alternating):
+            with self.assertRaisesRegex(ValueError,'Lost all common valid') as failure:
+                self.s.calculate(self.o,lambda _,message:progress.append(message))
+        data=self.s.last_result;report=data['validity_history'][-1]
+        self.assertEqual(self.b.snapshot(),initial);self.assertNotIn('response',data)
+        self.assertIn('QM1R.1 probe +0.1 A',str(failure.exception))
+        self.assertGreater(report['current_straight'],0);self.assertGreater(report['previous_common'],0)
+        self.assertEqual(report['common_straight'],0);self.assertFalse(np.any(data['valid']&data['straight']))
+        self.assertEqual(report['lost_bpms'],[self.b.bpm_names[i] for i in second])
+        self.assertEqual(len(report['settings']),3);self.assertIn('other/status invalid=',str(failure.exception))
+        self.assertTrue(any('BPM validity:' in message for message in progress))
+    def test_single_invalid_update_is_omitted_and_scan_continues(self):
+        initial=self.b.snapshot();region=straight_bpms(self.b.bpm_names);original=self.b.orbit
+        def dropout():
+            frame=original()
+            if self.b.acquisitions==31:frame['tmit'][region]=0.
+            return frame
+        with patch.object(self.b,'orbit',side_effect=dropout):
+            data=self.s.calculate(self.o)
+        report=data['validity_history'][1];settings=report['settings']
+        self.assertEqual(self.b.snapshot(),initial)
+        self.assertEqual(settings[0]['valid_straight'],int(region.sum()))
+        self.assertEqual(settings[0]['per_sample_valid_straight'],[0]+[int(region.sum())]*9)
+        self.assertEqual(settings[0]['invalid_intensity'],int(region.sum()))
+        self.assertEqual(settings[1]['valid_straight'],int(region.sum()))
+        self.assertEqual(settings[2]['valid_straight'],int(region.sum()))
+        self.assertEqual(settings[0]['valid_sample_count'],[9]*int(region.sum()))
+        self.assertEqual(settings[0]['max_invalid_streak'],[1]*int(region.sum()))
+        self.assertEqual(len(data['orbit_measurements']),99)
+        self.assertTrue(data['valid'][region].all());self.assertTrue(np.isfinite(data['response']).all())
+    def test_five_consecutive_invalid_updates_stop_scan_and_restore(self):
+        initial=self.b.snapshot();region=straight_bpms(self.b.bpm_names);original=self.b.orbit
+        def dropout():
+            frame=original()
+            if 32<=self.b.acquisitions<=36:frame['tmit'][region]=0.
+            return frame
+        with patch.object(self.b,'orbit',side_effect=dropout):
+            with self.assertRaisesRegex(ValueError,'5 consecutive invalid'):self.s.calculate(self.o)
+        self.assertEqual(self.b.snapshot(),initial)
+        setting=self.s.last_result['validity_history'][-1]['settings'][0]
+        self.assertEqual(setting['valid_straight'],0)
+        self.assertEqual(setting['max_invalid_streak'],[5]*int(region.sum()))
+    def read_pattern(self,reader,pattern):
+        frames=[]
+        for i,good in enumerate(pattern):
+            frame=self.b.orbit();frame['x'][0]=float(i) if good else (np.nan if i%2 else 1.e6)
+            frame['valid'][0]=good;frames.append(frame)
+        with patch.object(self.b,'orbit',side_effect=frames):reader._orbit(Options(bpm_samples=len(pattern)))
+        return reader.orbit_measurements[-1]
+    def test_four_invalid_updates_and_scattered_failures_use_only_good_values(self):
+        for pattern in ([False]*4+[True]*6,[False,True]*5):
+            self.s.reader.reset_sampling();frame=self.read_pattern(self.s.reader,pattern)
+            values=np.flatnonzero(pattern)
+            self.assertTrue(frame['valid'][0]);self.assertEqual(frame['valid_sample_count'][0],len(values))
+            self.assertAlmostEqual(frame['x'][0],np.mean(values));self.assertAlmostEqual(frame['stdx'][0],np.std(values))
+            self.assertEqual(frame['nshots'],10)
+    def test_invalid_streak_crosses_rf_batches_and_resets_for_new_acquisition(self):
+        reader=self.s.reader;reader.reset_sampling()
+        first=self.read_pattern(reader,[True]*6+[False]*4)
+        self.assertTrue(first['valid'][0]);self.assertEqual(first['trailing_invalid_streak'][0],4)
+        second=self.read_pattern(reader,[False]+[True]*9)
+        self.assertFalse(second['valid'][0]);self.assertEqual(second['max_invalid_streak'][0],5)
+        # A good update ends the streak; a later isolated failure is accepted.
+        third=self.read_pattern(reader,[False]+[True]*9)
+        self.assertTrue(third['valid'][0]);self.assertEqual(third['max_invalid_streak'][0],1)
+        self.read_pattern(reader,[True]*6+[False]*4);reader.reset_sampling()
+        fresh=self.read_pattern(reader,[False]+[True]*9)
+        self.assertTrue(fresh['valid'][0]);self.assertEqual(fresh['max_invalid_streak'][0],1)
+    def test_other_correction_readers_keep_strict_validity(self):
+        reader=CorrectionService(self.b)
+        frame=self.read_pattern(reader,[True]*9+[False])
+        self.assertFalse(frame['valid'][0])
     def test_all_corrector_solver_ignores_greedy_count_and_honors_bounds(self):
         b=DemoBackend();s=CorrectionService(b);o=Options(selection_method='all',count_v=1,step_A=.03)
         data=s.calculate('dispersion',o)

@@ -204,7 +204,7 @@ class QMDispersionPanel(CorrectionTool):
         self.save_status=QLabel('Apply auto-save: '+str(self.autosave_directory));self.save_status.setWordWrap(True)
         self.controls.insertWidget(self.controls.count()-1,self.save_status)
         self.set_button.setEnabled(False);self.reset_button.setEnabled(False)
-        self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 candidates; QM2R.1/.2 excluded by default).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy and COD.\n10 updated BPM frames per RF setting. Tune acquisition / constraints optional; off by default.')
+        self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 candidates; QM2R.1/.2 excluded by default).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy and COD.\n10 BPM updates per RF setting; average valid samples only. Exclude after 5 consecutive invalid updates.\nTune acquisition / constraints optional; off by default.')
         for w in (self.maximum,self.probe,self.step,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(self.invalidate)
         self.selection.currentIndexChanged.connect(self.invalidate)
         self.excluded.textChanged.connect(self.invalidate)

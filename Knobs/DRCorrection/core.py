@@ -159,6 +159,11 @@ class CorrectionService:
         finally:self.paused.clear()
         progress(percent,'RESUMED: continuing response measurement')
 
+    def summarize_orbit(self,arrays):
+        return dict(**{key:np.mean(arrays[key],axis=0) for key in ('x','y','tmit')},
+                    valid=np.all(arrays['valid'],axis=0),
+                    stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0))
+
     def _orbit(self,opt):
         count=opt.bpm_samples;interval=opt.bpm_interval_s
         validate_bpm_sampling(opt)
@@ -177,14 +182,12 @@ class CorrectionService:
             diagnostics.append(result.get('validity_diagnostics',{}))
             timestamps.append(result.get('timestamps',{}));fresh.append(result.get('freshness_verified',False))
         arrays={key:np.stack([s[key] for s in samples]) for key in ('x','y','tmit','valid')}
-        means={key:np.mean(arrays[key],axis=0) for key in ('x','y','tmit')}
-        valid=np.all(arrays['valid'],axis=0)
-        self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**means,valid=valid,
-            stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0),
+        summary=self.summarize_orbit(arrays)
+        self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**summary,
             nshots=int(count),sample_interval_s=float(interval),samples=arrays,
             position_unit='mm',freshness_verified=all(fresh),timestamps=timestamps,
             same_shot_verified=False,validity_diagnostics=diagnostics))
-        return means['x'],means['y'],valid
+        return summary['x'],summary['y'],summary['valid']
 
     def require_usable(self,names,measured,target,acquisition_valid,actuators,opt,measurements=None):
         enabled=np.array([n not in opt.excluded_bpms for n in names],bool)

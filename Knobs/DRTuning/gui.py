@@ -334,7 +334,7 @@ class TuningSession(DRCorrectionWindow):
         self.progress.setRange(0,100);self.progress.setValue(value)
         pending=' [Pause requested; finishing current operation]' if self.service.pause_requested.is_set() and not self.service.paused.is_set() else ''
         self.operation_status.setText(self._active_label+'：'+message+pending)
-        if message.startswith(('SKIP ','PAUSED:','RESUMED:')):self.log(message)
+        if message.startswith(('SKIP ','PAUSED:','RESUMED:','BPM validity:')):self.log(message)
     def task_finished(self):
         self.prepare_pause(False)
         self.timer.stop();self.tick();self.tabs.setEnabled(True);self.navigation.setEnabled(True);self.cancel_button.setEnabled(False)

@@ -61,9 +61,38 @@ def restore_quads(backend,names,values):
     if errors:raise RuntimeError('QM restoration incomplete: '+'; '.join(errors))
 
 
+class QMOrbitReader(CorrectionService):
+    """Keep isolated good samples; reject a BPM after five consecutive bad updates."""
+    invalid_streak_limit=5
+
+    def reset_sampling(self):
+        self.orbit_measurements=[]
+        self.invalid_streak=np.zeros(len(self.backend.bpm_names),dtype=int)
+
+    def summarize_orbit(self,arrays):
+        good=arrays['valid'];count=good.sum(axis=0)
+        streak=getattr(self,'invalid_streak',np.zeros(good.shape[1],dtype=int)).copy()
+        longest=np.zeros_like(streak)
+        for row in good:
+            streak=np.where(row,0,streak+1);longest=np.maximum(longest,streak)
+        self.invalid_streak=streak
+        means={key:np.divide(np.where(good,arrays[key],0.).sum(axis=0),count,
+                            out=np.full(count.shape,np.nan),where=count>0) for key in ('x','y','tmit')}
+        std={}
+        for key in ('x','y'):
+            residual=np.where(good,arrays[key],0.)-np.where(count>0,means[key],0.)
+            variance=np.divide(np.where(good,residual**2,0.).sum(axis=0),count,
+                               out=np.full(count.shape,np.nan),where=count>0)
+            std['std'+key]=np.sqrt(variance)
+        return dict(**means,**std,valid=(count>0)&(longest<self.invalid_streak_limit),
+                    valid_sample_count=count,max_invalid_streak=longest,
+                    trailing_invalid_streak=streak.copy(),invalid_streak_limit=self.invalid_streak_limit,
+                    averaging_policy='valid samples only')
+
+
 class DispersionService:
     def __init__(self,backend,cancel):
-        self.backend=backend;self.reader=CorrectionService(backend);self.reader.cancel=cancel;self.last_result=None
+        self.backend=backend;self.reader=QMOrbitReader(backend);self.reader.cancel=cancel;self.last_result=None
 
     def check(self):self.reader.check_cancel()
 
@@ -80,6 +109,36 @@ class DispersionService:
         if q.shape!=(2,) or not np.isfinite(q).all():raise ValueError('Invalid tune measurement')
         return self.reader.full_signal.copy(),valid,q,tunes
 
+    def validity_report(self,mask,previous,enabled,straight,start,label,opt):
+        """Describe the intersection and the consecutive-invalid update rule."""
+        region=enabled&straight;common=previous&mask&region
+        lost=[n for n,drop in zip(self.backend.bpm_names,previous&~mask&region) if drop]
+        record=dict(label=label,enabled_straight=int(region.sum()),current_straight=int((mask&region).sum()),
+                    previous_common=int((previous&region).sum()),common_straight=int(common.sum()),
+                    lost_bpms=lost,settings=[])
+        labels=('nominal RF',f'RF -{opt.frequency_change_khz/2:g} kHz',f'RF +{opt.frequency_change_khz/2:g} kHz')
+        for index,frame in enumerate(self.reader.orbit_measurements[start:],start):
+            samples=frame['samples'];valid=np.asarray(samples['valid'],bool)[:,region]
+            x=np.asarray(samples['x'])[:,region];y=np.asarray(samples['y'])[:,region];q=np.asarray(samples['tmit'])[:,region]
+            finite=np.isfinite(x)&np.isfinite(y);intensity=np.isfinite(q)&(q>0)
+            counts=valid.sum(axis=1)
+            record['settings'].append(dict(label=labels[index-start],measurement_index=index,
+                valid_straight=int((np.asarray(frame['valid'],bool)&region).sum()),
+                per_sample_valid_straight=counts.tolist(),nonfinite_xy=int((~finite).sum()),
+                invalid_intensity=int((~intensity).sum()),other_invalid=int((~valid&finite&intensity).sum()),
+                valid_sample_count=np.asarray(frame['valid_sample_count'])[region].tolist(),
+                max_invalid_streak=np.asarray(frame['max_invalid_streak'])[region].tolist(),
+                invalid_streak_limit=frame['invalid_streak_limit'],
+                source_diagnostics=copy.deepcopy(frame.get('validity_diagnostics',[]))))
+        settings='; '.join(f"{s['label']}: valid={s['valid_straight']}, "
+            f"per-update={s['per_sample_valid_straight']}, nonfinite XY={s['nonfinite_xy']}, "
+            f"invalid intensity={s['invalid_intensity']}, other/status invalid={s['other_invalid']}, "
+            f"streak >= {s['invalid_streak_limit']}: {sum(n>=s['invalid_streak_limit'] for n in s['max_invalid_streak'])} BPMs" for s in record['settings'])
+        record['message']=(f"BPM validity: {label}; enabled straight={record['enabled_straight']}, "
+            f"this observation={record['current_straight']}, common={record['previous_common']} -> {record['common_straight']}. "
+            +settings+'. Lost: '+(', '.join(lost) or 'none'))
+        return record
+
     def calculate(self,opt,progress=lambda *_:None,event=lambda *_:None):
         opt.validate();self.check();b=self.backend;b.validate_mode('dispersion')
         if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
@@ -95,18 +154,22 @@ class DispersionService:
         spans=np.minimum(opt.probe_A,np.minimum(centers-limits[0],limits[1]-centers))
         if np.any(spans<=1.e-6):raise ValueError('No symmetric QM probe margin; exclude the limited trim')
         for n,c,h in zip(names,centers,spans):b.validate_quadrupole_targets(n,[c-h,c,c+h])
-        baseline=b.snapshot();self.reader.orbit_measurements=[]
+        baseline=b.snapshot();self.reader.reset_sampling()
         measured,valid,tunes,tune_evidence=self.signal(opt)
-        if not np.any(valid&enabled&straight):raise ValueError('No valid straight-section BPM before QM probes')
         data=dict(schema='dr-qm-dispersion-1',mode='dispersion',backend_id=b.identity,
                   names=list(b.bpm_names),positions_m=np.asarray(b.positions_m),actuators=names,
                   centers=centers,limits=limits,baseline=baseline,full_measured=measured,valid=valid&enabled,
                   straight=straight,initial_tunes=tunes,initial_tune_evidence=tune_evidence,options=asdict(opt),applied=False,
                   full_signal_labels=['Dispersion X','Dispersion Y','COD X','COD Y'],scan_tunes=[],probe_readbacks=[],
-                  tune_measurement_enabled=opt.measure_tunes,acquisition_options=asdict(opt))
+                  tune_measurement_enabled=opt.measure_tunes,acquisition_options=asdict(opt),validity_history=[],
+                  bpm_invalid_streak_limit=self.reader.invalid_streak_limit)
         self.last_result=data;event(dict(kind='dispersion',data=copy.deepcopy(data)))
         columns=[];qcolumns=[]
         try:
+            diagnostic=self.validity_report(valid,np.ones_like(valid),enabled,straight,0,'Initial baseline',opt)
+            data['validity_history'].append(diagnostic);progress(0,diagnostic['message'])
+            if not np.any(valid&enabled&straight):
+                raise ValueError('No valid straight-section BPM before QM probes. '+diagnostic['message'])
             for j,(n,c,h) in enumerate(zip(names,centers,spans)):
                 frames=[];qs=[];readbacks=[]
                 try:
@@ -115,8 +178,17 @@ class DispersionService:
                         reading=float(b.quadrupole_current(n))
                         if not np.isfinite(reading):raise ValueError('Invalid QM current readback: '+n)
                         readbacks.append(reading)
-                        frame,mask,q,evidence=self.signal(opt);valid &= mask
-                        if not np.any(valid&enabled&straight):raise ValueError('Lost all common valid straight-section BPMs')
+                        start=len(self.reader.orbit_measurements)
+                        frame,mask,q,evidence=self.signal(opt)
+                        diagnostic=self.validity_report(mask,valid,enabled,straight,start,
+                            f'{n} probe {sign*h:+g} A (readback {reading:+g} A)',opt)
+                        data['validity_history'].append(diagnostic);valid &= mask;data['valid']=valid&enabled
+                        progress(round(90*j/len(names)),diagnostic['message'])
+                        if not np.any(valid&enabled&straight):
+                            raise ValueError('Lost all common valid straight-section BPMs. '+diagnostic['message']+
+                                '. A BPM is excluded after 5 consecutive invalid updates; averages use valid samples only. '
+                                'Common BPMs must remain usable at every RF setting and QM probe; '
+                                'individual observations may still contain valid BPMs. No correction applied.')
                         frames.append(frame)
                         if opt.measure_tunes:
                             qs.append(q);data['scan_tunes'].append(dict(magnet=n,current_A=c+sign*h,measurement=evidence))
@@ -219,7 +291,7 @@ class DispersionService:
         names=data['actuators'];centers=np.asarray(data['centers']);delta=np.asarray(data['delta']);changed=np.flatnonzero(abs(delta)>1.e-12)
         if not len(changed):raise ValueError('No QM correction proposed')
         for j in changed:b.validate_quadrupole_targets(names[j],[centers[j]+delta[j]])
-        self.reader.orbit_measurements=[]
+        self.reader.reset_sampling()
         try:
             for j in changed:
                 self.check();b.set_quadrupole_current(names[j],float(centers[j]+delta[j]))

@@ -43,6 +43,23 @@ QM dispersion:
   With the default 14 active trims: 29 dispersion observations, 87 COD settings,
   870 BPM frames. Enabling all 16 gives 33 observations / 99 settings / 990 frames.
   This can take several minutes with live settling.
+  "Lost all common valid straight-section BPMs" means no enabled straight BPM
+  remained usable through every accepted observation, not necessarily that all
+  BPMs failed simultaneously. QM dispersion excludes a BPM after FIVE consecutive
+  invalid updates. Valid updates require finite X/Y, positive finite intensity
+  and accepted BPM status. A good update resets the streak; consecutive failures
+  carry across RF and QM settings within CALC or Apply. Starting a new CALC or
+  Apply resets streaks. The common mask is intersected across all QM probes.
+  Each RF setting still acquires 10 updates. Means and standard deviations use
+  only valid samples; missing/invalid values are never averaged or filled in.
+  Thus an accepted average can contain fewer than 10 samples. Saved data include
+  valid_sample_count, max_invalid_streak, trailing_invalid_streak and the limit.
+  Other correction tools retain their previous sampling/validity rules.
+  Show detailed log now records "BPM validity:" for each observation, including
+  QM/current, current versus cumulative valid counts, lost BPM names, and
+  per-RF/per-update counts. The saved JSON validity_history retains these
+  diagnostics plus source status evidence and links to raw orbit measurements.
+  Once excluded during a scan, a BPM stays out of that scan's common response.
   Dx is targeted to zero at legacy straight BPMs MB19R–MB31R / MB66R–MB80R.
   Arc Dx, Dy and COD target their measured baselines. These are named physical
   BPM regions, not an assumption that the entire ring has zero dispersion.
