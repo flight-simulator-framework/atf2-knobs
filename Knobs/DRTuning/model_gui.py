@@ -119,8 +119,12 @@ class ModelPanel(QWidget):
             root=Path(path);(root/'model.json').write_text(json.dumps(serial(self.result),indent=2,allow_nan=False)+'\n')
             self.plot.save(root/'model_optics.png');self.window.log('Saved model audit: '+str(root))
     def save_diagnostics(self,path=None):
-        attempt=self.manager.last_attempt
-        if attempt is None:self.window.error('Run Build model / optics or model CALC first');return
+        managers=[self.manager]
+        bump=getattr(self.window,'coupling_panel',None)
+        if bump is not None:managers.append(bump.service.reader.model_manager)
+        attempts=[m.last_attempt for m in managers if m.last_attempt is not None]
+        attempt=max(attempts,key=lambda a:a.get('captured_unix_s',0),default=None)
+        if attempt is None:self.window.error('Run Build model / optics, model CALC or Bump selection first');return
         if not path:path,_=QFileDialog.getSaveFileName(self,'Save last model preparation attempt','dr_model_diagnostic.json','JSON (*.json)')
         if not path:return
         try:

@@ -305,6 +305,25 @@ class ModelGuiTests(unittest.TestCase):
     def setUpClass(cls):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
+    def test_diagnostics_save_latest_bump_or_main_attempt_without_machine_access(self):
+        from Knobs.DRTuning.gui import TuningSession
+        b=CountedBackend();window=TuningSession(b)
+        try:
+            main=window.service.model_manager;bump=window.coupling_panel.service.reader.model_manager
+            main.last_attempt=dict(captured_unix_s=1,status='ready')
+            bump.last_attempt=dict(captured_unix_s=2,status='failed',error='Actuator absent from model')
+            with tempfile.TemporaryDirectory() as root:
+                path=Path(root)/'diagnostic.json'
+                window.model_panel.save_diagnostics(path)
+                self.assertEqual(json.loads(path.read_text()),bump.last_attempt)
+                main.last_attempt=dict(captured_unix_s=3,status='ready')
+                window.model_panel.save_diagnostics(path)
+                self.assertEqual(json.loads(path.read_text()),main.last_attempt)
+                main.last_attempt=None
+                window.model_panel.save_diagnostics(path)
+                self.assertEqual(json.loads(path.read_text()),bump.last_attempt)
+            self.assertEqual(b.commands,[]);self.assertEqual(b.acquisitions,0)
+        finally:window.close();window.deleteLater();self.app.processEvents()
     def test_live_defaults_choose_sad_model_and_legacy_counts(self):
         from Knobs.DRTuning.gui import TuningSession
         b=CountedBackend();b.identity='epics:offline-fake'

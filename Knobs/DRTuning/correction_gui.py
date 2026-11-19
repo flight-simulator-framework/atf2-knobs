@@ -8,7 +8,7 @@ from uuid import uuid4
 import numpy as np
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy)
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QCheckBox)
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
@@ -73,6 +73,10 @@ class CouplingPanel(CorrectionTool):
         self.geometry=None;self.calibration=None;self.points=[];self.samples={};self.fits=[];self.last_orbit=None
         self.target=QComboBox();self.target.addItems([f'{f}.{i}' for f in ('SD1R','SF1R') for i in range(1,35)])
         self.form.addRow('SD / SF bump position',self.target)
+        self.match_tunes=QCheckBox('Match model tunes (optional)')
+        self.match_tunes.setChecked(False)
+        self.match_tunes.setToolTip('Off: use imported model strengths without QF1R/QF2R tune matching. Model stability is still required. Target displacement remains a model estimate; measured bump calibration and outside COD checks are required.')
+        self.form.addRow(self.match_tunes)
         self.amplitude=control(self.form,'Scan width [mm]',.8,.02,4.)
         self.amplitude.setToolTip('Full scan width. Try centered, then shifted windows containing zero; if none closes, use half this width. A shifted endpoint can reach the full width from zero.')
         self.refine=control(self.form,'Refinement ± [mm]',.1,.001,1.)
@@ -92,6 +96,7 @@ class CouplingPanel(CorrectionTool):
         self.calibrate_button.setEnabled(False);self.scan_button.setEnabled(False);self.reset_button.setEnabled(False)
         for widget in (self.amplitude,self.refine,self.probe,self.step,self.leak,self.rms,self.settle):widget.valueChanged.connect(self.invalidate)
         self.target.currentIndexChanged.connect(self.invalidate)
+        self.match_tunes.toggled.connect(self.invalidate)
         self.status.setText('Select a target, then inspect the automatically selected BPMs and correctors.\nTarget mm is reconstructed from local BPMs using model transport.')
         self.redraw()
     def options(self):
@@ -113,6 +118,7 @@ class CouplingPanel(CorrectionTool):
     def prepare(self):
         target=self.target.currentData() or self.target.currentText();opt=self.options()
         model_options=copy.deepcopy(self.window.panels['dispersion'].options)
+        model_options.model_match_tunes=self.match_tunes.isChecked()
         def done(g):
             self.geometry=g;self.calibration=None;self.result=g;self.calibrate_button.setEnabled(True);self.scan_button.setEnabled(False)
             self.set_table(['Corrector','Baseline [A]','Model knob [A/mm]'],zip(g['actuators'],g['centers'],g['model_knob_A_per_mm']))

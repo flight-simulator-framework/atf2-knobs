@@ -130,6 +130,7 @@ class CouplingService:
                         bpm_names=list(self.backend.bpm_names),positions_m=positions,
                         model_bpm_names=list(model.bpm_names))
         geometry['baseline']=self.backend.snapshot();geometry['options']=asdict(opt)
+        geometry['model_match_tunes']=bool(model_options.model_match_tunes)
         progress(100,'BPMs and correctors selected; no magnet changed')
         return geometry
 

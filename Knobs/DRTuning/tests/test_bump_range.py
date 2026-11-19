@@ -119,6 +119,28 @@ class AdaptiveBumpRangeTests(unittest.TestCase):
 
 
 class BumpRangeGuiTests(unittest.TestCase):
+    def test_bump_tune_matching_is_optional_and_independent(self):
+        from PyQt6.QtWidgets import QApplication
+        from Knobs.DRTuning.gui import TuningSession
+        from Knobs.DRTuning.tests.test_bump_dispersion import DispersionFixture
+        app=QApplication.instance() or QApplication([]);window=TuningSession(DispersionFixture())
+        try:
+            panel=window.coupling_panel;shared=window.panels['dispersion'].options
+            shared.model_match_tunes=True;shared.fixed_actuators=('unmapped',)
+            with patch.object(window,'start') as start,patch.object(panel.service,'prepare') as prepare:
+                panel.prepare();start.call_args.args[0](lambda *_:None)
+                options=prepare.call_args.args[2]
+                self.assertFalse(options.model_match_tunes)
+                self.assertEqual(options.fixed_actuators,('unmapped',))
+                self.assertTrue(shared.model_match_tunes)
+                panel.geometry={};panel.calibration={};panel.scan_button.setEnabled(True)
+                panel.match_tunes.setChecked(True)
+                self.assertIsNone(panel.geometry);self.assertIsNone(panel.calibration)
+                self.assertFalse(panel.scan_button.isEnabled())
+                panel.prepare();start.call_args.args[0](lambda *_:None)
+                self.assertTrue(prepare.call_args.args[2].model_match_tunes)
+        finally:window.close();app.processEvents()
+
     def test_full_width_control_and_selected_range_are_explicit(self):
         from PyQt6.QtWidgets import QApplication
         from Knobs.DRTuning.gui import TuningSession

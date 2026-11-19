@@ -245,6 +245,14 @@ Bump / XSR coupling:
      lists SD1R/SF1R by descending absolute current, displaying the signed value.
      Failed readbacks are listed separately and never ranked as zero current.
   2. Select a target and Select BPMs / correctors. Recorded-settings optics are
+     prepared with "Match model tunes (optional)" OFF by default on this page.
+     This skips QF1R/QF2R tune matching only; initial model stability remains
+     required. This Bump setting is independent of the Dispersion/model page
+     tune-match switches. Changing it requires selection and calibration again.
+     The selected setting is recorded as model_match_tunes in Bump data.
+     Unmatched model transport still predicts the target displacement; measured
+     calibration and outside COD checks do not validate its absolute scale.
+     Recorded-settings optics are
      linearized once; periodic responses solve (I-M)z=kick. Local element kick
      derivatives retain RFTrack's actual electron sign/coordinate convention.
      Two healthy BPMs bracket the target in a corrector-free interval. Two V
