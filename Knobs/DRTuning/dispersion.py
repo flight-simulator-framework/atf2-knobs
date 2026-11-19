@@ -134,8 +134,9 @@ class DispersionService:
         nominal,minus,plus=self.reader.orbit_measurements[-3:]
         def variance(frame,axis):
             count=np.asarray(frame['valid_sample_count'])
-            return np.divide(np.asarray(frame['std'+axis])**2,count,
-                             out=np.full(count.shape,np.nan),where=count>0)
+            # Stored std uses ddof=0; std^2/(n-1) is the unbiased estimate of mean variance.
+            return np.divide(np.asarray(frame['std'+axis])**2,count-1,
+                             out=np.full(count.shape,np.nan),where=count>1)
         dp=opt.frequency_change_khz*1000/(self.backend.nominal_frequency_hz*opt.momentum_compaction)
         self.signal_variance=np.array([(variance(minus,a)+variance(plus,a))/dp**2 for a in ('x','y')]+
                                       [variance(nominal,a) for a in ('x','y')])

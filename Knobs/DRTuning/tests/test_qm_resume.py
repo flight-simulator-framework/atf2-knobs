@@ -119,7 +119,9 @@ class QMAdaptiveTests(unittest.TestCase):
             for a,b in zip(attempts,attempts[1:]):self.assertEqual(b['half_span_A'],a['half_span_A']*2)
             self.assertTrue(attempts[-1]['quality']['usable'])
         self.assertTrue(all(q['snr']>=5 for q in result['probe_quality']))
-        for q in result['probe_quality']:self.assertAlmostEqual(q['target_change_mm'],5*q['orbit_noise_rms_mm'])
+        for q in result['probe_quality']:
+            self.assertAlmostEqual(q['target_change_mm'],5*q['orbit_noise_rms_mm'])
+            self.assertAlmostEqual(q['orbit_noise_rms_mm'],2*.0002/3.)
         for i in range(2,len(self.b.commands),3):self.assertEqual(self.b.commands[i][1],0.)
 
     def test_weak_response_at_attempt_limit_is_excluded_from_solver(self):
@@ -171,6 +173,17 @@ class QMAdaptiveTests(unittest.TestCase):
         self.assertEqual(limits,(0.,.015));self.assertEqual(get.call_count,2)
         targets,_=probe_pair(name,.009,limits,self.opt,.01)
         np.testing.assert_allclose(targets,[0.,.015])
+
+    def test_probe_rereads_changed_parameter_limits_and_uses_clipped_span(self):
+        self.opt.adaptive_probe=False;original=quad_limits;reads={}
+        def limits(backend,name):
+            reads[name]=reads.get(name,0)+1
+            if name==ACTIVE[0] and reads[name]>1:return 0.,.006
+            return original(backend,name)
+        with patch('Knobs.DRTuning.dispersion.quad_limits',side_effect=limits):result=self.s.calculate(self.opt)
+        np.testing.assert_allclose(result['probe_readbacks'][0]['requested'],[0.,.006])
+        np.testing.assert_allclose(result['response'][:len(self.b.bpm_names),0],self.b.dr[:,0],atol=1.e-10)
+        self.assertTrue(all(0<=v<=.006 for name,v in self.b.commands if name==ACTIVE[0]))
 
     def test_outside_probe_range_error_identifies_magnet_and_limits(self):
         self.b.q[ACTIVE[0]]=2.1
