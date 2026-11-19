@@ -185,11 +185,66 @@ class QMAdaptiveTests(unittest.TestCase):
         np.testing.assert_allclose(result['response'][:len(self.b.bpm_names),0],self.b.dr[:,0],atol=1.e-10)
         self.assertTrue(all(0<=v<=.006 for name,v in self.b.commands if name==ACTIVE[0]))
 
-    def test_outside_probe_range_error_identifies_magnet_and_limits(self):
+    def test_unrestorable_current_is_skipped_in_scan_solve_apply_and_reset(self):
         self.b.q[ACTIVE[0]]=2.1
-        with self.assertRaisesRegex(ValueError,r'QM1R\.1.*current=\+2.1.*supply='):
-            self.s.calculate(self.opt)
-        self.assertEqual(self.b.commands,[]);self.assertEqual(self.b.acquisitions,0)
+        result=self.s.calculate(self.opt)
+        self.assertEqual(result['skipped_qms'][0]['magnet'],ACTIVE[0])
+        self.assertIn('current=+2.1',result['skipped_qms'][0]['reason'])
+        self.assertFalse(result['response_column_measured'][0]);self.assertIsNone(result['probe_quality'][0]['signal_rms'])
+        self.assertEqual(result['delta'][0],0.);self.assertNotIn(ACTIVE[0],result['selected'])
+        # Fixed-probe refitting must also exclude the unmeasured placeholder.
+        self.opt.adaptive_probe=False;result=self.s.recalculate(result,self.opt)
+        self.assertNotIn(ACTIVE[0],result['selected'])
+        self.s.apply(result);self.s.reset(result)
+        self.assertEqual(self.b.q[ACTIVE[0]],2.1)
+        self.assertNotIn(ACTIVE[0],[n for n,_ in self.b.commands])
+
+    def test_outside_probe_cap_shifts_reference_but_restores_original_current(self):
+        self.opt.adaptive_probe=False
+        for center,expected in [(3.2,[2.99,3.]),(-3.2,[-3.,-2.99])]:
+            with self.subTest(center=center):
+                self.b.q[ACTIVE[0]]=center;self.b.quadrupoles[ACTIVE[0]]['limits_A']=[-5.,5.]
+                self.b.commands=[]
+                def validate(name,values):
+                    if np.max(abs(np.asarray(values)))>5:raise ValueError('supply limit')
+                with patch.object(self.b,'validate_quadrupole_targets',side_effect=validate):result=self.s.calculate(self.opt)
+                currents=[v for name,v in self.b.commands if name==ACTIVE[0]]
+                np.testing.assert_allclose(currents,expected+[center])
+                self.assertEqual(result['probe_readbacks'][0]['scheme'],'shifted inside probe range')
+                np.testing.assert_allclose(result['response'][:len(self.b.bpm_names),0],self.b.dr[:,0],atol=1.e-10)
+                self.assertEqual(self.b.q[ACTIVE[0]],center)
+
+    def test_disjoint_range_skip_is_checkpointed_and_resume_continues_other_qms(self):
+        self.opt.adaptive_probe=False
+        self.b.q[ACTIVE[0]]=4.5;self.b.quadrupoles[ACTIVE[0]]['limits_A']=[4.,5.]
+        def cancel_after_skip(_,message):
+            if message.startswith('QM dispersion response') and '(1/2)' in message:self.s.reader.cancel.set()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'skip.checkpoint.json'
+            with self.assertRaises(Cancelled):self.s.calculate(self.opt,cancel_after_skip,checkpoint_path=path)
+            saved=load_checkpoint(path);self.s.validate_checkpoint(saved)
+            self.assertEqual(saved['scan_state']['completed'],1)
+            self.assertEqual(len(saved['orbit_measurements']),3);self.assertTrue(saved['probe_readbacks'][0]['skipped'])
+            resumed=DispersionService(self.b,threading.Event()).resume(saved,self.opt)
+            self.assertEqual(resumed['scan_state']['status'],'complete')
+            self.assertNotIn(ACTIVE[0],resumed['selected'])
+            self.assertNotIn(ACTIVE[0],[n for n,_ in self.b.commands])
+
+    def test_all_ranges_unavailable_produce_no_proposal_and_no_qm_writes(self):
+        for name in ACTIVE[:2]:
+            self.b.q[name]=4.5;self.b.quadrupoles[name]['limits_A']=[4.,5.]
+        with self.assertRaisesRegex(ValueError,'No measurable QM response'):self.s.calculate(self.opt)
+        self.assertEqual(self.b.commands,[]);self.assertEqual(len(self.s.last_result['skipped_qms']),2)
+        self.assertNotIn('delta',self.s.last_result)
+
+    def test_unresolved_readback_span_restores_and_skips_without_dividing_by_zero(self):
+        original=self.b.quadrupole_current
+        with patch.object(self.b,'quadrupole_current',side_effect=lambda n:0. if n==ACTIVE[0] else original(n)):
+            result=self.s.calculate(self.opt)
+        self.assertIn('Unresolved actual',result['skipped_qms'][0]['reason'])
+        self.assertEqual(self.b.q[ACTIVE[0]],0.)
+        self.assertNotIn(ACTIVE[0],result['selected']);self.assertIn(ACTIVE[1],result['selected'])
+        self.assertTrue(np.isfinite(result['response']).all())
 
     def test_default_cod_hard_limit_is_off_during_apply(self):
         result=self.s.calculate(self.opt);original=self.b.orbit
@@ -228,6 +283,21 @@ class QMCheckpointGuiTests(unittest.TestCase):
                 self.assertEqual(len(list(Path(directory).glob('*.checkpoint.json'))),2)
                 self.assertIn('Scan checkpoint: 3/3',panel.save_status.text())
                 for probe in panel.result['probe_readbacks'][1:]:np.testing.assert_allclose(probe['requested'],[-.01,.01])
+        finally:window.close();self.app.processEvents()
+
+    def test_skipped_qm_is_visible_in_partial_and_complete_tables(self):
+        from Knobs.DRTuning.gui import TuningSession
+        window=TuningSession(DispersionFixture());panel=window.qm_dispersion
+        try:
+            window.backend.q[ACTIVE[0]]=4.5
+            window.backend.quadrupoles[ACTIVE[0]]['limits_A']=[4.,5.]
+            result=panel.service.calculate(panel.options());panel.display(result)
+            self.assertIn('Skipped QM: '+ACTIVE[0],panel.status.text())
+            self.assertTrue(panel.table.item(0,4).text().startswith('Skipped:'))
+            self.assertEqual(panel.table.item(0,5).text(),'Not measured')
+            partial=copy.deepcopy(result);partial.pop('delta');partial['scan_state']['status']='interrupted'
+            panel.display(partial)
+            self.assertEqual(panel.table.item(0,1).text(),'Skipped')
         finally:window.close();self.app.processEvents()
 
 

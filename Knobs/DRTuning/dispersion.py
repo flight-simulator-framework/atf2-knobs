@@ -291,7 +291,11 @@ class DispersionService:
                         try:restore_quads(b,[n],[c]);data['restored']=True
                         except BaseException as exc:data['restoration_error']=str(exc);raise
                     measured_span=readbacks[1]-readbacks[0]
-                    if measured_span<=max(1.e-6,(targets[1]-targets[0])*.1):raise ValueError('No resolved QM current probe: '+n)
+                    if measured_span<=max(1.e-6,(targets[1]-targets[0])*.1):
+                        skip_reason=f'Unresolved actual QM current span: {n}; requested={targets.tolist()}, readbacks={readbacks}'
+                        data['probe_attempts'].append(dict(magnet=n,half_span_A=h,requested=targets.copy(),actual=readbacks,
+                            accepted=False,reason=skip_reason,signal_frames=frames,signal_variances=variances))
+                        break
                     quality=self.probe_quality(frames,variances,pair_valid&enabled&straight,opt)
                     finished=(not opt.adaptive_probe or quality['usable'] or h>=margin-1.e-12 or attempt+1==opt.maximum_probe_pairs)
                     data['probe_attempts'].append(dict(magnet=n,half_span_A=h,requested=targets.copy(),actual=readbacks,
