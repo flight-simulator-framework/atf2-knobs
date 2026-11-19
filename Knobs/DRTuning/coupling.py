@@ -14,7 +14,7 @@ class BumpOptions:
     refine_mm: float = .1
     calibration_mm: float = .1
     probe_A: float = .05
-    max_step_A: float = 1.
+    max_step_A: float = 4.
     outside_max_mm: float = .01
     outside_rms_mm: float = .005
     position_tolerance_mm: float = .01
@@ -34,7 +34,11 @@ class BumpOptions:
         if int(self.max_iterations)!=self.max_iterations:raise ValueError('Iteration count must be integer')
 
 
-def fit_size(points,amplitude_mm):
+class BumpRangeUnavailable(ValueError):
+    """Current bounds or measured closure prevent this displacement, not an IO fault."""
+
+
+def fit_size(points,amplitude_mm,bounds_mm=None):
     """Fit sigma_y squared, then display sqrt(quadratic) in physical size units."""
     x=np.array([p['amplitude_mm'] for p in points]);y=np.array([p['xsr']['mean'] for p in points])
     err=np.array([p['xsr']['sem'] for p in points])
@@ -49,7 +53,8 @@ def fit_size(points,amplitude_mm):
     curvature=float(coefficients[0])
     if curvature<=0 or curvature<=2*np.sqrt(covariance[0,0]):
         raise ValueError('XSR fit has no resolved positive curvature; baseline restored')
-    best=float(-coefficients[1]/(2*curvature));low=max(-amplitude_mm,float(min(x)));high=min(amplitude_mm,float(max(x)))
+    limits=(-amplitude_mm,amplitude_mm) if bounds_mm is None else bounds_mm
+    best=float(-coefficients[1]/(2*curvature));low=max(limits[0],float(min(x)));high=min(limits[1],float(max(x)))
     if not low<best<high or np.polyval(coefficients,best)<=0:
         raise ValueError('XSR minimum is not bracketed inside the measured scan range; baseline restored')
     grid=np.linspace(low,high,201);size2=np.polyval(coefficients,grid)
@@ -101,8 +106,17 @@ class CouplingService:
         model=self.reader.model_manager.prepare(model_options,self.check,progress)
         _,valid=self.orbit(opt)
         indices=np.array([self.backend.bpm_names.index(n) for n in model.bpm_names],int)
-        geometry=select_geometry(model,target,valid[indices],excluded=model_options.excluded_bpms,
-                                 fixed=model_options.fixed_actuators,amplitude_mm=opt.amplitude_mm,max_step_A=opt.max_step_A)
+        try:
+            geometry=select_geometry(model,target,valid[indices],excluded=model_options.excluded_bpms,
+                                     fixed=model_options.fixed_actuators,amplitude_mm=opt.amplitude_mm,max_step_A=opt.max_step_A)
+            geometry['selection_half_range_mm']=opt.amplitude_mm
+        except ValueError as exc:
+            if not str(exc).startswith('No observable, bounded local bump geometry'):raise
+            # Geometry/calibration need only a small bidirectional probe. The
+            # measured scan-range search below verifies the larger displacements.
+            geometry=select_geometry(model,target,valid[indices],excluded=model_options.excluded_bpms,
+                                     fixed=model_options.fixed_actuators,amplitude_mm=opt.calibration_mm,max_step_A=opt.max_step_A)
+            geometry['selection_half_range_mm']=opt.calibration_mm
         # The model may omit explicitly excluded / unmapped BPMs. Lift its
         # matrices to the acquisition order, keeping excluded columns zero.
         total=len(self.backend.bpm_names);mapping=np.r_[indices,indices+total]
@@ -155,7 +169,8 @@ class CouplingService:
         names=g['actuators'];centers=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
         lower=np.maximum(lower,centers-opt.max_step_A);upper=np.minimum(upper,centers+opt.max_step_A)
         command=centers+amplitude*knob
-        if np.any(command<lower) or np.any(command>upper):raise ValueError('Scaled bump exceeds current / step bounds')
+        if np.any(command<lower-1.e-9) or np.any(command>upper+1.e-9):raise BumpRangeUnavailable('Scaled bump exceeds current / step bounds')
+        command=np.clip(command,lower,upper)  # Roundoff only, after the strict physical-bound check.
         constraint=np.asarray(g['reconstruction'])@response;desired=np.array([0.,0.,amplitude,0.])
         for iteration in range(opt.max_iterations+1):
             currents=self.move(names,command,opt)
@@ -164,10 +179,13 @@ class CouplingService:
             event(dict(kind='orbit',**observed))
             if self.closed(observed,amplitude,opt):return observed
             if iteration==opt.max_iterations:break
-            step=constrained_step(response[np.asarray(g['outside_rows'],int)],-observed['outside'],constraint,
-                                  desired-observed['state'],lower-command,upper-command)
+            try:
+                step=constrained_step(response[np.asarray(g['outside_rows'],int)],-observed['outside'],constraint,
+                                      desired-observed['state'],lower-command,upper-command)
+            except ValueError as exc:
+                raise BumpRangeUnavailable('Bump closure cannot reach this displacement: '+str(exc)) from exc
             command=command+step
-        raise ValueError('Beam-based bump did not close within COD / target tolerances; baseline restored')
+        raise BumpRangeUnavailable('Beam-based bump did not close within COD / target tolerances')
 
     def calibrate(self,geometry,opt,progress=lambda *_:None,event=lambda *_:None):
         opt.validate();self.backend.validate_mode('orbit');self.verify_geometry(geometry);g=copy.deepcopy(geometry);names=g['actuators']
@@ -194,7 +212,7 @@ class CouplingService:
                 g.setdefault('probe_readbacks',[]).append(dict(magnet=n,requested=[center-span,center+span],actual=readbacks))
                 progress(round(70*(j+1)/len(names)),f'Measured bump response {n} ({j+1}/{len(names)})')
             response=np.column_stack(columns)
-            margin=np.minimum(opt.max_step_A,np.minimum(centers-lower,upper-centers))/opt.amplitude_mm
+            margin=np.minimum(opt.max_step_A,np.minimum(centers-lower,upper-centers))/opt.calibration_mm
             knob=constrained_step(response[np.asarray(g['outside_rows'],int)],np.zeros(len(g['outside_rows'])),
                                   np.asarray(g['reconstruction'])@response,[0,0,1,0],-margin,margin)
             checks=[]
@@ -203,7 +221,7 @@ class CouplingService:
                 # Keep a common linear knob. Scan points still verify actual closure.
                 if amplitude>0:knob=(observed['currents_A']-centers)/amplitude
             knob=(checks[0]['currents_A']-checks[1]['currents_A'])/(2*opt.calibration_mm)
-            if np.any(abs(knob)>margin+1.e-10):raise ValueError('Calibrated bump exceeds the full scan current margin')
+            if np.any(abs(knob)>margin+1.e-10):raise ValueError('Calibrated bump exceeds the calibration current margin')
             g.update(response=response,knob_A_per_mm=knob,reference_orbit_mm=baseline,calibration_checks=checks,
                      calibrated=False,options=asdict(opt),orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
         except BaseException as exc:
@@ -218,6 +236,77 @@ class CouplingService:
         self.check();self.verify_geometry(geometry);g['calibrated']=True;self.last_result=g
         progress(100,'Measured bump calibrated in both signs; baseline currents restored')
         return g
+
+    def select_scan_range(self,g,opt,result,progress=lambda *_:None,event=lambda *_:None):
+        """Test contiguous windows around zero, prioritizing width over centering.
+
+        The default requested width is 0.8 mm, with a 0.4 mm fallback. Window
+        centers are tested nearest zero first in 1/8-width increments. Every
+        window contains the baseline (zero); a known failed interior point
+        invalidates a window. These are COD checks only, with no XSR acquisition.
+        Actual XSR measurements must independently pass closure again.
+        """
+        baseline=np.asarray(g['reference_orbit_mm']);knob=np.asarray(g['knob_A_per_mm'])
+        response=np.asarray(g['response']);checked={}
+        result['range_checks']=[];result['range_attempts']=[]
+        currents=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
+        lower=np.maximum(lower,currents-opt.max_step_A)-currents
+        upper=np.minimum(upper,currents+opt.max_step_A)-currents
+        active=abs(knob)>1.e-12
+        endpoints=np.array([lower[active]/knob[active],upper[active]/knob[active]])
+        reachable_low=float(np.max(np.min(endpoints,axis=0))) if active.any() else 0.
+        reachable_high=float(np.min(np.max(endpoints,axis=0))) if active.any() else 0.
+        for width in (2*opt.amplitude_mm,opt.amplitude_mm):
+            centers=[0.]+[sign*width*i/8 for i in range(1,5) for sign in (1,-1)]
+            # Do not miss a full-width window merely because a supply bound
+            # falls between the regular center steps (e.g. [-0.35,+0.45]).
+            low_min=max(reachable_low,-width);low_max=min(reachable_high-width,0.)
+            if low_min<=low_max:
+                aligned=float(np.clip(-width/2,low_min,low_max))+width/2
+                if not any(abs(aligned-c)<1.e-10 for c in centers):centers.append(aligned)
+            for center in centers:
+                self.check();low,high=np.round([center-width/2,center+width/2],12)
+                attempt=dict(bounds_mm=[float(low),float(high)],width_mm=width,status='checking')
+                result['range_attempts'].append(attempt)
+                failed=[a for a,entry in checked.items() if not entry['success'] and low-1.e-12<=a<=high+1.e-12]
+                if failed:
+                    attempt.update(status='rejected',reason='Contains a displacement with failed closure',failed_mm=failed)
+                    continue
+                progress(0,f'Checking bump scan range {low:+.3f} to {high:+.3f} mm (width {width:.3f} mm)')
+                # Endpoints first, then midpoint and quarters. Reuse only the
+                # range-search evidence; coarse/refinement/final measurements
+                # always move and recheck COD before and after their XSR reads.
+                grid=np.round(np.linspace(low,high,5),12)
+                for index in (0,4,2,1,3):
+                    amplitude=float(grid[index])
+                    if amplitude not in checked:
+                        entry=dict(amplitude_mm=amplitude,success=False)
+                        result['range_checks'].append(entry)
+                        try:
+                            observed=self.close_at(g,response,knob,baseline,amplitude,opt,event)
+                            entry.update(success=True,observation=observed)
+                        except BumpRangeUnavailable as exc:
+                            entry['error']=str(exc)
+                            restore_correctors(self.backend,g['actuators'],g['centers'])
+                        checked[amplitude]=entry
+                    entry=checked[amplitude]
+                    if not entry['success']:
+                        attempt.update(status='rejected',reason=entry['error'])
+                        attempt.setdefault('failed_mm',[]).append(amplitude)
+                    # Check both ends before shifting outward: if both +/-0.4
+                    # fail, every contiguous 0.8 mm window containing zero is
+                    # already ruled out. Do not needlessly try +/-0.5 or beyond.
+                    if index!=0 and attempt['status']=='rejected':break
+                else:
+                    attempt['status']='selected'
+                    selected=dict(bounds_mm=[float(low),float(high)],width_mm=width,center_mm=center,
+                        requested_width_mm=2*opt.amplitude_mm,fallback=bool(width<2*opt.amplitude_mm),
+                        shifted=bool(abs(center)>1.e-12),center_step_mm=width/8)
+                    result['scan_range']=selected
+                    event(dict(kind='range',scan_range=selected))
+                    progress(5,f'Selected bump scan range {low:+.3f} to {high:+.3f} mm (width {width:.3f} mm)')
+                    return selected
+        raise BumpRangeUnavailable('No closed scan window at the requested width or half-width; inspect range checks')
 
     def scan(self,calibration,opt,progress=lambda *_:None,event=lambda *_:None):
         opt.validate()
@@ -244,14 +333,17 @@ class CouplingService:
             result['points'].append(point);event(dict(kind='point',point=point))
             return point
         try:
-            for i,a in enumerate(np.linspace(-opt.amplitude_mm,opt.amplitude_mm,5)):
+            selected=self.select_scan_range(g,opt,result,progress,event)
+            low,high=selected['bounds_mm']
+            for i,a in enumerate(np.linspace(low,high,5)):
                 measure(a,'coarse');progress(10+10*i,f'XSR scan {a:+.3f} mm: 10 updates')
-            fit=fit_size(result['points'],opt.amplitude_mm);result['fits'].append(fit);event(dict(kind='fit',fit=fit))
+            result['observed_coarse_range_mm']=[min(p['amplitude_mm'] for p in result['points']),max(p['amplitude_mm'] for p in result['points'])]
+            fit=fit_size(result['points'],opt.amplitude_mm,selected['bounds_mm']);result['fits'].append(fit);event(dict(kind='fit',fit=fit))
             # Near a boundary the additional points stay within the authorized range.
-            refinement=np.clip([fit['best_mm']-opt.refine_mm,fit['best_mm']+opt.refine_mm],-opt.amplitude_mm,opt.amplitude_mm)
+            refinement=np.clip([fit['best_mm']-opt.refine_mm,fit['best_mm']+opt.refine_mm],low,high)
             result['refinement_mm']=refinement
             for a in refinement:measure(a,'refinement')
-            fit=fit_size(result['points'],opt.amplitude_mm);result['fits'].append(fit);event(dict(kind='fit',fit=fit))
+            fit=fit_size(result['points'],opt.amplitude_mm,selected['bounds_mm']);result['fits'].append(fit);event(dict(kind='fit',fit=fit))
             final=measure(fit['best_mm'],'final verification')
             best_measured=min(result['points'][:-1],key=lambda p:p['xsr']['mean'])
             tolerance=3*np.hypot(final['xsr']['sem'],best_measured['xsr']['sem'])+1.e-3

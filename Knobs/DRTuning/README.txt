@@ -259,8 +259,28 @@ Bump / XSR coupling:
      BPM averages, then fits outside COD with exact internal position/angle
      constraints and bounded currents. Both signs are tested; baseline currents
      are restored after calibration. Default max baseline current change is
-     1 A, outside max .01 mm and outside RMS .005 mm. Tolerances are editable.
-  4. Scan -> fit -> set optimum applies I(a)=I0+a*k at a=-.4,-.2,0,.2,.4 mm.
+     4 A, outside max .01 mm and outside RMS .005 mm. Tolerances are editable.
+     Calibration requires the small +/-0.1 mm probe, not proof that the full
+     requested scan already closes. If full-range model selection fails, a
+     geometry feasible at the calibration amplitude is tried before giving up.
+  4. Scan width [mm] is the FULL width, default 0.8 mm. Scan -> fit -> set optimum
+     first checks COD closure for a centered [-0.4,+0.4] mm window. If unavailable,
+     it tries shifted windows of the same 0.8 mm width, nearest zero first with
+     0.1 mm center increments. All windows contain the original zero, so the
+     furthest permitted shifted endpoint is +/-0.8 mm. If no full-width window
+     closes, try width 0.4 mm, centered first then shifted in 0.05 mm increments.
+     For other requested widths these increments and fallback scale proportionally.
+     A window aligned with the calculated current bounds is also checked when
+     those bounds fall between regular center increments.
+     Endpoints, midpoint and quarter points must pass COD/current/target checks;
+     a previously failed interior point rejects a candidate window. Failed
+     closure restores baseline currents before trying another window. Hardware,
+     acquisition and BPM validity failures abort instead of triggering fallback.
+     Range discovery performs no XSR acquisition. The selected bounds/full width,
+     all range attempts and measured checks are displayed/saved. No feasible
+     half-width window means stop and restore; no further automatic narrowing.
+     The accepted window is scanned at five equally spaced points using
+     I(a)=I0+a*k (e.g. -.4,-.2,0,.2,.4 mm if the original window closes).
      Actual outside X/Y and reconstructed target state are checked at every
      point. Only if needed, bounded beam-based iterations close leakage while
      retaining target amplitude/angle. No clipping or cumulative amplitude steps.
@@ -270,7 +290,7 @@ Bump / XSR coupling:
      quadratic fits sigma_y squared and is
      displayed as sigma_y. The minimum must have resolved positive curvature
      and be inside the measured scan range. Additional measurements at the
-     first fitted best +/- .1 mm (clamped to the original +/- .4 mm range) are
+     first fitted best +/- .1 mm (clamped to the selected window) are
      followed by a refit. The final fitted optimum is set, with another 10 XSR
      updates and COD verification. Final size must be consistent with the best
      measured point. Successful completion leaves the optimum currents set.

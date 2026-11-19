@@ -73,14 +73,17 @@ class CouplingPanel(CorrectionTool):
         self.geometry=None;self.calibration=None;self.points=[];self.samples={};self.fits=[];self.last_orbit=None
         self.target=QComboBox();self.target.addItems([f'{f}.{i}' for f in ('SD1R','SF1R') for i in range(1,35)])
         self.form.addRow('SD / SF bump position',self.target)
-        self.amplitude=control(self.form,'Scan half-range [mm]',.4,.01,2.)
+        self.amplitude=control(self.form,'Scan width [mm]',.8,.02,4.)
+        self.amplitude.setToolTip('Full scan width. Try centered, then shifted windows containing zero; if none closes, use half this width. A shifted endpoint can reach the full width from zero.')
         self.refine=control(self.form,'Refinement ± [mm]',.1,.001,1.)
         self.probe=control(self.form,'Corrector probe ± [A]',.05,.001,.5)
-        self.step=control(self.form,'Max change from baseline [A]',1.,.001,5.)
+        self.step=control(self.form,'Max change from baseline [A]',4.,.001,5.)
         self.leak=control(self.form,'Outside COD max [mm]',.01,.0001,1.,4)
         self.rms=control(self.form,'Outside COD RMS [mm]',.005,.0001,1.,4)
         self.settle=control(self.form,'Settle before acquisition [s]',1.,0.,60.)
         self.controls.insertWidget(0,QLabel('BPM: 10 updates / XSR: 10 updates\nXSR:PROJ_V_SIGMA — vertical size [µm]'))
+        self.range_status=QLabel('Requested width 0.800 mm; fallback 0.400 mm. Center may shift.')
+        self.range_status.setWordWrap(True);self.controls.insertWidget(1,self.range_status)
         self.add_button('Rank SD/SF by |trim current|',self.rank)
         self.add_button('1. Select BPMs / correctors',self.prepare)
         self.calibrate_button=self.add_button('2. Calibrate and close bump',self.calibrate)
@@ -92,11 +95,12 @@ class CouplingPanel(CorrectionTool):
         self.status.setText('Select a target, then inspect the automatically selected BPMs and correctors.\nTarget mm is reconstructed from local BPMs using model transport.')
         self.redraw()
     def options(self):
-        return BumpOptions(amplitude_mm=self.amplitude.value(),refine_mm=self.refine.value(),
-            calibration_mm=min(.1,self.amplitude.value()),probe_A=self.probe.value(),max_step_A=self.step.value(),
+        return BumpOptions(amplitude_mm=self.amplitude.value()/2,refine_mm=self.refine.value(),
+            calibration_mm=min(.1,self.amplitude.value()/2),probe_A=self.probe.value(),max_step_A=self.step.value(),
             outside_max_mm=self.leak.value(),outside_rms_mm=self.rms.value(),settle_s=self.settle.value())
     def invalidate(self,*_):
         self.geometry=None;self.calibration=None;self.calibrate_button.setEnabled(False);self.scan_button.setEnabled(False)
+        self.range_status.setText(f'Requested width {self.amplitude.value():.3f} mm; fallback {self.amplitude.value()/2:.3f} mm. Center may shift.')
     def rank(self):
         def done(rows):
             self.invalidate();self.target.blockSignals(True);self.target.clear()
@@ -145,11 +149,16 @@ class CouplingPanel(CorrectionTool):
         elif kind=='point':self.points.append(event['point'])
         elif kind=='fit':self.fits.append(event['fit'])
         elif kind=='orbit':self.last_orbit=event
+        elif kind=='range':
+            selected=event['scan_range'];low,high=selected['bounds_mm']
+            self.range_status.setText(f'Scan range {low:+.3f} to {high:+.3f} mm; width {selected["width_mm"]:.3f} mm'+
+                (' (reduced)' if selected['fallback'] else '')+'.')
         elif kind=='failure':
             if event.get('data') is not None:self.result=event['data']
             self.scan_button.setEnabled(False);self.calibrate_button.setEnabled(False)
             if self.result is not None:self.reset_button.setEnabled(bool(self.result.get('restoration_error')))
             self.status.setText('Operation failed / cancelled. See restoration status in the detailed log; acquired data can be saved.')
+            self.range_status.setText('Scan stopped. See saved range checks and restoration status.')
         self.redraw()
     def redraw(self):
         figure=self.plot.figure;figure.clear();ax,orbit=figure.subplots(2,1)

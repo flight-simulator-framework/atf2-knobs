@@ -508,7 +508,8 @@ class CorrectionGuiTests(unittest.TestCase):
                 point=dict(amplitude_mm=a,xsr=xsr);points.append(point);bump.on_update(dict(kind='point',point=point))
             fit=fit_size(points,.4);bump.on_update(dict(kind='fit',fit=fit))
             self.assertTrue(any('Fit 1:' in label for label in bump.plot.figure.axes[0].get_legend_handles_labels()[1]))
-            self.assertEqual(len(bump.samples),5);self.assertEqual(bump.amplitude.value(),.4);self.assertEqual(bump.refine.value(),.1)
+            self.assertEqual(len(bump.samples),5);self.assertEqual(bump.amplitude.value(),.8);self.assertEqual(bump.refine.value(),.1)
+            self.assertEqual(bump.options().amplitude_mm,.4);self.assertEqual(bump.step.value(),4.)
             w.open_tool('coupling');self.assertIs(w.tabs.currentWidget(),bump)
         finally:w.close();self.app.processEvents()
 
