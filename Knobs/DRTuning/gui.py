@@ -277,6 +277,10 @@ class TuningSession(DRCorrectionWindow):
             for label,key in tools:
                 action=menu.addAction(label);action.triggered.connect(lambda checked=False,k=key:self.open_tool(k))
                 self.tool_actions[key]=action
+    def correction_selection_changed(self):
+        self.qm_dispersion.invalidate()
+        self.coupling_panel.invalidate()
+
     def open_tool(self,key):
         if self.task and self.task.isRunning():
             self.log('Measurement running. Wait or cancel first.');return

@@ -1,5 +1,9 @@
 """Offline acquisition, measured closure, bounded correction and rollback tests."""
 import copy
+from contextlib import ExitStack
+import json
+from pathlib import Path
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -235,6 +239,56 @@ class DispersionTests(unittest.TestCase):
         self.s.solve(data,self.o);self.assertLessEqual(len(data['selected']),3)
         self.assertLessEqual(np.max(abs(data['predicted_tune_change'])),self.o.tune_tolerance+1.e-10)
         self.assertLessEqual(np.max(abs(data['delta'])),self.o.step_A+1.e-10)
+    def test_recalculate_changes_bpm_mask_without_any_machine_io(self):
+        data=self.s.calculate(self.o);before=copy.deepcopy(data)
+        j=int(np.flatnonzero(data['straight'])[0]);self.o.excluded_bpms=(data['names'][j],)
+        # Corrupt one measured BPM to make exclusion materially change the fit.
+        data['full_measured'][0,j]+=10.
+        with ExitStack() as stack:
+            for method in ('orbit','snapshot','same_settings','quadrupole_current','set_quadrupole_current',
+                           'validate_mode','validate_quadrupole_targets','measure_tunes','set_frequency'):
+                stack.enter_context(patch.object(self.b,method,side_effect=AssertionError('Unexpected machine IO: '+method)))
+            result=self.s.recalculate(data,self.o)
+        self.assertFalse(result['valid'][j]);self.assertTrue(data['valid'][j])
+        self.assertTrue(result['response_reused']);self.assertEqual(result['recalculation_count'],1)
+        self.assertEqual(result['baseline'],before['baseline']);np.testing.assert_equal(result['centers'],before['centers'])
+        self.assertEqual(result['acquisition_options']['excluded_bpms'],())
+        self.assertEqual(len(result['orbit_measurements']),len(before['orbit_measurements']))
+        self.assertLess(np.linalg.norm(result['full_predicted'][0,result['valid']]),
+                        np.linalg.norm(result['full_measured'][0,result['valid']])*.001)
+        self.assertIs(self.s.last_result,result)
+    def test_recalculation_can_reinclude_initially_excluded_but_never_invalid_bpm(self):
+        good,bad=np.flatnonzero(straight_bpms(self.b.bpm_names))[:2]
+        self.o.excluded_bpms=(self.b.bpm_names[good],)
+        original=self.b.orbit
+        def invalid():
+            result=original();result['valid'][bad]=False;return result
+        with patch.object(self.b,'orbit',side_effect=invalid):data=self.s.calculate(self.o)
+        self.assertFalse(data['valid'][good]);self.assertTrue(data['acquisition_valid'][good])
+        self.o.excluded_bpms=();result=self.s.recalculate(data,self.o)
+        self.assertTrue(result['valid'][good]);self.assertFalse(result['valid'][bad])
+        self.assertFalse(data['valid'][good]);self.assertEqual(result['acquisition_options']['excluded_bpms'],(self.b.bpm_names[good],))
+    def test_recalculate_rejects_changed_measurement_conditions_and_applied_baseline(self):
+        data=self.s.calculate(self.o)
+        for key,value,message in [('frequency_change_khz',2.,'RF / momentum'),
+                                  ('momentum_compaction',.003,'RF / momentum'),
+                                  ('fixed_actuators',('QM2R.1',),'QM selection')]:
+            opt=copy.deepcopy(self.o);setattr(opt,key,value)
+            with self.assertRaisesRegex(ValueError,message):self.s.recalculate(data,opt)
+        self.s.apply(data)
+        with self.assertRaisesRegex(ValueError,'Restore original'):self.s.recalculate(data,self.o)
+        self.s.reset(data);result=self.s.recalculate(data,self.o)
+        self.assertNotIn('full_after',result);self.assertFalse(result['applied'])
+        self.s.apply(result);self.assertTrue(result['applied']);self.assertNotIn('restored',result)
+    def test_apply_recalculated_proposal_ignores_excluded_bpm_cod_outlier(self):
+        data=self.s.calculate(self.o);j=int(np.flatnonzero(data['straight'])[0])
+        self.o.excluded_bpms=(data['names'][j],);result=self.s.recalculate(data,self.o)
+        original=self.b.orbit
+        def shifted():
+            frame=original();frame['x'][j]+=.5;return frame
+        with patch.object(self.b,'orbit',side_effect=shifted):self.s.apply(result)
+        self.assertTrue(result['applied']);self.assertIs(self.s.last_result,result)
+        self.assertGreater(abs(result['full_after'][2,j]-result['full_measured'][2,j]),self.o.orbit_tolerance_mm)
     def test_cancel_during_scan_restores_probe_and_rf(self):
         initial=self.b.snapshot()
         def progress(*_):self.cancel.set()
@@ -267,6 +321,76 @@ class CorrectionGuiTests(unittest.TestCase):
     def setUpClass(cls):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
+    def test_qm_apply_button_converts_numpy_decisions_to_python_bool(self):
+        from Knobs.DRTuning.gui import TuningSession
+        w=TuningSession(DispersionFixture())
+        try:
+            panel=w.qm_dispersion;data=panel.service.calculate(panel.options())
+            self.assertIsInstance(np.any(abs(data['delta'])>1.e-12),np.bool_)
+            with patch.object(panel.set_button,'setEnabled',wraps=panel.set_button.setEnabled) as enabled:
+                panel.display(data);self.assertTrue(panel.set_button.isEnabled())
+                data['delta']=np.zeros_like(data['delta'])
+                panel.display(data);self.assertFalse(panel.set_button.isEnabled())
+                data['delta'][0]=.01;data['applied']=np.bool_(True)
+                panel.display(data);self.assertFalse(panel.set_button.isEnabled())
+            self.assertEqual([call.args[0] for call in enabled.call_args_list],[True,False,False])
+            self.assertTrue(all(type(call.args[0]) is bool for call in enabled.call_args_list))
+        finally:w.close();self.app.processEvents()
+    def test_bpm_selection_invalidates_apply_and_recalculate_reuses_measurement(self):
+        from Knobs.DRTuning.gui import TuningSession
+        from Knobs.DRCorrection.selection import SelectionDialog
+        from PyQt6.QtCore import Qt
+        w=TuningSession(DispersionFixture())
+        try:
+            panel=w.qm_dispersion;data=panel.service.calculate(panel.options());panel.display(data)
+            self.assertTrue(panel.set_button.isEnabled());self.assertTrue(panel.recalculate_button.isEnabled())
+            dialog=SelectionDialog(w);j=int(np.flatnonzero(data['straight'])[0])
+            dialog.bpms.items.item(j).setCheckState(Qt.CheckState.Unchecked);dialog.apply_to(w)
+            self.assertFalse(panel.set_button.isEnabled());self.assertTrue(panel.recalculate_button.isEnabled())
+            with patch.object(w,'error') as error,patch.object(panel.service,'apply') as apply:
+                panel.apply();error.assert_called_once();apply.assert_not_called()
+            acquisitions=w.backend.acquisitions;commands=list(w.backend.commands)
+            with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):panel.recalculate()
+            self.assertTrue(panel.set_button.isEnabled());self.assertFalse(panel.result['valid'][j])
+            self.assertEqual(w.backend.acquisitions,acquisitions);self.assertEqual(w.backend.commands,commands)
+            dialog.close()
+        finally:w.close();self.app.processEvents()
+    def test_apply_automatically_saves_measured_json_and_plot_without_dialog(self):
+        from Knobs.DRTuning.gui import TuningSession
+        w=TuningSession(DispersionFixture())
+        try:
+            panel=w.qm_dispersion;panel.display(panel.service.calculate(panel.options()))
+            with tempfile.TemporaryDirectory() as folder:
+                panel.autosave_directory=Path(folder)/'results'
+                with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))),\
+                     patch('Knobs.DRTuning.correction_gui.QFileDialog.getSaveFileName',side_effect=AssertionError('Unexpected dialog')):
+                    panel.apply()
+                files=list(panel.autosave_directory.glob('*.json'));self.assertEqual(len(files),1)
+                saved=json.loads(files[0].read_text());self.assertTrue(saved['applied'])
+                np.testing.assert_allclose(saved['full_after'],panel.result['full_after'])
+                self.assertEqual(saved['autosave']['json'],str(files[0]))
+                self.assertTrue(files[0].with_suffix('.png').read_bytes().startswith(b'\x89PNG'))
+                self.assertIn('Auto-saved',panel.save_status.text());self.assertFalse(panel.recalculate_button.isEnabled())
+                panel.display(panel.result);self.assertEqual(len(list(panel.autosave_directory.glob('*.json'))),1)
+                panel.service.reset(panel.result);panel.display(panel.service.recalculate(panel.result,panel.options()))
+                with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):panel.apply()
+                self.assertEqual(len(list(panel.autosave_directory.glob('*.json'))),2)
+        finally:w.close();self.app.processEvents()
+    def test_save_failure_keeps_applied_settings_and_offers_manual_retry(self):
+        from Knobs.DRTuning.gui import TuningSession
+        w=TuningSession(DispersionFixture())
+        try:
+            panel=w.qm_dispersion;panel.display(panel.service.calculate(panel.options()))
+            with tempfile.TemporaryDirectory() as folder:
+                blocked=Path(folder)/'file';blocked.write_text('not a directory');panel.autosave_directory=blocked
+                with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))),\
+                     patch.object(panel.service,'reset') as reset,patch.object(w,'error') as error:
+                    panel.apply();reset.assert_not_called();error.assert_not_called()
+                self.assertTrue(panel.result['applied']);self.assertNotIn('error',panel.result)
+                for n,c,d in zip(panel.result['actuators'],panel.result['centers'],panel.result['delta']):
+                    self.assertAlmostEqual(w.backend.q[n],c+d)
+                self.assertIn('SET remains applied',panel.save_status.text());self.assertIn('Save data + plot',panel.save_status.text())
+        finally:w.close();self.app.processEvents()
     def test_new_navigation_actual_dispersion_and_live_fit_plot(self):
         from Knobs.DRTuning.gui import TuningSession
         b=DispersionFixture();w=TuningSession(b)

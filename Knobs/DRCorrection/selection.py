@@ -86,3 +86,4 @@ class SelectionDialog(QDialog):
             panel.options.excluded_bpms=self.bpms.excluded()
             panel.options.fixed_actuators=self.magnets.excluded()
             panel.invalidate()
+        if hasattr(window,'correction_selection_changed'):window.correction_selection_changed()

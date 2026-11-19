@@ -1,11 +1,14 @@
 """QM dispersion and measured local-bump/XSR controls for DRTuning."""
 import copy
 import json
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 import numpy as np
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QCheckBox)
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QCheckBox,QScrollArea)
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
@@ -29,7 +32,8 @@ class CorrectionTool(QWidget):
         self.status=QLabel();self.status.setWordWrap(True);self.controls.addWidget(self.status)
         self.buttons=QVBoxLayout();self.controls.addLayout(self.buttons)
         save=QPushButton('Save data + plot');save.clicked.connect(self.save);self.controls.addWidget(save)
-        self.controls.addStretch();split.addWidget(left);split.addWidget(right);split.setSizes([310,900])
+        self.controls.addStretch();scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(left)
+        split.addWidget(scroll);split.addWidget(right);split.setSizes([340,900])
         self.update.connect(self.on_update)
     def add_button(self,label,slot):
         button=QPushButton(label);button.clicked.connect(slot);self.buttons.addWidget(button);return button
@@ -183,35 +187,82 @@ class QMDispersionPanel(CorrectionTool):
         self.tune=control(self.form,'Max tune change',.002,.00001,.1,5)
         self.tune.setEnabled(defaults.measure_tunes)
         self.cod=control(self.form,'Max COD change [mm]',.05,.001,1.)
+        self.cod.setToolTip('Maximum absolute before/after COD change at every enabled valid BPM, in X and Y (not RMS).\n'
+                            'Constrains the prediction; measured excess after Apply restores the original QM currents.')
         self.ridge=control(self.form,'Relative regularization',.01,0.,1.,4)
+        self.ridge.setToolTip('Dimensionless alpha: lambda = alpha × largest singular value of the weighted response.\n'
+                              'Penalty: lambda² × sum(delta current²). Larger values suppress weak modes more.\n'
+                              '0 removes this penalty; the separate relative SVD cutoff (0.04) still applies.')
         self.add_button('1. Measure response / CALC',self.calculate)
+        self.add_button('BPM selection…',lambda:self.window.open_tool('selection'))
+        self.recalculate_button=self.add_button('Recalculate (measured response)',self.recalculate)
+        self.recalculate_button.setEnabled(False)
         self.set_button=self.add_button('2. Apply / remeasure dispersion',self.apply)
         self.reset_button=self.add_button('Restore original QM currents',self.reset)
+        self.autosave_directory=Path.home()/'DRTuning'/'results'
+        self.add_button('Choose automatic save folder…',self.choose_autosave_directory)
+        self.save_status=QLabel('Apply auto-save: '+str(self.autosave_directory));self.save_status.setWordWrap(True)
+        self.controls.insertWidget(self.controls.count()-1,self.save_status)
         self.set_button.setEnabled(False);self.reset_button.setEnabled(False)
         self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 candidates; QM2R.1/.2 excluded by default).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy and COD.\n10 updated BPM frames per RF setting. Tune acquisition / constraints optional; off by default.')
-        for w in (self.maximum,self.probe,self.step,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(lambda *_:self.set_button.setEnabled(False))
-        self.selection.currentIndexChanged.connect(lambda *_:self.set_button.setEnabled(False))
-        self.excluded.textChanged.connect(lambda *_:self.set_button.setEnabled(False))
+        for w in (self.maximum,self.probe,self.step,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(self.invalidate)
+        self.selection.currentIndexChanged.connect(self.invalidate)
+        self.excluded.textChanged.connect(self.invalidate)
         self.measure_tunes.toggled.connect(self.tune.setEnabled)
-        self.measure_tunes.toggled.connect(lambda *_:self.set_button.setEnabled(False))
+        self.measure_tunes.toggled.connect(self.invalidate)
+    def invalidate(self,*_):
+        self.set_button.setEnabled(False)
+        if self.result is not None and 'response' in self.result and not self.result.get('applied'):
+            self.status.setText('Selection / options changed. Recalculate from measured response before Apply.\n'
+                                'Changing RF settings or QM selection requires a new CALC.')
+    def proposal_matches_options(self,data):
+        saved=dict(data['options']);current=asdict(self.options())
+        for key in ('excluded_bpms','fixed_actuators'):
+            saved[key]=sorted(saved.get(key,()));current[key]=sorted(current[key])
+        return saved==current
+    def choose_autosave_directory(self):
+        path=QFileDialog.getExistingDirectory(self,'Automatic save folder',str(self.autosave_directory))
+        if path:
+            self.autosave_directory=Path(path);self.save_status.setText('Apply auto-save: '+path)
+    def applied(self,data):
+        self.display(data)
+        # File errors must never roll back an already verified machine correction.
+        try:
+            directory=Path(self.autosave_directory);directory.mkdir(parents=True,exist_ok=True)
+            stamp=datetime.now().astimezone()
+            dest=directory/('qm_dispersion_'+stamp.strftime('%Y%m%d_%H%M%S_%f')+'_'+uuid4().hex[:8]+'.json')
+            data['autosave']=dict(saved_at=stamp.isoformat(),json=str(dest),plot=str(dest.with_suffix('.png')))
+            dest.write_text(json.dumps(serial(data),indent=2,allow_nan=False),encoding='utf-8')
+            self.plot.save(dest.with_suffix('.png'))
+            self.save_status.setText('Auto-saved JSON + PNG:\n'+str(dest))
+            self.window.log('QM Apply auto-saved: '+str(dest)+' and '+str(dest.with_suffix('.png')))
+        except Exception as exc:
+            message='QM SET remains applied. Automatic save failed: '+str(exc)+'\nUse Save data + plot to retry.'
+            self.save_status.setText(message);self.window.log(message)
     def options(self):
         shared=self.window.panels['dispersion'].options
         return DispersionOptions(probe_A=self.probe.value(),step_A=self.step.value(),frequency_change_khz=self.rf.value(),
             momentum_compaction=shared.momentum_compaction,measure_tunes=self.measure_tunes.isChecked(),
             tune_tolerance=self.tune.value(),orbit_tolerance_mm=self.cod.value(),
             regularization=self.ridge.value(),selection=self.selection.currentData(),maximum=int(self.maximum.value()),
-            excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()}))
+            excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(sorted(set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()})))
     def calculate(self):
         opt=self.options();self.set_button.setEnabled(False)
         self.run(lambda p:self.service.calculate(opt,p,self.update.emit),self.display,'QM horizontal dispersion response')
+    def recalculate(self):
+        if self.result is None:return
+        data=self.result;opt=self.options();self.set_button.setEnabled(False)
+        self.run(lambda p:self.service.recalculate(data,opt,p),self.display,'Recalculate QM correction from measured response')
     def apply(self):
         if self.result is None:return
+        if not self.proposal_matches_options(self.result):
+            self.invalidate();self.window.error('Selection / options changed; recalculate before Apply');return
         data=self.result;self.set_button.setEnabled(False)
-        self.run(lambda p:self.service.apply(data,p,self.update.emit),self.display,'Set QM correction and measure actual dispersion')
+        self.run(lambda p:self.service.apply(data,p,self.update.emit),self.applied,'Set QM correction and measure actual dispersion')
     def reset(self):
         if self.result is None:return
         data=self.result
-        def done(_):self.display(data);self.set_button.setEnabled(False);self.status.setText('Original QM currents restored. CALC again.')
+        def done(_):self.display(data);self.set_button.setEnabled(False);self.status.setText('Original QM currents restored. Recalculate or CALC again.')
         self.run(lambda _:self.service.reset(data),done,'Restore QM currents')
     def on_update(self,event):
         if event.get('data') is not None:self.display(event['data'])
@@ -235,11 +286,15 @@ class QMDispersionPanel(CorrectionTool):
         if 'delta' in data:
             self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]'],
                 [(n,f'{c:.5f}',f'{d:+.5f}',f'{c+d:.5f}') for n,c,d in zip(data['actuators'],data['centers'],data['delta'])])
-            self.set_button.setEnabled(not data.get('applied') and not data.get('error') and np.any(abs(np.asarray(data['delta']))>1.e-12))
+            self.set_button.setEnabled(bool(not data.get('applied') and not data.get('error') and
+                                       self.proposal_matches_options(data) and np.any(abs(np.asarray(data['delta']))>1.e-12)))
             tune_status=('Predicted tune change: '+str(np.round(data['predicted_tune_change'],6))
                          if data.get('predicted_tune_change') is not None else 'Tune acquisition / tune constraints skipped.')
-            self.status.setText(('SET applied; dispersion remeasured.' if data.get('applied') else 'CALC ready; probe currents restored.')+
-                '\n'+data['solver']+'\n'+tune_status)
+            self.status.setText(('SET applied; dispersion remeasured.' if data.get('applied') else
+                'Recalculated from measured response; no new acquisition.' if data.get('response_reused') else 'CALC ready; probe currents restored.')+
+                '\n'+data['solver']+'\n'+tune_status+f'\nFit BPMs: {valid.sum()} / {len(valid)}')
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
         self.reset_button.setEnabled(bool(data.get('applied') or data.get('error')))
+        self.recalculate_button.setEnabled('response' in data and not data.get('applied') and not data.get('restoration_error') and
+                                           (not data.get('error') or bool(data.get('restored'))))

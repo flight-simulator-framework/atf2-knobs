@@ -48,7 +48,18 @@ QM dispersion:
   BPM regions, not an assumption that the entire ring has zero dispersion.
   The default uses all enabled trims in bounded regularized SVD; Greedy chooses
   the best response columns up to the selected maximum. COD linear constraints
-  apply in both modes (default |delta COD| <= .05 mm).
+  apply in both modes (default |delta COD| <= .05 mm). This is a hard maximum
+  at every enabled valid BPM in BOTH planes, not an RMS limit. It is also
+  checked against actual before/after COD after SET, with rollback on excess.
+  This extra .05 mm guard is not present in legacy drhdispbyq.n; coddispersion.n
+  includes COD as a weighted fit objective instead. Its factor1=.05 is a
+  dispersion weight, not a .05 mm COD limit. Appropriate tolerance depends on
+  measured BPM noise/drift and the acceptable orbit change.
+  Relative regularization alpha=.01 means lambda=alpha*s_max, where s_max is
+  the largest singular value of the weighted response of the selected QMs.
+  The solver adds lambda^2*sum(delta_I^2) to its retained-mode squared residual.
+  It is not a 1% current limit. Increasing alpha suppresses weak modes more;
+  alpha=0 removes that penalty but retains the separate SVD cutoff of .04.
   At the operator's request, tune acquisition and tune constraints are OFF by
   default. CALC and SET do not validate, wait for or read tune PVs in this mode.
   The UI/log/data state that tunes are skipped; missing tune values, responses
@@ -59,7 +70,24 @@ QM dispersion:
   SET verifies actual dispersion improvement and COD (also tunes when enabled), restoring the
   changed trims if measurement fails or a tolerance is exceeded. The graph
   shows measured before, predicted, target, and measured after, for Dx/Dy/X/Y.
-  Save data + plot writes JSON and PNG, including failed SET measurements.
+  To exclude a suspect BPM after CALC: BPM selection > uncheck it > OK >
+  Recalculate (measured response). This uses the measured baseline and response
+  without any machine reads/writes or fresh BPM acquisition, updates the plots
+  and proposed currents, and requires a separate Apply. Selection changes
+  disable the old Apply proposal. Acquisition validity and original scan options
+  are retained separately: rechecking a BPM never revives invalid scan data.
+  Changing RF span, momentum compaction or QM selection requires a new CALC;
+  enabling tune constraints requires a measured tune response. After SET,
+  restore original QM currents or run a new CALC before recalculating. Apply
+  still verifies the live settings match the original CALC baseline.
+  Successful Apply automatically saves JSON and PNG to ~/DRTuning/results/,
+  with unique timestamped names and the actual before/after measurements,
+  fit options, original acquisition options, response and applied currents.
+  Choose automatic save folder changes the destination for this session;
+  the saved path is shown in the panel and log. Saving never changes hardware:
+  a file error leaves SET applied and reports that manual saving is needed.
+  Save data + plot remains available for manual saving, including failed SET
+  measurements. Failed SET attempts are not automatically saved.
 
   When tune acquisition is enabled, "No fresh H/V tune pair" means the PV tune
   mode could not acquire TBT:TUNE:H and TBT:TUNE:V;

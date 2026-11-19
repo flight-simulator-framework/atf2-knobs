@@ -96,14 +96,14 @@ class DispersionService:
         if np.any(spans<=1.e-6):raise ValueError('No symmetric QM probe margin; exclude the limited trim')
         for n,c,h in zip(names,centers,spans):b.validate_quadrupole_targets(n,[c-h,c,c+h])
         baseline=b.snapshot();self.reader.orbit_measurements=[]
-        measured,valid,tunes,tune_evidence=self.signal(opt);valid &= enabled
-        if not np.any(valid&straight):raise ValueError('No valid straight-section BPM before QM probes')
+        measured,valid,tunes,tune_evidence=self.signal(opt)
+        if not np.any(valid&enabled&straight):raise ValueError('No valid straight-section BPM before QM probes')
         data=dict(schema='dr-qm-dispersion-1',mode='dispersion',backend_id=b.identity,
                   names=list(b.bpm_names),positions_m=np.asarray(b.positions_m),actuators=names,
-                  centers=centers,limits=limits,baseline=baseline,full_measured=measured,valid=valid,
+                  centers=centers,limits=limits,baseline=baseline,full_measured=measured,valid=valid&enabled,
                   straight=straight,initial_tunes=tunes,initial_tune_evidence=tune_evidence,options=asdict(opt),applied=False,
                   full_signal_labels=['Dispersion X','Dispersion Y','COD X','COD Y'],scan_tunes=[],probe_readbacks=[],
-                  tune_measurement_enabled=opt.measure_tunes)
+                  tune_measurement_enabled=opt.measure_tunes,acquisition_options=asdict(opt))
         self.last_result=data;event(dict(kind='dispersion',data=copy.deepcopy(data)))
         columns=[];qcolumns=[]
         try:
@@ -116,7 +116,7 @@ class DispersionService:
                         if not np.isfinite(reading):raise ValueError('Invalid QM current readback: '+n)
                         readbacks.append(reading)
                         frame,mask,q,evidence=self.signal(opt);valid &= mask
-                        if not np.any(valid&straight):raise ValueError('Lost all common valid straight-section BPMs')
+                        if not np.any(valid&enabled&straight):raise ValueError('Lost all common valid straight-section BPMs')
                         frames.append(frame)
                         if opt.measure_tunes:
                             qs.append(q);data['scan_tunes'].append(dict(magnet=n,current_A=c+sign*h,measurement=evidence))
@@ -129,7 +129,8 @@ class DispersionService:
                 progress(round(90*(j+1)/len(names)),f'QM dispersion response {n} ({j+1}/{len(names)})')
             self.check()
             if not b.same_settings(b.snapshot(),baseline):raise ValueError('Settings changed during QM response scan; calculate again')
-            data.update(response=np.column_stack(columns),tune_response=np.column_stack(qcolumns) if opt.measure_tunes else None,valid=valid,
+            data.update(response=np.column_stack(columns),tune_response=np.column_stack(qcolumns) if opt.measure_tunes else None,
+                        acquisition_valid=valid.copy(),valid=valid&enabled,
                         orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
             self.solve(data,opt);event(dict(kind='dispersion',data=copy.deepcopy(data)))
             progress(100,'QM proposal ready; all diagnostic currents and RF restored')
@@ -138,8 +139,32 @@ class DispersionService:
             data['error']=str(exc);data['orbit_measurements']=copy.deepcopy(self.reader.orbit_measurements)
             raise
 
+    def recalculate(self,data,opt,progress=lambda *_:None):
+        """Refit a complete response without reading or writing any machine setting."""
+        opt.validate();self.check()
+        if 'response' not in data:raise ValueError('No complete measured response; CALC first')
+        if data.get('applied'):raise ValueError('Restore original QM currents or CALC again before recalculating')
+        if data.get('restoration_error') or (data.get('error') and not data.get('restored')):
+            raise ValueError('Resolve the previous acquisition / restoration failure and CALC again')
+        acquired=data.get('acquisition_options',data['options'])
+        for key in ('frequency_change_khz','momentum_compaction'):
+            if getattr(opt,key)!=acquired[key]:raise ValueError('RF / momentum settings changed; CALC again')
+        expected=[n for n in QM_CANDIDATES if n not in opt.fixed_actuators]
+        if expected!=list(data['actuators']):raise ValueError('QM selection changed; CALC again')
+        result=copy.deepcopy(data)
+        for key in ('error','restoration_error','restored','full_after','after_valid','after_tunes',
+                    'after_tune_evidence','after_orbit_measurements','tune_check_performed','applied_currents_A','autosave'):
+            result.pop(key,None)
+        result.setdefault('acquisition_options',copy.deepcopy(acquired))
+        result.update(applied=False,response_reused=True,recalculation_count=data.get('recalculation_count',0)+1)
+        self.solve(result,opt);self.last_result=result
+        progress(100,'Recalculated from measured response; no BPM acquisition or magnet / RF writes')
+        return result
+
     def solve(self,data,opt):
-        opt.validate();valid=np.asarray(data['valid'],bool);straight=np.asarray(data['straight'],bool)
+        opt.validate();valid=np.asarray(data.get('acquisition_valid',data['valid']),bool).copy()
+        valid &= np.array([n not in opt.excluded_bpms for n in data['names']])
+        straight=np.asarray(data['straight'],bool)
         if not np.any(valid&straight):raise ValueError('No common valid straight-section BPM across scan')
         measured=np.asarray(data['full_measured']);target=measured.copy();target[0,straight]=0.
         response=np.asarray(data['response']);mask=np.tile(valid,4)
@@ -179,13 +204,14 @@ class DispersionService:
                 if best[0]>=score-1.e-12:break
                 score,j,step,singular=best;selected.append(j);available.remove(j)
         delta=np.zeros(len(c));delta[selected]=step
-        data.update(options=asdict(opt),delta=delta,full_target=target,full_predicted=measured+(response@delta).reshape(measured.shape),
+        data.update(options=asdict(opt),valid=valid,delta=delta,full_target=target,full_predicted=measured+(response@delta).reshape(measured.shape),
                     predicted_tune_change=tune_response@delta if opt.measure_tunes else None,selected=[data['actuators'][i] for i in selected],
                     singular_values=singular,solver='bounded regularized SVD + '+
                     ('tune/COD constraints; ' if opt.measure_tunes else 'COD constraints; tune acquisition / constraints skipped; ')+opt.selection)
         return data
 
     def apply(self,data,progress=lambda *_:None,event=lambda *_:None):
+        self.last_result=data
         self.check();b=self.backend;saved_options=dict(data['options']);saved_options.setdefault('measure_tunes',True)
         opt=DispersionOptions(**saved_options);b.validate_mode('dispersion')
         if data.get('applied') or data['backend_id']!=b.identity:raise ValueError('Stale or already applied QM proposal')
@@ -227,3 +253,4 @@ class DispersionService:
 
     def reset(self,data):
         restore_quads(self.backend,data['actuators'],data['centers']);data['applied']=False;data['restored']=True
+        data.pop('restoration_error',None)
