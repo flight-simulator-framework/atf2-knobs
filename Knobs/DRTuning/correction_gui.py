@@ -8,7 +8,7 @@ from uuid import uuid4
 import numpy as np
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QCheckBox,QScrollArea)
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea)
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
@@ -38,7 +38,7 @@ class CorrectionTool(QWidget):
         self.table=QTableWidget();self.table.setMaximumHeight(170);self.right.addWidget(self.table)
         self.status=QLabel();self.status.setWordWrap(True);self.controls.addWidget(self.status)
         self.buttons=QVBoxLayout();self.controls.addLayout(self.buttons)
-        save=QPushButton('Save data + plot');save.clicked.connect(self.save);self.controls.addWidget(save)
+        self.save_button=QPushButton('Save data + plot');self.save_button.clicked.connect(self.save);self.controls.addWidget(self.save_button)
         self.controls.addStretch();scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(left)
         split.addWidget(scroll);split.addWidget(right);split.setSizes([340,900])
         self.update.connect(self.on_update)
@@ -180,80 +180,62 @@ class QMDispersionPanel(CorrectionTool):
     def __init__(self,window):
         super().__init__(window);self.service=DispersionService(window.backend,window.service.cancel)
         defaults=DispersionOptions()
-        self.selection=QComboBox();self.selection.addItem('All enabled / regularized SVD','all');self.selection.addItem('Greedy / best columns','greedy')
-        self.selection.setMaximumWidth(230);self.form.addRow('Solver',self.selection)
-        self.excluded=QLineEdit();self.excluded.setMaximumWidth(150);self.excluded.setPlaceholderText('QM2R.1, QM2R.2')
-        self.excluded.setText(', '.join(defaults.fixed_actuators))
-        self.excluded.setToolTip('Comma-separated physical QM trim names');self.form.addRow('Exclude QM trims',self.excluded)
-        self.maximum=control(self.form,'Greedy maximum trims',8,1,16,0)
-        self.probe_presets=QCheckBox('Start with per-QM widths (2026-11-19)');self.probe_presets.setChecked(defaults.use_probe_presets)
-        self.probe_presets.setToolTip('Initial widths estimated for S/N 6.5 (30% above target 5).\n'+
-            '\n'.join(f'{n}: {width:.2f} A' for n,width in QM_PROBE_PRESETS_A.items())+
-            '\nMatching previous-response estimates take priority. QM2R uses the fallback width if enabled.')
-        self.form.addRow(self.probe_presets)
-        self.probe=control(self.form,'Fallback / uniform QM probe width [A]',defaults.probe_A,.01,3.,2);self.probe.setSingleStep(.01)
-        self.probe.setToolTip('Used without a per-QM preset or matching previous-response estimate.\n'
-                             'Normally current +/- this width. At a limit, clip each endpoint independently.\n'
-                             'A one-sided pair is allowed; response uses the actual readback difference.')
-        self.adaptive=QCheckBox('Adapt QM probe to target response / noise');self.adaptive.setChecked(defaults.adaptive_probe)
-        self.form.addRow(self.adaptive)
-        self.reuse_widths=QCheckBox('Use widths estimated from previous responses');self.reuse_widths.setChecked(defaults.reuse_probe_widths)
-        self.form.addRow(self.reuse_widths)
-        self.first_pass=QCheckBox('First pass: one valid pair per QM');self.first_pass.setChecked(defaults.characterize_first_scan)
-        self.first_pass.setToolTip('Without a matching saved response, collect one valid pair and estimate the next scan width.\n'
-                                  'Invalid probes still restore and shrink. Weak responses are not used for correction.')
-        self.form.addRow(self.first_pass)
-        self.growth=control(self.form,'Maximum probe growth factor',defaults.probe_max_growth,1.1,10.,1)
-        self.probe_limit=control(self.form,'QM current limit ± [A] (probe / Apply)',defaults.probe_current_limit_A,.01,3.,2)
+        self.controls.setSpacing(10)
+        def section(title):
+            box=QGroupBox(title);form=QFormLayout(box)
+            form.setVerticalSpacing(8);self.form.addRow(box);return form
+        measurement=section('Measurement')
+        self.rf=control(measurement,'RF span [kHz]',defaults.frequency_change_khz,.01,10.)
+        self.target_snr=control(measurement,'Target S/N',defaults.target_snr,1.,100.,1)
+        self.probe=control(measurement,'Fallback probe [A]',defaults.probe_A,.01,3.,2);self.probe.setSingleStep(.01)
+        self.probe.setToolTip('Used for a QM without an individual starting width.')
+        self.probe_limit=control(measurement,'Current limit ± [A]',defaults.probe_current_limit_A,.01,3.,2)
         self.probe_limit.setSingleStep(.01)
-        self.probe_limit.setToolTip('Intersect [-limit,+limit] with supply parameter.A (lower) / parameter.B (upper).\n'
-                                   'Probe reference and endpoints are automatically moved inside this range.\n'
-                                   'If no usable pair can be measured and restored, skip that QM and continue.')
-        self.target_snr=control(self.form,'Target response / noise',defaults.target_snr,1.,100.,1)
-        self.target_snr.setToolTip('Straight-section RMS horizontal dispersion change between the measured QM current pair.\n'
-            'Target = this factor × uncertainty estimated from the valid BPM samples.\n'
-            'Response and target are displayed as RF orbit differences in micrometres.\n'
-            'Estimate the next span from target / measured S/N with 30% headroom and a growth cap.\n'
-            'Invalid BPMs: restore, then halve and round down to 0.01 A (0.05 -> 0.02 -> 0.01).\n'
-            'S/N above target is accepted immediately. Each pair restores the baseline current.')
-        self.rf=control(self.form,'RF full span [kHz]',defaults.frequency_change_khz,.01,10.)
-        self.measure_tunes=QCheckBox('Measure / constrain H and V tunes');self.measure_tunes.setChecked(defaults.measure_tunes)
-        self.form.addRow(self.measure_tunes)
-        self.tune=control(self.form,'Max tune change',.002,.00001,.1,5)
-        self.tune.setEnabled(defaults.measure_tunes)
-        self.cod=control(self.form,'Max COD change [mm]',.05,.001,1.)
-        self.constrain_cod=QCheckBox('Enforce max COD change');self.constrain_cod.setChecked(defaults.constrain_cod)
-        self.form.addRow(self.constrain_cod);self.cod.setEnabled(defaults.constrain_cod)
-        self.cod.setToolTip('Maximum absolute before/after COD change at every enabled valid BPM, in X and Y (not RMS).\n'
-                            'Constrains the prediction; measured excess after Apply restores the original QM currents.')
-        self.ridge=control(self.form,'Relative regularization',.01,0.,1.,4)
-        self.ridge.setToolTip('Dimensionless alpha: lambda = alpha × largest singular value of the weighted response.\n'
-                              'Penalty: lambda² × sum(delta current²). Larger values suppress weak modes more.\n'
-                              '0 removes this penalty; the separate relative SVD cutoff (0.04) still applies.')
-        self.add_button('1. Measure response / CALC',self.calculate)
-        self.add_button('Load QM scan checkpoint…',self.load_scan)
-        self.resume_button=self.add_button('Resume unfinished QM scan',self.resume_scan);self.resume_button.setEnabled(False)
-        self.add_button('BPM selection…',lambda:self.window.open_tool('selection'))
-        self.recalculate_button=self.add_button('Recalculate (measured response)',self.recalculate)
-        self.recalculate_button.setEnabled(False)
-        self.set_button=self.add_button('2. Apply / remeasure dispersion',self.apply)
-        self.reset_button=self.add_button('Restore original QM / RF settings',self.reset)
-        self.autosave_directory=Path.home()/'DRTuning'/'results'
-        self.add_button('Choose automatic save folder…',self.choose_autosave_directory)
-        self.save_status=QLabel('Scan checkpoints / Apply auto-save: '+str(self.autosave_directory));self.save_status.setWordWrap(True)
-        self.controls.insertWidget(self.controls.count()-1,self.save_status)
-        self.set_button.setEnabled(False);self.reset_button.setEnabled(False)
-        self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 candidates; QM2R.1/.2 excluded by default).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy and COD.\n10 BPM updates per RF setting; average valid samples only. Exclude after 5 consecutive invalid updates.\nTune acquisition / constraints optional; off by default.')
-        for w in (self.maximum,self.probe,self.probe_limit,self.growth,self.target_snr,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(self.invalidate)
-        self.adaptive.toggled.connect(self.invalidate)
-        self.probe_presets.toggled.connect(self.invalidate)
-        self.reuse_widths.toggled.connect(self.invalidate)
-        self.first_pass.toggled.connect(self.invalidate)
-        self.constrain_cod.toggled.connect(self.cod.setEnabled);self.constrain_cod.toggled.connect(self.invalidate)
+        correction=section('Correction')
+        self.selection=QComboBox();self.selection.addItem('SVD — all QMs','all');self.selection.addItem('Greedy — select QMs','greedy')
+        correction.addRow('Solver',self.selection)
+        self.maximum=control(correction,'Maximum QMs',defaults.maximum,1,16,0)
+        correction.setRowVisible(self.maximum,False)
+        self.excluded=QLineEdit(', '.join(defaults.fixed_actuators));correction.addRow('Exclude QMs',self.excluded)
+        self.ridge=control(correction,'Regularization',defaults.regularization,0.,1.,4)
+        self.ridge.setToolTip('Larger values reduce correction from weak responses.')
+        def button_row(items):
+            row=QHBoxLayout();self.buttons.addLayout(row);buttons=[]
+            for label,slot in items:
+                button=QPushButton(label);button.setMinimumHeight(32);button.clicked.connect(slot)
+                row.addWidget(button);buttons.append(button)
+            return buttons
+        self.calc_button,self.set_button=button_row([
+            ('1. CALC',self.calculate),('2. Apply',self.apply)])
+        self.calc_button.setStyleSheet('font-weight: 600;')
+        self.set_button.setStyleSheet('font-weight: 600;')
+        self.bpm_button,self.recalculate_button=button_row([
+            ('Select BPMs…',lambda:self.window.open_tool('selection')),('Recalculate',self.recalculate)])
+        self.recalculate_button.setToolTip('Reuse measured responses with the current BPM selection.')
+        self.load_button,self.resume_button=button_row([
+            ('Load scan…',self.load_scan),('Resume',self.resume_scan)])
+        self.reset_button=self.add_button('Restore original QM / RF',self.reset)
+        for button in (self.set_button,self.recalculate_button,self.resume_button,self.reset_button):button.setEnabled(False)
+        self.controls.removeWidget(self.save_button)
+        storage=QGroupBox('Data');storage_layout=QVBoxLayout(storage)
+        self.autosave_directory=Path('/atf/data/flight-simulator/DRTuning')/datetime.now().strftime('%Y')
+        self.save_directory=QLabel(str(self.autosave_directory));self.save_directory.setWordWrap(True)
+        storage_layout.addWidget(self.save_directory)
+        self.save_status=QLabel('Measurements and applied results save automatically.');self.save_status.setWordWrap(True)
+        storage_layout.addWidget(self.save_status)
+        row=QHBoxLayout();storage_layout.addLayout(row)
+        self.folder_button=QPushButton('Change folder…');self.folder_button.clicked.connect(self.choose_autosave_directory)
+        row.addWidget(self.folder_button);row.addWidget(self.save_button)
+        self.controls.insertWidget(self.controls.count()-1,storage)
+        self.status.setText('Ready to measure.')
+        self.status.setStyleSheet('padding: 6px; font-weight: 600;')
+        self.table.setMaximumHeight(260)
+        self.set_table(['QM trim','Initial probe [A]'],
+            [(name,f'{width:.2f}') for name,width in QM_PROBE_PRESETS_A.items()])
+        for w in (self.maximum,self.probe,self.probe_limit,self.target_snr,self.rf,self.ridge):w.valueChanged.connect(self.invalidate)
+        self.selection.currentIndexChanged.connect(lambda _:correction.setRowVisible(self.maximum,self.selection.currentData()=='greedy'))
         self.selection.currentIndexChanged.connect(self.invalidate)
         self.excluded.textChanged.connect(self.invalidate)
-        self.measure_tunes.toggled.connect(self.tune.setEnabled)
-        self.measure_tunes.toggled.connect(self.invalidate)
     def invalidate(self,*_):
         self.set_button.setEnabled(False)
         if self.result is not None and 'response' in self.result and not self.result.get('applied'):
@@ -267,7 +249,7 @@ class QMDispersionPanel(CorrectionTool):
     def choose_autosave_directory(self):
         path=QFileDialog.getExistingDirectory(self,'Automatic save folder',str(self.autosave_directory))
         if path:
-            self.autosave_directory=Path(path);self.save_status.setText('Scan checkpoints / Apply auto-save: '+path)
+            self.autosave_directory=Path(path);self.save_directory.setText(path);self.save_status.setText('Save folder updated.')
     def new_checkpoint_path(self):
         stamp=datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')
         return Path(self.autosave_directory)/('qm_scan_'+stamp+'_'+uuid4().hex[:8]+'.checkpoint.json')
@@ -277,7 +259,7 @@ class QMDispersionPanel(CorrectionTool):
         try:
             data=self.service.validate_checkpoint(load_checkpoint(path))
             self.service.restore_width_cache(data);self.service.last_result=data;self.display(data)
-            self.save_status.setText('Loaded checkpoint: '+path)
+            self.save_status.setText('Loaded: '+Path(path).name)
             self.window.log('Loaded QM scan: '+path)
         except Exception as exc:self.window.error(str(exc))
     def resume_scan(self):
@@ -295,7 +277,7 @@ class QMDispersionPanel(CorrectionTool):
             data['autosave']=dict(saved_at=stamp.isoformat(),json=str(dest),plot=str(dest.with_suffix('.png')))
             dest.write_text(json.dumps(serial(data),indent=2,allow_nan=False),encoding='utf-8')
             self.plot.save(dest.with_suffix('.png'))
-            self.save_status.setText('Auto-saved JSON + PNG:\n'+str(dest))
+            self.save_status.setText('Auto-saved JSON + PNG:\n'+dest.name)
             self.window.log('QM Apply auto-saved: '+str(dest)+' and '+str(dest.with_suffix('.png')))
         except Exception as exc:
             message='QM SET remains applied. Automatic save failed: '+str(exc)+'\nUse Save data + plot to retry.'
@@ -303,12 +285,9 @@ class QMDispersionPanel(CorrectionTool):
     def options(self):
         shared=self.window.panels['dispersion'].options
         return DispersionOptions(probe_A=self.probe.value(),step_A=self.probe_limit.value(),frequency_change_khz=self.rf.value(),
-            use_probe_presets=self.probe_presets.isChecked(),
-            adaptive_probe=self.adaptive.isChecked(),probe_current_limit_A=self.probe_limit.value(),target_snr=self.target_snr.value(),
-            probe_max_growth=self.growth.value(),reuse_probe_widths=self.reuse_widths.isChecked(),
-            characterize_first_scan=self.first_pass.isChecked(),
-            momentum_compaction=shared.momentum_compaction,measure_tunes=self.measure_tunes.isChecked(),
-            tune_tolerance=self.tune.value(),constrain_cod=self.constrain_cod.isChecked(),orbit_tolerance_mm=self.cod.value(),
+            use_probe_presets=True,adaptive_probe=True,reuse_probe_widths=True,characterize_first_scan=False,
+            probe_current_limit_A=self.probe_limit.value(),target_snr=self.target_snr.value(),
+            momentum_compaction=shared.momentum_compaction,measure_tunes=False,constrain_cod=False,
             regularization=self.ridge.value(),selection=self.selection.currentData(),maximum=int(self.maximum.value()),
             excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(sorted(set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()})))
     def calculate(self):
@@ -331,7 +310,7 @@ class QMDispersionPanel(CorrectionTool):
         self.run(lambda _:self.service.reset(data),done,'Restore QM currents')
     def on_update(self,event):
         if event['kind']=='checkpoint':
-            self.save_status.setText(f"Scan checkpoint: {event['completed']}/{event['total']} QMs processed; {event.get('skipped',0)} skipped\n"+event['path'])
+            self.save_status.setText(f"Scan checkpoint: {event['completed']}/{event['total']} saved; {event.get('skipped',0)} skipped")
             return
         if event.get('data') is not None:self.display(event['data'])
         if event['kind']=='failure':self.set_button.setEnabled(False)
@@ -365,15 +344,15 @@ class QMDispersionPanel(CorrectionTool):
             self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]','Response / target [µm]','S/N','Next probe [A]'],rows)
             self.set_button.setEnabled(bool(not data.get('applied') and not data.get('error') and
                                        self.proposal_matches_options(data) and np.any(abs(np.asarray(data['delta']))>1.e-12)))
-            tune_status=('Predicted tune change: '+str(np.round(data['predicted_tune_change'],6))
-                         if data.get('predicted_tune_change') is not None else 'Tune acquisition / tune constraints skipped.')
-            self.status.setText(('SET applied; dispersion remeasured.' if data.get('applied') else
-                'Recalculated from measured response; no new acquisition.' if data.get('response_reused') else 'CALC ready; probe currents restored.')+
-                '\n'+data['solver']+'\n'+tune_status+f'\nFit BPMs: {valid.sum()} / {len(valid)}')
+            if data.get('applied'):message='Applied. Dispersion remeasured.'
+            elif not self.proposal_matches_options(data):message='Settings changed. Recalculate before Apply.'
+            elif not np.any(abs(np.asarray(data['delta']))>1.e-12):message='No correction proposed.'
+            else:message='Ready to apply.'
+            self.status.setText(message+f'\nFit BPMs: {valid.sum()} / {len(valid)}')
         else:
             self.set_button.setEnabled(False)
             state=data.get('scan_state',{});done=state.get('completed',0)
-            self.status.setText(f"QM response scan: {done}/{len(data['actuators'])} processed.\nResume retains completed pairs; the unfinished QM is measured again.")
+            self.status.setText(f"Measured: {done}/{len(data['actuators'])} QMs.")
             qualities=data.get('probe_quality',[])
             estimates=data.get('successful_probe_widths',{})
             self.set_table(['QM trim','Scan','Response / target [µm]','Next probe [A]'],
@@ -383,7 +362,7 @@ class QMDispersionPanel(CorrectionTool):
                  for i,n in enumerate(data['actuators'])])
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
-        elif data.get('proposal_unavailable_reason'):self.status.setText(data['proposal_unavailable_reason'])
+        elif data.get('proposal_unavailable_reason'):self.status.setText('S/N below target. Run CALC to remeasure.')
         if data.get('skipped_qms'):
             self.status.setText(self.status.text()+'\nSkipped QM: '+', '.join(r['magnet'] for r in data['skipped_qms']))
         state=data.get('scan_state',{})

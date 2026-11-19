@@ -145,7 +145,7 @@ class QMAdaptiveTests(unittest.TestCase):
         self.opt.use_probe_presets=True
         original=self.b.orbit
         def weak():
-            frame=original();frame['x']+=.01*(1 if self.b.acquisitions%2 else -1);return frame
+            frame=original();frame['x']+=.002*(1 if self.b.acquisitions%2 else -1);return frame
         self.b.orbit=weak
         result=self.s.calculate(self.opt)
         for name in result['actuators']:
@@ -499,24 +499,25 @@ class QMCheckpointGuiTests(unittest.TestCase):
         from Knobs.DRTuning.correction_gui import QFileDialog
         window=TuningSession(DispersionFixture());panel=window.qm_dispersion
         try:
-            panel.probe_presets.setChecked(False)
-            self.assertEqual(panel.probe.value(),3.);self.assertEqual(panel.probe_limit.value(),3.)
-            self.assertFalse(panel.constrain_cod.isChecked());self.assertFalse(panel.cod.isEnabled())
+            self.assertEqual(panel.probe.value(),.1);self.assertEqual(panel.probe_limit.value(),3.)
+            self.assertFalse(panel.options().constrain_cod)
             with tempfile.TemporaryDirectory() as directory:
                 panel.autosave_directory=Path(directory)
                 panel.excluded.setText(', '.join(n for n in QM_CANDIDATES if n not in ACTIVE))
-                opt=panel.options();opt.probe_A=.1;path=Path(directory)/'old.checkpoint.json'
+                opt=panel.options();opt.probe_A=.05;path=Path(directory)/'old.checkpoint.json'
                 def progress(_,message):
                     if message.startswith('QM dispersion response') and '(1/3)' in message:window.service.cancel.set()
                 with self.assertRaises(Cancelled):panel.service.calculate(opt,progress,checkpoint_path=path)
                 with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'JSON')):panel.load_scan()
-                self.assertEqual(panel.probe.value(),3.);self.assertTrue(panel.resume_button.isEnabled())
+                self.assertEqual(panel.probe.value(),.1);self.assertTrue(panel.resume_button.isEnabled())
                 self.assertFalse(panel.set_button.isEnabled());window.service.cancel.clear()
                 with patch.object(window,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):panel.resume_scan()
                 self.assertFalse(panel.resume_button.isEnabled());self.assertTrue(panel.set_button.isEnabled())
                 self.assertEqual(len(list(Path(directory).glob('*.checkpoint.json'))),2)
                 self.assertIn('Scan checkpoint: 3/3',panel.save_status.text())
-                for probe in panel.result['probe_readbacks'][1:]:np.testing.assert_allclose(probe['requested'],[-2.,2.])
+                for probe in panel.result['probe_readbacks'][1:]:
+                    width=QM_PROBE_PRESETS_A[probe['magnet']]
+                    np.testing.assert_allclose(probe['requested'],[-width,width])
         finally:window.close();self.app.processEvents()
 
     def test_skipped_qm_is_visible_in_partial_and_complete_tables(self):
@@ -541,12 +542,12 @@ class QMCheckpointGuiTests(unittest.TestCase):
             frame=original();frame['x']+=.0002*(1 if backend.acquisitions%2 else -1);return frame
         backend.orbit=noisy;window=TuningSession(backend);panel=window.qm_dispersion
         try:
-            panel.probe_presets.setChecked(False);panel.first_pass.setChecked(True)
             panel.probe.setValue(.01)
             panel.excluded.setText(', '.join(n for n in QM_CANDIDATES if n not in ACTIVE[:2]))
-            result=panel.service.calculate(panel.options());panel.display(result)
+            old_options=panel.options();old_options.use_probe_presets=False;old_options.characterize_first_scan=True
+            result=panel.service.calculate(old_options);panel.display(result)
             self.assertFalse(panel.set_button.isEnabled());self.assertFalse(panel.resume_button.isEnabled())
-            self.assertIn('calibration saved',panel.status.text())
+            self.assertIn('S/N below target',panel.status.text())
             self.assertEqual(panel.table.horizontalHeaderItem(3).text(),'Next probe [A]')
             self.assertGreater(float(panel.table.item(0,3).text()),.01)
             panel.target_snr.setValue(1.)

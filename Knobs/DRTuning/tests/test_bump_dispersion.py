@@ -199,7 +199,7 @@ class DispersionTests(unittest.TestCase):
         self.o=DispersionOptions(probe_A=.01,use_probe_presets=False,regularization=0.,fixed_actuators=(),measure_tunes=True,adaptive_probe=False)
     def test_requested_defaults_skip_tunes_through_calc_set_reset_and_exclude_qm2(self):
         opt=DispersionOptions();initial=self.b.snapshot()
-        self.assertEqual((opt.probe_A,opt.probe_current_limit_A,opt.frequency_change_khz),(3.,3.,4.))
+        self.assertEqual((opt.probe_A,opt.probe_current_limit_A,opt.frequency_change_khz),(.1,3.,4.))
         self.assertTrue(opt.adaptive_probe);self.assertEqual(opt.probe_current_limit_A,3.)
         self.assertEqual(opt.target_snr,5.);self.assertFalse(opt.constrain_cod)
         self.assertEqual(opt.fixed_actuators,('QM2R.1','QM2R.2'))
@@ -483,14 +483,19 @@ class CorrectionGuiTests(unittest.TestCase):
         b=DispersionFixture();w=TuningSession(b)
         try:
             panel=w.qm_dispersion;defaults=panel.options()
-            self.assertEqual((panel.probe.value(),panel.probe_limit.value(),panel.rf.value()),(3.,3.,4.))
-            self.assertTrue(panel.probe_presets.isChecked());self.assertFalse(panel.first_pass.isChecked())
+            self.assertEqual((panel.probe.value(),panel.probe_limit.value(),panel.rf.value()),(.1,3.,4.))
+            from PyQt6.QtWidgets import QCheckBox
+            from datetime import datetime
+            self.assertEqual(panel.findChildren(QCheckBox),[])
+            self.assertTrue(defaults.use_probe_presets);self.assertTrue(defaults.adaptive_probe)
+            self.assertTrue(defaults.reuse_probe_widths);self.assertFalse(defaults.characterize_first_scan)
+            self.assertFalse(defaults.constrain_cod)
+            self.assertEqual(panel.autosave_directory,Path('/atf/data/flight-simulator/DRTuning')/datetime.now().strftime('%Y'))
             self.assertEqual(set(defaults.fixed_actuators),{'QM2R.1','QM2R.2'})
-            self.assertFalse(defaults.measure_tunes);self.assertFalse(panel.tune.isEnabled())
+            self.assertFalse(defaults.measure_tunes)
             data=panel.service.calculate(defaults)
             panel.service.apply(data);panel.display(data)
-            self.assertIn('tune constraints skipped',panel.status.text())
-            panel.measure_tunes.setChecked(True);self.assertTrue(panel.options().measure_tunes);self.assertTrue(panel.tune.isEnabled())
+            self.assertIn('Applied. Dispersion remeasured.',panel.status.text())
             self.assertEqual(len(panel.plot.figure.axes),4)
             self.assertTrue(all('Measured after SET' in ax.get_legend_handles_labels()[1] for ax in panel.plot.figure.axes))
             w.open_tool('qm_dispersion');self.assertIs(w.tabs.currentWidget(),panel)

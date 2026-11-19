@@ -188,8 +188,8 @@ QM dispersion:
   the scan after restoration; it does not continue accumulating unsaved pairs.
   Resume unfinished QM scan uses the current partial result, or first choose
   Load QM scan checkpoint after restarting the GUI. Completed response columns
-  are reused; the unfinished QM starts from a matching saved estimate or the
-  current initial width (default 3 A). Loading a scan never overwrites the
+  are reused; the unfinished QM starts from a matching saved estimate, its
+  enabled per-QM preset, or the uniform/fallback width. Loading a scan never overwrites the
   current initial-width control.
   Resume checks machine identity/profile, BPM order, acquisition RF/tune
   settings, QM selection, supply limits and original machine settings before

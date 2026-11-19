@@ -26,7 +26,7 @@ PROBE_SNR_HEADROOM=1.3
 
 @dataclass
 class DispersionOptions:
-    probe_A: float = 3.
+    probe_A: float = .1
     use_probe_presets: bool = True
     adaptive_probe: bool = True
     probe_current_limit_A: float = 3.
