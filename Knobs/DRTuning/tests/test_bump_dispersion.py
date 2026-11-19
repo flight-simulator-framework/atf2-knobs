@@ -199,19 +199,19 @@ class DispersionTests(unittest.TestCase):
         self.o=DispersionOptions(probe_A=.01,use_probe_presets=False,regularization=0.,fixed_actuators=(),measure_tunes=True,adaptive_probe=False)
     def test_requested_defaults_skip_tunes_through_calc_set_reset_and_exclude_qm2(self):
         opt=DispersionOptions();initial=self.b.snapshot()
-        self.assertEqual((opt.probe_A,opt.probe_current_limit_A,opt.frequency_change_khz),(.1,3.,4.))
-        self.assertTrue(opt.adaptive_probe);self.assertEqual(opt.probe_current_limit_A,3.)
+        self.assertEqual((opt.probe_A,opt.step_A,opt.frequency_change_khz),(.1,3.,4.))
+        self.assertTrue(opt.adaptive_probe);self.assertEqual(opt.step_A,3.)
         self.assertEqual(opt.target_snr,5.);self.assertFalse(opt.constrain_cod)
-        self.assertEqual(opt.fixed_actuators,('QM2R.1','QM2R.2'))
+        self.assertEqual(opt.fixed_actuators,('QM2R.1','QM2R.2','QM3R.2'))
         with patch.object(self.b,'measure_tunes',side_effect=AssertionError('Tune read must be skipped')) as tunes,\
              patch.object(self.b,'validate_tune_measurement',create=True,side_effect=AssertionError('Tune preflight must be skipped')) as validate,\
              patch.object(self.b,'set_frequency',wraps=self.b.set_frequency) as frequency:
             data=self.s.calculate(opt)
-            self.assertEqual(self.b.snapshot(),initial);self.assertEqual(len(data['actuators']),14)
-            self.assertEqual(len(data['orbit_measurements']),87)
+            self.assertEqual(self.b.snapshot(),initial);self.assertEqual(len(data['actuators']),13)
+            self.assertEqual(len(data['orbit_measurements']),81)
             for key in ('initial_tunes','tune_response','predicted_tune_change'):self.assertIsNone(data[key])
             self.assertEqual(data['scan_tunes'],[]);self.assertIn('skipped',data['solver'])
-            expected_widths=[.16,.34,.13,.62,.50,.28,.16,.22,.21,.18,.47,.28,.20,.29]
+            expected_widths=[.16,.34,.13,.62,.50,.28,.16,.22,.18,.47,.28,.20,.29]
             self.assertTrue(opt.use_probe_presets);self.assertFalse(opt.characterize_first_scan)
             for probe,width in zip(data['probe_readbacks'],expected_widths):
                 np.testing.assert_allclose(probe['requested'],[-width,width])
@@ -274,7 +274,7 @@ class DispersionTests(unittest.TestCase):
         self.o.excluded_bpms=();result=self.s.recalculate(data,self.o)
         self.assertTrue(result['valid'][good]);self.assertFalse(result['valid'][bad])
         self.assertFalse(data['valid'][good]);self.assertEqual(result['acquisition_options']['excluded_bpms'],(self.b.bpm_names[good],))
-    def test_recalculate_rejects_changed_measurement_conditions_and_applied_baseline(self):
+    def test_recalculate_rejects_changed_measurement_conditions_and_uses_applied_baseline(self):
         data=self.s.calculate(self.o)
         for key,value,message in [('frequency_change_khz',2.,'RF / momentum'),
                                   ('momentum_compaction',.003,'RF / momentum'),
@@ -282,7 +282,9 @@ class DispersionTests(unittest.TestCase):
             opt=copy.deepcopy(self.o);setattr(opt,key,value)
             with self.assertRaisesRegex(ValueError,message):self.s.recalculate(data,opt)
         self.s.apply(data)
-        with self.assertRaisesRegex(ValueError,'Restore original'):self.s.recalculate(data,self.o)
+        next_step=self.s.recalculate(data,self.o)
+        np.testing.assert_allclose(next_step['full_measured'],data['full_after'])
+        self.assertEqual(next_step['baseline'],self.b.snapshot())
         self.s.reset(data);result=self.s.recalculate(data,self.o)
         self.assertNotIn('full_after',result);self.assertFalse(result['applied'])
         self.s.apply(result);self.assertTrue(result['applied']);self.assertNotIn('restored',result)
@@ -457,7 +459,7 @@ class CorrectionGuiTests(unittest.TestCase):
                 np.testing.assert_allclose(saved['full_after'],panel.result['full_after'])
                 self.assertEqual(saved['autosave']['json'],str(files[0]))
                 self.assertTrue(files[0].with_suffix('.png').read_bytes().startswith(b'\x89PNG'))
-                self.assertIn('Auto-saved',panel.save_status.text());self.assertFalse(panel.recalculate_button.isEnabled())
+                self.assertIn('Auto-saved',panel.save_status.text());self.assertTrue(panel.recalculate_button.isEnabled())
                 panel.display(panel.result);self.assertEqual(len(list(panel.autosave_directory.glob('*.json'))),1)
                 panel.service.reset(panel.result);panel.display(panel.service.recalculate(panel.result,panel.options()))
                 with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):panel.apply()
@@ -483,7 +485,7 @@ class CorrectionGuiTests(unittest.TestCase):
         b=DispersionFixture();w=TuningSession(b)
         try:
             panel=w.qm_dispersion;defaults=panel.options()
-            self.assertEqual((panel.probe.value(),panel.probe_limit.value(),panel.rf.value()),(.1,3.,4.))
+            self.assertEqual((panel.probe.value(),panel.step.value(),panel.rf.value()),(.1,3.,4.))
             from PyQt6.QtWidgets import QCheckBox
             from datetime import datetime
             self.assertEqual(panel.findChildren(QCheckBox),[])
@@ -491,7 +493,7 @@ class CorrectionGuiTests(unittest.TestCase):
             self.assertTrue(defaults.reuse_probe_widths);self.assertFalse(defaults.characterize_first_scan)
             self.assertFalse(defaults.constrain_cod)
             self.assertEqual(panel.autosave_directory,Path('/atf/data/flight-simulator/DRTuning')/datetime.now().strftime('%Y'))
-            self.assertEqual(set(defaults.fixed_actuators),{'QM2R.1','QM2R.2'})
+            self.assertEqual(set(defaults.fixed_actuators),{'QM2R.1','QM2R.2','QM3R.2'})
             self.assertFalse(defaults.measure_tunes)
             data=panel.service.calculate(defaults)
             panel.service.apply(data);panel.display(data)

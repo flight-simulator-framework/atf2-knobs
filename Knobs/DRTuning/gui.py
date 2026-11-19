@@ -1,5 +1,6 @@
 """DRTuning launcher: one shared interface, serialized machine operations."""
 import json
+import re
 import time
 import traceback
 from pathlib import Path
@@ -332,8 +333,32 @@ class TuningSession(DRCorrectionWindow):
         self.task.progress.connect(self.show_progress);self.task.finished.connect(self.task_finished);self.task.start()
     def show_progress(self,value,message):
         self.progress.setRange(0,100);self.progress.setValue(value)
-        pending=' [Pause requested; finishing current operation]' if self.service.pause_requested.is_set() and not self.service.paused.is_set() else ''
-        self.operation_status.setText(self._active_label+'：'+message+pending)
+        pending=' [Pause requested]' if self.service.pause_requested.is_set() and not self.service.paused.is_set() else ''
+        summary=None
+        magnet=re.search(r'QM\d+R\.\d+',message)
+        if message.startswith('BPM validity:'):
+            summary=f'{magnet[0]}: measuring response' if magnet else 'QM dispersion: measuring baseline'
+        elif message.startswith('QM probe:') and magnet:
+            phase=('reducing probe and retrying' if 'rejected at' in message else
+                   'response below target' if 'below target' in message else
+                   'response acquired' if message.endswith('accepted') else 'measuring response')
+            summary=f'{magnet[0]}: {phase}'
+        elif message.startswith('SKIP QM probe:'):
+            summary=f'{magnet[0]}: skipped' if magnet else 'QM probe skipped'
+        elif message.startswith('QM dispersion response ') and magnet:
+            count=re.search(r'\(\d+/\d+\)',message)
+            summary=f'{magnet[0]}: complete'+(' '+count[0] if count else '')
+        elif message.startswith(('Resume:','Tune acquisition / tune constraints skipped;')):
+            summary='QM dispersion: measuring baseline'
+        elif message.startswith('QM proposal ready;'):
+            summary='QM dispersion: ready to apply'
+        elif message.startswith('Recalculated from measured response;'):
+            summary='QM dispersion: recalculated'
+        elif message.startswith('QM correction set;'):
+            summary='QM correction applied; dispersion checked'
+        elif message.startswith('No QM response reaches the target signal/noise ratio;'):
+            summary='QM dispersion: S/N below target'
+        self.operation_status.setText((summary or self._active_label+'：'+message)+pending)
         if message.startswith(('SKIP ','PAUSED:','RESUMED:','BPM validity:','QM probe:','Resume:')):self.log(message)
     def task_finished(self):
         self.prepare_pause(False)

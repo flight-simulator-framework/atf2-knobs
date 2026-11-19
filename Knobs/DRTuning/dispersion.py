@@ -29,13 +29,13 @@ class DispersionOptions:
     probe_A: float = .1
     use_probe_presets: bool = True
     adaptive_probe: bool = True
-    probe_current_limit_A: float = 3.
+    probe_current_limit_A: float = 3.  # Legacy saved-file field; absolute limits come from the supply.
     target_snr: float = 5.
     maximum_probe_pairs: int = 12
     probe_max_growth: float = 3.
     reuse_probe_widths: bool = True
     characterize_first_scan: bool = False
-    step_A: float = 3.  # Legacy saved-file field; the shared absolute current limit controls the solver.
+    step_A: float = 3.  # Maximum |delta I| per Apply, relative to this iteration's baseline.
     frequency_change_khz: float = 4.
     momentum_compaction: float = .0021
     measure_tunes: bool = False
@@ -48,10 +48,10 @@ class DispersionOptions:
     selection: str = 'all'
     maximum: int = 8
     excluded_bpms: tuple = ()
-    fixed_actuators: tuple = ('QM2R.1','QM2R.2')
+    fixed_actuators: tuple = ('QM2R.1','QM2R.2','QM3R.2')
 
     def validate(self):
-        for k in ('probe_A','probe_current_limit_A','target_snr','step_A','frequency_change_khz','momentum_compaction','orbit_tolerance_mm','dispersion_weight'):
+        for k in ('probe_A','target_snr','step_A','frequency_change_khz','momentum_compaction','orbit_tolerance_mm','dispersion_weight'):
             if not np.isfinite(getattr(self,k)) or getattr(self,k)<=0:raise ValueError('Invalid '+k)
         if not isinstance(self.measure_tunes,bool):raise ValueError('Invalid measure_tunes option')
         if not isinstance(self.constrain_cod,bool):raise ValueError('Invalid constrain_cod option')
@@ -101,9 +101,8 @@ def probe_floor(value):return round(np.floor(value/PROBE_INCREMENT_A+1.e-10)*PRO
 def probe_ceil(value):return round(np.ceil(value/PROBE_INCREMENT_A-1.e-10)*PROBE_INCREMENT_A,12)
 
 
-def probe_bounds(limits,opt):
-    lower=max(float(limits[0]),-opt.probe_current_limit_A)
-    upper=min(float(limits[1]),opt.probe_current_limit_A)
+def probe_bounds(limits):
+    lower,upper=map(float,limits)
     lo=probe_ceil(lower);hi=probe_floor(upper)
     if lo<lower:lo=round(lo+PROBE_INCREMENT_A,12)
     if hi>upper:hi=round(hi-PROBE_INCREMENT_A,12)
@@ -114,9 +113,9 @@ def probe_pair(magnet,center,limits,opt,width):
     """Move the probe reference inside the allowed range, then clip the endpoints."""
     if not np.isfinite(limits).all() or limits[0]>=limits[1]:
         raise ValueError(f'Invalid QM supply limits for {magnet}: {limits}')
-    lower,upper=probe_bounds(limits,opt)
+    lower,upper=probe_bounds(limits)
     detail=(f'{magnet}: current={center:+.6g} A; supply=[{limits[0]:+.6g}, {limits[1]:+.6g}] A; '
-            f'probe absolute limit=+/-{opt.probe_current_limit_A:g} A; allowed=[{lower:+.6g}, {upper:+.6g}] A')
+            f'allowed probe endpoints=[{lower:+.6g}, {upper:+.6g}] A')
     if not limits[0]<=center<=limits[1]:
         raise ProbeRangeUnavailable('Original current is outside supply limits; cannot guarantee restoration. '+detail)
     if upper-lower<PROBE_INCREMENT_A-1.e-9:raise ProbeRangeUnavailable('No 0.01 A QM probe span within limits. '+detail)
@@ -128,7 +127,7 @@ def probe_pair(magnet,center,limits,opt,width):
 
 def estimated_probe_width(center,limits,measured_span,quality,opt):
     """Infer a target width from measured span and S/N, including clipped pairs."""
-    lo,hi=probe_bounds(limits,opt);reference=float(np.clip(center,lo,hi))
+    lo,hi=probe_bounds(limits);reference=float(np.clip(center,lo,hi))
     near=min(reference-lo,hi-reference);far=max(reference-lo,hi-reference)
     snr=quality['snr']
     if snr is None or snr<=0:return None
@@ -265,7 +264,7 @@ class DispersionService:
     def width_context(self,data,opt):
         context=dict(backend_id=data['backend_id'],profile_signature=data['profile_signature'],names=list(data['names']),
             frequency_change_khz=opt.frequency_change_khz,momentum_compaction=opt.momentum_compaction,
-            excluded_bpms=sorted(opt.excluded_bpms),initial_probe_A=opt.probe_A,current_limit_A=opt.probe_current_limit_A,
+            excluded_bpms=sorted(opt.excluded_bpms),initial_probe_A=opt.probe_A,probe_limits='supply',
             measure_tunes=opt.measure_tunes,constrain_cod=opt.constrain_cod,orbit_tolerance_mm=opt.orbit_tolerance_mm)
         if opt.use_probe_presets:context['probe_presets']='20261119-snr6p5'
         return context
@@ -540,7 +539,6 @@ class DispersionService:
         """Refit a complete response without reading or writing any machine setting."""
         opt.validate();self.check()
         if 'response' not in data:raise ValueError('No complete measured response; CALC first')
-        if data.get('applied'):raise ValueError('Restore original QM currents or CALC again before recalculating')
         if data.get('restoration_error') or (data.get('error') and not data.get('restored')):
             raise ValueError('Resolve the previous acquisition / restoration failure and CALC again')
         acquired=data.get('acquisition_options',data['options'])
@@ -549,8 +547,11 @@ class DispersionService:
         expected=[n for n in QM_CANDIDATES if n not in opt.fixed_actuators]
         if expected!=list(data['actuators']):raise ValueError('QM selection changed; CALC again')
         result=copy.deepcopy(data)
+        if data.get('applied'):
+            self._advance_iteration(result,opt)
         for key in ('error','restoration_error','restored','full_after','after_valid','after_tunes',
-                    'after_tune_evidence','after_orbit_measurements','tune_check_performed','applied_currents_A','autosave'):
+                    'after_tune_evidence','after_orbit_measurements','tune_check_performed','applied_currents_A',
+                    'applied_baseline','applied_at','autosave'):
             result.pop(key,None)
         result.setdefault('acquisition_options',copy.deepcopy(acquired))
         result.update(applied=False,response_reused=True,recalculation_count=data.get('recalculation_count',0)+1)
@@ -558,8 +559,46 @@ class DispersionService:
         progress(100,'Recalculated from measured response; no BPM acquisition or magnet / RF writes')
         return result
 
+    def _advance_iteration(self,data,opt):
+        """Use the verified post-Apply observation, never the old residual or prediction."""
+        if data.get('backend_id')!=self.backend.identity or data['names']!=list(self.backend.bpm_names):
+            raise ValueError('Machine / BPM order differs from the applied QM correction')
+        n=len(data['names']);m=len(data['actuators'])
+        after=np.asarray(data.get('full_after'),float)
+        valid=np.asarray(data.get('after_valid'),bool)
+        currents=np.asarray(data.get('applied_currents_A'),float)
+        if after.shape!=(4,n) or valid.shape!=(n,) or currents.shape!=(m,) or not np.isfinite(currents).all():
+            raise ValueError('Missing verified after-Apply measurements / currents; CALC again')
+        if opt.measure_tunes and (not data.get('tune_check_performed') or
+                np.asarray(data.get('after_tunes')).shape!=(2,)):
+            raise ValueError('No verified after-Apply tunes; CALC with tune acquisition enabled first')
+        baseline=copy.deepcopy(data['baseline'])
+        if not set(data['actuators'])<=set(baseline.get('quadrupoles',{})):
+            raise ValueError('Missing QM settings in saved baseline; CALC again')
+        baseline['quadrupoles'].update(zip(data['actuators'],currents.tolist()))
+        # Older applied files have the measured currents but no complete post-Apply snapshot.
+        # Keep all other settings at their saved values; Apply checks them against the machine.
+        applied_baseline=data.get('applied_baseline',baseline)
+        if not self.backend.same_settings(applied_baseline,baseline):
+            raise ValueError('After-Apply settings disagree with the saved correction; CALC again')
+        origin_keys=('baseline','centers','full_measured','valid','acquisition_valid',
+                     'initial_tunes','initial_tune_evidence')
+        data.setdefault('iteration_origin',{key:copy.deepcopy(data[key]) for key in origin_keys if key in data})
+        history_keys=origin_keys+('delta','full_predicted','full_after','after_valid','after_tunes',
+            'after_tune_evidence','after_orbit_measurements','applied_currents_A','applied_baseline',
+            'applied_at','options','selected','autosave')
+        data.setdefault('iteration_history',[]).append(
+            dict(kind='applied',iteration=data.get('iteration_index',0)+1,
+                 **{key:copy.deepcopy(data[key]) for key in history_keys if key in data}))
+        data.update(baseline=copy.deepcopy(applied_baseline),centers=currents.copy(),full_measured=after.copy(),
+                    initial_tunes=copy.deepcopy(data.get('after_tunes')),
+                    initial_tune_evidence=copy.deepcopy(data.get('after_tune_evidence')),
+                    iteration_valid=np.asarray(data.get('iteration_valid',np.ones(n,bool)),bool)&valid,
+                    iteration_index=data.get('iteration_index',0)+1)
+
     def solve(self,data,opt):
         opt.validate();valid=np.asarray(data.get('acquisition_valid',data['valid']),bool).copy()
+        valid &= np.asarray(data.get('iteration_valid',np.ones_like(valid)),bool)
         valid &= np.array([n not in opt.excluded_bpms for n in data['names']])
         straight=np.asarray(data['straight'],bool)
         if not np.any(valid&straight):raise ValueError('No common valid straight-section BPM across scan')
@@ -570,7 +609,7 @@ class DispersionService:
         weights=np.repeat([opt.dispersion_weight,opt.dispersion_weight,1.,1.],len(valid))
         a=(response*weights[:,None])[mask];residual=((measured-target).ravel()*weights)[mask]
         c=np.asarray(data['centers']);lo,hi=np.asarray(data['limits'])
-        lower=np.maximum(lo,-opt.probe_current_limit_A)-c;upper=np.minimum(hi,opt.probe_current_limit_A)-c
+        lower=np.maximum(lo-c,-opt.step_A);upper=np.minimum(hi-c,opt.step_A)
         constraints=response[2*len(valid):][np.tile(valid,2)] if opt.constrain_cod else np.empty((0,len(c)))
         tolerance=np.full(len(constraints),opt.orbit_tolerance_mm)
         if opt.measure_tunes:
@@ -622,13 +661,13 @@ class DispersionService:
     def apply(self,data,progress=lambda *_:None,event=lambda *_:None):
         self.last_result=data
         self.check();b=self.backend;saved_options=dict(data['options']);saved_options.setdefault('measure_tunes',True)
-        opt=DispersionOptions(**saved_options);b.validate_mode('dispersion')
+        opt=DispersionOptions(**saved_options);opt.validate();b.validate_mode('dispersion')
         if data.get('applied') or data['backend_id']!=b.identity:raise ValueError('Stale or already applied QM proposal')
         if not b.same_settings(b.snapshot(),data['baseline']):raise ValueError('Settings changed since QM CALC')
         names=data['actuators'];centers=np.asarray(data['centers']);delta=np.asarray(data['delta']);changed=np.flatnonzero(abs(delta)>1.e-12)
         if not len(changed):raise ValueError('No QM correction proposed')
-        if np.any(abs(centers[changed]+delta[changed])>opt.probe_current_limit_A+1.e-9):
-            raise ValueError('QM proposal exceeds the shared absolute current limit; recalculate')
+        if np.any(abs(delta[changed])>opt.step_A+1.e-9):
+            raise ValueError('QM proposal exceeds the per-Apply current change limit; recalculate')
         for j in changed:b.validate_quadrupole_targets(names[j],[centers[j]+delta[j]])
         self.reader.reset_sampling()
         try:
@@ -649,7 +688,15 @@ class DispersionService:
             straight=mask&np.asarray(data['straight'],bool)
             if np.linalg.norm(after[0,straight])>np.linalg.norm(np.asarray(data['full_measured'],float)[0,straight]):
                 raise ValueError('Measured horizontal straight dispersion did not improve; restored')
-            self.check();data['applied_currents_A']=[b.quadrupole_current(n) for n in names]
+            self.check()
+            expected=copy.deepcopy(data['baseline'])
+            expected['quadrupoles'].update(zip(names,(centers+delta).tolist()))
+            applied_baseline=b.snapshot()
+            if not b.same_settings(applied_baseline,expected):
+                raise ValueError('Settings changed or QM targets were not reached after Apply; restored changed trims')
+            data['applied_currents_A']=[applied_baseline['quadrupoles'][n] for n in names]
+            data['applied_baseline']=applied_baseline
+            data['applied_at']=datetime.now(timezone.utc).isoformat()
             data['applied']=True;data.pop('restored',None);event(dict(kind='dispersion',data=copy.deepcopy(data)))
             progress(100,'QM correction set; actual dispersion and COD remeasured; '+
                      ('tunes remeasured' if opt.measure_tunes else 'tune acquisition / constraints skipped'))
@@ -664,15 +711,25 @@ class DispersionService:
 
     def reset(self,data):
         self.last_result=data;errors=[]
+        origin=data.get('iteration_origin',data)
         skipped={r['magnet'] for r in data.get('probe_readbacks',[]) if r.get('skipped')}
-        restore=[(n,c) for n,c in zip(data['actuators'],data['centers']) if n not in skipped]
+        restore=[(n,c) for n,c in zip(data['actuators'],origin['centers']) if n not in skipped]
         try:restore_quads(self.backend,[n for n,_ in restore],[c for _,c in restore])
         except Exception as exc:errors.append(str(exc))
         if data.get('checkpoint_schema'):
-            try:self.backend.restore_frequency(data['baseline'].get('ramp_state',data['baseline']['frequency']))
+            try:self.backend.restore_frequency(origin['baseline'].get('ramp_state',origin['baseline']['frequency']))
             except Exception as exc:errors.append(str(exc))
         if errors:
             data.update(restored=False,restoration_error='; '.join(errors))
             raise RuntimeError(data['restoration_error'])
+        if 'iteration_origin' in data:
+            data.setdefault('iteration_history',[]).append(dict(kind='restore_original',
+                timestamp=datetime.now(timezone.utc).isoformat(),iteration=data.get('iteration_index',0)+1,
+                was_applied=bool(data.get('applied'))))
+            data.update(copy.deepcopy(origin))
+            for key in ('iteration_origin','iteration_valid','delta','full_predicted','full_target',
+                        'full_after','after_valid','applied_baseline','applied_currents_A'):
+                data.pop(key,None)
+            data['iteration_index']=0
         data['applied']=False;data['restored']=True
         data.pop('restoration_error',None)

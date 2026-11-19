@@ -211,7 +211,7 @@ class QMAdaptiveTests(unittest.TestCase):
         self.assertFalse(result['probe_quality'][0]['usable']);self.assertEqual(result['delta'][0],0.)
         self.assertNotIn(ACTIVE[0],result['selected']);self.assertIn(ACTIVE[1],result['selected'])
 
-    def test_absolute_three_amp_limit_is_not_a_three_amp_delta(self):
+    def test_probe_uses_hardware_limits_without_absolute_three_amp_cap(self):
         self.opt.fixed_actuators=tuple(n for n in QM_CANDIDATES if n!=ACTIVE[0])
         self.b.q[ACTIVE[0]]=2.9;self.b.quadrupoles[ACTIVE[0]]['limits_A']=[-5.,5.];self.b.dr[:,0]=0.
         def validate(n,values):
@@ -219,7 +219,7 @@ class QMAdaptiveTests(unittest.TestCase):
         with patch.object(self.b,'validate_quadrupole_targets',side_effect=validate):
             with self.assertRaisesRegex(ValueError,'No QM response reaches'):self.s.calculate(self.opt)
         commands=[v for n,v in self.b.commands if n==ACTIVE[0]]
-        self.assertAlmostEqual(max(commands),3.);self.assertAlmostEqual(min(commands),-3.)
+        self.assertAlmostEqual(max(commands),5.);self.assertAlmostEqual(min(commands),-5.)
         self.assertAlmostEqual(self.b.q[ACTIVE[0]],2.9)
 
     def test_new_invalid_bpm_shrinks_and_does_not_revisit_failed_width(self):
@@ -285,9 +285,9 @@ class QMAdaptiveTests(unittest.TestCase):
         self.assertEqual(self.b.q[ACTIVE[0]],2.1)
         self.assertNotIn(ACTIVE[0],[n for n,_ in self.b.commands])
 
-    def test_outside_probe_cap_shifts_reference_but_restores_original_current(self):
+    def test_probe_above_three_amps_stays_centered_and_restores_original_current(self):
         self.opt.adaptive_probe=False
-        for center,expected in [(3.2,[2.99,3.]),(-3.2,[-3.,-2.99])]:
+        for center,expected in [(3.2,[3.19,3.21]),(-3.2,[-3.21,-3.19])]:
             with self.subTest(center=center):
                 self.b.q[ACTIVE[0]]=center;self.b.quadrupoles[ACTIVE[0]]['limits_A']=[-5.,5.]
                 self.b.commands=[]
@@ -296,13 +296,13 @@ class QMAdaptiveTests(unittest.TestCase):
                 with patch.object(self.b,'validate_quadrupole_targets',side_effect=validate):result=self.s.calculate(self.opt)
                 currents=[v for name,v in self.b.commands if name==ACTIVE[0]]
                 np.testing.assert_allclose(currents,expected+[center])
-                self.assertEqual(result['probe_readbacks'][0]['scheme'],'shifted inside probe range')
+                self.assertEqual(result['probe_readbacks'][0]['scheme'],'symmetric')
                 np.testing.assert_allclose(result['response'][:len(self.b.bpm_names),0],self.b.dr[:,0],atol=1.e-10)
                 self.assertEqual(self.b.q[ACTIVE[0]],center)
 
-    def test_disjoint_range_skip_is_checkpointed_and_resume_continues_other_qms(self):
+    def test_narrow_supply_range_skip_is_checkpointed_and_resume_continues_other_qms(self):
         self.opt.adaptive_probe=False
-        self.b.q[ACTIVE[0]]=4.5;self.b.quadrupoles[ACTIVE[0]]['limits_A']=[4.,5.]
+        self.b.q[ACTIVE[0]]=.002;self.b.quadrupoles[ACTIVE[0]]['limits_A']=[0.,.005]
         def cancel_after_skip(_,message):
             if message.startswith('QM dispersion response') and '(1/2)' in message:self.s.reader.cancel.set()
         with tempfile.TemporaryDirectory() as directory:
@@ -318,7 +318,7 @@ class QMAdaptiveTests(unittest.TestCase):
 
     def test_all_ranges_unavailable_produce_no_proposal_and_no_qm_writes(self):
         for name in ACTIVE[:2]:
-            self.b.q[name]=4.5;self.b.quadrupoles[name]['limits_A']=[4.,5.]
+            self.b.q[name]=.002;self.b.quadrupoles[name]['limits_A']=[0.,.005]
         with self.assertRaisesRegex(ValueError,'No measurable QM response'):self.s.calculate(self.opt)
         self.assertEqual(self.b.commands,[]);self.assertEqual(len(self.s.last_result['skipped_qms']),2)
         self.assertNotIn('delta',self.s.last_result)
@@ -446,18 +446,18 @@ class QMAdaptiveTests(unittest.TestCase):
         self.assertIn('delta',second);self.assertNotIn('proposal_unavailable_reason',second)
         self.assertTrue(all(q['usable'] for q in second['probe_quality']))
 
-    def test_shared_absolute_limit_bounds_probe_and_apply_without_legacy_delta_limit(self):
+    def test_legacy_absolute_cap_is_ignored_and_per_apply_delta_is_limited(self):
         self.opt.fixed_actuators=tuple(n for n in QM_CANDIDATES if n!=ACTIVE[0])
-        self.opt.probe_current_limit_A=.3;self.opt.step_A=.001
+        self.opt.probe_current_limit_A=.3;self.opt.step_A=.1
         for sign in (-1,1):
             with self.subTest(sign=sign):
-                self.b.q[ACTIVE[0]]=sign*.2;self.b.d0=-self.b.dr[:,0]*(sign*.5);self.b.commands=[]
+                self.b.q[ACTIVE[0]]=sign*.8;self.b.d0=-self.b.dr[:,0]*(sign*1.5);self.b.commands=[]
                 result=self.s.calculate(self.opt)
-                self.assertAlmostEqual(result['centers'][0]+result['delta'][0],sign*.3,places=6)
-                self.assertGreater(abs(result['delta'][0]),self.opt.step_A)
+                self.assertAlmostEqual(result['centers'][0]+result['delta'][0],sign*.9,places=6)
+                self.assertAlmostEqual(abs(result['delta'][0]),self.opt.step_A)
                 self.s.apply(result)
-                self.assertAlmostEqual(self.b.q[ACTIVE[0]],sign*.3,places=6)
-                self.assertTrue(all(abs(v)<=.3+1.e-9 for _,v in self.b.commands))
+                self.assertAlmostEqual(self.b.q[ACTIVE[0]],sign*.9,places=6)
+                self.assertTrue(all(abs(v)<=2.+1.e-9 for _,v in self.b.commands))
                 self.s.reset(result)
 
 
@@ -499,7 +499,7 @@ class QMCheckpointGuiTests(unittest.TestCase):
         from Knobs.DRTuning.correction_gui import QFileDialog
         window=TuningSession(DispersionFixture());panel=window.qm_dispersion
         try:
-            self.assertEqual(panel.probe.value(),.1);self.assertEqual(panel.probe_limit.value(),3.)
+            self.assertEqual(panel.probe.value(),.1);self.assertEqual(panel.step.value(),3.)
             self.assertFalse(panel.options().constrain_cod)
             with tempfile.TemporaryDirectory() as directory:
                 panel.autosave_directory=Path(directory)
@@ -524,8 +524,8 @@ class QMCheckpointGuiTests(unittest.TestCase):
         from Knobs.DRTuning.gui import TuningSession
         window=TuningSession(DispersionFixture());panel=window.qm_dispersion
         try:
-            window.backend.q[ACTIVE[0]]=4.5
-            window.backend.quadrupoles[ACTIVE[0]]['limits_A']=[4.,5.]
+            window.backend.q[ACTIVE[0]]=.002
+            window.backend.quadrupoles[ACTIVE[0]]['limits_A']=[0.,.005]
             result=panel.service.calculate(panel.options());panel.display(result)
             self.assertIn('Skipped QM: '+ACTIVE[0],panel.status.text())
             self.assertTrue(panel.table.item(0,4).text().startswith('Skipped:'))

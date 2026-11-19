@@ -31,7 +31,7 @@ QM dispersion:
   Use QM dispersion > Measure response / CALC, inspect the current table and
   before/predicted curves, then Apply / remeasure dispersion. Candidates are
   QM1R–QM4R and QM20R–QM23R, both .1/.2 (16 individually mapped trims, including
-  QM2). QM2R.1 and QM2R.2 are excluded by default (14 active candidates); the
+  QM2). QM2R.1, QM2R.2 and QM3R.2 are excluded by default (13 active candidates); the
   Exclude QM trims field contains these actual selections, not placeholder text.
   Defaults: per-QM initial widths inferred from the 2026-11-19 13:58 scan,
   targeting S/N 6.5 (30% above acceptance threshold 5), in A:
@@ -42,13 +42,13 @@ QM dispersion:
   These are widths around the current allowed reference, not absolute currents.
   The fallback width is 0.1 A, used for a QM without an individual width
   (QM2R if explicitly enabled). It is editable in Measurement.
-  Shared absolute QM current limit is +/-3 A and RF full span is 4 kHz
-  (baseline +/-2 kHz). Absolute supply limits still apply.
+  Maximum current change per Apply is 3 A and RF full span is 4 kHz
+  (baseline +/-2 kHz). Absolute currents are bounded by the supply limits.
   The existing confirmed site mappings, coil calibration, current limits
   and readback checks are used. Explicit exclusions are available in the panel.
   CALC measures a two-current response, normalizing by actual readback span.
-  Probe and Apply both use the intersection of parameter.A (lower) / parameter.B
-  (upper) with the shared absolute current cap [-3,+3] A. Parameter PVs take precedence
+  Probe and Apply both respect parameter.A (lower) / parameter.B (upper).
+  There is no additional absolute +/-3 A cap. Parameter PVs take precedence
   over static limits when both are configured; limits are reread before each
   pair and validated again by the live backend before each write.
   Each endpoint is automatically clipped, independently. At a 0 A lower limit,
@@ -72,9 +72,9 @@ QM dispersion:
   with null quality metrics rather than invented zero-signal measurements.
   If every QM is skipped, stop without a correction proposal. Nonfinite/reversed
   supply limits still fail validation instead of being treated as a usable range.
-  There is one current-limit control for probing and correction; the old
-  separate +/-2 A correction increment bound is removed. The legacy step_A
-  saved-file field is accepted for compatibility but does not constrain QM fits.
+  Max change / Apply [A] controls |delta_I| for each correction (step_A, default
+  3 A), independently of probe width. Legacy probe_current_limit_A fields are
+  accepted when loading saved files but no longer impose an absolute current cap.
   The QM GUI has no checkboxes: per-QM starting widths, adaptive probing and
   reuse of matching measured estimates are always enabled. Tune acquisition
   and COD hard constraints remain disabled. Measurement and Correction groups
@@ -115,8 +115,8 @@ QM dispersion:
   usable, no correction proposal is produced. S/N is adjustable in the panel.
   Each dispersion observation measures nominal COD plus symmetric RF offsets,
   with 10 BPM updates at each setting; RF and temporary currents are restored.
-  With one pair per default 14 active trims: 29 dispersion observations, 87 COD settings,
-  870 BPM frames. Enabling all 16 gives 33 observations / 99 settings / 990 frames.
+  With one pair per default 13 active trims: 27 dispersion observations, 81 COD settings,
+  810 BPM frames. Enabling all 16 gives 33 observations / 99 settings / 990 frames.
   Each extra adaptive pair adds 6 COD settings / 60 BPM updates. This can take
   several minutes with live settling.
   "Lost all common valid straight-section BPMs" means no enabled straight BPM
@@ -162,7 +162,7 @@ QM dispersion:
   operation constrains |delta tune| <= .002 by default. Q-modulation beta scans
   keep their separate tune measurement requirements.
   Apply gain is 1: I_set = I_baseline + proposed delta_I. The solver already
-  bounds I_set by the shared absolute +/-3 A limit and supply limits. SET verifies
+  bounds |delta_I| by the per-Apply limit and I_set by the supply limits. SET verifies
   actual dispersion improvement, and COD/tunes only when their constraints
   are enabled. Failed measurements or enabled checks restore changed trims. The graph
   shows measured before, predicted, target, and measured after, for Dx/Dy/X/Y.
@@ -173,9 +173,19 @@ QM dispersion:
   disable the old Apply proposal. Acquisition validity and original scan options
   are retained separately: rechecking a BPM never revives invalid scan data.
   Changing RF span, momentum compaction or QM selection requires a new CALC;
-  enabling tune constraints requires a measured tune response. After SET,
-  restore original QM currents or run a new CALC before recalculating. Apply
-  still verifies the live settings match the original CALC baseline.
+  enabling tune constraints requires a measured tune response and, after Apply,
+  verified after-Apply tunes. After a successful Apply, use Recalculate > Apply
+  to iterate without scanning the response again. Recalculate uses the measured
+  after-Apply dispersion / COD and verified QM currents as the new baseline,
+  retaining the response, acquisition validity and prior iterations in saved data.
+  It performs no BPM acquisition or magnet / RF writes. Apply checks live settings
+  against this new baseline, limits each step to |delta_I| <= step_A while keeping
+  absolute currents within parameter A/B, and measures the result again.
+  Repeated corrections may exceed 3 A in total. Failed Apply restores the preceding
+  iteration's currents. Restore original QM / RF returns to the initial scan
+  settings, including after preparing the next iteration. A response reused after
+  optics changes is an approximation; use CALC again if prediction and measurement
+  diverge. Next probe [A] is for a subsequent CALC at matching settings, not Apply.
   CALC automatically writes qm_scan_*.checkpoint.json under /atf/data/flight-simulator/DRTuning/<year>/
   (or the chosen save folder). Baseline and each completed QM pair are saved;
   adaptive attempts and available raw frames are also recorded. A pair is
