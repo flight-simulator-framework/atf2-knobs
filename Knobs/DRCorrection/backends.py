@@ -313,12 +313,13 @@ class EpicsBackend(DemoBackend):
             if not np.isfinite(reading) or abs(reading-value)>rf['tolerance_hz']:raise RuntimeError('RF readback mismatch')
         except Exception:
             self.put(rf['set'],(self.nominal_frequency_hz+old)/rf['hz_per_unit']);raise
-    def orbit(self):
+    def orbit(self,values_by_pv=None):
         p=self.profile['orbit']
+        read=self.get if values_by_pv is None else values_by_pv.__getitem__
         if p.get('mode_read') and self.get(p['mode_read'])!=p['required_mode']:
             raise RuntimeError('BPM mode is not the configured COD mode')
         if p.get('packed_pv'):
-            raw=np.asarray(self.get(p['packed_pv']),float).reshape((-1,p['row_width']))
+            raw=np.asarray(read(p['packed_pv']),float).reshape((-1,p['row_width']))
             raw=raw[np.asarray(p['row_indices'],int)]
             values={axis:raw[:,p['columns'][axis]] for axis in ('x','y','tmit')}
             status=raw[:,p['columns']['status']]==p['valid_status']
@@ -326,7 +327,7 @@ class EpicsBackend(DemoBackend):
             diagnostic=dict(pv=p['packed_pv'],required_status=p['valid_status'],
                 status_counts={str(v):int(c) for v,c in zip(status_values,status_counts)})
         else:
-            values={axis:np.asarray(self.get(p[axis]),float) for axis in ('x','y','tmit')}
+            values={axis:np.asarray(read(p[axis]),float) for axis in ('x','y','tmit')}
             status=np.ones(len(self.bpm_names),bool)
             diagnostic=dict(pv=', '.join(p[k] for k in ('x','y','tmit')))
         if any(v.shape!=(len(self.bpm_names),) for v in values.values()):raise ValueError('BPM waveform length/order differs from profile')

@@ -83,6 +83,8 @@ class Options:
     step_A: float = .1
     skew_step: float = .0007
     svd_cut: float = .04
+    selection_method: str = 'greedy'
+    regularization: float = .01
     dispersion_weight: float = .05
     orbit_weight: float = 1.
     excluded_bpms: tuple = ()
@@ -160,25 +162,28 @@ class CorrectionService:
     def _orbit(self,opt):
         count=opt.bpm_samples;interval=opt.bpm_interval_s
         validate_bpm_sampling(opt)
-        samples=[];diagnostics=[]
+        samples=[];diagnostics=[];timestamps=[];fresh=[]
+        stream=iter(self.backend.orbit_samples(count,self.cancel,interval)) if hasattr(self.backend,'orbit_samples') else None
         for _ in range(int(count)):
             self.check_cancel()
             # Same sampling cadence as SysID, but wait BEFORE each sample
             # (including the first) instead of after it, to avoid an immediate
             # pre-change read. Total scheduled wait remains count * interval.
-            if interval and self.cancel.wait(interval):self.check_cancel()
-            result=self.backend.orbit()
+            if stream is None and interval and self.cancel.wait(interval):self.check_cancel()
+            result=next(stream) if stream is not None else self.backend.orbit()
             self.check_cancel()
             x,y,valid=checked_orbit(result,self.backend.bpm_names)
             samples.append(dict(x=x.copy(),y=y.copy(),tmit=np.asarray(result['tmit'],float).copy(),valid=valid.copy()))
             diagnostics.append(result.get('validity_diagnostics',{}))
+            timestamps.append(result.get('timestamps',{}));fresh.append(result.get('freshness_verified',False))
         arrays={key:np.stack([s[key] for s in samples]) for key in ('x','y','tmit','valid')}
         means={key:np.mean(arrays[key],axis=0) for key in ('x','y','tmit')}
         valid=np.all(arrays['valid'],axis=0)
         self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**means,valid=valid,
             stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0),
             nshots=int(count),sample_interval_s=float(interval),samples=arrays,
-            position_unit='mm',freshness_verified=False,validity_diagnostics=diagnostics))
+            position_unit='mm',freshness_verified=all(fresh),timestamps=timestamps,
+            same_shot_verified=False,validity_diagnostics=diagnostics))
         return means['x'],means['y'],valid
 
     def require_usable(self,names,measured,target,acquisition_valid,actuators,opt,measurements=None):
@@ -477,7 +482,11 @@ class CorrectionService:
             matrix=a[:,indices];u,s,vt=np.linalg.svd(matrix,full_matrices=False)
             keep=s>max(s[0]*opt.svd_cut,1e-14) if len(s) else np.zeros(0,bool)
             if not keep.any():return np.zeros(len(indices)),s,0
-            fit=lsq_linear(s[keep,None]*vt[keep],-(u[:,keep].T@residual),bounds=(lower[indices],upper[indices]))
+            matrix=s[keep,None]*vt[keep];rhs=-(u[:,keep].T@residual)
+            if opt.selection_method=='all' and opt.regularization:
+                matrix=np.vstack((matrix,opt.regularization*s[0]*np.eye(len(indices))))
+                rhs=np.r_[rhs,np.zeros(len(indices))]
+            fit=lsq_linear(matrix,rhs,bounds=(lower[indices],upper[indices]))
             if not fit.success:raise RuntimeError('Bounded solve failed')
             return fit.x,s,int(keep.sum())
         symmetric=np.all(lower[available]==-step_limit) and np.all(upper[available]==step_limit)
@@ -487,7 +496,13 @@ class CorrectionService:
         if np.linalg.norm(residual)>1e-14 and not np.any(a[:,available]):
             raise ValueError('No measured response: all enabled response columns are zero. '+diagnostic+
                 '. Check magnet readbacks, BPM updates and settling; no correction was applied.')
-        if symmetric and constraints is None and np.linalg.norm(residual)>1e-14:
+        if opt.selection_method not in ('greedy','all') or not np.isfinite(opt.regularization) or opt.regularization<0:
+            raise ValueError('Invalid selection method / regularization')
+        if opt.selection_method=='all' and np.linalg.norm(residual)>1e-14:
+            selected=list(np.flatnonzero(available));step,singular_values,rank=solve(selected)
+            delta=np.zeros(len(actuators));delta[selected]=step
+            solver='All enabled magnets: bounded regularized truncated SVD'
+        elif symmetric and constraints is None and np.linalg.norm(residual)>1e-14:
             from .ported_solver import propose,ClosedOrbitError
             try:delta,selected_names,singular_values,rank=propose(data,opt,valid,available,maximum,step_limit)
             except ClosedOrbitError as exc:

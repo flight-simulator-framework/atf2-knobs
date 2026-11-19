@@ -113,7 +113,7 @@ class CorrectionPanel(QWidget):
         self.options=Options(probe1=backend.hcorrectors[0],probe2=backend.hcorrectors[len(backend.hcorrectors)//2])
         self.plane_probe_targets={axis:self.options.adaptive_target_mm for axis in ('x','y')}
         if backend.identity.startswith('epics:'):
-            self.options.bpm_samples=3;self.options.bpm_interval_s=1.
+            self.options.bpm_samples=10;self.options.bpm_interval_s=1.
         if backend.unit('skews')=='A':self.options.skew_probe=.05;self.options.skew_step=.1
         if getattr(backend,'ramp',None):self.options.frequency_change_khz=2.
         self.form=uic.loadUi(str(HERE/'forms'/f'{mode}.ui'))
@@ -237,7 +237,8 @@ class CorrectionPanel(QWidget):
             self.selection_label.setText((f'RFTrack will calculate {count} magnet responses; {bpms} BPMs enabled.\nMachine: '+('one RF scan pair.' if self.mode=='dispersion' else 'two horizontal probe scans.' if self.mode=='skew' else 'orbit read only.')) if o.response_source=='rftrack' else f'CALC will scan {count} magnets; {bpms} BPMs enabled for fitting.'+
                 ((f' RF scan pairs: up to {1+2*count*int(o.adaptive_max_pairs)}.' if o.adaptive_probe else f' RF scan pairs: {1+2*count}.') if self.mode=='dispersion' and count else '')+
                 (f' Up to {o.adaptive_max_pairs} probe pairs per magnet.' if o.adaptive_probe else '')+
-                '\nMaximum correctors limits SET selection, not the CALC scan count.')
+                ('\nAll enabled magnets participate in the bounded regularized solve; maximum count is ignored.' if o.selection_method=='all'
+                 else '\nMaximum correctors limits SET selection, not the CALC scan count.'))
         for key,widget in getattr(self,'modern_fields',{}).items():
             widget.blockSignals(True)
             if isinstance(widget,QCheckBox):widget.setChecked(getattr(self.options,key))
@@ -268,7 +269,7 @@ class CorrectionPanel(QWidget):
             data=self.data;o=data['options'];plane='H' if o['plane']=='x' else 'V'
             maximum=o['count_h'] if plane=='H' else o['count_v']
             scope='skew supplies' if self.mode=='skew' else plane+' correctors'
-            bound='' if self.mode=='skew' else f'; maximum {maximum}'
+            bound='' if self.mode=='skew' else ('; all enabled magnets' if o.get('selection_method')=='all' else f'; maximum {maximum}')
             verb='SET changed' if data.get('applied') else 'SET will change'
             self.proposal_summary.setText(f'{verb} {count} {scope}{bound}; {len(data["actuators"])} response candidates.\n'
                 'Only nonzero setting changes are written. Details: Magnet settings tab.')
@@ -296,8 +297,11 @@ class CorrectionPanel(QWidget):
         form=QFormLayout(dialog);fields={}
         for key,label in [('count_h','Maximum H correctors'),('count_v','Maximum V correctors'),('bpm_samples','BPM samples per setting')]:
             spin=QSpinBox();spin.setRange(1,500);spin.setValue(getattr(self.options,key));form.addRow(label,spin);fields[key]=spin
-        for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','dispersion_weight','orbit_weight','bpm_interval_s','model_extraction_weight'):
+        for key in ('corrector_probe_A','skew_probe','step_A','skew_step','svd_cut','regularization','dispersion_weight','orbit_weight','bpm_interval_s','model_extraction_weight'):
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(0.,1000.);spin.setValue(getattr(self.options,key));form.addRow(key,spin);fields[key]=spin
+        selection=QComboBox();selection.addItem('SAD-style greedy / maximum correctors','greedy')
+        selection.addItem('All enabled / bounded regularized SVD (ignores maximum count)','all')
+        selection.setCurrentIndex(selection.findData(self.options.selection_method));form.addRow('Solver',selection)
         if self.mode=='dispersion':
             spin=QDoubleSpinBox();spin.setDecimals(7);spin.setRange(.0000001,1.)
             spin.setValue(self.options.momentum_compaction)
@@ -308,6 +312,7 @@ class CorrectionPanel(QWidget):
         buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);form.addRow(buttons)
         if dialog.exec():
             for key,w in fields.items():setattr(self.options,key,w.value())
+            self.options.selection_method=selection.currentData()
             self.invalidate()
 
     def calculate(self,dataset=None):

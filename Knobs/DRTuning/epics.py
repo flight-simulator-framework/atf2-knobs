@@ -19,6 +19,23 @@ class LiveBackend(EpicsBackend):
     def read_xsr_sizes(self):
         from .emittance import read_xsr_sizes
         return read_xsr_sizes(self.get)
+    def orbit_samples(self,count,cancel,interval_s=0.):
+        from .fresh import updates
+        p=self.profile['orbit']
+        pvs=[p['packed_pv']] if p.get('packed_pv') else [p[k] for k in ('x','y','tmit')]
+        for records in updates(self.metadata,pvs,count,cancel,
+                timeout_s=self.profile.get('update_timeout_s',15.),interval_s=interval_s):
+            result=self.orbit({pv:r['value'] for pv,r in records.items()})
+            result.update(timestamps={pv:float(r['timestamp']) for pv,r in records.items()},
+                          freshness_verified=True,same_shot_verified=False)
+            yield result
+    def sample_xsr(self,cancel,count=10,callback=lambda *_:None):
+        from .fresh import updates,scalar_statistics
+        pv='XSR:PROJ_V_SIGMA';values=[];stamps=[]
+        for records in updates(self.metadata,[pv],count,cancel,timeout_s=self.profile.get('update_timeout_s',15.)):
+            values.append(float(records[pv]['value']));stamps.append(float(records[pv]['timestamp']))
+            result=scalar_statistics(values,stamps,pv);callback(result)
+        return result
     def put(self,pv,value):
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         return super().put(pv,value)
@@ -78,6 +95,16 @@ class LiveBackend(EpicsBackend):
             time.sleep(delay)
         except Exception:
             self.put(p['set'],original);wait(original);raise
+    def restore_quadrupole_current(self,name,value):
+        """Known original current can be commanded even after a readback failure."""
+        self.validate_quadrupole_targets(name,[value]);p=self.quadrupoles[name]
+        self.put(p['set'],float(value));deadline=time.monotonic()+self.profile['readback_timeout_s']
+        while True:
+            reading=self.quadrupole_current(name)
+            if np.isfinite(reading) and abs(reading-value)<=self.profile['current_tolerance_A']:break
+            if time.monotonic()>=deadline:raise TimeoutError('QM restoration readback did not settle: '+name)
+            time.sleep(.05)
+        time.sleep(float(p['settle_s']))
     def tbt_acquire(self,turns=1024,start_turn=1,cancel=None,progress=lambda *_:None):
         self.validate_tbt_acquisition()
         progress(0,'New shot: checking acquisition mode and waveform updates')

@@ -19,6 +19,12 @@ class FaultClient(FakeEpics):
     def caget(self,pv,**kwargs):
         if pv=='y':return np.array([.15,-.1])+self.values['v2']*np.array([1.,-1.])+self.values['v3']*np.array([.5,1.])
         return super().caget(pv,**kwargs)
+    def get_pv(self,pv,**kwargs):
+        from types import SimpleNamespace
+        def metadata(**_):
+            self.timestamp=getattr(self,'timestamp',0.)+1.
+            return dict(value=self.caget(pv),timestamp=self.timestamp,severity=0)
+        return SimpleNamespace(get_with_metadata=metadata)
     def caput(self,pv,value,**kwargs):
         self.commands.append((pv,value))
         if pv=='v_set':

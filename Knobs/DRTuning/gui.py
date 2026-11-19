@@ -233,6 +233,9 @@ class TuningSession(DRCorrectionWindow):
         self.model_panel=ModelPanel(self);self.tabs.addTab(self.model_panel,'RFTrack model / optics')
         from .emittance_gui import EmittancePanel
         self.emittance_panel=EmittancePanel(self);self.tabs.addTab(self.emittance_panel,'XSR emittance')
+        from .correction_gui import QMDispersionPanel,CouplingPanel
+        self.qm_dispersion=QMDispersionPanel(self);self.tabs.addTab(self.qm_dispersion,'QM horizontal dispersion')
+        self.coupling_panel=CouplingPanel(self);self.tabs.addTab(self.coupling_panel,'Local bump / XSR coupling')
         from .presentation import STYLE,reflow_correction
         self.setStyleSheet(STYLE);self.resize(1280,820)
         for mode,panel in self.panels.items():
@@ -246,7 +249,7 @@ class TuningSession(DRCorrectionWindow):
             reflow_correction(panel)
         layout=self.centralWidget().layout();layout.removeWidget(self.tabs)
         self.navigation=QListWidget();self.navigation.setMinimumWidth(160);self.navigation.setMaximumWidth(185)
-        self.navigation.addItems(['COD correction','Dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance'])
+        self.navigation.addItems(['COD correction','Dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance','QM dispersion','Bump / XSR coupling'])
         self.tabs.tabBar().hide();self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
         self.tabs.currentChanged.connect(self.navigation.setCurrentRow);self.navigation.setCurrentRow(0)
         content=QSplitter();content.addWidget(self.navigation);content.addWidget(self.tabs);content.setStretchFactor(1,1)
@@ -268,7 +271,7 @@ class TuningSession(DRCorrectionWindow):
         self.tool_actions={}
         for title,tools in (
             ('Measurements',[('TBT waveform / beta','tbt'),('QF1R beta','qf1'),('QF2R beta','qf2'),('QM trim 1 beta','qm1'),('QM trim 2 beta','qm2'),('XSR emittance','emittance')]),
-            ('Corrections',[('COD correction','orbit'),('Dispersion','dispersion'),('Skew correction','skew')]),
+            ('Corrections',[('COD correction','orbit'),('Dispersion','dispersion'),('Skew correction','skew'),('QM horizontal dispersion','qm_dispersion'),('Local bump / XSR coupling','coupling')]),
             ('Utilities',[('RFTrack model / optics','model'),('Orbit buffers','buffers'),('BPM / magnet selection','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr'),('SR / SR2 beta fit','sr_beta')])):
             menu=self.menuBar().addMenu(title)
             for label,key in tools:
@@ -282,6 +285,8 @@ class TuningSession(DRCorrectionWindow):
         elif key=='tbt':self.tabs.setCurrentWidget(self.tbt)
         elif key=='model':self.tabs.setCurrentWidget(self.model_panel)
         elif key=='emittance':self.tabs.setCurrentWidget(self.emittance_panel)
+        elif key=='qm_dispersion':self.tabs.setCurrentWidget(self.qm_dispersion)
+        elif key=='coupling':self.tabs.setCurrentWidget(self.coupling_panel)
         elif key=='sr_beta':self.tabs.setCurrentWidget(self.tbt);self.tbt.sr_beta()
         elif key=='sr':
             data=self.panels['dispersion'].data

@@ -1,6 +1,98 @@
 DRTuning — RFTrack / machine interface launcher
 ==============================================
 
+Measured dispersion and local-bump / XSR correction (2026-11-19)
+---------------------------------------------------------------
+SysID is unchanged. DRTuning LiveBackend waits for advancing EPICS timestamps:
+DR:monitors for COD and XSR:PROJ_V_SIGMA for vertical size. It parses the gated
+payload without re-reading it. The new correction tools acquire 10 updates per
+setting, save all values/timestamps, and reject missing/invalid beam data.
+The existing correction panel defaults to 10; its count remains editable.
+update_timeout_s in the site profile defaults to 15 s per update. Freshness
+means a new PV update, not proof of independent beam shots or camera frames.
+XSR _AVE and SIGMA_SIGMA are not used. Size units follow the existing source
+plane XSR calibration in micrometres. A configurable post-current settling
+delay precedes the acquisition watermark; IOC processing latency still matters.
+
+QM dispersion:
+  Use QM dispersion > Measure response / CALC, inspect the current table and
+  before/predicted curves, then Apply / remeasure dispersion. Candidates are
+  QM1R–QM4R and QM20R–QM23R, both .1/.2 (16 individually mapped trims, including
+  QM2). The existing confirmed site mappings, coil calibration, current limits
+  and readback checks are used. Explicit exclusions are available in the panel.
+  CALC measures each +/- current response, normalizing by actual readback span.
+  Each dispersion observation measures nominal COD plus symmetric RF offsets,
+  with 10 BPM updates at each setting; RF and temporary currents are restored.
+  With all 16 trims: 33 dispersion observations, 99 COD settings, 990 BPM frames,
+  plus 33 tune measurements. This can take several minutes with live settling.
+  Dx is targeted to zero at legacy straight BPMs MB19R–MB31R / MB66R–MB80R.
+  Arc Dx, Dy and COD target their measured baselines. These are named physical
+  BPM regions, not an assumption that the entire ring has zero dispersion.
+  The default uses all trims in bounded regularized SVD; Greedy chooses the
+  best response columns up to the selected maximum. Tune/COD linear constraints
+  apply in both modes (defaults |delta tune| <= .002, |delta COD| <= .05 mm).
+  SET verifies actual dispersion improvement, tunes and COD, restoring the
+  changed trims if measurement fails or a tolerance is exceeded. The graph
+  shows measured before, predicted, target, and measured after, for Dx/Dy/X/Y.
+  Save data + plot writes JSON and PNG, including failed SET measurements.
+
+Vertical dispersion:
+  Continue to use Dispersion > V with vertical correctors. Response / limits /
+  SVD settings now offers the existing SAD-style greedy solver and an all-
+  enabled bounded regularized SVD solver. The latter ignores maximum-corrector
+  count and solves within absolute and step limits, without post-fit clipping.
+  Neither algorithm is universally best: greedy uses fewer supplies; the full
+  solve distributes correction and regularizes weak modes. Compare measured
+  after-SET dispersion and COD, not only the predicted residual.
+
+Bump / XSR coupling:
+  1. Rank SD/SF by |trim current| reads the individual skew trim supplies and
+     lists SD1R/SF1R by descending absolute current, displaying the signed value.
+     Failed readbacks are listed separately and never ranked as zero current.
+  2. Select a target and Select BPMs / correctors. Recorded-settings optics are
+     linearized once; periodic responses solve (I-M)z=kick. Local element kick
+     derivatives retain RFTrack's actual electron sign/coordinate convention.
+     Two healthy BPMs bracket the target in a corrector-free interval. Two V
+     and two H correctors on each side (8 total) provide four-dimensional
+     closure; H correctors suppress horizontal leakage from coupling. Physical
+     ring order, wrap-around, rank, enabled BPMs/magnets and current margins are
+     checked. The selected names and model currents are shown before calibration.
+     A poor/unavailable local geometry is rejected, not replaced with a global
+     bump. Target mm and angle are inferred from internal BPMs using model
+     transport; no direct position monitor at the sextupole is implied.
+  3. Calibrate and close bump measures both X/Y response columns with 10-update
+     BPM averages, then fits outside COD with exact internal position/angle
+     constraints and bounded currents. Both signs are tested; baseline currents
+     are restored after calibration. Default max baseline current change is
+     1 A, outside max .01 mm and outside RMS .005 mm. Tolerances are editable.
+  4. Scan -> fit -> set optimum applies I(a)=I0+a*k at a=-.4,-.2,0,.2,.4 mm.
+     Actual outside X/Y and reconstructed target state are checked at every
+     point. Only if needed, bounded beam-based iterations close leakage while
+     retaining target amplitude/angle. No clipping or cumulative amplitude steps.
+     XSR takes 10 new updates at each point; raw values, means +/- SEM and fit
+     curves are plotted live. The fitted horizontal coordinate is the observed
+     local displacement; requested amplitudes are saved separately. A weighted
+     quadratic fits sigma_y squared and is
+     displayed as sigma_y. The minimum must have resolved positive curvature
+     and be inside the measured scan range. Additional measurements at the
+     first fitted best +/- .1 mm (clamped to the original +/- .4 mm range) are
+     followed by a refit. The final fitted optimum is set, with another 10 XSR
+     updates and COD verification. Final size must be consistent with the best
+     measured point. Successful completion leaves the optimum currents set.
+     Normal runs have 5 coarse + 2 refinement + 1 final points = 80 XSR updates.
+  Cancel, stalled acquisition, invalid fit or failed closure restores the
+  pre-scan selected currents. Restoration attempts all supplies and reports
+  failures; a failed restoration is never reported as success. Baseline reset
+  and JSON/PNG export are available after completion. Native transverse RFTrack
+  has no radiation-equilibrium XSR signal: it cannot run an actual size scan.
+  No physical beam-size signal is synthesized for that backend.
+
+Offline verification covers timestamp gating, duplicate updates, alarms,
+timeouts, readback-normalized probes, nonlinear leakage refinement, physical
+amplitude preservation, fit/refinement/final-setting, stale inputs, limits,
+cancel/failure restoration and actual before/after dispersion. These tests do
+not establish live-machine optics accuracy or correction performance.
+
 SAD COD reference preparation and readback diagnostics (2026-10-23)
 ----------------------------------------------------------------
 On the Machine interface, correction pages now default to RFTrack model
@@ -636,9 +728,9 @@ afterward can be the scan's restoration to its original OFF state. These
 offline checks do not establish why a live controller failed to switch.
 Corrector/skew operations check current convergence without an extra fixed wait
 (magnet_settle_s defaults to 0). As in SysID, correction measurements use repeated
-BPM acquisition: the live GUI defaults to BPM samples per setting = 3 and BPM
+BPM acquisition: the live GUI defaults to BPM samples per setting = 10 and BPM
 interval [s] = 1, both editable. Waits occur before each read, including the first;
-the total per setting is about 3 s plus communication time. Means, population
+the total per setting is about 10 s plus communication time. Means, population
 standard deviations and raw samples are saved. A BPM must be valid in every
 sample to be fitted. Samples are not certified independent/fresh shots: COD
 does not yet verify waveform timestamps/shot IDs. RF/quad waits remain separate.

@@ -47,7 +47,7 @@ class GuiTests(unittest.TestCase):
         try:
             for panel in window.panels.values():
                 reflow_correction(panel)
-                self.assertEqual(panel.options.bpm_samples,3)
+                self.assertEqual(panel.options.bpm_samples,10)
                 self.assertEqual(panel.options.bpm_interval_s,1.)
                 panel.modern_fields['bpm_samples'].setValue(5)
                 panel.modern_fields['bpm_interval_s'].setValue(.5)
