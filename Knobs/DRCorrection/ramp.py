@@ -15,6 +15,8 @@ class _PresetTransition(RuntimeError):
 class DeltaRamp:
     def __init__(self,get,put,config):
         self.get=get;self.put=put;self.config=config;self.report=lambda message:None
+    @property
+    def verify_frequency_readback(self):return self.config.get('verify_frequency_readback',True)
     def trace(self,message):self.report('DeltaFRamp: '+message)
     def command(self,pv,value):
         self.trace(f'command {pv}={value}')
@@ -47,7 +49,11 @@ class DeltaRamp:
         value=float(self.get(self.config['read']))*self.config['hz_per_unit']
         if not np.isfinite(value):raise RuntimeError('Nonfinite frequency readback')
         return value
-    def snapshot(self):return dict(self.state(),read_hz=self.read_hz())
+    def snapshot(self):
+        state=self.state()
+        if self.verify_frequency_readback:state['read_hz']=self.read_hz()
+        else:state['frequency_readback_verified']=False
+        return state
     def diagnostics(self,extra_pvs=()):
         # Read only: preserve evidence before rollback, without issuing another
         # command or processing the frequency record. Diagnostics must not mask
@@ -102,24 +108,31 @@ class DeltaRamp:
     def restore(self,state):
         self.trace('restoring '+str(state))
         self._apply(state)
-        if 'read_hz' in state:self.wait_frequency(state['read_hz'],'restored RF frequency')
+        check=self.verify_frequency_readback and 'read_hz' in state
+        if check:self.wait_frequency(state['read_hz'],'restored RF frequency')
+        elif not self.verify_frequency_readback:self.trace('restored RF frequency check SKIPPED (rf.verify_frequency_readback=false)')
         time.sleep(self.config['settle_s'])
-        if 'read_hz' in state and abs(self.read_hz()-state['read_hz'])>self.config['tolerance_hz']:raise RuntimeError('Restored RF frequency did not remain settled')
+        if check and abs(self.read_hz()-state['read_hz'])>self.config['tolerance_hz']:raise RuntimeError('Restored RF frequency did not remain settled')
         self.trace('restoration complete')
     def set(self,offset):
         self.label(offset)  # Reject unsupported sub-kHz targets before writes.
-        old=self.snapshot();before=old['read_hz']
+        old=self.snapshot();check=self.verify_frequency_readback
         target=dict(enabled=True,offset_hz=float(offset))
-        expected=before+offset-old['offset_hz']
-        self.trace(f'request {old} -> {target}; expected_hz={expected:.6f}')
+        if check:
+            before=old['read_hz'];expected=before+offset-old['offset_hz']
+            self.trace(f'request {old} -> {target}; expected_hz={expected:.6f}')
+        else:self.trace(f'request {old} -> {target}; RF frequency check SKIPPED (rf.verify_frequency_readback=false)')
         try:
             self._apply(target)
-            self.wait_frequency(expected,'RF frequency',
-                                f'initial_hz={before:.6f}; initial_enabled={old["enabled"]}; '
-                                f'initial_offset_hz={old["offset_hz"]}; target_offset_hz={offset}')
+            if check:
+                self.wait_frequency(expected,'RF frequency',
+                                    f'initial_hz={before:.6f}; initial_enabled={old["enabled"]}; '
+                                    f'initial_offset_hz={old["offset_hz"]}; target_offset_hz={offset}')
             time.sleep(self.config['settle_s'])
-            if abs(self.read_hz()-expected)>self.config['tolerance_hz']:raise RuntimeError('RF frequency did not remain settled')
-            self.trace(f'target settled: offset_hz={offset}; expected_hz={expected:.6f}')
+            if check:
+                if abs(self.read_hz()-expected)>self.config['tolerance_hz']:raise RuntimeError('RF frequency did not remain settled')
+                self.trace(f'target settled: offset_hz={offset}; expected_hz={expected:.6f}')
+            else:self.trace(f'preset confirmed and settling wait complete: offset_hz={offset}; RF frequency unchecked')
         except Exception as error:
             self.trace('failed before restoration: '+str(error))
             try:self.restore(old)

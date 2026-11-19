@@ -37,6 +37,45 @@ def ramp_profile():
 
 
 class RecoveredControlTests(unittest.TestCase):
+    def test_frequency_bypass_sets_restores_and_compares_settings_without_rf_reads(self):
+        class MissingFrequencyClient(RampClient):
+            def caget(self,pv,**kwargs):
+                if pv=='rf':raise RuntimeError('RF frequency readback unavailable')
+                return super().caget(pv,**kwargs)
+        client=MissingFrequencyClient();profile=ramp_profile()
+        profile['rf'].update(verify_frequency_readback=False,read_process_pv='rf.PROC',settle_s=.2,enable_settle_s=.7)
+        backend=EpicsBackend(profile,client);messages=[];backend.ramp.report=messages.append
+        before=backend.snapshot();state=backend.frequency_state()
+        self.assertFalse(state['frequency_readback_verified']);self.assertNotIn('read_hz',state)
+        with patch('Knobs.DRCorrection.ramp.time.sleep') as sleep:
+            backend.set_frequency(-1000.);self.assertEqual(backend.frequency(),-1000.)
+            backend.set_frequency(1000.);self.assertEqual(backend.frequency(),1000.)
+            self.assertFalse(backend.same_settings(before,backend.snapshot()))
+            # Also bypass verification when restoring an older saved snapshot
+            # which still contains the original physical frequency readback.
+            backend.restore_frequency(dict(state,read_hz=123.))
+        self.assertEqual([call.args[0] for call in sleep.call_args_list],[.7,.2,.2,.2])
+        self.assertTrue(backend.same_settings(before,backend.snapshot()))
+        self.assertNotIn('rf.PROC',[pv for pv,_ in client.calls])
+        self.assertTrue(any('RF frequency check SKIPPED' in message for message in messages))
+        self.assertFalse(any('confirmed RF frequency' in message for message in messages))
+        client.values['v']+=.1
+        self.assertFalse(backend.same_settings(before,backend.snapshot()))
+
+    def test_frequency_bypass_still_requires_preset_confirmation_and_restores(self):
+        class StuckPresetClient(RampClient):
+            def caput(self,pv,value,**kwargs):
+                if pv=='RAMP:PL1:ONOFF_SW':self.calls.append((pv,value));return 1
+                return super().caput(pv,value,**kwargs)
+        client=StuckPresetClient();profile=ramp_profile()
+        profile['rf'].update(verify_frequency_readback=False,timeout_s=.001)
+        backend=EpicsBackend(profile,client);before=backend.frequency_state()
+        with self.assertRaisesRegex(RuntimeError,'timeout: preset PL1'):backend.set_frequency(1000.)
+        self.assertEqual(backend.frequency_state(),before)
+        client.values['RAMP:STATUS_READ']=1;client.values['RAMP:HOLD:STATUS_READ']=1;client.calls=[]
+        with self.assertRaisesRegex(RuntimeError,'HOLD'):backend.set_frequency(1000.)
+        self.assertEqual(client.calls,[])
+
     def test_minus_to_plus_waits_for_transient_preset_bits(self):
         for overlap in (False,True):
             with self.subTest(overlap=overlap):

@@ -367,6 +367,7 @@ class HardwareDefaultsTests(unittest.TestCase):
         self.assertEqual(p['tbt']['names'][-1],'MB96R')
         self.assertEqual(p['rf']['mode'],'delta_ramp')
         self.assertEqual(p['rf']['hz_per_unit'],1e6)
+        self.assertFalse(p['rf']['verify_frequency_readback'])
         self.assertEqual(p['quadrupoles']['QM7R.1']['calibration']['main_current_pv'],'QM7AR:internalCurrentWrite')
         for n,a in p['actuators'].items():
             self.assertEqual(a['lower_limit_pv'],n.replace('.','_')+':parameter.A')

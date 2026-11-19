@@ -283,8 +283,9 @@ class EpicsBackend(DemoBackend):
         if self.ramp:
             a=left.get('ramp_state',{});b=right.get('ramp_state',{})
             if any(a.get(k)!=b.get(k) for k in ('enabled','offset_hz')):return False
-            readings=[a.get('read_hz',float('nan')),b.get('read_hz',float('nan'))]
-            if not np.isfinite(readings).all() or abs(readings[0]-readings[1])>self.profile['rf']['tolerance_hz']:return False
+            if self.ramp.verify_frequency_readback:
+                readings=[a.get('read_hz',float('nan')),b.get('read_hz',float('nan'))]
+                if not np.isfinite(readings).all() or abs(readings[0]-readings[1])>self.profile['rf']['tolerance_hz']:return False
         for kind in ('correctors','skews'):
             if set(left[kind])!=set(right[kind]):return False
             if not all(np.isfinite(left[kind][n]) and abs(left[kind][n]-right[kind][n])<=self.profile['current_tolerance_A'] for n in left[kind]):return False

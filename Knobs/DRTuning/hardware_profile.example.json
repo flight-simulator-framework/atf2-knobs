@@ -272,7 +272,8 @@
     "mode": "delta_ramp",
     "timeout_s": 10.0,
     "default_total_span_khz": 2.0,
-    "read_process_pv": "FREQUENCY:DR_read.PROC"
+    "read_process_pv": "FREQUENCY:DR_read.PROC",
+    "verify_frequency_readback": false
   },
   "target_dispersion_mm": {
     "x": null,

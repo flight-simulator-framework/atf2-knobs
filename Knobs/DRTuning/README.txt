@@ -1,6 +1,19 @@
 DRTuning — RFTrack / machine interface launcher
 ==============================================
 
+Temporary DeltaFRamp frequency-readback bypass (2026-11-19)
+---------------------------------------------------------
+At the operator's request, the bundled default/example profiles now set
+rf.verify_frequency_readback=false. Restart DRTuning to load the change.
+Custom site profiles can select the same setting; omission retains verification.
+With this setting, RF snapshots, switching, restoration and stale-setting
+comparisons do not read/process FREQUENCY:DR_read or require its agreement with
+the requested offset. RAMP ON/OFF, HOLD and selected-preset checks, settling
+waits and failure restoration still run. Logs explicitly say the frequency
+check was skipped; snapshots record frequency_readback_verified=false without
+inventing an RF readback. Dispersion uses the requested preset frequency span.
+Set rf.verify_frequency_readback=true to restore the physical-frequency checks.
+
 Measured dispersion and local-bump / XSR correction (2026-11-19)
 ---------------------------------------------------------------
 SysID is unchanged. DRTuning LiveBackend waits for advancing EPICS timestamps:
@@ -713,7 +726,9 @@ The default RF/quad settling delays are 5 s; RF tolerance is 100 Hz and timeout
 times. RF uses the linked DeltaFRamp controller and MHz readback conversion.
 On an OFF-to-ON transition, RF scans wait an additional 1 s before selecting a
 preset (rf.enable_settle_s), following op-base mOTRScanner. Already-ON scans do
-not resend CONTROL_ON_SW. Preset and physical RF readback checks still apply;
+not resend CONTROL_ON_SW. Preset checks always apply; physical RF readback
+checks apply when rf.verify_frequency_readback=true (temporarily false in the
+bundled profiles at the operator's request, as described above);
 timeouts include read-only PV diagnostics captured before restoration. This
 sequence is tested offline; it does not establish the cause of a live MI1
 timeout. OFF retains SysID's CONTROL_OFF_SW=0 convention; the recovered Qt/mOTR
