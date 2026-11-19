@@ -13,18 +13,28 @@ from .qm_checkpoint import prepare_destination,save_checkpoint
 
 QM_CANDIDATES=tuple(f'QM{i}R.{j}' for j in (1,2) for i in (1,2,3,4,20,21,22,23))
 PROBE_INCREMENT_A=.01
+# Initial widths inferred from the 2026-11-19 13:58 DR scan, for S/N 6.5.
+# These are probe widths, not absolute current targets or measured responses.
+QM_PROBE_PRESETS_A={
+    'QM1R.1':.16,'QM3R.1':.34,'QM4R.1':.13,'QM20R.1':.62,
+    'QM21R.1':.50,'QM22R.1':.28,'QM23R.1':.16,
+    'QM1R.2':.22,'QM3R.2':.21,'QM4R.2':.18,'QM20R.2':.47,
+    'QM21R.2':.28,'QM22R.2':.20,'QM23R.2':.29,
+}
+PROBE_SNR_HEADROOM=1.3
 
 
 @dataclass
 class DispersionOptions:
     probe_A: float = 3.
+    use_probe_presets: bool = True
     adaptive_probe: bool = True
     probe_current_limit_A: float = 3.
     target_snr: float = 5.
     maximum_probe_pairs: int = 12
     probe_max_growth: float = 3.
     reuse_probe_widths: bool = True
-    characterize_first_scan: bool = True
+    characterize_first_scan: bool = False
     step_A: float = 3.  # Legacy saved-file field; the shared absolute current limit controls the solver.
     frequency_change_khz: float = 4.
     momentum_compaction: float = .0021
@@ -52,6 +62,7 @@ class DispersionOptions:
         if not np.isfinite(self.probe_max_growth) or self.probe_max_growth<=1 or not isinstance(self.reuse_probe_widths,bool):
             raise ValueError('Invalid QM growth / width reuse options')
         if not isinstance(self.characterize_first_scan,bool):raise ValueError('Invalid first-pass option')
+        if not isinstance(self.use_probe_presets,bool):raise ValueError('Invalid per-QM probe preset option')
         if self.measure_tunes and (not np.isfinite(self.tune_tolerance) or self.tune_tolerance<=0):raise ValueError('Invalid tune_tolerance')
         if (not np.isfinite([self.regularization,self.svd_cut]).all() or self.regularization<0 or
                 not 0<=self.svd_cut<1 or self.selection not in ('all','greedy') or
@@ -122,7 +133,7 @@ def estimated_probe_width(center,limits,measured_span,quality,opt):
     snr=quality['snr']
     if snr is None or snr<=0:return None
     # A small headroom avoids repeated measurements just below the target.
-    wanted_span=measured_span*1.1*opt.target_snr/snr
+    wanted_span=measured_span*PROBE_SNR_HEADROOM*opt.target_snr/snr
     estimate=wanted_span/2 if wanted_span<=2*near else wanted_span-near
     return min(probe_ceil(far),max(PROBE_INCREMENT_A,probe_ceil(estimate)))
 
@@ -252,10 +263,12 @@ class DispersionService:
                    skipped=len(data.get('skipped_qms',[]))))
 
     def width_context(self,data,opt):
-        return dict(backend_id=data['backend_id'],profile_signature=data['profile_signature'],names=list(data['names']),
+        context=dict(backend_id=data['backend_id'],profile_signature=data['profile_signature'],names=list(data['names']),
             frequency_change_khz=opt.frequency_change_khz,momentum_compaction=opt.momentum_compaction,
             excluded_bpms=sorted(opt.excluded_bpms),initial_probe_A=opt.probe_A,current_limit_A=opt.probe_current_limit_A,
             measure_tunes=opt.measure_tunes,constrain_cod=opt.constrain_cod,orbit_tolerance_mm=opt.orbit_tolerance_mm)
+        if opt.use_probe_presets:context['probe_presets']='20261119-snr6p5'
+        return context
 
     def restore_width_cache(self,data):
         for n,entry in data.get('successful_probe_widths',{}).items():
@@ -268,6 +281,8 @@ class DispersionService:
         entry=self.successful_widths.get(n)
         if opt.adaptive_probe and opt.reuse_probe_widths and entry and entry['context']==self.width_context(data,opt):
             if self.backend.same_settings(data['baseline'],entry['baseline']):return probe_floor(entry['width_A']),'previous response S/N estimate'
+        if opt.use_probe_presets and n in QM_PROBE_PRESETS_A:
+            return QM_PROBE_PRESETS_A[n],'per-QM initial preset (2026-11-19, S/N 6.5)'
         return opt.probe_A,'initial setting'
 
     def probe_quality(self,frames,variances,mask,opt):
@@ -330,7 +345,7 @@ class DispersionService:
                 self.check();n=names[j];c=centers[j]
                 h,width_source=self.initial_width(n,data,opt)
                 progress(round(90*j/len(names)),f'QM probe: {n} starting width {h:g} A ({width_source})')
-                characterize=opt.adaptive_probe and opt.characterize_first_scan and width_source=='initial setting'
+                characterize=opt.adaptive_probe and opt.characterize_first_scan and width_source!='previous response S/N estimate'
                 state['active_magnet']=n;skip_reason=None;failed_width=None
                 for attempt in range(opt.maximum_probe_pairs if opt.adaptive_probe else 1):
                     self.check()
@@ -360,7 +375,7 @@ class DispersionService:
                                         '. A BPM is excluded after 5 consecutive invalid updates; averages use valid samples only.')
                                 if opt.adaptive_probe and np.any(valid&enabled&~mask):
                                     raise ProbeSignalRejected('New invalid BPMs during adaptive QM probe. '+diagnostic['message'])
-                                if opt.constrain_cod and np.max(abs(frame[2:,pair_valid&enabled]-np.asarray(data['full_measured'])[2:,pair_valid&enabled]))>opt.orbit_tolerance_mm:
+                                if opt.constrain_cod and np.max(abs(frame[2:,pair_valid&enabled]-np.asarray(data['full_measured'],float)[2:,pair_valid&enabled]))>opt.orbit_tolerance_mm:
                                     raise ProbeSignalRejected('Measured COD change exceeds QM probe tolerance; restored')
                                 frames.append(frame);variances.append(self.signal_variance.copy())
                                 if opt.measure_tunes:
@@ -510,7 +525,7 @@ class DispersionService:
             if not np.any(valid&enabled&np.asarray(data['straight'],bool)):raise ValueError('No common valid straight BPM at resume baseline')
             data.setdefault('resume_checks',[]).append(dict(timestamp=datetime.now(timezone.utc).isoformat(),
                 full_measured=frame,valid=mask,tunes=tunes,tune_evidence=evidence,options=asdict(opt),
-                change_from_previous=frame-np.asarray(data['full_measured']),completed=data['scan_state']['completed']))
+                change_from_previous=frame-np.asarray(data['full_measured'],float),completed=data['scan_state']['completed']))
             # Use the current baseline as the fit target; retained columns were measured at the same magnet/RF settings.
             data.update(full_measured=frame,initial_tunes=tunes,initial_tune_evidence=evidence,valid=valid&enabled,restored=True)
             data['scan_state']['common_valid']=valid.copy()
@@ -548,8 +563,10 @@ class DispersionService:
         valid &= np.array([n not in opt.excluded_bpms for n in data['names']])
         straight=np.asarray(data['straight'],bool)
         if not np.any(valid&straight):raise ValueError('No common valid straight-section BPM across scan')
-        measured=np.asarray(data['full_measured']);target=measured.copy();target[0,straight]=0.
-        response=np.asarray(data['response']);mask=np.tile(valid,4)
+        # JSON stores unavailable BPM values as null; preserve them as NaN and
+        # apply the recorded validity mask before checking the fitted rows.
+        measured=np.asarray(data['full_measured'],float);target=measured.copy();target[0,straight]=0.
+        response=np.asarray(data['response'],float);mask=np.tile(valid,4)
         weights=np.repeat([opt.dispersion_weight,opt.dispersion_weight,1.,1.],len(valid))
         a=(response*weights[:,None])[mask];residual=((measured-target).ravel()*weights)[mask]
         c=np.asarray(data['centers']);lo,hi=np.asarray(data['limits'])
@@ -599,6 +616,7 @@ class DispersionService:
                     singular_values=singular,solver='bounded regularized SVD; '+
                     ('COD constraints; ' if opt.constrain_cod else 'COD hard limit disabled; ')+
                     ('tune constraints; ' if opt.measure_tunes else 'tune acquisition / tune constraints skipped; ')+opt.selection)
+        data.pop('proposal_unavailable_reason',None)
         return data
 
     def apply(self,data,progress=lambda *_:None,event=lambda *_:None):
@@ -620,7 +638,7 @@ class DispersionService:
             mask=np.asarray(data['valid'],bool)
             if not valid[mask].all():raise ValueError('A fitted BPM became invalid after SET')
             dt=(tunes-np.asarray(data['initial_tunes'])+.5)%1-.5 if opt.measure_tunes else None
-            orbit_change=after[2:,mask]-np.asarray(data['full_measured'])[2:,mask]
+            orbit_change=after[2:,mask]-np.asarray(data['full_measured'],float)[2:,mask]
             data.update(full_after=after,after_valid=valid,after_tunes=tunes,after_tune_evidence=evidence,
                         tune_check_performed=opt.measure_tunes,
                         after_orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
@@ -629,7 +647,7 @@ class DispersionService:
             if opt.constrain_cod and np.max(abs(orbit_change))>opt.orbit_tolerance_mm:
                 raise ValueError('Measured COD change exceeds QM correction tolerance; restored')
             straight=mask&np.asarray(data['straight'],bool)
-            if np.linalg.norm(after[0,straight])>np.linalg.norm(np.asarray(data['full_measured'])[0,straight]):
+            if np.linalg.norm(after[0,straight])>np.linalg.norm(np.asarray(data['full_measured'],float)[0,straight]):
                 raise ValueError('Measured horizontal straight dispersion did not improve; restored')
             self.check();data['applied_currents_A']=[b.quadrupole_current(n) for n in names]
             data['applied']=True;data.pop('restored',None);event(dict(kind='dispersion',data=copy.deepcopy(data)))

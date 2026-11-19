@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
 from .coupling import CouplingService,BumpOptions
-from .dispersion import DispersionService,DispersionOptions
+from .dispersion import DispersionService,DispersionOptions,QM_PROBE_PRESETS_A
 from .qm_checkpoint import load_checkpoint
 
 
@@ -186,8 +186,14 @@ class QMDispersionPanel(CorrectionTool):
         self.excluded.setText(', '.join(defaults.fixed_actuators))
         self.excluded.setToolTip('Comma-separated physical QM trim names');self.form.addRow('Exclude QM trims',self.excluded)
         self.maximum=control(self.form,'Greedy maximum trims',8,1,16,0)
-        self.probe=control(self.form,'Initial QM probe width [A]',defaults.probe_A,.01,3.,2);self.probe.setSingleStep(.01)
-        self.probe.setToolTip('Normally current +/- this width. At a limit, clip each endpoint independently.\n'
+        self.probe_presets=QCheckBox('Start with per-QM widths (2026-11-19)');self.probe_presets.setChecked(defaults.use_probe_presets)
+        self.probe_presets.setToolTip('Initial widths estimated for S/N 6.5 (30% above target 5).\n'+
+            '\n'.join(f'{n}: {width:.2f} A' for n,width in QM_PROBE_PRESETS_A.items())+
+            '\nMatching previous-response estimates take priority. QM2R uses the fallback width if enabled.')
+        self.form.addRow(self.probe_presets)
+        self.probe=control(self.form,'Fallback / uniform QM probe width [A]',defaults.probe_A,.01,3.,2);self.probe.setSingleStep(.01)
+        self.probe.setToolTip('Used without a per-QM preset or matching previous-response estimate.\n'
+                             'Normally current +/- this width. At a limit, clip each endpoint independently.\n'
                              'A one-sided pair is allowed; response uses the actual readback difference.')
         self.adaptive=QCheckBox('Adapt QM probe to target response / noise');self.adaptive.setChecked(defaults.adaptive_probe)
         self.form.addRow(self.adaptive)
@@ -207,7 +213,7 @@ class QMDispersionPanel(CorrectionTool):
         self.target_snr.setToolTip('Straight-section RMS horizontal dispersion change between the measured QM current pair.\n'
             'Target = this factor × uncertainty estimated from the valid BPM samples.\n'
             'Response and target are displayed as RF orbit differences in micrometres.\n'
-            'Estimate the next span from target / measured S/N, with a growth cap.\n'
+            'Estimate the next span from target / measured S/N with 30% headroom and a growth cap.\n'
             'Invalid BPMs: restore, then halve and round down to 0.01 A (0.05 -> 0.02 -> 0.01).\n'
             'S/N above target is accepted immediately. Each pair restores the baseline current.')
         self.rf=control(self.form,'RF full span [kHz]',defaults.frequency_change_khz,.01,10.)
@@ -240,6 +246,7 @@ class QMDispersionPanel(CorrectionTool):
         self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 candidates; QM2R.1/.2 excluded by default).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy and COD.\n10 BPM updates per RF setting; average valid samples only. Exclude after 5 consecutive invalid updates.\nTune acquisition / constraints optional; off by default.')
         for w in (self.maximum,self.probe,self.probe_limit,self.growth,self.target_snr,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(self.invalidate)
         self.adaptive.toggled.connect(self.invalidate)
+        self.probe_presets.toggled.connect(self.invalidate)
         self.reuse_widths.toggled.connect(self.invalidate)
         self.first_pass.toggled.connect(self.invalidate)
         self.constrain_cod.toggled.connect(self.cod.setEnabled);self.constrain_cod.toggled.connect(self.invalidate)
@@ -296,6 +303,7 @@ class QMDispersionPanel(CorrectionTool):
     def options(self):
         shared=self.window.panels['dispersion'].options
         return DispersionOptions(probe_A=self.probe.value(),step_A=self.probe_limit.value(),frequency_change_khz=self.rf.value(),
+            use_probe_presets=self.probe_presets.isChecked(),
             adaptive_probe=self.adaptive.isChecked(),probe_current_limit_A=self.probe_limit.value(),target_snr=self.target_snr.value(),
             probe_max_growth=self.growth.value(),reuse_probe_widths=self.reuse_widths.isChecked(),
             characterize_first_scan=self.first_pass.isChecked(),
@@ -330,16 +338,19 @@ class QMDispersionPanel(CorrectionTool):
     def display(self,data):
         self.result=data;figure=self.plot.figure;figure.clear();figure.set_layout_engine('constrained',rect=(0,0,1,.89))
         axes=figure.subplots(2,2).ravel()
-        valid=np.asarray(data['valid'],bool);s=np.asarray(data['positions_m']);order=np.argsort(s)
+        valid=np.asarray(data['valid'],bool);s=np.asarray(data['positions_m'],float)
+        known=np.isfinite(s).all()
+        if not known:s=np.arange(1,len(data['names'])+1)
+        order=np.argsort(s)
         for i,ax in enumerate(axes):
             for key,label,style in [('full_measured','Measured before','k.'),('full_predicted','Predicted','C2--'),('full_after','Measured after SET','C3-'),('full_target','Target',':')]:
                 if key not in data:continue
                 mask=valid.copy()
                 if key=='full_after':mask &= np.asarray(data['after_valid'],bool)
                 if key=='full_after' and data.get('restored'):label='After SET (since restored)'
-                ax.plot(s[order],np.where(mask,np.asarray(data[key])[i],np.nan)[order],style,label=label,
+                ax.plot(s[order],np.where(mask,np.asarray(data[key],float)[i],np.nan)[order],style,label=label,
                         **({'color':'gray'} if key=='full_target' else {}))
-            ax.set(xlabel='s [m]',ylabel='η [mm / (dp/p)]' if i<2 else 'COD [mm]',title=data['full_signal_labels'][i]);ax.grid(alpha=.2)
+            ax.set(xlabel='s [m]' if known else 'BPM index (measurement order)',ylabel='η [mm / (dp/p)]' if i<2 else 'COD [mm]',title=data['full_signal_labels'][i]);ax.grid(alpha=.2)
         handles,labels=axes[0].get_legend_handles_labels()
         figure.legend(handles,labels,loc='upper center',ncol=2,fontsize=8)
         self.plot.canvas.draw_idle()
@@ -349,8 +360,9 @@ class QMDispersionPanel(CorrectionTool):
                 q=data.get('probe_quality',[]);q=q[i] if i<len(q) else None
                 quality=probe_quality_text(q)
                 snr=('Not measured' if q.get('skipped') else f"{q['snr']:.2f}" if q['snr'] is not None else 'No measured scatter') if q else ''
-                rows.append((n,f'{c:.5f}',f'{d:+.5f}',f'{c+d:.5f}',quality,snr))
-            self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]','Response / target [µm]','S/N'],rows)
+                estimate=data.get('successful_probe_widths',{}).get(n,{}).get('width_A')
+                rows.append((n,f'{c:.5f}',f'{d:+.5f}',f'{c+d:.5f}',quality,snr,f'{estimate:.2f}' if estimate is not None else ''))
+            self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]','Response / target [µm]','S/N','Next probe [A]'],rows)
             self.set_button.setEnabled(bool(not data.get('applied') and not data.get('error') and
                                        self.proposal_matches_options(data) and np.any(abs(np.asarray(data['delta']))>1.e-12)))
             tune_status=('Predicted tune change: '+str(np.round(data['predicted_tune_change'],6))
@@ -363,9 +375,11 @@ class QMDispersionPanel(CorrectionTool):
             state=data.get('scan_state',{});done=state.get('completed',0)
             self.status.setText(f"QM response scan: {done}/{len(data['actuators'])} processed.\nResume retains completed pairs; the unfinished QM is measured again.")
             qualities=data.get('probe_quality',[])
-            self.set_table(['QM trim','Scan','Response / target [µm]'],
+            estimates=data.get('successful_probe_widths',{})
+            self.set_table(['QM trim','Scan','Response / target [µm]','Next probe [A]'],
                 [(n,('Skipped' if qualities[i].get('skipped') else 'Complete') if i<done else 'Pending',
-                  probe_quality_text(qualities[i]) if i<len(qualities) else '')
+                  probe_quality_text(qualities[i]) if i<len(qualities) else '',
+                  f"{estimates[n]['width_A']:.2f}" if n in estimates else '')
                  for i,n in enumerate(data['actuators'])])
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])

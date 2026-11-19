@@ -33,22 +33,33 @@ QM dispersion:
   QM1R–QM4R and QM20R–QM23R, both .1/.2 (16 individually mapped trims, including
   QM2). QM2R.1 and QM2R.2 are excluded by default (14 active candidates); the
   Exclude QM trims field contains these actual selections, not placeholder text.
-  Defaults: initial QM probe width .01 A, correction step bound +/-2 A from the baseline,
-  and RF full span 4 kHz (baseline +/-2 kHz). Absolute supply limits still apply.
+  Defaults: per-QM initial widths inferred from the 2026-11-19 13:58 scan,
+  targeting S/N 6.5 (30% above acceptance threshold 5), in A:
+                 QM1R QM3R QM4R QM20R QM21R QM22R QM23R
+             .1  .16  .34  .13   .62   .50   .28   .16
+             .2  .22  .21  .18   .47   .28   .20   .29
+  No checkpoint load is required. Start with per-QM widths is ON by default.
+  These are widths around the current allowed reference, not absolute currents.
+  The uniform/fallback width is 3 A (used for QM2R if explicitly enabled, or
+  when presets are disabled and no matching previous response is reused).
+  Shared absolute QM current limit is +/-3 A and RF full span is 4 kHz
+  (baseline +/-2 kHz). Absolute supply limits still apply.
   The existing confirmed site mappings, coil calibration, current limits
   and readback checks are used. Explicit exclusions are available in the panel.
   CALC measures a two-current response, normalizing by actual readback span.
-  The probe uses the intersection of parameter.A (lower) / parameter.B (upper)
-  with the absolute probe current cap [-3,+3] A. Parameter PVs take precedence
+  Probe and Apply both use the intersection of parameter.A (lower) / parameter.B
+  (upper) with the shared absolute current cap [-3,+3] A. Parameter PVs take precedence
   over static limits when both are configured; limits are reread before each
   pair and validated again by the live backend before each write.
   Each endpoint is automatically clipped, independently. At a 0 A lower limit,
   a requested [-.01,+.01] A pair becomes [0,+.01] A. Near a limit the pair may
   be asymmetric; at a limit it is one-sided. The actual measured current span,
   not twice the nominal probe width, is always used in the response derivative.
+  Probe widths and commanded probe endpoints use a .01 A grid; narrower ranges
+  are skipped. The initial width is editable, with .01 A as the minimum.
   If the baseline is outside the probe cap but inside the supply range, the
   probe reference is moved to the nearest permitted boundary. For example,
-  baseline 3.2 A with a +/-3 A probe cap starts with [2.99,3.00] A, then restores
+  baseline 3.2 A with a +/-3 A cap and a .01 A width uses [2.99,3.00] A, then restores
   the original 3.2 A. The recorded current pair and scheme identify this shift;
   its response was measured away from the original operating point and may
   differ if the optics are nonlinear. Actual dispersion is verified after Apply.
@@ -61,17 +72,48 @@ QM dispersion:
   with null quality metrics rather than invented zero-signal measurements.
   If every QM is skipped, stop without a correction proposal. Nonfinite/reversed
   supply limits still fail validation instead of being treated as a usable range.
-  QM correction limit applies to the final correction, not to the probe range.
-  Adaptive QM probing is ON by default: double the width between restored pairs
-  until the straight horizontal dispersion change reaches target S/N=5, or the
-  current range / 12-pair maximum is reached. The target uses RMS uncertainty
+  There is one current-limit control for probing and correction; the old
+  separate +/-2 A correction increment bound is removed. The legacy step_A
+  saved-file field is accepted for compatibility but does not constrain QM fits.
+  Adaptive probing is ON; First pass: one valid pair per QM is OFF by default.
+  Start each QM at its preset, remeasure at a rescaled width in the same CALC
+  if S/N is insufficient, and shrink/retry invalid probes. Matching estimates
+  from subsequent scans take priority over presets. The preset selection is
+  included in the reuse context so older uniform-scan estimates cannot silently
+  override the new starting widths.
+  If First pass is explicitly enabled, first collect one valid pair per QM
+  (invalid probes still shrink/retry), then save a QM-specific target-width
+  estimate from its response/noise. S/N<5 columns are not used in correction.
+  If all measured responses are weak, calibration finishes without an Apply
+  proposal; run CALC again to use the estimates. It does not auto-apply or start
+  another scan. The table shows Next probe [A].
+  Later scans start at each estimated width when machine/profile, baseline
+  settings, RF options, initial-width setting and BPM exclusions match. The
+  estimates are retained in the session and checkpoints; loading a checkpoint
+  restores them. Disable Use widths estimated from previous responses to force
+  the preset widths; also disable Start with per-QM widths to use the uniform
+  initial width instead.
+  For a weak response, estimate the next span from target/measured S/N with 30%
+  headroom, convert it to the necessary width including clipped/one-sided
+  geometry, and round UP to .01 A. Growth is capped at 3x per trial by default,
+  as well as the allowed current range. S/N>=5 is accepted immediately; a strong
+  response is not remeasured at smaller width during that scan. Instead its
+  estimate can reduce the starting width of the next scan. Zero observed noise
+  cannot establish a smaller target width, so the measured width is retained.
+  The target uses RMS uncertainty
   from valid-sample SEM of the four RF +/- orbit means in the QM current pair.
   Log/table values convert the dispersion change to an RF orbit difference in
   micrometres: target = 5 * measured uncertainty, not a fixed displacement.
   This estimate does not account for slow drift, systematic errors or correlated
   PV updates. Zero observed scatter is shown explicitly, not as a finite S/N.
-  New invalid BPMs during adaptive probing stop further growth and restore the
-  original current. At the width/attempt limit, weak responses are retained in
+  New invalid BPMs (including loss of all common straight BPMs) restore the
+  original current, halve the width and round DOWN to .01 A: .05 -> .02 -> .01 A;
+  from the default 3 A: 3 -> 1.50 -> .75 -> .37 -> .18 -> .09 -> .04 -> .02 -> .01 A.
+  The failed width is a strict upper bound for later growth during that QM scan.
+  At .01 A, or the 12-trial limit, skip an invalid QM and continue. Failed
+  measurements remain in diagnostics but do not remove BPMs from accepted
+  columns. Cancellation, RF/tune/PV errors and restoration failures do not retry.
+  At the width/attempt limit, weak responses are retained in
   the record but omitted from the adaptive-mode correction solver. If none are
   usable, no correction proposal is produced. S/N is adjustable in the panel.
   Each dispersion observation measures nominal COD plus symmetric RF offsets,
@@ -123,7 +165,7 @@ QM dispersion:
   operation constrains |delta tune| <= .002 by default. Q-modulation beta scans
   keep their separate tune measurement requirements.
   Apply gain is 1: I_set = I_baseline + proposed delta_I. The solver already
-  bounds delta_I by +/-2 A and by the absolute supply limits. SET verifies
+  bounds I_set by the shared absolute +/-3 A limit and supply limits. SET verifies
   actual dispersion improvement, and COD/tunes only when their constraints
   are enabled. Failed measurements or enabled checks restore changed trims. The graph
   shows measured before, predicted, target, and measured after, for Dx/Dy/X/Y.
@@ -146,8 +188,9 @@ QM dispersion:
   the scan after restoration; it does not continue accumulating unsaved pairs.
   Resume unfinished QM scan uses the current partial result, or first choose
   Load QM scan checkpoint after restarting the GUI. Completed response columns
-  are reused; the unfinished QM starts again from the current initial width
-  (default .01 A). Loading an older .1 A scan never changes that field back.
+  are reused; the unfinished QM starts from a matching saved estimate or the
+  current initial width (default 3 A). Loading a scan never overwrites the
+  current initial-width control.
   Resume checks machine identity/profile, BPM order, acquisition RF/tune
   settings, QM selection, supply limits and original machine settings before
   any probe. It remeasures the baseline (30 BPM updates), resets invalid streaks,

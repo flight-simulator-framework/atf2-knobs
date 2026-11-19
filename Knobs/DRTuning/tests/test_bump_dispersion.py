@@ -196,10 +196,10 @@ class DispersionFixture(DemoBackend):
 class DispersionTests(unittest.TestCase):
     def setUp(self):
         self.b=DispersionFixture();self.cancel=threading.Event();self.s=DispersionService(self.b,self.cancel)
-        self.o=DispersionOptions(probe_A=.01,regularization=0.,fixed_actuators=(),measure_tunes=True,adaptive_probe=False)
+        self.o=DispersionOptions(probe_A=.01,use_probe_presets=False,regularization=0.,fixed_actuators=(),measure_tunes=True,adaptive_probe=False)
     def test_requested_defaults_skip_tunes_through_calc_set_reset_and_exclude_qm2(self):
         opt=DispersionOptions();initial=self.b.snapshot()
-        self.assertEqual((opt.probe_A,opt.probe_current_limit_A,opt.frequency_change_khz),(1.,3.,4.))
+        self.assertEqual((opt.probe_A,opt.probe_current_limit_A,opt.frequency_change_khz),(3.,3.,4.))
         self.assertTrue(opt.adaptive_probe);self.assertEqual(opt.probe_current_limit_A,3.)
         self.assertEqual(opt.target_snr,5.);self.assertFalse(opt.constrain_cod)
         self.assertEqual(opt.fixed_actuators,('QM2R.1','QM2R.2'))
@@ -211,7 +211,10 @@ class DispersionTests(unittest.TestCase):
             self.assertEqual(len(data['orbit_measurements']),87)
             for key in ('initial_tunes','tune_response','predicted_tune_change'):self.assertIsNone(data[key])
             self.assertEqual(data['scan_tunes'],[]);self.assertIn('skipped',data['solver'])
-            for probe in data['probe_readbacks']:np.testing.assert_allclose(probe['requested'],[-1.,1.])
+            expected_widths=[.16,.34,.13,.62,.50,.28,.16,.22,.21,.18,.47,.28,.20,.29]
+            self.assertTrue(opt.use_probe_presets);self.assertFalse(opt.characterize_first_scan)
+            for probe,width in zip(data['probe_readbacks'],expected_widths):
+                np.testing.assert_allclose(probe['requested'],[-width,width])
             self.s.apply(data);self.assertTrue(data['applied']);self.assertFalse(data['tune_check_performed'])
             self.assertIsNone(data['after_tunes']);self.s.reset(data)
             tunes.assert_not_called();validate.assert_not_called()
@@ -480,7 +483,8 @@ class CorrectionGuiTests(unittest.TestCase):
         b=DispersionFixture();w=TuningSession(b)
         try:
             panel=w.qm_dispersion;defaults=panel.options()
-            self.assertEqual((panel.probe.value(),panel.probe_limit.value(),panel.rf.value()),(1.,3.,4.))
+            self.assertEqual((panel.probe.value(),panel.probe_limit.value(),panel.rf.value()),(3.,3.,4.))
+            self.assertTrue(panel.probe_presets.isChecked());self.assertFalse(panel.first_pass.isChecked())
             self.assertEqual(set(defaults.fixed_actuators),{'QM2R.1','QM2R.2'})
             self.assertFalse(defaults.measure_tunes);self.assertFalse(panel.tune.isEnabled())
             data=panel.service.calculate(defaults)
