@@ -186,12 +186,16 @@ class QMDispersionPanel(CorrectionTool):
         self.excluded.setText(', '.join(defaults.fixed_actuators))
         self.excluded.setToolTip('Comma-separated physical QM trim names');self.form.addRow('Exclude QM trims',self.excluded)
         self.maximum=control(self.form,'Greedy maximum trims',8,1,16,0)
-        self.probe=control(self.form,'Initial QM probe width [A]',defaults.probe_A,.001,1.)
+        self.probe=control(self.form,'Initial QM probe width [A]',defaults.probe_A,.01,1.,2);self.probe.setSingleStep(.01)
         self.probe.setToolTip('Normally current +/- this width. At a limit, clip each endpoint independently.\n'
                              'A one-sided pair is allowed; response uses the actual readback difference.')
         self.adaptive=QCheckBox('Adapt QM probe to target response / noise');self.adaptive.setChecked(defaults.adaptive_probe)
         self.form.addRow(self.adaptive)
-        self.probe_limit=control(self.form,'Probe absolute current limit ± [A]',defaults.probe_current_limit_A,.001,3.)
+        self.reuse_widths=QCheckBox('Reuse previous successful QM widths');self.reuse_widths.setChecked(defaults.reuse_probe_widths)
+        self.form.addRow(self.reuse_widths)
+        self.growth=control(self.form,'Maximum probe growth factor',defaults.probe_max_growth,1.1,10.,1)
+        self.probe_limit=control(self.form,'QM current limit ± [A] (probe / Apply)',defaults.probe_current_limit_A,.01,3.,2)
+        self.probe_limit.setSingleStep(.01)
         self.probe_limit.setToolTip('Intersect [-limit,+limit] with supply parameter.A (lower) / parameter.B (upper).\n'
                                    'Probe reference and endpoints are automatically moved inside this range.\n'
                                    'If no usable pair can be measured and restored, skip that QM and continue.')
@@ -199,10 +203,9 @@ class QMDispersionPanel(CorrectionTool):
         self.target_snr.setToolTip('Straight-section RMS horizontal dispersion change between the measured QM current pair.\n'
             'Target = this factor × uncertainty estimated from the valid BPM samples.\n'
             'Response and target are displayed as RF orbit differences in micrometres.\n'
-            'Probe width doubles between pairs; each pair restores the baseline current.')
-        self.step=control(self.form,'QM correction limit ± [A]',defaults.step_A,.001,2.)
-        self.step.setToolTip('Maximum Apply change from the CALC baseline. This does not limit the probe width.\n'
-                             'The solver also enforces each supply current limit. Apply gain is 1.')
+            'Estimate the next span from target / measured S/N, with a growth cap.\n'
+            'Invalid BPMs: restore, then halve and round down to 0.01 A (0.05 -> 0.02 -> 0.01).\n'
+            'S/N above target is accepted immediately. Each pair restores the baseline current.')
         self.rf=control(self.form,'RF full span [kHz]',defaults.frequency_change_khz,.01,10.)
         self.measure_tunes=QCheckBox('Measure / constrain H and V tunes');self.measure_tunes.setChecked(defaults.measure_tunes)
         self.form.addRow(self.measure_tunes)
@@ -231,8 +234,9 @@ class QMDispersionPanel(CorrectionTool):
         self.controls.insertWidget(self.controls.count()-1,self.save_status)
         self.set_button.setEnabled(False);self.reset_button.setEnabled(False)
         self.status.setText('QM1–4R and QM20–23R, .1/.2 (16 candidates; QM2R.1/.2 excluded by default).\nTarget: zero Dx at MB19–31 / MB66–80; preserve measured arc dispersion, Dy and COD.\n10 BPM updates per RF setting; average valid samples only. Exclude after 5 consecutive invalid updates.\nTune acquisition / constraints optional; off by default.')
-        for w in (self.maximum,self.probe,self.probe_limit,self.target_snr,self.step,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(self.invalidate)
+        for w in (self.maximum,self.probe,self.probe_limit,self.growth,self.target_snr,self.rf,self.tune,self.cod,self.ridge):w.valueChanged.connect(self.invalidate)
         self.adaptive.toggled.connect(self.invalidate)
+        self.reuse_widths.toggled.connect(self.invalidate)
         self.constrain_cod.toggled.connect(self.cod.setEnabled);self.constrain_cod.toggled.connect(self.invalidate)
         self.selection.currentIndexChanged.connect(self.invalidate)
         self.excluded.textChanged.connect(self.invalidate)
@@ -260,7 +264,7 @@ class QMDispersionPanel(CorrectionTool):
         if not path:return
         try:
             data=self.service.validate_checkpoint(load_checkpoint(path))
-            self.service.last_result=data;self.display(data)
+            self.service.restore_width_cache(data);self.service.last_result=data;self.display(data)
             self.save_status.setText('Loaded checkpoint: '+path)
             self.window.log('Loaded QM scan: '+path)
         except Exception as exc:self.window.error(str(exc))
@@ -286,8 +290,9 @@ class QMDispersionPanel(CorrectionTool):
             self.save_status.setText(message);self.window.log(message)
     def options(self):
         shared=self.window.panels['dispersion'].options
-        return DispersionOptions(probe_A=self.probe.value(),step_A=self.step.value(),frequency_change_khz=self.rf.value(),
+        return DispersionOptions(probe_A=self.probe.value(),step_A=self.probe_limit.value(),frequency_change_khz=self.rf.value(),
             adaptive_probe=self.adaptive.isChecked(),probe_current_limit_A=self.probe_limit.value(),target_snr=self.target_snr.value(),
+            probe_max_growth=self.growth.value(),reuse_probe_widths=self.reuse_widths.isChecked(),
             momentum_compaction=shared.momentum_compaction,measure_tunes=self.measure_tunes.isChecked(),
             tune_tolerance=self.tune.value(),constrain_cod=self.constrain_cod.isChecked(),orbit_tolerance_mm=self.cod.value(),
             regularization=self.ridge.value(),selection=self.selection.currentData(),maximum=int(self.maximum.value()),
