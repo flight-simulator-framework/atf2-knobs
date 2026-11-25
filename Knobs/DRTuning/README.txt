@@ -27,11 +27,15 @@ Saved nominal RFTrack uses the bundled 4 kHz reference matrix.
 For mapped-channel differences use RFTrack model > Exclude unmapped BPMs /
 magnets. Measure selected ZVs measures the actual response before Apply.
 
-Vertical dispersion uses the current vertical dispersion and COD to rank ZVs
-with the RFTrack response. Set Maximum ZVs (default 5) and click Find ZVs.
+Vertical dispersion ranks ZVs and fits measured responses with a weight of 1
+on vertical dispersion error and 0.05 on the change from the measured vertical
+orbit at nominal RF. Set Maximum ZVs (default 5) and click Find ZVs.
 Measure selected ZVs measures only those response columns. Review the proposed
 currents and predicted curves, then click Apply / remeasure to see the measured
 after curves. Select BPMs / magnets and Recalculate reuse the measured columns.
+To reuse a completed measurement after restarting DRTuning, save it with
+Save data + plots, then use Load measured response to open dispersion.json.
+This recalculates the proposal using the current fit settings.
 For a valid ZV probe pair, the default acceptance threshold is 0.075 mm
 (0.1 mm target with 25% tolerance) in peak vertical COD half-difference over
 eligible BPMs. The scan accepts any response at or above this threshold immediately.

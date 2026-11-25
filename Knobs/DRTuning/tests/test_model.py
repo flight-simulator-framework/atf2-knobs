@@ -558,6 +558,51 @@ class ModelGuiTests(unittest.TestCase):
     def setUpClass(cls):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
+
+    def test_load_legacy_measured_zvs_refits_for_dispersion_without_scanning(self):
+        from Knobs.DRCorrection.core import save_session
+        from Knobs.DRTuning.gui import TuningSession
+        from PyQt6.QtWidgets import QFileDialog
+        machine = CountedBackend()
+        window = TuningSession(machine)
+        try:
+            panel = window.panels['dispersion']
+            machine.errors['y'][:] = .05
+            machine.disp0[:] = .05
+            machine.dispr[:] = -1.
+            machine.orm['y'][:] = 1.
+            opt = copy.deepcopy(panel.options)
+            opt.response_source = 'rftrack_nominal'
+            opt.count_v = 1
+            preview = window.service.calculate('dispersion', opt)
+            np.testing.assert_array_equal(preview['target'][1], preview['measured'][1])
+            legacy = copy.deepcopy(preview)
+            legacy['options'].pop('preserve_vertical_dispersion_orbit')
+            legacy['options'].update(dispersion_weight=.05, orbit_weight=1.)
+            saved = window.service.measure_selected_zvs(legacy)
+            self.assertLess(saved['delta'][0], 0.)
+            saved['options'].pop('preserve_vertical_dispersion_orbit')
+            saved['acquisition_options'].pop('preserve_vertical_dispersion_orbit')
+            reads = machine.acquisitions
+            machine.commands.clear()
+            with tempfile.TemporaryDirectory() as root:
+                path = Path(root) / 'dispersion.json'
+                save_session(path, saved)
+                def run(action, finished, **kwargs):
+                    finished(action(lambda *_: None))
+                with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(path), '')), patch.object(window, 'start', run):
+                    panel.load_measured_response()
+            result = panel.data
+            self.assertTrue(panel.apply_button.isEnabled())
+            self.assertTrue(result['reused_response'])
+            np.testing.assert_array_equal(result['target'][1], saved['measured'][1])
+            np.testing.assert_array_equal(result['response'], saved['response'])
+            np.testing.assert_allclose(result['delta'], [.05 / (1. + .05**2)], atol=1e-9)
+            self.assertEqual(machine.acquisitions, reads)
+            self.assertEqual(machine.commands, [])
+        finally:
+            window.close();window.deleteLater();self.app.processEvents()
+
     def test_diagnostics_save_latest_bump_or_main_attempt_without_machine_access(self):
         from Knobs.DRTuning.gui import TuningSession
         b=CountedBackend();window=TuningSession(b)

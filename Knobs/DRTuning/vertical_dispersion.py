@@ -1,10 +1,13 @@
 """Vertical dispersion correction with RFTrack selection and measured ZV response."""
 
+import copy
+
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import (QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
+from PyQt6.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
                              QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget)
 
 from Knobs.DRCorrection.assessment import changed_indices
+from Knobs.DRCorrection.core import load_session
 from Knobs.DRCorrection.gui import CorrectionPanel
 from .correction_gui import DispersionPlot, control
 from .presentation import scroll, table_style
@@ -18,6 +21,9 @@ class VerticalDispersionPanel(CorrectionPanel):
         super().__init__(window, mode)
         self.baseline_observed.connect(self.plot.correction)
         self.options.count_v = 5
+        self.options.preserve_vertical_dispersion_orbit = True
+        self.options.dispersion_weight = 1.
+        self.options.orbit_weight = .05
         old = self.layout().takeAt(0).widget()
         old.hide()
         self._legacy_container = old
@@ -65,6 +71,9 @@ class VerticalDispersionPanel(CorrectionPanel):
         self.undo_button = QPushButton('Undo last SET')
         self.undo_button.clicked.connect(self.reset)
         left.addWidget(self.undo_button)
+        load_response = QPushButton('Load measured response…')
+        load_response.clicked.connect(self.load_measured_response)
+        left.addWidget(load_response)
         row = QHBoxLayout()
         left.addLayout(row)
         for label, action in [('Load target…', self.load_target), ('Save data + plots…', self.save_bundle)]:
@@ -119,6 +128,23 @@ class VerticalDispersionPanel(CorrectionPanel):
             return
         self.window.start(lambda p: self.window.service.measure_selected_zvs(preview, p),
                           self.display, label='Measure selected ZVs', pausable=True)
+
+    def load_measured_response(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Load measured vertical dispersion response',
+                                              '', 'Correction session (*.json)')
+        if not path:
+            return
+        options = copy.deepcopy(self.options)
+        options.response_source = 'measured'
+
+        def refit(progress):
+            data = load_session(path)
+            if (data.get('mode') != 'dispersion' or not data.get('rftrack_candidates')
+                    or data['options']['plane'] != 'y' or data['options']['response_source'] != 'measured'):
+                raise ValueError('Select dispersion.json saved after Measure selected ZVs.')
+            return self.window.service.recalculate(data, options, progress)
+
+        self.window.start(refit, self.display, label='Recalculate saved ZV response')
 
     def display(self, data):
         self.options.response_source = data['options']['response_source']

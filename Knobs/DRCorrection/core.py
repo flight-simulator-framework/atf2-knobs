@@ -96,6 +96,7 @@ class Options:
     orbit_weight: float = 1.
     excluded_bpms: tuple = ()
     fixed_actuators: tuple = ()
+    preserve_vertical_dispersion_orbit: bool = False
 
 
 def checked_orbit(value,names):
@@ -562,6 +563,10 @@ class CorrectionService:
         response=np.asarray(data['response'],float)
         if measured.shape!=target.shape or measured.ndim!=2 or measured.shape[1]!=len(names):
             raise ValueError('Signal shape mismatch')
+        if mode=='dispersion' and opt.plane=='y' and opt.preserve_vertical_dispersion_orbit:
+            # Both model screening and measured fits use the beam orbit at nominal RF.
+            target=np.stack((target[0],measured[1]))
+            data['target']=target
         if response.shape!=(measured.size,len(actuators)):
             raise ValueError('Invalid response matrix')
         selected=copy.deepcopy(opt)
