@@ -34,12 +34,22 @@ class FreshTests(unittest.TestCase):
         event.clear()
         with self.assertRaises(RuntimeError):list(updates(lambda _:dict(value=5,timestamp=2,severity=2),['x'],1,event))
     def test_live_xsr_is_ten_raw_updates_and_callbacks(self):
-        b=object.__new__(LiveBackend);b.profile={};counter=iter(range(30));seen=[]
-        b.metadata=lambda pv:dict(value=12.+next(counter)*.01,timestamp=next(counter))
-        result=b.sample_xsr(threading.Event(),callback=seen.append)
+        b=object.__new__(LiveBackend);b.profile={};seen=[]
+        reads=[];elapsed=0.;cancel=threading.Event()
+        def wait(seconds):
+            nonlocal elapsed
+            elapsed+=seconds
+            return False
+        def metadata(pv):
+            reads.append(elapsed)
+            return dict(value=12.,timestamp=6*(elapsed//6))
+        b.metadata=metadata
+        with patch.object(cancel,'wait',side_effect=wait),patch('Knobs.DRTuning.fresh.time.monotonic',side_effect=lambda:elapsed):
+            result=b.sample_xsr(cancel,callback=seen.append)
+        self.assertEqual(reads,list(range(61)))
         self.assertEqual(result['pv'],'XSR:PROJ_V_SIGMA');self.assertEqual(result['count'],10)
         self.assertEqual(len(seen),10);self.assertTrue(result['update_verified'])
-        self.assertEqual(len(set(result['timestamps'])),10)
+        self.assertEqual(result['timestamps'],list(range(6,61,6)))
     def test_live_bpm_reads_metadata_payload_without_second_waveform_read(self):
         b=object.__new__(LiveBackend);b.profile={'orbit':dict(packed_pv='bpm',row_width=4,row_indices=[0],
             columns=dict(status=0,x=1,y=2,tmit=3),valid_status=1,mm_per_unit=.001)}

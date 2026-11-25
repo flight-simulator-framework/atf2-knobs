@@ -41,7 +41,8 @@ class LiveBackend(EpicsBackend):
     def sample_xsr(self,cancel,count=10,callback=lambda *_:None):
         from .fresh import updates,scalar_statistics
         pv='XSR:PROJ_V_SIGMA';values=[];stamps=[]
-        for records in updates(self.metadata,[pv],count,cancel,timeout_s=self.profile.get('update_timeout_s',15.)):
+        for records in updates(self.metadata,[pv],count,cancel,interval_s=1.,poll_s=1.,
+                               timeout_s=self.profile.get('update_timeout_s',15.)):
             values.append(float(records[pv]['value']));stamps.append(float(records[pv]['timestamp']))
             result=scalar_statistics(values,stamps,pv);callback(result)
         return result

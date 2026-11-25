@@ -4,10 +4,10 @@ import numpy as np
 from Knobs.DRCorrection.core import Cancelled
 
 
-def updates(metadata, pvs, count, cancel, *, timeout_s=15., interval_s=0.):
+def updates(metadata, pvs, count, cancel, *, timeout_s=15., interval_s=0., poll_s=.02):
     if int(count) != count or not 1 <= count <= 1000:
         raise ValueError('Sample count must be an integer in 1..1000')
-    if not np.isfinite([timeout_s, interval_s]).all() or timeout_s <= 0 or interval_s < 0:
+    if not np.isfinite([timeout_s, interval_s, poll_s]).all() or timeout_s <= 0 or interval_s < 0 or poll_s <= 0:
         raise ValueError('Invalid update timeout / interval')
     def read(pv):
         if cancel.is_set():raise Cancelled('Acquisition cancelled')
@@ -26,7 +26,7 @@ def updates(metadata, pvs, count, cancel, *, timeout_s=15., interval_s=0.):
                 yield records
                 break
             if time.monotonic()>=deadline:raise TimeoutError('No new PV update: '+', '.join(pvs))
-            if cancel.wait(.02):raise Cancelled('Acquisition cancelled')
+            if cancel.wait(poll_s):raise Cancelled('Acquisition cancelled')
 
 
 def scalar_statistics(values, timestamps, pv):

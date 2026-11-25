@@ -174,6 +174,18 @@ class AdaptiveProbeTests(unittest.TestCase):
         np.testing.assert_allclose(data['response'][:2],[[100.],[100.]],atol=1.e-8)
         self.assertEqual(b.offset,0.);self.assertEqual(b.currents['V'],0.)
 
+    def test_vertical_dispersion_accepts_sufficient_response_in_first_pair(self):
+        for gain in (1.6,4.):
+            with self.subTest(gain=gain):
+                b=LinearBeam(gain=gain)
+                data=CorrectionService(b).acquire('dispersion',options(corrector_probe_A=.05))
+                self.assertEqual([c[2] for c in b.commands],[[-.05],[.05],[0.]])
+                record,=data['probe_history']
+                self.assertTrue(record['target_reached'])
+                self.assertTrue(record['used_for_response'])
+                self.assertAlmostEqual(record['observed_mm'],gain*.05)
+                np.testing.assert_allclose(data['response'][:2],[[100.],[100.]],atol=1.e-8)
+
     def test_skew_targets_change_in_vertical_probe_response(self):
         b=LinearBeam()
         data=CorrectionService(b).acquire('skew',options(skew_probe=.05))

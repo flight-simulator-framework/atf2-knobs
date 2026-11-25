@@ -32,6 +32,9 @@ with the RFTrack response. Set Maximum ZVs (default 5) and click Find ZVs.
 Measure selected ZVs measures only those response columns. Review the proposed
 currents and predicted curves, then click Apply / remeasure to see the measured
 after curves. Select BPMs / magnets and Recalculate reuse the measured columns.
+For a valid ZV probe pair, the default acceptance threshold is 0.075 mm
+(0.1 mm target with 25% tolerance) in peak vertical COD half-difference over
+eligible BPMs. The scan accepts any response at or above this threshold immediately.
 If an initial ZV probe loses all common enabled BPMs, the scan restores that
 ZV and checks BPM coverage at the original current across all three RF settings.
 On recovery it repeats both endpoints at a smaller width (e.g. ±0.05, ±0.02,
@@ -352,7 +355,8 @@ Bump / XSR coupling:
      Actual outside X/Y and reconstructed target state are checked at every
      point. Only if needed, bounded beam-based iterations close leakage while
      retaining target amplitude/angle. No clipping or cumulative amplitude steps.
-     XSR takes 10 new updates at each point; raw values, means +/- SEM and fit
+     XSR polls once per second and takes 10 timestamp advances at each point;
+     raw values, means +/- SEM and fit
      curves are plotted live. The fitted horizontal coordinate is the observed
      local displacement; requested amplitudes are saved separately. A weighted
      quadratic fits sigma_y squared and is

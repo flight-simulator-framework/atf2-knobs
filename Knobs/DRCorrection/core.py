@@ -453,7 +453,11 @@ class CorrectionService:
                         self.sync_dispersion_selection(mode,opt)
                         enabled=np.array([n not in opt.excluded_bpms for n in self.backend.bpm_names])
                     observed=finite_abs_max(signal[...,valid & enabled])
-                    reached=abs(observed/opt.adaptive_target_mm-1)<=opt.adaptive_target_tolerance
+                    relative_change=observed/opt.adaptive_target_mm
+                    if mode=='dispersion' and opt.plane=='y':
+                        reached=relative_change>=1-opt.adaptive_target_tolerance
+                    else:
+                        reached=abs(relative_change-1)<=opt.adaptive_target_tolerance
                     record=dict(magnet=name,pair=attempt+1,amplitude=amplitude,unit=self.backend.unit(kind),
                         commanded=[lo,hi],readbacks=readbacks,readback_span=span,observed_mm=observed,
                         target_mm=opt.adaptive_target_mm,target_reached=bool(reached),used_for_response=False,
@@ -464,18 +468,17 @@ class CorrectionService:
                         raise MagnetReadbackError([name],f'{name}: adaptive probe has no positive readback span: '
                             f'commanded {lo:g}/{hi:g}, readbacks {readbacks} {self.backend.unit(kind)}; '
                             'original current restored; no correction calculated')
-                    if reduced:
+                    if reached or reduced:
                         record['status']='target_reached' if reached else 'reduced_initial_probe'
                         record['used_for_response']=True
                         progress(int(100*(j+(attempt+1)/pairs)/len(names)),
-                            f'{name}: using reduced probe ±{amplitude:g} A; BPM response {observed:.5g} mm')
+                            f'{name}: accepted pair {attempt+1} at ±{amplitude:g} {record["unit"]}; BPM response {observed:.5g} mm')
                         break
                     next_amplitude=min(opt.adaptive_max_probe,
                         next_excitation_amplitude(amplitude,observed,opt.adaptive_target_mm,opt.adaptive_max_probe))
                     next_lo=max(low[j],centers[j]-next_amplitude);next_hi=min(high[j],centers[j]+next_amplitude)
                     unchanged=np.allclose([next_lo,next_hi],[lo,hi],rtol=1.e-9,atol=1.e-12)
-                    if reached:record['status']='target_reached'
-                    elif unchanged:record['status']='amplitude_or_supply_limit'
+                    if unchanged:record['status']='amplitude_or_supply_limit'
                     elif attempt+1==pairs:record['status']='max_pairs'
                     progress(int(100*(j+(attempt+1)/pairs)/len(names)),
                         f'{name}: pair {attempt+1}/{pairs}; BPM response {observed:.5g} / target {opt.adaptive_target_mm:g} mm; '
