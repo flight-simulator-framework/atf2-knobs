@@ -4,10 +4,12 @@ import copy
 import time
 import numpy as np
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
-from .bump_maps import constrained_step,BumpGeometryUnavailable
+from Knobs.DRCorrection.backends import MagnetCurrentLimitError
+from .bump_maps import constrained_step,BumpGeometryUnavailable,BumpRangeUnavailable,BumpLimitUnavailable
 from .bump_presets import preset_geometry,bump_targets,bump_preset,ranked_closure_helpers
 from .model import name,verify_inputs
 from .fresh import AcquisitionUnavailable
+from .bump_fit import fit_size,size_fit,next_xsr_point,NoXSRMinimum
 
 
 @dataclass
@@ -27,6 +29,13 @@ class BumpOptions:
     settle_s: float = 1.
     use_presets: bool = True  # Legacy serialized option; Bump now always uses presets.
 
+    @property
+    def scan_widths_mm(self):
+        widths=[2*self.amplitude_mm]
+        while widths[-1]>.2:
+            widths.append(max(.2,widths[-1]/2))
+        return widths
+
     def validate(self):
         for key,value in asdict(self).items():
             if key=='use_presets':continue
@@ -38,41 +47,11 @@ class BumpOptions:
         if int(self.max_iterations)!=self.max_iterations:raise ValueError('Iteration count must be integer')
 
 
-class BumpRangeUnavailable(ValueError):
-    """Current bounds or measured closure prevent this displacement, not an IO fault."""
-
 class BumpLeakage(BumpRangeUnavailable):
     def __init__(self,observed):
         super().__init__(f"Outside COD exceeds tolerance: max {observed['outside_max_mm']*1000:.2f} µm, "
                          f"RMS {observed['outside_rms_mm']*1000:.2f} µm")
         self.outside=observed['outside']
-
-
-def fit_size(points,amplitude_mm,bounds_mm=None):
-    """Fit sigma_y squared, then display sqrt(quadratic) in physical size units."""
-    x=np.array([p['amplitude_mm'] for p in points]);y=np.array([p['xsr']['mean'] for p in points])
-    err=np.array([p['xsr']['sem'] for p in points])
-    if len(x)<5 or len(np.unique(x))<3 or not np.isfinite(np.r_[x,y,err]).all() or (y<=0).any():
-        raise ValueError('Need at least five valid XSR measurements for a size-squared fit')
-    uncertainty=np.maximum(2*y*err,max(float(np.median(y*y))*1.e-6,1.e-12))
-    matrix=np.column_stack((x*x,x,np.ones(len(x))))/uncertainty[:,None]
-    coefficients,_,rank,_=np.linalg.lstsq(matrix,y*y/uncertainty,rcond=1.e-10)
-    if rank!=3:raise ValueError('Rank-deficient XSR fit')
-    residual=(np.polyval(coefficients,x)-y*y)/uncertainty
-    covariance=np.linalg.inv(matrix.T@matrix)*max(float(residual@residual)/(len(x)-3),1.)
-    curvature=float(coefficients[0])
-    if curvature<=0 or curvature<=2*np.sqrt(covariance[0,0]):
-        raise ValueError('XSR fit has no resolved positive curvature; baseline restored')
-    limits=(-amplitude_mm,amplitude_mm) if bounds_mm is None else bounds_mm
-    best=float(-coefficients[1]/(2*curvature));low=max(limits[0],float(min(x)));high=min(limits[1],float(max(x)))
-    if not low<best<high or np.polyval(coefficients,best)<=0:
-        raise ValueError('XSR minimum is not bracketed inside the measured scan range; baseline restored')
-    grid=np.linspace(low,high,201);size2=np.polyval(coefficients,grid)
-    if np.any(size2<=0):raise ValueError('Unphysical fitted XSR size')
-    return dict(coefficients_size_squared=coefficients,covariance=covariance,best_mm=best,
-                predicted_size_um=float(np.sqrt(np.polyval(coefficients,best))),
-                amplitude_mm=grid,size_um=np.sqrt(size2),weighted_residual=residual,
-                method='weighted quadratic in sigma_y squared; positive curvature and bracket required')
 
 
 def restore_correctors(backend,names,values):
@@ -92,6 +71,7 @@ class CouplingService:
         self.last_result=None
         self.response_matrix=None
         self.frozen_bpms={}
+        self.xsr_history_floor_um=0.
 
     def check(self):self.reader.check_cancel()
 
@@ -185,7 +165,12 @@ class CouplingService:
         _,valid=self.orbit(opt,self.acquisition_status(event,'check',f'1/5 {target}: Checking BPM validity'),
                            required=required,essential=required,event=event)
         valid=self.reader.orbit_measurements[-1].get('acquisition_valid',valid)
-        geometry=preset_geometry(self.backend,target,valid,opt,options)
+        try:geometry=preset_geometry(self.backend,target,valid,opt,options)
+        except BumpLimitUnavailable as exc:
+            self.last_result=dict(target=target,stage='preset check',baseline=baseline,
+                                  bpm_names=list(self.backend.bpm_names),actuators=[],centers=[],
+                                  restored=True,magnet_writes=False,error=str(exc))
+            raise
         if not self.backend.same_settings(self.backend.snapshot(),baseline):
             raise ValueError('Machine settings changed during preset check; calibrate again')
         geometry['baseline']=baseline;geometry['options']=asdict(opt)
@@ -203,7 +188,8 @@ class CouplingService:
         for n in ranked_closure_helpers(self.backend,g,loss.outside,opt,measured):
             self.check()
             center=float(self.backend.read('correctors',[n])[0])
-            low,high=np.asarray(self.backend.limits('correctors',[n]),float)[:,0]
+            try:low,high=np.asarray(self.backend.limits('correctors',[n]),float)[:,0]
+            except MagnetCurrentLimitError:continue
             if not np.isfinite([center,low,high]).all() or min(center-low,high-center)<=1.e-6:continue
             geometry={key:copy.deepcopy(g[key]) for key in (
                 'target','actuators','bpm_names','positions_m','outside_indices','outside_rows','internal_indices',
@@ -255,7 +241,9 @@ class CouplingService:
         if geometry.get('model_settings'):verify_inputs(self.backend,geometry['model_settings'])
 
     def move(self,names,values,opt):
-        self.check();self.backend.write('correctors',names,values)
+        self.check()
+        try:self.backend.write('correctors',names,values)
+        except MagnetCurrentLimitError as exc:raise BumpLimitUnavailable(str(exc)) from exc
         actual=self.backend.read('correctors',names)
         tolerance=getattr(self.backend,'profile',{}).get('current_tolerance_A',1.e-5)
         if not np.isfinite(actual).all() or np.max(abs(actual-values))>tolerance:
@@ -301,7 +289,7 @@ class CouplingService:
         for seed in (knob,*g.get('prior_scan_knobs',())):
             command=centers+amplitude*seed
             if np.all(command>=lower-1.e-9) and np.all(command<=upper+1.e-9):break
-        else:raise BumpRangeUnavailable('Scaled bump exceeds current / step bounds')
+        else:raise BumpLimitUnavailable('Scaled bump exceeds current / step bounds')
         command=np.clip(command,lower,upper)  # Roundoff only, after the strict physical-bound check.
         constraint=np.asarray(g['reconstruction'])@np.nan_to_num(response,nan=0.);desired=np.array([0.,0.,amplitude,0.])
         for iteration in range(opt.max_iterations+1):
@@ -320,10 +308,10 @@ class CouplingService:
             try:
                 step=constrained_step(outside_response[usable],-observed['outside'][usable],constraint,
                                       desired-observed['state'],lower-command,upper-command)
-            except ValueError as exc:
+            except BumpLimitUnavailable as exc:
                 if observed['outside_max_mm']>opt.outside_max_mm or observed['outside_rms_mm']>opt.outside_rms_mm:
                     raise BumpLeakage(observed) from exc
-                raise BumpRangeUnavailable('Bump closure cannot reach this displacement: '+str(exc)) from exc
+                raise
             command=command+step
         if observed['outside_max_mm']>opt.outside_max_mm or observed['outside_rms_mm']>opt.outside_rms_mm:
             raise BumpLeakage(observed)
@@ -451,7 +439,9 @@ class CouplingService:
             self.check_matrix_settings(self.response_matrix,g['baseline'])
             cached=self.response_matrix['columns']
         spans=np.minimum(min(opt.probe_A,opt.max_step_A),np.minimum(centers-lower,upper-centers))
-        if (spans<=1.e-6).any():raise ValueError('No symmetric probe margin for selected correctors')
+        if (spans<=1.e-6).any():
+            g.update(restored=True,calibrated=False)
+            raise BumpLimitUnavailable('No symmetric probe margin for selected correctors')
         outside=np.asarray(g['outside_indices'])
         common=outside[baseline_valid[outside]]
         n_bpms=len(baseline_valid)
@@ -485,8 +475,8 @@ class CouplingService:
             try:
                 knob=constrained_step(response[outrows[usable]],np.zeros(np.count_nonzero(usable)),
                                       np.asarray(g['reconstruction'])@np.nan_to_num(response,nan=0.),[0,0,1,0],-margin,margin)
-            except ValueError as exc:
-                raise BumpRangeUnavailable('Measured response cannot form the calibration bump: '+str(exc)) from exc
+            except BumpLimitUnavailable as exc:
+                raise BumpLimitUnavailable('Measured response cannot form the calibration bump: '+str(exc)) from exc
             checks=[]
             for amplitude in (opt.calibration_mm,-opt.calibration_mm):
                 self.status(event,'closure',f'4/5 Checking closure at Y {amplitude:+.3f} mm')
@@ -495,7 +485,7 @@ class CouplingService:
                 # Keep a common linear knob. Scan points still verify actual closure.
                 if amplitude>0:knob=(observed['currents_A']-centers)/amplitude
             knob=(checks[0]['currents_A']-checks[1]['currents_A'])/(2*opt.calibration_mm)
-            if np.any(abs(knob)>margin+1.e-10):raise BumpRangeUnavailable('Calibrated bump exceeds the calibration current margin')
+            if np.any(abs(knob)>margin+1.e-10):raise BumpLimitUnavailable('Calibrated bump exceeds the calibration current margin')
             g.update(response=response,knob_A_per_mm=knob,reference_orbit_mm=baseline,calibration_checks=checks,
                      calibrated=False,options=asdict(opt),orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
         except BaseException as exc:
@@ -523,7 +513,7 @@ class CouplingService:
     def select_scan_range(self,g,opt,result,progress=lambda *_:None,event=lambda *_:None):
         """Test contiguous windows around zero, prioritizing width over centering.
 
-        The default requested width is 0.8 mm, with a 0.4 mm fallback. Window
+        The default widths are 0.8, 0.4 and 0.2 mm, in that order. Window
         centers are tested nearest zero first in 1/8-width increments. Every
         window contains the baseline (zero); a known failed interior point
         invalidates a window. These are COD checks only, with no XSR acquisition.
@@ -531,7 +521,7 @@ class CouplingService:
         """
         baseline=np.asarray(g['reference_orbit_mm']);knob=np.asarray(g['knob_A_per_mm'])
         response=np.asarray(g['response']);checked={}
-        result['range_checks']=[];result['range_attempts']=[];leakage=None
+        result['range_checks']=[];result['range_attempts']=[]
         currents=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
         lower=np.maximum(lower,currents-opt.max_step_A)-currents
         upper=np.minimum(upper,currents+opt.max_step_A)-currents
@@ -539,7 +529,7 @@ class CouplingService:
         endpoints=np.array([lower[active]/knob[active],upper[active]/knob[active]])
         reachable_low=float(np.max(np.min(endpoints,axis=0))) if active.any() else 0.
         reachable_high=float(np.min(np.max(endpoints,axis=0))) if active.any() else 0.
-        for width in (2*opt.amplitude_mm,opt.amplitude_mm):
+        for width in opt.scan_widths_mm:
             centers=[0.]+[sign*width*i/8 for i in range(1,5) for sign in (1,-1)]
             # Do not miss a full-width window merely because a supply bound
             # falls between the regular center steps (e.g. [-0.35,+0.45]).
@@ -569,7 +559,6 @@ class CouplingService:
                             observed=self.close_at(g,response,knob,baseline,amplitude,opt,event)
                             entry.update(success=True,observation=observed)
                         except BumpRangeUnavailable as exc:
-                            if isinstance(exc,BumpLeakage):leakage=exc
                             entry['error']=str(exc)
                             if isinstance(exc,BumpLeakage) and len(g.get('closure_helpers',()))==2:raise
                             restore_correctors(self.backend,g['actuators'],g['centers'])
@@ -596,8 +585,7 @@ class CouplingService:
                     event(dict(kind='range',scan_range=selected))
                     progress(5,f'Selected bump scan range {low:+.3f} to {high:+.3f} mm (width {width:.3f} mm)')
                     return selected
-        if leakage is not None:raise leakage
-        raise BumpRangeUnavailable('No closed scan window at the requested width or half-width; inspect range checks')
+        raise BumpLimitUnavailable(f'No closed scan window down to {opt.scan_widths_mm[-1]:g} mm full width')
 
     def scan(self,calibration,opt,progress=lambda *_:None,event=lambda *_:None,*,resume=None):
         if resume is not None:
@@ -651,13 +639,14 @@ class CouplingService:
         g=copy.deepcopy(calibration);baseline=np.asarray(g['reference_orbit_mm']);knob=np.asarray(g['knob_A_per_mm'])
         response=np.asarray(g['response']);self.reader.orbit_measurements=[]
         result=dict(schema='dr-coupling-bump-1',calibration=g,options=asdict(opt),
-                    points=[],fits=[],started_unix_s=resume['started_unix_s'] if resume else time.time(),applied=False)
+                    points=[],fits=[],history_floor_um=resume.get('history_floor_um',0.) if resume else self.xsr_history_floor_um,
+                    started_unix_s=resume['started_unix_s'] if resume else time.time(),applied=False)
         self.last_result=result
         retained=resume['points'][:resume.get('resume_from')] if resume else []
         if retained and retained[-1]['phase']=='final verification':retained=retained[:-1]
         if resume:
             event(dict(kind='scan_history',target=g['target'],points=retained,
-                       fits=resume['fits'][:int(len(retained)>=5)+int(len(retained)>=7)]))
+                       fits=[f for f in resume['fits'] if f.get('point_count',5)<=len(retained)]))
         saved_points=iter(retained)
         def measure(amplitude,phase):
             previous=next(saved_points,None)
@@ -676,13 +665,6 @@ class CouplingService:
                        orbit=observed,actuators=list(g['actuators']))
             result['points'].append(point);event(dict(kind='point',point=point))
             return point
-        def fit_points(keep_on_failure):
-            try:fit=fit_size(result['points'],opt.amplitude_mm,selected['bounds_mm'])
-            except ValueError:
-                result['resume_from']=keep_on_failure
-                raise
-            result['fits'].append(fit);event(dict(kind='fit',fit=fit,index=len(result['fits'])-1))
-            return fit
         try:
             if resume and 'scan_range' in resume:
                 for key in ('range_checks','range_attempts','scan_range'):
@@ -694,21 +676,60 @@ class CouplingService:
             for i,a in enumerate(np.linspace(low,high,5)):
                 measure(a,'coarse');progress(10+10*i,f'XSR scan {a:+.3f} mm: 10 updates')
             result['observed_coarse_range_mm']=[min(p['amplitude_mm'] for p in result['points']),max(p['amplitude_mm'] for p in result['points'])]
-            fit=fit_points(0)
-            # Near a boundary the additional points stay within the authorized range.
-            refinement=np.clip([fit['best_mm']-opt.refine_mm,fit['best_mm']+opt.refine_mm],low,high)
-            result['refinement_mm']=refinement
-            for a in refinement:measure(a,'refinement')
-            fit=fit_points(5)
+            result['sem_floor_um']=max(result['history_floor_um'],float(np.median([p['xsr']['sem'] for p in result['points']])))
+            result['refinement_mm']=[];result['xsr_bounds_mm']=[float(low),float(high)]
+            blocked=[c['amplitude_mm'] for c in result['range_checks'] if not c['success']]
+            # Replay any failed extension at the same decision stage on Resume.
+            rejections=resume.get('edge_rejections',[]) if resume else []
+            result['edge_rejections']=[]
+            while True:
+                stage=len(result['points'])
+                if not result['fits'] or result['fits'][-1]['point_count']!=stage:
+                    try:fit=size_fit(result['points'],result['xsr_bounds_mm'],result['sem_floor_um'])
+                    except ValueError:
+                        result['resume_from']=0 if stage==5 else stage-1
+                        raise
+                    result['fits'].append(fit)
+                    event(dict(kind='fit',fit=fit,index=len(result['fits'])-1))
+                    for rejection in rejections:
+                        if rejection['stage']==stage:
+                            result['edge_rejections'].append(rejection)
+                            blocked.append(rejection['amplitude_mm'])
+                decision=next_xsr_point(fit,result['points'],selected,opt.refine_mm,blocked)
+                if decision is None:break
+                amplitude,phase=decision
+                self.status(event,'scan',f'{g["target"]}: {phase} at {amplitude:+.3f} mm')
+                try:measure(amplitude,phase)
+                except BumpLeakage:raise
+                except BumpRangeUnavailable as exc:
+                    if phase!='edge':raise
+                    restore_correctors(self.backend,g['actuators'],g['centers'])
+                    result['edge_rejections'].append(dict(stage=stage,amplitude_mm=amplitude,reason=str(exc)))
+                    blocked.append(amplitude)
+                    continue
+                result['refinement_mm'].append(amplitude)
+                if phase=='edge':
+                    result['xsr_bounds_mm']=[(low+high)/2-.5,(low+high)/2+.5]
+                    event(dict(kind='xsr_bounds',bounds=result['xsr_bounds_mm']))
             final=measure(fit['best_mm'],'final verification')
             best_measured=min(result['points'][:-1],key=lambda p:p['xsr']['mean'])
-            tolerance=3*np.hypot(final['xsr']['sem'],best_measured['xsr']['sem'])+1.e-3
+            tolerance=3*np.hypot(max(result['sem_floor_um'],final['xsr']['sem']),
+                                 max(result['sem_floor_um'],best_measured['xsr']['sem']))+1.e-3
             if final['xsr']['mean']>best_measured['xsr']['mean']+tolerance:
                 raise ValueError('Verified fitted optimum is worse than the best measured size; baseline restored')
             result.update(applied=True,final_amplitude_mm=fit['best_mm'],final=final,
                           final_observed_amplitude_mm=final['amplitude_mm'],
                           final_currents_A=self.backend.read('correctors',g['actuators']))
             self.check();progress(100,f"Set fitted optimum {fit['best_mm']:+.4f} mm; final XSR verified")
+        except NoXSRMinimum as exc:
+            result.update(skip_reason=str(exc),applied=False)
+            try:
+                restore_correctors(self.backend,g['actuators'],g['centers'])
+                self.verify_geometry(g);result['restored']=True
+            except Exception as restore_error:
+                result.update(restoration_error=str(restore_error),restored=False)
+                raise
+            self.check()
         except BaseException as exc:
             result.update(error=str(exc),applied=False)
             try:restore_correctors(self.backend,g['actuators'],g['centers']);result['restored']=True

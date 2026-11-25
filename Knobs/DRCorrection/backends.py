@@ -12,6 +12,10 @@ import numpy as np
 HERE=Path(__file__).resolve().parent
 
 
+class MagnetCurrentLimitError(ValueError):
+    """A finite magnet command exceeds the permitted current range."""
+
+
 class MagnetReadbackError(RuntimeError):
     """A named magnet's current could not be read or did not converge."""
     def __init__(self,names,message):
@@ -180,7 +184,7 @@ class EpicsBackend(DemoBackend):
             else:lo,hi=self.profile['skew_limits_A'] if kind=='skews' else (-5.,5.)
             if not np.isfinite([lo,hi]).all() or lo>=hi:raise ValueError('Invalid current-limit PVs for '+name)
             if kind!='skews':lo=max(lo,-5.);hi=min(hi,5.)
-            if lo>=hi:raise ValueError('No permitted current range for '+name)
+            if lo>=hi:raise MagnetCurrentLimitError('No permitted current range for '+name)
             lower.append(lo);upper.append(hi)
         if names is None:return max(lower),min(upper)
         return np.asarray(lower),np.asarray(upper)
@@ -217,8 +221,11 @@ class EpicsBackend(DemoBackend):
         settle=float(self.profile.get('magnet_settle_s',0.))
         if not np.isfinite(settle) or settle<0:raise ValueError('Invalid magnet_settle_s')
         available=self.skews if kind=='skews' else self.hcorrectors+self.vcorrectors
-        if len(names)!=len(values) or len(set(names))!=len(names) or set(names)-set(available) or not np.isfinite(values).all() or np.any(values<lo) or np.any(values>hi):
+        if values.shape!=(len(names),) or len(set(names))!=len(names) or set(names)-set(available) or not np.isfinite(values).all():
             raise ValueError('Command outside current limits')
+        outside=(values<lo)|(values>hi)
+        if outside.any():
+            raise MagnetCurrentLimitError('Command outside current limits: '+', '.join(np.asarray(names)[outside]))
         if not names:return
         old=self.read(kind,names)
         tolerance=float(self.profile['current_tolerance_A'])

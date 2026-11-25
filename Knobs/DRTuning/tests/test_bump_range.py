@@ -30,8 +30,8 @@ class AdaptiveBumpRangeTests(unittest.TestCase):
         self.assertEqual(result['scan_range']['width_mm'],.8)
         self.assertTrue(result['scan_range']['shifted']);self.assertFalse(result['scan_range']['fallback'])
         self.assertAlmostEqual(result['final_amplitude_mm'],.5,places=5)
-        np.testing.assert_allclose(result['refinement_mm'],[.4,.6],atol=1.e-6)
-        self.assertEqual(sum(e['kind']=='sample' for e in events),80)
+        np.testing.assert_allclose(result['refinement_mm'],[.5],atol=1.e-6)
+        self.assertEqual(sum(e['kind']=='sample' for e in events),70)
         self.assertTrue(any(e['kind']=='range' for e in events))
         lo,hi=np.asarray(self.g['limits'])
         for _,names,values in self.b.commands:
@@ -50,7 +50,7 @@ class AdaptiveBumpRangeTests(unittest.TestCase):
         np.testing.assert_allclose(result['scan_range']['bounds_mm'],[-.2,.2])
         self.assertEqual(result['scan_range']['width_mm'],.4)
         self.assertTrue(result['scan_range']['fallback']);self.assertFalse(result['scan_range']['shifted'])
-        np.testing.assert_allclose(result['refinement_mm'],[.03,.2],atol=1.e-6)
+        self.assertEqual(result['refinement_mm'],[])
         self.assertAlmostEqual(result['final_amplitude_mm'],.13,places=5)
         amplitudes=[check['amplitude_mm'] for check in result['range_checks']]
         self.assertEqual(len(amplitudes),len(set(amplitudes)))
@@ -71,8 +71,16 @@ class AdaptiveBumpRangeTests(unittest.TestCase):
         self.assertFalse(result['scan_range']['fallback']);self.assertEqual(result['scan_range']['width_mm'],.8)
         self.assertAlmostEqual(result['final_amplitude_mm'],.3,places=5)
 
-    def test_no_feasible_half_width_restores_and_never_reads_xsr(self):
+    def test_quarter_width_can_scan_and_apply(self):
         self.current_window(-.15,.15)
+        self.b.minimum=.03
+        result=self.s.scan(self.g,self.opt)
+        np.testing.assert_allclose(result['scan_range']['bounds_mm'],[-.1,.1])
+        self.assertTrue(result['applied'])
+        self.assertAlmostEqual(result['final_amplitude_mm'],.03,places=5)
+
+    def test_no_feasible_minimum_width_restores_and_never_reads_xsr(self):
+        self.current_window(-.075,.075)
         with patch.object(self.b,'sample_xsr',side_effect=AssertionError('XSR before feasible range')):
             with self.assertRaisesRegex(BumpRangeUnavailable,'No closed scan window'):self.s.scan(self.g,self.opt)
         self.assertEqual(self.b.snapshot(),self.baseline);self.assertTrue(self.s.last_result['restored'])

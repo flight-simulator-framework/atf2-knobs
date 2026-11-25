@@ -113,10 +113,11 @@ class CouplingTests(unittest.TestCase):
             if value['kind']=='point':
                 self.assertEqual(self.b.acquisitions,bpm_counts_at_xsr_end[-1])
                 self.assertTrue(value['point']['orbit']['closed'])
+        self.s.xsr_history_floor_um=.17
         result=self.s.scan(g,self.o,event=event)
         self.assertTrue(result['applied']);self.assertAlmostEqual(result['final_amplitude_mm'],.13,places=5)
         np.testing.assert_allclose(result['refinement_mm'],[.03,.23],atol=1.e-6)
-        self.assertEqual(len(result['points']),8);self.assertEqual(len(result['fits']),2)
+        self.assertEqual(len(result['points']),8);self.assertEqual(len(result['fits']),3)
         self.assertEqual(sum(e['kind']=='sample' for e in events),80)
         self.assertEqual(self.b.acquisitions,bpm_counts_at_xsr_end[-1])
         self.assertLess(result['final']['orbit']['outside_max_mm'],1.e-6)
@@ -141,7 +142,9 @@ class CouplingTests(unittest.TestCase):
                 self.assertFalse(self.s.last_result['applied'])
     def test_unbracketed_minimum_restores(self):
         g=self.s.calibrate(self.b.geometry(),self.o);initial=self.b.snapshot();self.b.minimum=.8
-        with self.assertRaisesRegex(ValueError,'not bracketed'):self.s.scan(g,self.o)
+        result=self.s.scan(g,self.o)
+        self.assertIn('not bracketed',result['skip_reason'])
+        self.assertFalse(result['applied']);self.assertTrue(result['restored'])
         self.assertEqual(self.b.snapshot(),initial)
     def test_changed_settings_block_scan_before_writes(self):
         g=self.s.calibrate(self.b.geometry(),self.o);self.b.offset=1.;self.b.commands=[]

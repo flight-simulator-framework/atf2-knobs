@@ -13,6 +13,7 @@ from Knobs.DRCorrection.core import serial
 from .qmod_gui import QModPanel,HERE,FAMILIES
 from .optics import phase_beta
 from .hardware import load_hardware_profile
+from .model import name as magnet_name
 from .vertical_dispersion import VerticalDispersionPanel
 
 
@@ -242,7 +243,9 @@ class TuningSession(DRCorrectionWindow):
         self.coupling_panel=CouplingPanel(self);self.tabs.addTab(self.coupling_panel,'Local bump / XSR coupling')
         from .presentation import STYLE,reflow_correction
         self.setStyleSheet(STYLE);self.resize(1280,820)
+        default_fixed={n for n in backend.hcorrectors+backend.vcorrectors if magnet_name(n) in ('ZH15R','ZV16R')}
         for mode,panel in self.panels.items():
+            panel.options.fixed_actuators=tuple(sorted(set(panel.options.fixed_actuators)|default_fixed))
             if backend.identity.startswith('epics:') or backend.label.startswith('RFTrack'):
                 panel.options.adaptive_probe=True
             if backend.identity.startswith('epics:'):

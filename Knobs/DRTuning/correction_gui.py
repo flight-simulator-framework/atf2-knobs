@@ -12,7 +12,8 @@ from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,
 from Knobs.DRCorrection.core import serial,Cancelled
 from Knobs.DRCorrection.gui import Plot
 from .dispersion_plot import DispersionPlot
-from .coupling import CouplingService,BumpOptions,BumpRangeUnavailable
+from .coupling import CouplingService,BumpOptions,BumpRangeUnavailable,BumpLimitUnavailable
+from .bump_fit import historical_sem_floor
 from .bump_presets import bump_preset
 from .dispersion import DispersionService,DispersionOptions,QM_PROBE_PRESETS_A
 from .qm_checkpoint import load_checkpoint,prepare_destination,save_checkpoint
@@ -107,15 +108,16 @@ class CouplingPanel(CorrectionTool):
         self.target=QComboBox();self.target.addItems([f'{f}.{i}' for f in ('SD1R','SF1R') for i in range(1,35)])
         self.form.addRow('SD / SF bump position',self.target)
         self.amplitude=control(self.form,'Scan width [mm]',.8,.02,4.)
-        self.amplitude.setToolTip('Full scan width. Try centered, then shifted windows containing zero; if none closes, use half this width. A shifted endpoint can reach the full width from zero.')
+        self.amplitude.setToolTip('Full scan width. Try centered and shifted windows containing zero, then narrow down to 0.2 mm.')
         self.refine=control(self.form,'Refinement ± [mm]',.1,.001,1.)
+        self.refine.setToolTip('Candidate offset from the fitted minimum. Measure one side at a time. Edge minima can expand the full window to 1 mm.')
         self.probe=control(self.form,'Corrector probe ± [A]',.05,.001,.5)
         self.step=control(self.form,'Max change from baseline [A]',2.,.001,5.)
         self.leak=control(self.form,'Outside COD max [µm]',30.,.1,1000.,1)
         self.rms=control(self.form,'Outside COD RMS [µm]',20.,.1,1000.,1)
         self.settle=control(self.form,'Settle before acquisition [s]',1.,0.,60.)
         self.controls.insertWidget(0,QLabel('BPM: 10 updates / XSR: 10 updates\nXSR:PROJ_V_SIGMA — vertical size [µm]'))
-        self.range_status=QLabel('Requested width 0.800 mm; fallback 0.400 mm. Center may shift.')
+        self.range_status=QLabel(self.scan_width_text())
         self.range_status.setWordWrap(True);self.controls.insertWidget(1,self.range_status)
         self.preset_status=QLabel();self.preset_status.setWordWrap(True);self.controls.insertWidget(2,self.preset_status)
         self.availability_status=QLabel('Positions not checked against current BPMs / currents.');self.availability_status.setWordWrap(True)
@@ -188,6 +190,9 @@ class CouplingPanel(CorrectionTool):
         options=copy.deepcopy(self.window.panels['dispersion'].options)
         options.model_match_tunes=False
         return options
+    def scan_width_text(self):
+        widths=' → '.join(f'{width:.3f}' for width in self.options().scan_widths_mm)
+        return f'Full scan width [mm]: {widths}. Center may shift.'
     def preview_preset(self):
         target=self.target.currentData() or self.target.currentText()
         preset=bump_preset(target)
@@ -208,7 +213,7 @@ class CouplingPanel(CorrectionTool):
         self.geometry=None;self.calibration=None;self.scan_button.setEnabled(False)
         index=self.target.currentIndex()
         self.calibrate_button.setEnabled(index>=0 and self.target.model().item(index).isEnabled())
-        self.range_status.setText(f'Requested width {self.amplitude.value():.3f} mm; fallback {self.amplitude.value()/2:.3f} mm. Center may shift.')
+        self.range_status.setText(self.scan_width_text())
         self.preview_preset()
         target=self.target.currentData() or self.target.currentText()
         self.activity_label.setText('Idle — '+target+' preset ready for calibration.' if index>=0 else 'No available bump position.')
@@ -241,7 +246,7 @@ class CouplingPanel(CorrectionTool):
         self.availability_status.setText(f'Last check: {len(enabled)}/{self.target.count()} positions available. Gray = unavailable.\nRecheck after machine settings change; scan width still requires measured closure.')
         self.set_table(['Target','Available','Reason / BPMs'],[(r['target'],'Yes' if r['available'] else 'No',
             ', '.join(r['internal_bpms']) if r['available'] else r['reason']) for r in report['rows']])
-        self.status.setText('Preset BPMs and current budget checked. Minimum predicted scan width '+f'{self.options().amplitude_mm:.3f} mm. No magnet changed.')
+        self.status.setText('Preset BPMs and current budget checked. Minimum predicted scan width '+f'{self.options().scan_widths_mm[-1]:.3f} mm. No magnet changed.')
     def rank(self):
         def done(rows):
             previous=set(self.checked_targets()) if self.queue_list.count() else None
@@ -307,6 +312,7 @@ class CouplingPanel(CorrectionTool):
 
     def run(self,action,done,label):
         recovery_data=None
+        target=self.queue[0] if self.running_queue else self.target.currentData() or self.target.currentText()
         def work(progress):
             try:
                 if recovery_data and recovery_data.get('restoration_error'):
@@ -316,9 +322,10 @@ class CouplingPanel(CorrectionTool):
                 return action(progress)
             except Exception as exc:
                 partial=self.service.last_result
-                if self.running_queue and isinstance(exc,BumpRangeUnavailable) and partial and partial.get('restored') and not partial.get('restoration_error'):
+                if isinstance(exc,BumpRangeUnavailable) and partial and partial.get('restored') and not partial.get('restoration_error'):
                     g=partial.get('pending_geometry') or partial.get('calibration',partial)
-                    if g.get('target')==self.queue[0] and len(g.get('closure_helpers',()))==2:
+                    exhausted_helpers=self.running_queue and len(g.get('closure_helpers',()))==2
+                    if g.get('target')==target and (isinstance(exc,BumpLimitUnavailable) or exhausted_helpers):
                         try:
                             self.service.verify_geometry(g)
                             self.service.check()
@@ -360,10 +367,13 @@ class CouplingPanel(CorrectionTool):
             self.after_worker(lambda:self.recovery(message,lambda:self.finish_skipped(value)))
             return
         self.skipped.append(dict(record,path=str(path)))
-        self.window.log(f'{target} skipped after two extra correctors. Baseline verified. {reason}\n{path}')
-        self.queue.pop(0);self.scan_resume=None
+        self.window.log(f'{target} skipped. Baseline verified. {reason}\n{path}')
+        self.scan_resume=None
         self.invalidate();self.reset_button.setEnabled(False)
-        self.after_worker(self.next_target)
+        self.status.setText(f'{target} skipped: {reason}. Baseline verified.')
+        self.activity_label.setText(self.status.text())
+        if self.running_queue:
+            self.queue.pop(0);self.after_worker(self.next_target)
 
     def recovery(self,message,retry):
         box=QMessageBox(self)
@@ -405,6 +415,15 @@ class CouplingPanel(CorrectionTool):
             self.tempfiles_directory.mkdir(parents=True,exist_ok=True)
             dest=self.tempfiles_directory/f'bump_{target}_{datetime.now():%Y%m%d_%H%M%S_%f}.png'
             figure.savefig(dest,dpi=150)
+            if result['fits'] and result['fits'][-1].get('point_count'):
+                points=result['points'];fit=result['fits'][-1]
+                summary=dict(schema='dr-bump-xsr-history-1',target=target,machine=self.window.backend.identity,
+                    median_sem_um=float(np.median([p['xsr']['sem'] for p in points[:-1]])),
+                    verification_error_um=result['final']['xsr']['mean']-fit['predicted_size_um'],
+                    points=[dict(amplitude_mm=p['amplitude_mm'],requested_amplitude_mm=p['requested_amplitude_mm'],
+                                 phase=p['phase'],mean_um=p['xsr']['mean'],sem_um=p['xsr']['sem']) for p in points],
+                    fits=result['fits'],sem_floor_um=result['sem_floor_um'],xsr_bounds_mm=result['xsr_bounds_mm'])
+                save_checkpoint(dest.with_suffix('.xsr.json'),summary)
         except Exception as exc:
             message='Optimum applied. XSR plot export failed: '+str(exc)
             self.after_worker(lambda:self.recovery(message,lambda:self.finish_scan(result)))
@@ -441,13 +460,17 @@ class CouplingPanel(CorrectionTool):
         opt=self.options();g=copy.deepcopy(self.calibration)
         self.points=[];self.samples={};self.fits=[];self.redraw()
         def done(value):
+            if value.get('skip_reason'):
+                self.finish_skipped(dict(skip_target=g['target'],reason=value['skip_reason'],partial=value));return
             self.calibration=value['calibration']
             self.result=value;self.scan_button.setEnabled(False);self.calibrate_button.setEnabled(False);self.reset_button.setEnabled(True)
             self.status.setText(f"Set {value['final_amplitude_mm']:+.4f} mm; XSR {value['final']['xsr']['mean']:.3f} µm.\nCalibrate again before another scan.")
             self.activity_label.setText(f"Scan complete — Optimum Y {value['final_amplitude_mm']:+.4f} mm applied; currents remain at the optimum.")
             self.finish_scan(value)
         def measure(p):
-            if not self.scan_resume:self.update.emit(dict(kind='scan_restart',target=g['target']))
+            if not self.scan_resume:
+                self.service.xsr_history_floor_um=historical_sem_floor(self.tempfiles_directory,self.window.backend.identity)
+                self.update.emit(dict(kind='scan_restart',target=g['target']))
             return self.service.scan(g,opt,p,self.update.emit,resume=self.scan_resume)
         self.run(measure,done,'Local bump / XSR minimization')
     def reset(self):
@@ -470,6 +493,9 @@ class CouplingPanel(CorrectionTool):
         if kind=='scan_restart':
             self.plot_target=event['target'];self.points=[];self.samples={};self.fits=[];self.last_orbit=None
             self.redraw();return
+        if kind=='xsr_bounds':
+            low,high=event['bounds']
+            self.range_status.setText(f'Expanded XSR window: {low:+.3f} to {high:+.3f} mm.');return
         if kind=='scan_history':
             self.plot_target=event['target'];self.points=list(event['points']);self.fits=list(event['fits'])
             self.samples={(p['phase'],p['amplitude_mm']):p['xsr'] for p in self.points}
@@ -542,8 +568,12 @@ class CouplingPanel(CorrectionTool):
             ax.errorbar(p['amplitude_mm'],p['xsr']['mean'],yerr=p['xsr']['sem'],fmt='o',color='C0',
                         label='10-update mean ± SEM' if i==0 else None)
         for i,fit in enumerate(fits):
-            ax.plot(fit['amplitude_mm'],fit['size_um'],'--' if i==0 else '-',label=f'Fit {i+1}: {fit["best_mm"]:+.4f} mm')
-            ax.axvline(fit['best_mm'],color=f'C{i+1}',alpha=.4)
+            best=fit['best_mm'];bracketed=fit.get('bracketed',True)
+            label=f'Fit {i+1}: '+(f'{best:+.4f} mm' if bracketed else 'minimum not bracketed')
+            if i==len(fits)-1 and bracketed and fit.get('ci95_mm'):
+                lo,hi=fit['ci95_mm'];label+=f' (95% CI {lo:+.3f} to {hi:+.3f})'
+            ax.plot(fit['amplitude_mm'],fit['size_um'],'--' if i==0 else '-',label=label)
+            if bracketed:ax.axvline(best,color=f'C{i+1}',alpha=.4)
         ax.set(xlabel='Vertical displacement at SD/SF [mm]',ylabel='XSR σy [µm]',title=f'{target}  XSR σy')
         if points or fits:ax.legend(fontsize=8)
         ax.grid(alpha=.2)

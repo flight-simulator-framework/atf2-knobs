@@ -5,7 +5,8 @@ from functools import lru_cache
 from pathlib import Path
 import numpy as np
 from .model import name
-from .bump_maps import constrained_step,BumpGeometryUnavailable
+from Knobs.DRCorrection.backends import MagnetCurrentLimitError
+from .bump_maps import constrained_step,BumpGeometryUnavailable,BumpLimitUnavailable
 from scipy.optimize import linprog
 
 
@@ -93,15 +94,18 @@ def preset_geometry(backend,target,valid,opt,options):
     for j,label in enumerate(saved_names):
         if label in bpm_map:
             i=bpm_map[label];response[[i,i+n]]=saved_response[[j,j+saved_n]]
-    centers=np.asarray(backend.read('correctors',selected),float);lower,upper=np.asarray(backend.limits('correctors',selected),float)
+    centers=np.asarray(backend.read('correctors',selected),float)
+    try:lower,upper=np.asarray(backend.limits('correctors',selected),float)
+    except MagnetCurrentLimitError as exc:raise BumpLimitUnavailable(str(exc)) from exc
     if not np.isfinite(np.r_[centers,lower,upper]).all():raise ValueError('Nonfinite corrector readbacks / limits')
     margin=np.minimum(opt.max_step_A,np.minimum(centers-lower,upper-centers))
-    if np.any(margin<=1.e-6):raise BumpGeometryUnavailable('Insufficient current margin for bidirectional corrector probes')
+    if np.any(margin<=1.e-6):raise BumpLimitUnavailable('Insufficient current margin for bidirectional corrector probes')
     outrows=np.r_[outside,outside+n];constraint=reconstruction@response
     try:
         knob=constrained_step(response[outrows],np.zeros(len(outrows)),constraint,[0,0,1,0],
                               -margin/opt.calibration_mm,margin/opt.calibration_mm)
-    except ValueError as exc:raise BumpGeometryUnavailable('Insufficient calibration current budget: '+str(exc)) from exc
+    except BumpLimitUnavailable as exc:raise BumpLimitUnavailable('Insufficient calibration current budget: '+str(exc)) from exc
+    except ValueError as exc:raise BumpGeometryUnavailable('Calibration response solve failed: '+str(exc)) from exc
     leakage=np.column_stack((response[outrows],np.zeros(len(outrows))))
     equality=np.column_stack((constraint,-np.array([0.,0.,1.,0.])))
     bounds=list(zip(np.maximum(lower-centers,-opt.max_step_A),np.minimum(upper-centers,opt.max_step_A)))+[(None,None)]
@@ -109,11 +113,13 @@ def preset_geometry(backend,target,valid,opt,options):
     for sign in (1.,-1.):
         fit=linprog(sign*objective,A_eq=equality,b_eq=np.zeros(4),A_ub=np.r_[leakage,-leakage],
             b_ub=np.full(2*len(outrows),opt.outside_max_mm),bounds=bounds,method='highs')
-        if not fit.success:raise BumpGeometryUnavailable('Preset/current limits do not give a feasible scan interval')
+        if fit.status==2:raise BumpLimitUnavailable('Preset/current limits do not give a feasible scan interval')
+        if not fit.success:raise BumpGeometryUnavailable('Scan interval solve failed: '+fit.message)
         predicted.append(float(fit.x[-1]))
     width=predicted[1]-predicted[0]
-    if width<opt.amplitude_mm-1.e-8:
-        raise BumpGeometryUnavailable(f'Insufficient current budget: predicted scan width {width:.4g} mm < minimum {opt.amplitude_mm:.4g} mm')
+    minimum=opt.scan_widths_mm[-1]
+    if width<minimum-1.e-8:
+        raise BumpLimitUnavailable(f'Insufficient current budget: predicted scan width {width:.4g} mm < minimum {minimum:.4g} mm')
     return dict(target=target,actuators=selected,bpm_names=bpms,positions_m=np.asarray(backend.positions_m).copy(),
         outside_indices=outside,outside_rows=outrows,internal_indices=internal,internal_bpms=[bpms[i] for i in internal],
         reconstruction=reconstruction,model_response=response,model_knob_A_per_mm=knob,centers=centers,limits=[lower,upper],

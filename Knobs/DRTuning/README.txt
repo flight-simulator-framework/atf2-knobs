@@ -346,9 +346,12 @@ Bump / XSR coupling:
   Readback, acquisition and restoration failures pause for operator recovery.
   Eligibility uses current readbacks, parameter A/B and max change from
   baseline, with nominal response only to estimate the reachable interval.
-  A shifted interval with the fallback width (default 0.4 mm) is sufficient;
+  A shifted interval with the minimum full width (default 0.2 mm) is sufficient;
   the bidirectional calibration probe must also fit. Measured closure still
   determines the actual scan interval. Recheck after machine settings change.
+  ZV16R and ZH15R start unchecked in Utilities > BPM / magnet selection.
+  This shared selection also applies to bump calibration, closure helper selection
+  and shared response measurements. Check either corrector to enable it.
   Opening the live bump panel ranks targets by absolute trim current and checks
   the first five with available readbacks. Run checked in order calibrates
   and scans each checked target with the previous target's optimum in place.
@@ -386,8 +389,10 @@ Bump / XSR coupling:
      it tries shifted windows of the same 0.8 mm width, nearest zero first with
      0.1 mm center increments. All windows contain the original zero, so the
      furthest permitted shifted endpoint is +/-0.8 mm. If no full-width window
-     closes, try width 0.4 mm, centered first then shifted in 0.05 mm increments.
-     For other requested widths these increments and fallback scale proportionally.
+     closes, try full widths 0.4 and 0.2 mm in order. At each width try the
+     centered window first and then shift the center in steps of one eighth
+     of the width. Custom widths also halve down to 0.2 mm. A requested width
+     below 0.2 mm is tried as entered.
      A window aligned with the calculated current bounds is also checked when
      those bounds fall between regular center increments.
      Endpoints, midpoint and quarter points must pass COD/current/target checks;
@@ -395,8 +400,9 @@ Bump / XSR coupling:
      closure restores baseline currents before trying another window. Hardware,
      acquisition and BPM validity failures abort instead of triggering fallback.
      Range discovery performs no XSR acquisition. The selected bounds/full width,
-     all range attempts and measured checks are displayed/saved. No feasible
-     half-width window means stop and restore; no further automatic narrowing.
+     all range attempts and measured checks are displayed/saved. Insufficient
+     corrector current margin or exhaustion of the scan windows skips the target
+     after baseline verification. The queue proceeds to its next checked target.
      The accepted window is scanned at five equally spaced points using
      I(a)=I0+a*k (e.g. -.4,-.2,0,.2,.4 mm if the original window closes).
      Before XSR acquisition at each point, the scan checks outside X/Y and
@@ -409,14 +415,28 @@ Bump / XSR coupling:
      curves are plotted live. The fitted horizontal coordinate is the observed
      local displacement; requested amplitudes are saved separately. A weighted
      quadratic fits sigma_y squared and is
-     displayed as sigma_y. The minimum must have resolved positive curvature
-     and be inside the measured scan range. Additional measurements at the
-     first fitted best +/- .1 mm (clamped to the selected window) are
-     followed by a refit. Each point is recorded immediately after its tenth
-     fresh XSR update. The final fitted optimum uses the same sequence.
-     Final size must be consistent with the best
-     measured point. Successful completion leaves the optimum currents set.
-     Normal runs have 5 coarse + 2 refinement + 1 final points = 80 XSR updates.
+     displayed as sigma_y. Five coarse points establish the first fit. The
+     fitted minimum and its nominal 95% interval are calculated by testing
+     where the derivative of that quadratic is consistent with zero. A
+     bracketed interval within 0.05 mm on each side of the optimum allows
+     immediate final verification. Otherwise, evaluate the expected interval
+     at each candidate (default best +/-0.1 mm), measure the more informative
+     side and refit. Up to two extra XSR points are taken. At that limit the
+     minimum must have resolved positive curvature and its bounded interval
+     must lie within the observed positions.
+     For a minimum near an edge, extend the full window up to 1.0 mm about
+     the selected window center and measure the outer endpoint on that side.
+     A centered initial scan can reach -0.5 or +0.5 mm. The BPM closure and
+     current limits also apply here; known failed range points are respected.
+     If further expansion is unavailable, check between the outer points.
+     A flat scan or unresolved/unbracketed minimum restores and verifies
+     baseline and skips the target. Successful scans use 6 to 8 XSR points,
+     including the independently measured final optimum. The final size must
+     be consistent with the best measured point before leaving the currents set.
+     Each fit uses a SEM floor based on the five coarse points and up to 20
+     recent same-machine summaries. The historical estimate uses median SEM
+     and (from three prior scans) the spread of verification errors. A
+     timestamped .xsr.json next to the PNG saves point statistics and fits.
   The SD/SF-labelled XSR plot for each completed target is saved under
   /mnt/nas1/atf-data/op/tempfiles/. On error, Resume retries the interrupted
   stage. A scan restored to its baseline reuses completed XSR points. A failed

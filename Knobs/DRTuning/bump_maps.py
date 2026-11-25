@@ -10,6 +10,18 @@ from .model import linear_map,normal_modes,name
 from .model_optics import partial_element
 
 
+class BumpGeometryUnavailable(ValueError):
+    """Healthy acquisition, but no usable local geometry within the bounds."""
+
+
+class BumpRangeUnavailable(BumpGeometryUnavailable):
+    """Current bounds or measured closure prevent this displacement."""
+
+
+class BumpLimitUnavailable(BumpRangeUnavailable):
+    """Insufficient current margin or no feasible scan window for this target."""
+
+
 def constrained_step(a,b,e,target,lower,upper,ridge=1.e-5):
     """Bounded least squares with exact observable constraints, no clipping."""
     a,b,e,target,lower,upper=map(lambda v:np.asarray(v,float),(a,b,e,target,lower,upper))
@@ -18,7 +30,8 @@ def constrained_step(a,b,e,target,lower,upper,ridge=1.e-5):
         raise ValueError('Nonfinite, rank-deficient or infeasible bump response')
     norms=np.linalg.norm(e,axis=1);en=e/norms[:,None];tn=target/norms
     feasible=linprog(np.zeros(len(lower)),A_eq=en,b_eq=tn,bounds=list(zip(lower,upper)),method='highs')
-    if not feasible.success:raise ValueError('Bump target cannot be reached within current limits')
+    if feasible.status==2:raise BumpLimitUnavailable('Bump target cannot be reached within current limits')
+    if not feasible.success:raise ValueError('Current feasibility solve failed: '+feasible.message)
     scale=max(float(np.linalg.norm(a,2)),1.e-12);a=a/scale;b=b/scale
     h=a.T@a+ridge**2*np.eye(len(lower));g=a.T@b
     fit=minimize(lambda x:.5*x@h@x-g@x,feasible.x,jac=lambda x:h@x-g,
@@ -77,10 +90,6 @@ def periodic_response(table,bpms,correctors,actuators):
             values.append(z[[0,2]])
         columns.append(np.asarray(values).T.ravel())
     return np.column_stack(columns)
-
-
-class BumpGeometryUnavailable(ValueError):
-    """Healthy acquisition, but no usable local geometry within the bounds."""
 
 
 def select_geometry(model,target,valid,*,excluded=(),fixed=(),amplitude_mm=.4,max_step_A=1.,preferred=None,table=None,min_width_mm=0.,outside_max_mm=.01):

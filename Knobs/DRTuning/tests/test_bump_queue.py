@@ -105,7 +105,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(len(saved['points']), 3)
             result = service.scan(calibration, opt, resume=saved)
         self.assertTrue(result['applied'])
-        self.assertEqual(len(calls), 9)
+        self.assertEqual(len(calls), 7)
         self.assertAlmostEqual(calls[3], calls[4])
 
     def test_scan_preserves_xsr_through_two_helpers_and_interrupted_calibration(self):
@@ -126,7 +126,7 @@ class RecoveryTests(unittest.TestCase):
                 raise TimeoutError('helper probe interrupted')
             return probe(n,*args,**kwargs)
         def leak(geometry,*args):
-            if (len(geometry['actuators']),read.call_count) in ((8,3),(9,6)):
+            if (len(geometry['actuators']),read.call_count) in ((8,3),(9,5)):
                 outside=np.zeros(len(g['outside_rows']))
                 outside[:len(outside)//2]=np.linspace(.03,.08,len(outside)//2)
                 raise BumpLeakage(dict(outside=outside,outside_max_mm=.08,outside_rms_mm=.05))
@@ -141,8 +141,8 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(len(partial['points']),3)
             first=partial['points'][0]
             result=service.scan(g,opt,resume=partial)
-        self.assertEqual(read.call_count,8)  # 5 coarse, 2 refinement, 1 final
-        self.assertEqual([len(p['actuators']) for p in result['points']],[8]*3+[9]*3+[10]*2)
+        self.assertEqual(read.call_count,6)  # 5 coarse and the verified optimum
+        self.assertEqual([len(p['actuators']) for p in result['points']],[8]*3+[9]*2+[10])
         self.assertIs(result['points'][0],first)
         self.assertEqual(result['started_unix_s'],partial['started_unix_s'])
         self.assertTrue(result['applied'])
@@ -189,6 +189,46 @@ class RecoveryTests(unittest.TestCase):
 
 
 class QueueGuiTests(unittest.TestCase):
+    def test_preset_current_limit_skips_before_writing_without_helpers(self):
+        from Knobs.DRTuning.bump_presets import bump_preset
+        app=QApplication.instance() or QApplication([])
+        backend=PresetBackend()
+        target='SF1R.2'
+        backend.currents[bump_preset(target)['actuators'][0]]=5.
+        window=TuningSession(backend);panel=window.coupling_panel
+        try:
+            with tempfile.TemporaryDirectory() as tmp, patch.object(window,'start',side_effect=lambda work,done,label:done(work(lambda *_:None))), \
+                 patch.object(panel,'after_worker',side_effect=lambda run:run()),patch.object(panel,'recovery') as popup:
+                panel.run_data_directory=Path(tmp)
+                panel.target.clear();panel.target.addItem(target,target)
+                panel.queue=[target];panel.running_queue=True
+                panel.next_target()
+                popup.assert_not_called()
+                self.assertEqual(backend.commands,[])
+                self.assertFalse(panel.running_queue)
+                record,=panel.skipped
+                self.assertEqual(record['target'],target)
+                self.assertTrue(record['baseline_verified'])
+                self.assertIn('current margin',record['reason'])
+        finally:window.close();app.processEvents()
+
+    def test_default_fixed_magnets_can_be_reenabled_from_shared_selection(self):
+        from Knobs.DRCorrection.selection import SelectionDialog
+        app=QApplication.instance() or QApplication([])
+        backend=PresetBackend()
+        window=TuningSession(backend)
+        try:
+            selection=SelectionDialog(window)
+            excluded={'ZV16R','ZH15R'}
+            self.assertEqual(set(selection.magnets.excluded()),excluded)
+            panel=window.coupling_panel
+            self.assertEqual(set(panel.model_options().fixed_actuators),excluded)
+            for item in selection.magnets.rows():
+                if item.text()=='ZH15R':item.setCheckState(Qt.CheckState.Checked)
+            selection.apply_to(window)
+            self.assertEqual(panel.model_options().fixed_actuators,('ZV16R',))
+        finally:window.close();app.processEvents()
+
     def test_exhausted_closure_saves_points_and_runs_next_checked_target(self):
         app=QApplication.instance() or QApplication([])
         backend=DispersionFixture()
