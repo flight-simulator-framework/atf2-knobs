@@ -308,7 +308,7 @@ class CouplingService:
             try:
                 step=constrained_step(outside_response[usable],-observed['outside'][usable],constraint,
                                       desired-observed['state'],lower-command,upper-command)
-            except BumpLimitUnavailable as exc:
+            except ValueError as exc:
                 if observed['outside_max_mm']>opt.outside_max_mm or observed['outside_rms_mm']>opt.outside_rms_mm:
                     raise BumpLeakage(observed) from exc
                 raise

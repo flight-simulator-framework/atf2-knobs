@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 import numpy as np
-from Knobs.DRCorrection.backends import DemoBackend,EpicsBackend,HERE,profile_issues
+from Knobs.DRCorrection.backends import DemoBackend,EpicsBackend,HERE,MagnetCurrentLimitError,profile_issues
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled,save_session,load_session,export_curves
 from Knobs.DRCorrection.dataio import parse_sad_orbits,aligned_difference,fit_sr,load_tbt_text
 from Knobs.DRCorrection.tbt import analyze_tbt
@@ -169,7 +169,9 @@ class EpicsTests(unittest.TestCase):
         client.fail='v'
         with self.assertRaises(RuntimeError):b.write('correctors',['H','V'],[.2,.3])
         self.assertEqual(b.snapshot(),original)
-        with self.assertRaises(ValueError):b.write('correctors',['H'],[5.1])
+        with self.assertRaisesRegex(MagnetCurrentLimitError,'H'):b.write('correctors',['H'],[5.1])
+        with self.assertRaises(ValueError) as exc:b.write('correctors',['H'],[np.nan])
+        self.assertNotIsInstance(exc.exception,MagnetCurrentLimitError)
         b.set_frequency(500.);self.assertEqual(b.frequency(),500.);b.restore(original)
     def test_nan_readback_rejected(self):
         client=FakeEpics();b=EpicsBackend(fake_profile(),client)
