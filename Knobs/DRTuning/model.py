@@ -460,7 +460,20 @@ class ModelManager:
         self.model=model;self.settings=settings;self.baseline=baseline
         return model
     def acquire(self,service,mode,opt,progress):
-        b=self.backend;model=self.prepare(opt,service.check_cancel,progress)
+        b=self.backend
+        try:
+            model=self.prepare(opt,service.check_cancel,progress)
+        except ValueError as exc:
+            attempt=self.last_attempt or {}
+            if (mode!='dispersion' or opt.plane!='y' or
+                    attempt.get('stage')!='initial imported optics stability check' or
+                    'initial_optics_failure' not in attempt):
+                raise
+            hint='Save diagnostics before retrying. '
+            if not opt.model_match_tunes and attempt['settings'].get('preparation')=='sad_cod':
+                hint+='With current tune targets, try Current optics + tune fit. '
+            hint+='For nominal ZV selection, choose Saved nominal RFTrack, then Find ZVs and Measure selected ZVs before Apply.'
+            raise ValueError(f'{exc}\n{hint}') from exc
         if mode=='dispersion' and opt.plane=='y':
             target_y=np.asarray(b.target_dispersion('y'),float)
             if target_y.shape!=(len(b.bpm_names),) or not np.isfinite(target_y).all():

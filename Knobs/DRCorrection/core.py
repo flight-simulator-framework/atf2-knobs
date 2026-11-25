@@ -37,6 +37,13 @@ class Cancelled(RuntimeError):
     pass
 
 
+class NoCommonBPMs(ValueError):
+    """The acquisition has no valid BPM in the enabled selection."""
+
+
+ZV_RETRY_STEP_A = .01
+
+
 def serial(value):
     if isinstance(value,np.ndarray):return serial(value.tolist())
     if isinstance(value,np.generic):return serial(value.item())
@@ -227,7 +234,16 @@ class CorrectionService:
             message+='No common valid BPMs across the acquired samples/settings. '
         if not available.any():message+='Enable magnets for the selected plane/family. '
         frames=self.orbit_measurements if measurements is None else measurements
-        if frames:
+        if (opt.response_source=='rftrack_nominal' and len(frames)==3 and
+                all('names' in frame and 'valid' in frame.get('samples',{}) for frame in frames)):
+            fit_names=np.asarray(names)[enabled]
+            for label,frame in zip(('RF baseline','RF minus','RF plus'),frames):
+                rows=np.isin(frame['names'],fit_names)
+                shots=np.asarray(frame['samples']['valid'],bool)[:,rows]
+                per_shot=shots.sum(axis=1)
+                message+=(f'{label}: {int(shots.all(axis=0).sum())} BPMs valid on every update; '
+                          f'{int(per_shot.min())}–{int(per_shot.max())} per update. ')
+        elif frames:
             counts=[int(np.sum(frame['valid'])) for frame in frames]
             last=frames[-1];samples=last.get('samples',last)
             x=np.asarray(samples['x']);y=np.asarray(samples['y']);q=np.asarray(samples['tmit'])
@@ -237,6 +253,8 @@ class CorrectionService:
             diagnostics=last.get('validity_diagnostics',[])
             if diagnostics:message+='BPM source/status per sample: '+str(diagnostics)+'. '
         message+='Check COD mode, beam/intensity and BPM selection; no correction applied.'
+        if enabled.any() and available.any() and not (enabled & acquisition_valid).any():
+            raise NoCommonBPMs(message)
         raise ValueError(message)
 
     def _signal(self,mode,opt):
@@ -282,7 +300,14 @@ class CorrectionService:
             return np.array(signals),mask
         raise ValueError('Unknown correction mode')
 
-    def acquire(self,mode,opt,progress=lambda *_:None):
+    def _measure_probe_signal(self,mode,opt,previous_valid,names):
+        value,mask=self._signal(mode,opt)
+        self.sync_dispersion_selection(mode,opt)
+        valid=previous_valid & mask
+        self.require_usable(self.backend.bpm_names,value,np.zeros_like(value),valid,names,opt)
+        return value,valid
+
+    def acquire(self,mode,opt,progress=lambda *_:None,*,retry_zv_probes=False):
         validate_bpm_sampling(opt)
         validate_adaptive_probe(opt)
         if opt.response_source=='rftrack_nominal':
@@ -346,21 +371,36 @@ class CorrectionService:
             valid_before=valid.copy();restored=False;restoration_error=''
             try:
                 amplitude=min(probe,opt.adaptive_max_probe) if opt.adaptive_probe else probe
-                pairs=int(opt.adaptive_max_pairs) if opt.adaptive_probe else 1
+                pairs=int(opt.adaptive_max_pairs) if opt.adaptive_probe else (Options.adaptive_max_pairs if retry_zv_probes else 1)
+                initial_pair=True
+                skip_reason=''
                 for attempt in range(pairs):
                     self.pause_checkpoint(progress,int(100*j/len(names)),baseline,ignored)
                     self.check_cancel();values=[];full_values=[];readbacks=[];restored=False
                     lo=max(low[j],centers[j]-amplitude);hi=min(high[j],centers[j]+amplitude)
                     if hi<=lo:raise ValueError('No available probe range')
+                    pair_valid=valid.copy()
+                    reduced=initial_pair and attempt>0
                     try:
                         for setting in (lo,hi):
                             delay=float(getattr(self.backend,'profile',{}).get('magnet_settle_s',0.))
                             progress(int(100*j/len(names)),f'{name}: pair {attempt+1}/{pairs}, set {setting:.6g} {self.backend.unit(kind)}; current readback + {delay:g} s extra wait; BPM {opt.bpm_samples} samples, {opt.bpm_interval_s:g} s interval (first read delayed)')
                             self.backend.write(kind,[name],[setting])
-                            value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
-                            if opt.adaptive_probe:readbacks.append(float(self.backend.read(kind,[name])[0]))
-                            self.sync_dispersion_selection(mode,opt)
-                            self.require_usable(self.backend.bpm_names,value,np.zeros_like(value),valid,names,opt)
+                            try:
+                                value,accepted=self._measure_probe_signal(mode,opt,pair_valid,names)
+                            except NoCommonBPMs:
+                                if not retry_zv_probes or attempt==0:raise
+                                delay_s=3.
+                                probe_history.append(dict(magnet=name,pair=attempt+1,amplitude=amplitude,
+                                    setting_A=setting,status='retry_bpm',delay_s=delay_s,used_for_response=False))
+                                progress(int(100*j/len(names)),f'{name}: no common BPM at {setting:g} A; waiting 3 s before remeasuring this endpoint once')
+                                if self.cancel.wait(delay_s):self.check_cancel()
+                                try:value,accepted=self._measure_probe_signal(mode,opt,pair_valid,names)
+                                except NoCommonBPMs as repeated:
+                                    raise NoCommonBPMs(f'{name}: no common BPM after retry at {setting:g} A. {repeated}') from repeated
+                            pair_valid=accepted
+                            values.append(value);full_values.append(self.full_signal.copy())
+                            if opt.adaptive_probe or reduced:readbacks.append(float(self.backend.read(kind,[name])[0]))
                     except BaseException as exc:
                         try:
                             if hasattr(self.backend,'restore_probe'):self.backend.restore_probe(kind,name,centers[j])
@@ -370,12 +410,38 @@ class CorrectionService:
                             restoration_error=f'Probe restoration also failed for {name}: {restoration}'
                             if not isinstance(exc,MagnetReadbackError) or set(exc.names)!={name}:
                                 raise RuntimeError(f'{exc}\n{restoration_error}') from exc
-                        raise
+                        if not (restored and retry_zv_probes and initial_pair and isinstance(exc,NoCommonBPMs)):
+                            raise
+                        self.check_cancel()
+                        progress(int(100*j/len(names)),f'{name}: no common BPM at {setting:g} A; restored to {centers[j]:g} A. Checking beam at original current.')
+                        reference,reference_valid=self._signal(mode,opt)
+                        self.sync_dispersion_selection(mode,opt)
+                        try:
+                            self.require_usable(self.backend.bpm_names,reference,np.zeros_like(reference),
+                                valid & reference_valid,names,opt,self.orbit_measurements[-3:])
+                        except ValueError as recovery:
+                            raise ValueError(f'{name}: BPM coverage unavailable at original current {centers[j]:g} A. {recovery}') from recovery
+                        # Shrink the actual failed excursion, including a supply-clipped endpoint.
+                        excursion=min(amplitude,abs(setting-centers[j]))
+                        half_steps=np.floor(excursion/(2*ZV_RETRY_STEP_A)+1.e-10)
+                        smaller=ZV_RETRY_STEP_A*max(1,half_steps)
+                        retry=smaller<excursion-1.e-10 and attempt+1<pairs
+                        probe_history.append(dict(magnet=name,pair=attempt+1,amplitude=amplitude,unit='A',
+                            commanded=[lo,hi],failed_setting_A=setting,readbacks=readbacks,restored=True,
+                            used_for_response=False,status='no_common_bpm',next_width_A=smaller if retry else None))
+                        if not retry:
+                            skip_reason=f'No common BPM at {setting:g} A; minimum probe width or pair limit reached'
+                            break
+                        progress(int(100*j/len(names)),f'{name}: retry initial probe ±{amplitude:g} → ±{smaller:g} A')
+                        amplitude=smaller
+                        continue
                     else:
                         self.backend.write(kind,[name],[centers[j]])
                         restored=True
+                    valid=pair_valid
+                    initial_pair=False
                     span=hi-lo
-                    if not opt.adaptive_probe:break
+                    if not opt.adaptive_probe and not reduced:break
                     # Use physical readback differences, not assumed movement
                     # within the supply's allowed convergence tolerance.
                     span=readbacks[1]-readbacks[0]
@@ -398,6 +464,12 @@ class CorrectionService:
                         raise MagnetReadbackError([name],f'{name}: adaptive probe has no positive readback span: '
                             f'commanded {lo:g}/{hi:g}, readbacks {readbacks} {self.backend.unit(kind)}; '
                             'original current restored; no correction calculated')
+                    if reduced:
+                        record['status']='target_reached' if reached else 'reduced_initial_probe'
+                        record['used_for_response']=True
+                        progress(int(100*(j+(attempt+1)/pairs)/len(names)),
+                            f'{name}: using reduced probe ±{amplitude:g} A; BPM response {observed:.5g} mm')
+                        break
                     next_amplitude=min(opt.adaptive_max_probe,
                         next_excitation_amplitude(amplitude,observed,opt.adaptive_target_mm,opt.adaptive_max_probe))
                     next_lo=max(low[j],centers[j]-next_amplitude);next_hi=min(high[j],centers[j]+next_amplitude)
@@ -430,6 +502,11 @@ class CorrectionService:
                     if record['magnet']==name:record['used_for_response']=False
                 valid=valid_before
                 progress(int(100*(j+1)/len(names)),f"SKIP {name}: {error['error']}; {error['restoration']}")
+                continue
+            if skip_reason:
+                scan_errors.append(dict(magnet=name,stage='initial ZV probe',error=skip_reason,
+                    restored=True,restoration='original current restored; BPM coverage verified'))
+                progress(int(100*(j+1)/len(names)),f'SKIP {name}: {skip_reason}')
                 continue
             successful.append(j)
             columns.append(((values[1]-values[0])/span).reshape(-1))
@@ -595,7 +672,7 @@ class CorrectionService:
         opt.response_source='measured'
         scan=copy.deepcopy(opt)
         scan.fixed_actuators=tuple(sorted(set(opt.fixed_actuators) | (set(self.backend.vcorrectors)-set(names))))
-        data=self.acquire('dispersion',scan,progress)
+        data=self.acquire('dispersion',scan,progress,retry_zv_probes=True)
         data['rftrack_candidates']=names
         if 'reference_matrix' in proposal:
             data['reference_matrix']=copy.deepcopy(proposal['reference_matrix'])

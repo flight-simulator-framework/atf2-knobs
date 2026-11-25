@@ -32,6 +32,18 @@ with the RFTrack response. Set Maximum ZVs (default 5) and click Find ZVs.
 Measure selected ZVs measures only those response columns. Review the proposed
 currents and predicted curves, then click Apply / remeasure to see the measured
 after curves. Select BPMs / magnets and Recalculate reuse the measured columns.
+If an initial ZV probe loses all common enabled BPMs, the scan restores that
+ZV and checks BPM coverage at the original current across all three RF settings.
+On recovery it repeats both endpoints at a smaller width (e.g. ±0.05, ±0.02,
+±0.01 A) and uses the first valid reduced pair for that ZV. If no width works
+within the retry range or pair limit, that ZV is skipped. Loss of BPM coverage
+at the restored current stops the scan.
+From the second pair on each ZV, a loss of all common enabled BPMs triggers
+one repeat of that endpoint's three RF measurements after a 3-second wait at
+the same ZV current and original RF setting. A repeated failure during the
+initial width search returns to the shrinking procedure above. A repeated
+failure after a successful pair restores the ZV and stops the scan. Cancel
+also works during the wait.
 QM horizontal dispersion is directly below this page in the navigation.
 On either plot, hover over a measured point to read its BPM name, position
 and signal value. Click the point to exclude it or the grey point to include

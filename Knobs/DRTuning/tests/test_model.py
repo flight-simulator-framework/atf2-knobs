@@ -124,6 +124,183 @@ class ModelRoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Settings changed'):
             self.service.measure_selected_zvs(preview)
         self.assertEqual(self.machine.commands,[])
+
+    def test_initial_zv_loss_retries_both_endpoints_from_restored_center(self):
+        self.opt.count_v=1
+        self.opt.response_source='rftrack_nominal'
+        self.opt.adaptive_probe=True
+        self.opt.bpm_samples=10
+        preview=self.service.calculate('dispersion',self.opt)
+        name,=preview['selected']
+        orbit=self.machine.orbit
+        def lost_at_upper_endpoint():
+            result=orbit()
+            if self.machine.currents[name]>.011:result['valid'][:]=False
+            return result
+        with patch.object(self.machine,'orbit',side_effect=lost_at_upper_endpoint),patch.object(
+                self.service.cancel,'wait',return_value=False) as wait:
+            data=self.service.measure_selected_zvs(preview)
+        wait.assert_called_once_with(3.)
+        commands=[c[2][0] for c in self.machine.commands if c[0]=='correctors']
+        np.testing.assert_allclose(commands,[-.05,.05,0.,-.02,.02,0.,-.01,.01,0.])
+        history=data['probe_history']
+        self.assertEqual([r['used_for_response'] for r in history],[False,False,False,True])
+        self.assertEqual([r['next_width_A'] for r in history if r['status']=='no_common_bpm'],[.02,.01])
+        self.assertTrue(data['valid'].all())
+        j=self.machine.vcorrectors.index(name)
+        np.testing.assert_allclose(data['response'][:96,0],self.machine.dispr[:,j],atol=1.e-8)
+        self.assertEqual(self.machine.snapshot(),preview['baseline'])
+
+    def test_unmeasurable_zv_at_floor_is_skipped_only_if_center_recovers(self):
+        self.opt.count_v=2
+        self.opt.response_source='rftrack_nominal'
+        preview=self.service.calculate('dispersion',self.opt)
+        first,remaining=sorted(preview['selected'],key=self.machine.vcorrectors.index)
+        orbit=self.machine.orbit
+        def lost_on_probe():
+            result=orbit()
+            if self.machine.currents[first]:result['tmit'][:]=0.
+            return result
+        with patch.object(self.machine,'orbit',side_effect=lost_on_probe),patch.object(
+                self.service.cancel,'wait',return_value=False):
+            data=self.service.measure_selected_zvs(preview)
+        self.assertEqual(data['actuators'],[remaining])
+        self.assertEqual(data['response'].shape,(192,1))
+        self.assertEqual(data['scan_errors'][0]['magnet'],first)
+        self.assertEqual([r['amplitude'] for r in data['probe_history'] if r['status']=='no_common_bpm'],[.05,.02,.01])
+        self.assertEqual(self.machine.snapshot(),preview['baseline'])
+
+        self.machine.commands.clear()
+        def lost_at_center_too():
+            result=orbit()
+            if any(c[0]=='correctors' for c in self.machine.commands):result['valid'][:]=False
+            return result
+        with patch.object(self.machine,'orbit',side_effect=lost_at_center_too):
+            with self.assertRaisesRegex(ValueError,'BPM coverage unavailable at original current'):
+                self.service.measure_selected_zvs(preview)
+        self.assertEqual([c[2] for c in self.machine.commands if c[0]=='correctors'],[[-.05],[0.]])
+        self.assertEqual(self.machine.snapshot(),preview['baseline'])
+
+    def test_zv_restoration_failure_never_retries(self):
+        self.opt.count_v=1
+        self.opt.response_source='rftrack_nominal'
+        preview=self.service.calculate('dispersion',self.opt)
+        name,=preview['selected']
+        orbit=self.machine.orbit
+        def lost_on_probe():
+            result=orbit()
+            if self.machine.currents[name]:result['valid'][:]=False
+            return result
+        with patch.object(self.machine,'orbit',side_effect=lost_on_probe),patch.object(
+                self.machine,'restore_probe',create=True,side_effect=RuntimeError('restore failed')):
+            with self.assertRaisesRegex(RuntimeError,'Probe restoration also failed'):
+                self.service.measure_selected_zvs(preview)
+        self.assertEqual([c[2] for c in self.machine.commands if c[0]=='correctors'],[[-.05]])
+
+    def test_later_adaptive_zv_pair_does_not_restart_initial_probe_search(self):
+        self.opt.count_v=1
+        self.opt.adaptive_probe=True
+        self.opt.adaptive_target_mm=10.
+        self.opt.response_source='rftrack_nominal'
+        preview=self.service.calculate('dispersion',self.opt)
+        name,=preview['selected']
+        orbit=self.machine.orbit
+        def lost_after_growth():
+            result=orbit()
+            if abs(self.machine.currents[name])>.05:result['valid'][:]=False
+            return result
+        with patch.object(self.machine,'orbit',side_effect=lost_after_growth),patch.object(
+                self.service.cancel,'wait',return_value=False) as wait:
+            with self.assertRaisesRegex(ValueError,'no common BPM after retry'):
+                self.service.measure_selected_zvs(preview)
+        wait.assert_called_once_with(3.)
+        commands=[c[2][0] for c in self.machine.commands if c[0]=='correctors']
+        self.assertEqual(commands[:3],[-.05,.05,0.])
+        self.assertEqual(len(commands),5)
+        self.assertEqual(self.machine.snapshot(),preview['baseline'])
+
+    def test_later_zv_endpoint_recovers_on_fresh_rf_triplet_at_same_current(self):
+        self.opt.count_v=1
+        self.opt.adaptive_probe=True
+        self.opt.adaptive_target_mm=10.
+        self.opt.adaptive_max_pairs=2
+        self.opt.bpm_samples=10
+        self.opt.response_source='rftrack_nominal'
+        preview=self.service.calculate('dispersion',self.opt)
+        name,=preview['selected']
+        orbit=self.machine.orbit
+        upper_observations=[]
+        def first_high_triplet_lost():
+            result=orbit()
+            if self.machine.currents[name]>.05:
+                upper_observations.append(self.machine.offset)
+                if len(upper_observations)<=30:
+                    result['valid'][:]=False
+                    result['y'][:]=99999.
+            return result
+        def wait_at_restored_rf(seconds):
+            self.assertEqual(seconds,3.)
+            self.assertEqual(self.machine.offset,0.)
+            self.assertGreater(self.machine.currents[name],.05)
+            return False
+        with patch.object(self.machine,'orbit',side_effect=first_high_triplet_lost),patch.object(
+                self.service.cancel,'wait',side_effect=wait_at_restored_rf) as wait:
+            data=self.service.measure_selected_zvs(preview)
+        wait.assert_called_once_with(3.)
+        self.assertEqual(len(upper_observations),60)
+        self.assertEqual(upper_observations[:30],upper_observations[30:])
+        self.assertEqual(len([c for c in self.machine.commands if c[0]=='correctors']),6)
+        self.assertTrue(data['valid'].all())
+        self.assertTrue(data['probe_history'][-1]['used_for_response'])
+        self.assertEqual(data['probe_history'][-2]['status'],'retry_bpm')
+        j=self.machine.vcorrectors.index(name)
+        np.testing.assert_allclose(data['response'][:96,0],self.machine.dispr[:,j],atol=1.e-8)
+        self.assertEqual(self.machine.snapshot(),preview['baseline'])
+
+    def test_cancel_during_zv_retry_wait_restores_without_reacquiring(self):
+        from Knobs.DRCorrection.core import Cancelled
+        self.opt.count_v=1
+        self.opt.adaptive_probe=True
+        self.opt.adaptive_target_mm=10.
+        self.opt.response_source='rftrack_nominal'
+        preview=self.service.calculate('dispersion',self.opt)
+        name,=preview['selected']
+        orbit=self.machine.orbit
+        observations=[]
+        def invalid_at_larger_width():
+            result=orbit()
+            if abs(self.machine.currents[name])>.05:
+                observations.append(self.machine.offset)
+                result['valid'][:]=False
+            return result
+        def cancel(seconds):
+            self.service.cancel.set()
+            return True
+        with patch.object(self.machine,'orbit',side_effect=invalid_at_larger_width),patch.object(
+                self.service.cancel,'wait',side_effect=cancel):
+            with self.assertRaises(Cancelled):self.service.measure_selected_zvs(preview)
+        self.assertEqual(len(observations),3)
+        self.assertEqual(self.machine.snapshot(),preview['baseline'])
+
+    def test_nominal_zv_reports_which_rf_setting_lost_bpm_coverage(self):
+        self.opt.response_source='rftrack_nominal'
+        self.opt.bpm_samples=10
+        self.machine.bpm_names[-1]='unmapped BPM'
+        self.opt.excluded_bpms=(self.machine.bpm_names[0],)
+        orbit=self.machine.orbit
+        def interrupted_update():
+            result=orbit()
+            if self.machine.acquisitions==14:result['tmit'][:]=0.
+            return result
+        with patch.object(self.machine,'orbit',side_effect=interrupted_update):
+            with self.assertRaises(ValueError) as caught:self.service.calculate('dispersion',self.opt)
+        message=str(caught.exception)
+        self.assertIn('RF baseline: 94 BPMs valid on every update',message)
+        self.assertIn('RF minus: 0 BPMs valid on every update; 0–94 per update',message)
+        self.assertIn('RF plus: 94 BPMs valid on every update',message)
+        self.assertEqual(self.machine.acquisitions,30)
+        self.assertEqual(self.machine.frequency(),0.)
+        self.assertEqual([c[0] for c in self.machine.commands],['rf','rf','rf'])
     def test_skew_only_two_horizontal_diagnostic_probes(self):
         self.service.calculate('skew',self.opt)
         self.assertEqual(len(self.machine.commands),6)
@@ -188,6 +365,22 @@ class ModelMathTests(unittest.TestCase):
         self.assertEqual(manager.last_attempt['optics_failure']['max_modulus_deviation'],1.)
         from Knobs.DRCorrection.core import serial
         json.dumps(serial(manager.last_attempt),allow_nan=False)
+
+    def test_vertical_unstable_import_offers_explicit_recovery_before_probe(self):
+        b=CountedBackend()
+        options=Options(plane='y',response_source='rftrack',model_match_tunes=False)
+        settings={'preparation':'sad_cod','tunes':None}
+        fake=Mock()
+        fake.tunes.side_effect=lambda:normal_modes(np.diag([1.29989,1/1.29989,1.,1.]))
+        service=CorrectionService(b)
+        with patch('Knobs.DRTuning.model.capture_settings',return_value=settings),patch('Knobs.DRTuning.model.OpticsModel',return_value=fake):
+            with self.assertRaises(ValueError) as error:
+                service.acquire('dispersion',options)
+        for expected in ('0.29989','Current optics + tune fit','Saved nominal RFTrack','Measure selected ZVs'):
+            self.assertIn(expected,str(error.exception))
+        self.assertEqual(service.model_manager.last_attempt['stage'],'initial imported optics stability check')
+        self.assertEqual(b.commands,[])
+        fake.match_tunes.assert_not_called()
     def test_unstable_tune_trial_backtracks_and_failed_fit_restores_model(self):
         from types import SimpleNamespace
         class Quadrupole:

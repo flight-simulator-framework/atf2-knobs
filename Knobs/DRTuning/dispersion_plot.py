@@ -49,14 +49,15 @@ class DispersionPlot(Plot):
         before = data.get('bpm_observations', data)
         names = np.asarray(before['names'])
         positions = np.asarray(before['positions_m'], float)
-        known = np.isfinite(positions).all()
-        x = positions if known else np.arange(1, len(names) + 1)
         indices = {name: i for i, name in enumerate(names)}
         rows = np.array([indices[n] for n in data['names']])
         excluded = np.isin(names, list(self.excluded))
         valid = np.asarray(data.get('acquisition_valid', data.get('scan_state', {}).get('common_valid', data['valid'])), bool)
         valid = valid & np.asarray(data.get('iteration_valid', True), bool)
         observed = valid if before is data else np.asarray(before['valid'], bool)
+        known = bool(observed.any() and np.isfinite(positions[observed]).all())
+        x = positions if known else np.arange(1, len(names) + 1)
+        valid = valid & observed[rows]
         order = np.argsort(x, kind='stable')
         active = order[~excluded[order]]
         curve_order = np.argsort(x[rows], kind='stable')
@@ -67,14 +68,10 @@ class DispersionPlot(Plot):
             unit = 'mm / (dp/p)' if i < 2 else 'mm'
             ax.plot(x[active], np.where(observed, values, np.nan)[active], 'k.-',
                     linewidth=.65, markersize=4, label='Measured before')
-            grey = excluded & np.isfinite(values)
+            visible = observed & np.isfinite(values)
+            grey = excluded & visible
             if grey.any():
                 ax.plot(x[grey], values[grey], '.', color='0.65', label='Excluded', zorder=4)
-            invalid = ~observed & ~excluded & np.isfinite(values)
-            if invalid.any():
-                ax.plot(x[invalid], values[invalid], 'o', color='0.6', fillstyle='none',
-                        markersize=3, label='Invalid for fit')
-            visible = np.isfinite(values)
             self.points[ax] = (names[visible], np.column_stack((x[visible], values[visible])),
                                positions[visible], title, unit)
             for key, label, style in [('full_predicted','Predicted','C2--'),

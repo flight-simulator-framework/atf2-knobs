@@ -35,6 +35,39 @@ class DispersionPlotTests(unittest.TestCase):
         event = MouseEvent(kind, plot.canvas, x, y, button=1 if click else None)
         plot.canvas.callbacks.process(kind, event)
 
+    def test_invalid_observations_hidden_and_manual_exclusion_reversible(self):
+        from Knobs.DRTuning.dispersion_plot import DispersionPlot
+        plot = DispersionPlot()
+        self.addCleanup(plot.close)
+        names = ['MB1R', 'MB2R', 'MB3R', 'MB4R', 'MB5R']
+        observed = dict(names=names, positions_m=[1., 2., 3., 4., np.nan],
+                        valid=[True, True, True, False, False],
+                        full_measured=np.tile([1., 2., 3., 99999., 0.], (4, 1)),
+                        full_signal_labels=['Dispersion X', 'Dispersion Y', 'COD X', 'COD Y'])
+        # The live preview uses all BPMs. The nominal response uses mapped rows.
+        subset = [2, 1, 3]
+        nominal = dict(observed, names=[names[i] for i in subset], bpm_observations=observed,
+                       valid=[True, False, False], acquisition_valid=[True, True, False],
+                       full_predicted=observed['full_measured'][:, subset])
+        plot.bpm_clicked.connect(lambda name: plot.set_excluded(plot.excluded ^ {name}))
+        for data in (observed, nominal):
+            plot.set_excluded({'MB2R', 'MB4R'})
+            plot.correction(data)
+            for ax in plot.figure.axes:
+                self.assertEqual(ax.get_xlabel(), 's [m]')
+                self.assertLess(ax.get_ylim()[1], 10.)
+                self.assertEqual(list(plot.points[ax][0]), names[:3])
+                grey = next(line for line in ax.lines if line.get_label() == 'Excluded')
+                np.testing.assert_equal(grey.get_xdata(), [2.])
+            self.point(plot, plot.figure.axes[1], 'MB2R', click=True)
+            self.assertEqual(plot.excluded, {'MB4R'})
+            self.assertIn(2., plot.figure.axes[1].lines[0].get_ydata())
+            plot.set_excluded(())
+            for ax in plot.figure.axes:
+                self.assertLess(ax.get_ylim()[1], 10.)
+                self.assertNotIn('MB4R', plot.points[ax][0])
+                self.assertNotIn('Invalid for fit', ax.get_legend_handles_labels()[1])
+
     def test_vertical_points_remain_editable_during_zv_scan_and_after_set(self):
         from Knobs.DRTuning.tests.test_model import CountedBackend
         from Knobs.DRCorrection.backends import DemoBackend

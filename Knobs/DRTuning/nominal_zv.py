@@ -39,7 +39,7 @@ def acquire(service, mode, opt, progress):
     centers = np.asarray(b.read('correctors', zv), float)
     limits = b.limits('correctors', zv)
     service.pause_checkpoint(progress, 0, baseline)
-    progress(0, 'Measuring vertical dispersion and COD for nominal RFTrack ZV selection')
+    progress(0, f'Loaded nominal ZV responses. Measuring BPMs at 3 RF settings ({opt.bpm_samples} updates each); ZV currents held fixed.')
     service.orbit_measurements = []
     measured, valid = service._signal(mode, opt)
     service.publish_dispersion_baseline(mode, valid)
