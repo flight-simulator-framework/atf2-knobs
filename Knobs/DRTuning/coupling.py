@@ -5,7 +5,7 @@ import time
 import numpy as np
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
 from .bump_maps import constrained_step,BumpGeometryUnavailable
-from .bump_presets import preset_geometry,bump_targets
+from .bump_presets import preset_geometry,bump_targets,bump_preset
 from .model import name,verify_inputs
 
 
@@ -100,8 +100,13 @@ class CouplingService:
             except Exception as exc:rows.append(dict(name=name(n),current_A=None,available=False,error=str(exc)))
         return sorted(rows,key=lambda r:(not r['available'],-abs(r['current_A'] or 0.)))
 
-    def orbit(self,opt,on_sample=None):
-        x,y,valid=self.reader._orbit(Options(bpm_samples=10),on_sample=on_sample)
+    def orbit(self,opt,on_sample=None,*,required=(),event=lambda *_:None):
+        extra_updates=3
+        def retry(attempt,names,accepted):
+            self.status(event,'bpm_retry',f'BPM retry {attempt}/{extra_updates}: {names}',
+                        samples=accepted,total=opt.bpm_samples)
+        x,y,valid=self.reader._orbit(Options(bpm_samples=opt.bpm_samples),on_sample=on_sample,
+            required_bpms=required,extra_updates=extra_updates,on_retry=retry)
         return np.r_[x,y],valid
 
     @staticmethod
@@ -118,7 +123,12 @@ class CouplingService:
         options=model_options or Options(model_match_tunes=False)
         self.status(event,'check',f'1/5 {target}: Checking preset and current settings')
         baseline=self.backend.snapshot();progress(0,'Checking preset BPMs and current budget')
-        _,valid=self.orbit(opt,self.acquisition_status(event,'check',f'1/5 {target}: Checking BPM validity'))
+        preset=bump_preset(target)
+        internal=set(preset['internal_bpms']) if preset else set()
+        internal.difference_update(name(n) for n in options.excluded_bpms)
+        required=[i for i,n in enumerate(self.backend.bpm_names) if name(n) in internal]
+        _,valid=self.orbit(opt,self.acquisition_status(event,'check',f'1/5 {target}: Checking BPM validity'),
+                           required=required,event=event)
         geometry=preset_geometry(self.backend,target,valid,opt,options)
         if not self.backend.same_settings(self.backend.snapshot(),baseline):
             raise ValueError('Machine settings changed during preset check; calibrate again')
@@ -165,10 +175,9 @@ class CouplingService:
         if self.cancel.wait(opt.settle_s):self.check()
         return actual
 
-    def observe(self,g,baseline,opt,on_sample=None):
-        orbit,valid=self.orbit(opt,on_sample)
+    def observe(self,g,baseline,opt,on_sample=None,*,event=lambda *_:None):
         required=np.unique(np.r_[g['outside_indices'],g['internal_indices']])
-        if not valid[required].all():raise ValueError('Required bump BPM lost beam / validity')
+        orbit,valid=self.orbit(opt,on_sample,required=required,event=event)
         delta=np.where(np.tile(valid,2),np.nan_to_num(orbit-baseline,nan=0.,posinf=0.,neginf=0.),0.)
         state=np.asarray(g['reconstruction'])@delta
         outside=delta[np.asarray(g['outside_rows'],int)]
@@ -194,7 +203,7 @@ class CouplingService:
             details=dict(magnets=list(names),command_A=command.copy(),baseline_A=centers.copy(),amplitude_mm=float(amplitude),iteration=iteration)
             self.status(event,'closure',label+f' — Setting currents; settling {opt.settle_s:g} s',**details)
             currents=self.move(names,command,opt)
-            observed=self.observe(g,baseline,opt,self.acquisition_status(event,'closure',label+' — Measuring outside COD and target position',readback_A=currents.copy(),**details))
+            observed=self.observe(g,baseline,opt,self.acquisition_status(event,'closure',label+' — Measuring outside COD and target position',readback_A=currents.copy(),**details),event=event)
             observed.update(amplitude_mm=float(amplitude),iteration=iteration,currents_A=currents.copy(),closed=self.closed(observed,amplitude,opt))
             event(dict(kind='orbit',**observed))
             if self.closed(observed,amplitude,opt):return observed
@@ -211,9 +220,9 @@ class CouplingService:
         opt.validate();self.backend.validate_mode('orbit');self.verify_geometry(geometry);g=copy.deepcopy(geometry);names=g['actuators']
         self.last_result=g
         centers=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
-        baseline,valid=self.orbit(opt,self.acquisition_status(event,'baseline',f"1/5 {g['target']}: Measuring baseline orbit"));columns=[];self.reader.orbit_measurements=[]
         required=np.unique(np.r_[g['outside_indices'],g['internal_indices']])
-        if not valid[required].all():raise ValueError('Required BPM invalid before calibration')
+        baseline,_=self.orbit(opt,self.acquisition_status(event,'baseline',f"1/5 {g['target']}: Measuring baseline orbit"),required=required,event=event)
+        columns=[];self.reader.orbit_measurements=[]
         spans=np.minimum(min(opt.probe_A,opt.max_step_A),np.minimum(centers-lower,upper-centers))
         if (spans<=1.e-6).any():raise ValueError('No symmetric probe margin for selected correctors')
         try:
@@ -225,8 +234,7 @@ class CouplingService:
                         label=f'2/5 Response {j+1}/{len(names)}: {n} / delta {sign*span:+.4f} A'
                         self.status(event,'probe',label+f' — Setting currents; settling {opt.settle_s:g} s',**details)
                         readbacks.append(float(self.move([n],np.array([center+sign*span]),opt)[0]))
-                        orbit,mask=self.orbit(opt,self.acquisition_status(event,'probe',label+' — Acquiring BPM updates',readback_A=[readbacks[-1]],**details))
-                        if not mask[required].all():raise ValueError('Required BPM invalid during corrector probe')
+                        orbit,mask=self.orbit(opt,self.acquisition_status(event,'probe',label+' — Acquiring BPM updates',readback_A=[readbacks[-1]],**details),required=required,event=event)
                         values.append(np.where(np.tile(mask,2),orbit,0.))
                 finally:
                     self.status(event,'restore_probe',f'2/5 {n}: Sending restore command {center:+.4f} A')
@@ -360,7 +368,7 @@ class CouplingService:
             self.check()
             if xsr['count']!=10 or not xsr.get('update_verified'):raise ValueError('Ten fresh XSR updates required')
             # Verify closure after the XSR integration as well as before it.
-            after=self.observe(g,baseline,opt)
+            after=self.observe(g,baseline,opt,event=event)
             if not self.closed(after,amplitude,opt):raise ValueError('COD drifted during XSR acquisition; baseline restored')
             point=dict(amplitude_mm=actual_amplitude,requested_amplitude_mm=float(amplitude),phase=phase,xsr=xsr,orbit=observed,orbit_after_xsr=after)
             result['points'].append(point);event(dict(kind='point',point=point))

@@ -225,7 +225,7 @@ class CouplingPanel(CorrectionTool):
                     if readbacks is not None:text+=f' / readback {readbacks[i]:+.4f} A'
                     currents.append(text)
                 self.activity_currents.setText('\n'.join(currents))
-            else:self.activity_currents.clear()
+            elif event['stage']!='bpm_retry':self.activity_currents.clear()
             marker=(event['stage'],event['message'])
             if marker!=self.last_stage_message:
                 self.window.log(event['message']);self.last_stage_message=marker

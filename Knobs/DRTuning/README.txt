@@ -338,7 +338,10 @@ Bump / XSR coupling:
   absolute value; failed readbacks are listed separately.
   1. Calibrate and close bump automatically checks the selected preset against
      current BPMs and limits, then measures X/Y corrector response columns with
-     10-update BPM averages. Both signs are tested and baseline currents are
+     10-update BPM averages. At each setting, a sample with an invalid required
+     BPM is discarded and replaced at the same currents, up to three extra
+     updates. A fourth invalid sample stops the measurement and reports the
+     affected BPMs. Both signs are tested and baseline currents are
      restored. Default max baseline current change is 4 A, outside max .01 mm
      and outside RMS .005 mm. Calibration uses the small +/-0.1 mm probe.
   2. Scan width [mm] is the FULL width, default 0.8 mm. Scan -> fit -> set optimum

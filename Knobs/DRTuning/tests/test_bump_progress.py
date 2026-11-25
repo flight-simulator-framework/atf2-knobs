@@ -39,6 +39,39 @@ class BumpProgressTests(unittest.TestCase):
         self.assertEqual(self.backend.snapshot(),baseline)
         self.assertTrue(any(e.get('stage')=='restore' for e in events))
         self.assertFalse(any(e.get('stage')=='complete' for e in events))
+
+    def test_invalid_updates_replaced_at_same_setting(self):
+        events=[]
+        orbit=self.backend.orbit
+        def intermittent():
+            row=orbit()
+            shot=self.backend.acquisitions
+            row['x'][:]=shot
+            if shot in (1,5,12):
+                row['valid'][shot%2]=False
+                row['x'][:]=999.
+            return row
+        with patch.object(self.backend,'orbit',side_effect=intermittent):
+            position,_=self.service.orbit(self.options,required=[0,1],event=events.append)
+        self.assertEqual(self.backend.acquisitions,13)
+        self.assertEqual(self.backend.commands,[])
+        self.assertEqual([e['samples'] for e in events],[0,3,9])
+        np.testing.assert_allclose(position[:8],np.mean([2,3,4,6,7,8,9,10,11,13]))
+
+    def test_persistent_loss_during_probe_names_bpm_and_restores(self):
+        initial=self.backend.snapshot()
+        orbit=self.backend.orbit
+        def missing_at_probe():
+            row=orbit()
+            if any(self.backend.currents.values()):
+                row['tmit'][2]=0.
+            return row
+        with patch.object(self.backend,'orbit',side_effect=missing_at_probe):
+            with self.assertRaisesRegex(ValueError,'after 3 retries: B2'):
+                self.service.calibrate(self.backend.geometry(),self.options)
+        self.assertEqual(self.backend.acquisitions,14)
+        self.assertEqual(self.backend.snapshot(),initial)
+        self.assertTrue(self.service.last_result['restored'])
     def test_failed_restoration_is_reported_as_failure(self):
         events=[]
         with patch.object(self.service,'verify_geometry',side_effect=[None,ValueError('readback mismatch')]):

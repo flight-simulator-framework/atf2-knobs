@@ -186,8 +186,8 @@ class CorrectionService:
                     valid=np.all(arrays['valid'],axis=0),
                     stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0))
 
-    def _orbit(self,opt,on_sample=None):
-        collect=lambda:self._collect_orbit_samples(opt,on_sample)
+    def _orbit(self,opt,on_sample=None,*,required_bpms=(),extra_updates=0,on_retry=None):
+        collect=lambda:self._collect_orbit_samples(opt,on_sample,required_bpms,extra_updates,on_retry)
         stable_read=getattr(self.backend,'stable_beam_read',None)
         arrays,diagnostics,timestamps,fresh=stable_read(collect) if stable_read else collect()
         count=opt.bpm_samples
@@ -199,12 +199,15 @@ class CorrectionService:
             same_shot_verified=False,validity_diagnostics=diagnostics))
         return summary['x'],summary['y'],summary['valid']
 
-    def _collect_orbit_samples(self,opt,on_sample):
+    def _collect_orbit_samples(self,opt,on_sample,required_bpms,extra_updates,on_retry):
         count=opt.bpm_samples;interval=opt.bpm_interval_s
         validate_bpm_sampling(opt)
         samples=[];diagnostics=[];timestamps=[];fresh=[]
-        stream=iter(self.backend.orbit_samples(count,self.cancel,interval)) if hasattr(self.backend,'orbit_samples') else None
-        for _ in range(int(count)):
+        required=np.asarray(required_bpms,dtype=int)
+        budget=int(count)+(extra_updates if required.size else 0)
+        stream=iter(self.backend.orbit_samples(budget,self.cancel,interval)) if hasattr(self.backend,'orbit_samples') else None
+        rejected=0
+        for _ in range(budget):
             self.check_cancel()
             # Same sampling cadence as SysID, but wait BEFORE each sample
             # (including the first) instead of after it, to avoid an immediate
@@ -213,10 +216,20 @@ class CorrectionService:
             result=next(stream) if stream is not None else self.backend.orbit()
             self.check_cancel()
             x,y,valid=checked_orbit(result,self.backend.bpm_names)
+            missing=required[~valid[required]]
+            if missing.size:
+                rejected+=1
+                names=', '.join(self.backend.bpm_names[i] for i in missing)
+                if rejected>extra_updates:
+                    raise ValueError(f'Required BPM invalid after {extra_updates} retries: {names} '
+                                     f'({len(samples)}/{int(count)} valid updates)')
+                if on_retry is not None:on_retry(rejected,names,len(samples))
+                continue
             samples.append(dict(x=x.copy(),y=y.copy(),tmit=np.asarray(result['tmit'],float).copy(),valid=valid.copy()))
             diagnostics.append(result.get('validity_diagnostics',{}))
             timestamps.append(result.get('timestamps',{}));fresh.append(result.get('freshness_verified',False))
             if on_sample is not None:on_sample(len(samples),int(count))
+            if len(samples)==int(count):break
         arrays={key:np.stack([s[key] for s in samples]) for key in ('x','y','tmit','valid')}
         return arrays,diagnostics,timestamps,fresh
 
