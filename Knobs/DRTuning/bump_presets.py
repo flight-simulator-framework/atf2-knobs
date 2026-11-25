@@ -30,6 +30,31 @@ def _responses():
     with np.load(Path(__file__).with_name('bump_preset_responses.npz'),allow_pickle=False) as archive:
         return {target:archive[target] for target in bump_targets()}
 
+def ranked_closure_helpers(backend, geometry, leakage):
+    """Rank unused correctors by their nominal response to the observed leakage."""
+    catalog=_catalog()
+    saved={n:i for i,n in enumerate(catalog['bpm_names'])}
+    internal={name(n) for n in geometry['internal_bpms']}
+    outside=[name(geometry['bpm_names'][i]) for i in geometry['outside_indices']]
+    if not set(outside)<=saved.keys():return []
+    rows=np.array([saved[n] for n in outside])
+    rows=np.r_[rows,rows+len(saved)]
+    magnets={name(n):n for n in backend.hcorrectors+backend.vcorrectors}
+    used={name(n) for n in [*geometry['actuators'],*geometry.get('fixed_actuators',())]}
+    scores={}
+    for target,preset in catalog['presets'].items():
+        # Keep the reconstruction interval kick-free: use correctors from
+        # presets in a disjoint section, checked in both directions.
+        if not internal.issubset(preset['outside_bpms']) or not set(preset['internal_bpms']).issubset(outside):continue
+        for i,n in enumerate(preset['actuators']):
+            if n in used or n not in magnets or n in scores:continue
+            column=_responses()[target][rows,i]
+            norm=np.linalg.norm(column)
+            if norm:
+                score=abs(column@leakage)/norm
+                if score>1.e-12:scores[n]=score
+    return [magnets[n] for n in sorted(scores,key=scores.get,reverse=True)]
+
 
 def preset_geometry(backend,target,valid,opt,options):
     """Bind a fixed preset to current BPM ordering, readbacks and supply limits."""
@@ -80,6 +105,6 @@ def preset_geometry(backend,target,valid,opt,options):
         outside_indices=outside,outside_rows=outrows,internal_indices=internal,internal_bpms=[bpms[i] for i in internal],
         reconstruction=reconstruction,model_response=response,model_knob_A_per_mm=knob,centers=centers,limits=[lower,upper],
         source='Saved nominal bump transport; no runtime RFTrack model',model_settings={},model_match_tunes=False,
-        selection=dict(method='preset',preset_id=preset['id']),predicted_range_mm=predicted,
+        selection=dict(method='preset',preset_id=preset['id']),fixed_actuators=list(fixed),predicted_range_mm=predicted,
         selection_half_range_mm=opt.calibration_mm,
         target_position_note='Target mm inferred from saved nominal transport; corrector response measured during calibration')

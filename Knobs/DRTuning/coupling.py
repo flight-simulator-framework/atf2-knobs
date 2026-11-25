@@ -5,8 +5,9 @@ import time
 import numpy as np
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
 from .bump_maps import constrained_step,BumpGeometryUnavailable
-from .bump_presets import preset_geometry,bump_targets,bump_preset
+from .bump_presets import preset_geometry,bump_targets,bump_preset,ranked_closure_helpers
 from .model import name,verify_inputs
+from .fresh import AcquisitionUnavailable
 
 
 @dataclass
@@ -15,9 +16,9 @@ class BumpOptions:
     refine_mm: float = .1
     calibration_mm: float = .1
     probe_A: float = .05
-    max_step_A: float = 4.
-    outside_max_mm: float = .01
-    outside_rms_mm: float = .005
+    max_step_A: float = 2.
+    outside_max_mm: float = .030
+    outside_rms_mm: float = .020
     position_tolerance_mm: float = .01
     angle_tolerance_mrad: float = .01
     max_iterations: int = 4
@@ -39,6 +40,12 @@ class BumpOptions:
 
 class BumpRangeUnavailable(ValueError):
     """Current bounds or measured closure prevent this displacement, not an IO fault."""
+
+class BumpLeakage(BumpRangeUnavailable):
+    def __init__(self,observed):
+        super().__init__(f"Outside COD exceeds tolerance: max {observed['outside_max_mm']*1000:.2f} µm, "
+                         f"RMS {observed['outside_rms_mm']*1000:.2f} µm")
+        self.outside=observed['outside']
 
 
 def fit_size(points,amplitude_mm,bounds_mm=None):
@@ -87,6 +94,7 @@ class CouplingService:
     def check(self):self.reader.check_cancel()
 
     def ranked_targets(self):
+        self.last_result=None
         if self.backend.unit('skews')!='A':
             raise ValueError('Trim-current ranking needs SD/SF readbacks in A (no physical XSR in native RFTrack)')
         rows=[]
@@ -102,12 +110,19 @@ class CouplingService:
 
     def orbit(self,opt,on_sample=None,*,required=(),event=lambda *_:None):
         extra_updates=3
-        def retry(attempt,names,accepted):
-            self.status(event,'bpm_retry',f'BPM retry {attempt}/{extra_updates}: {names}',
+        def retry(attempt,names,accepted,widespread):
+            delay=' in 3 s' if widespread else ''
+            self.status(event,'bpm_retry',f'BPM retry {attempt}/{extra_updates}{delay}: {names}',
                         samples=accepted,total=opt.bpm_samples)
-        x,y,valid=self.reader._orbit(Options(bpm_samples=opt.bpm_samples),on_sample=on_sample,
-            required_bpms=required,extra_updates=extra_updates,on_retry=retry)
-        return np.r_[x,y],valid
+            if widespread and self.cancel.wait(3.):self.check()
+        for attempt in range(extra_updates+1):
+            try:
+                x,y,valid=self.reader._orbit(Options(bpm_samples=opt.bpm_samples),on_sample=on_sample,
+                    required_bpms=required,extra_updates=extra_updates,on_retry=retry)
+                return np.r_[x,y],valid
+            except (AcquisitionUnavailable,TimeoutError):
+                if attempt==extra_updates:raise
+            retry(attempt+1,'BPM waveform unavailable',0,True)
 
     @staticmethod
     def status(event,stage,message,**details):
@@ -138,8 +153,38 @@ class CouplingService:
 
     def calibrate_target(self,target,opt,options=None,progress=lambda *_:None,event=lambda *_:None):
         geometry=self.prepare(target,opt,options,lambda p,s:progress(round(p*.1),s),event)
-        event(dict(kind='geometry',data=copy.deepcopy(geometry)))
-        return self.calibrate(geometry,opt,lambda p,s:progress(10+round(p*.9),s),event)
+        return self.calibrate_with_helpers(geometry,opt,progress,event)
+
+    def extend_geometry(self,g,opt,loss,event):
+        if len(g.get('closure_helpers',()))>=2:return None
+        self.verify_geometry(g)
+        for n in ranked_closure_helpers(self.backend,g,loss.outside):
+            self.check()
+            center=float(self.backend.read('correctors',[n])[0])
+            low,high=np.asarray(self.backend.limits('correctors',[n]),float)[:,0]
+            if not np.isfinite([center,low,high]).all() or min(center-low,high-center)<=1.e-6:continue
+            geometry={key:copy.deepcopy(g[key]) for key in (
+                'target','actuators','bpm_names','positions_m','outside_indices','outside_rows','internal_indices',
+                'internal_bpms','reconstruction','centers','limits','baseline','options','selection','fixed_actuators',
+                'model_settings','source','predicted_range_mm','target_position_note') if key in g}
+            geometry['actuators']=[*g['actuators'],n]
+            geometry['centers']=np.r_[g['centers'],center]
+            geometry['limits']=[np.r_[g['limits'][0],low],np.r_[g['limits'][1],high]]
+            geometry['closure_helpers']=[*g.get('closure_helpers',()),n]
+            if 'response' in g:
+                geometry['previous_columns']=dict(names=list(g['actuators']),response=g['response'],
+                                                  readbacks=g['probe_readbacks'])
+            self.status(event,'helper',f"{g['target']}: measuring additional closure corrector {n}")
+            return geometry
+        return None
+
+    def calibrate_with_helpers(self,geometry,opt,progress,event):
+        while True:
+            event(dict(kind='geometry',data=copy.deepcopy(geometry)))
+            try:return self.calibrate(geometry,opt,progress,event)
+            except BumpLeakage as loss:
+                geometry=self.extend_geometry(self.last_result,opt,loss,event)
+                if geometry is None:raise
 
     def available_targets(self,opt,model_options=None,progress=lambda *_:None):
         """Read-only preset checks; no lattice construction or tune matching."""
@@ -212,8 +257,12 @@ class CouplingService:
                 step=constrained_step(response[np.asarray(g['outside_rows'],int)],-observed['outside'],constraint,
                                       desired-observed['state'],lower-command,upper-command)
             except ValueError as exc:
+                if observed['outside_max_mm']>opt.outside_max_mm or observed['outside_rms_mm']>opt.outside_rms_mm:
+                    raise BumpLeakage(observed) from exc
                 raise BumpRangeUnavailable('Bump closure cannot reach this displacement: '+str(exc)) from exc
             command=command+step
+        if observed['outside_max_mm']>opt.outside_max_mm or observed['outside_rms_mm']>opt.outside_rms_mm:
+            raise BumpLeakage(observed)
         raise BumpRangeUnavailable('Beam-based bump did not close within COD / target tolerances')
 
     def calibrate(self,geometry,opt,progress=lambda *_:None,event=lambda *_:None):
@@ -222,11 +271,18 @@ class CouplingService:
         centers=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
         required=np.unique(np.r_[g['outside_indices'],g['internal_indices']])
         baseline,_=self.orbit(opt,self.acquisition_status(event,'baseline',f"1/5 {g['target']}: Measuring baseline orbit"),required=required,event=event)
-        columns=[];self.reader.orbit_measurements=[]
+        columns=[];g['probe_readbacks']=[];self.reader.orbit_measurements=[]
+        previous=g.pop('previous_columns',None)
+        if previous:
+            if list(names[:len(previous['names'])])!=previous['names']:
+                raise ValueError('Added corrector differs from the measured response ordering')
+            columns=list(np.asarray(previous['response']).T)
+            g['probe_readbacks']=previous['readbacks']
         spans=np.minimum(min(opt.probe_A,opt.max_step_A),np.minimum(centers-lower,upper-centers))
         if (spans<=1.e-6).any():raise ValueError('No symmetric probe margin for selected correctors')
         try:
-            for j,(n,center,span) in enumerate(zip(names,centers,spans)):
+            for j in range(len(columns),len(names)):
+                n,center,span=names[j],centers[j],spans[j]
                 values=[];readbacks=[]
                 try:
                     for sign in (-1,1):
@@ -244,7 +300,7 @@ class CouplingService:
                 columns.append((values[1]-values[0])/measured_span)
                 g.setdefault('probe_readbacks',[]).append(dict(magnet=n,requested=[center-span,center+span],actual=readbacks))
                 progress(round(70*(j+1)/len(names)),f'Measured bump response {n} ({j+1}/{len(names)})')
-            response=np.column_stack(columns)
+            response=np.column_stack(columns);g['response']=response
             self.status(event,'solve','3/5 Solving Y bump currents from measured response; constraining X, angles and outside COD')
             progress(72,'Calculating Y bump currents from measured response')
             margin=np.minimum(opt.max_step_A,np.minimum(centers-lower,upper-centers))/opt.calibration_mm
@@ -289,7 +345,7 @@ class CouplingService:
         """
         baseline=np.asarray(g['reference_orbit_mm']);knob=np.asarray(g['knob_A_per_mm'])
         response=np.asarray(g['response']);checked={}
-        result['range_checks']=[];result['range_attempts']=[]
+        result['range_checks']=[];result['range_attempts']=[];leakage=None
         currents=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
         lower=np.maximum(lower,currents-opt.max_step_A)-currents
         upper=np.minimum(upper,currents+opt.max_step_A)-currents
@@ -327,8 +383,14 @@ class CouplingService:
                             observed=self.close_at(g,response,knob,baseline,amplitude,opt,event)
                             entry.update(success=True,observation=observed)
                         except BumpRangeUnavailable as exc:
+                            if isinstance(exc,BumpLeakage):leakage=exc
                             entry['error']=str(exc)
                             restore_correctors(self.backend,g['actuators'],g['centers'])
+                            if isinstance(exc,BumpLeakage):
+                                expanded=self.extend_geometry(g,opt,exc,event)
+                                if expanded is not None:
+                                    exc.expanded=expanded
+                                    raise
                         checked[amplitude]=entry
                     entry=checked[amplitude]
                     if not entry['success']:
@@ -347,9 +409,24 @@ class CouplingService:
                     event(dict(kind='range',scan_range=selected))
                     progress(5,f'Selected bump scan range {low:+.3f} to {high:+.3f} mm (width {width:.3f} mm)')
                     return selected
+        if leakage is not None:raise leakage
         raise BumpRangeUnavailable('No closed scan window at the requested width or half-width; inspect range checks')
 
-    def scan(self,calibration,opt,progress=lambda *_:None,event=lambda *_:None):
+    def scan(self,calibration,opt,progress=lambda *_:None,event=lambda *_:None,*,resume=None):
+        if resume is not None:
+            if resume.get('applied') or not resume.get('restored') or resume['calibration']['target']!=calibration['target']:
+                raise ValueError('Cannot resume this bump scan from its recorded baseline')
+            calibration=resume['calibration']
+        while True:
+            try:return self.scan_calibrated(calibration,opt,progress,event,resume)
+            except BumpLeakage as loss:
+                geometry=getattr(loss,'expanded',None) or self.extend_geometry(calibration,opt,loss,event)
+                if geometry is None:raise
+                calibration=self.calibrate_with_helpers(geometry,opt,progress,event)
+                resume=None
+                event(dict(kind='scan_restart',target=geometry['target']))
+
+    def scan_calibrated(self,calibration,opt,progress,event,resume):
         opt.validate()
         if not hasattr(self.backend,'sample_xsr'):raise ValueError('Backend has no measured XSR size acquisition')
         if not calibration.get('calibrated'):raise ValueError('Calibrate the local bump first')
@@ -360,7 +437,15 @@ class CouplingService:
         result=dict(schema='dr-coupling-bump-1',calibration=copy.deepcopy(g),options=asdict(opt),
                     points=[],fits=[],started_unix_s=time.time(),applied=False)
         self.last_result=result
+        saved_points=iter(resume['points'][:resume.get('resume_from')] if resume else ())
         def measure(amplitude,phase):
+            previous=next(saved_points,None)
+            if previous is not None and phase!='final verification':
+                if previous['phase']!=phase or not np.isclose(previous['requested_amplitude_mm'],amplitude):
+                    raise ValueError('Saved XSR point differs from resumed scan grid')
+                result['points'].append(previous)
+                event(dict(kind='point',point=previous))
+                return previous
             observed=self.close_at(g,response,knob,baseline,float(amplitude),opt,event)
             actual_amplitude=float(observed['state'][2])
             def sample(value):event(dict(kind='sample',amplitude_mm=actual_amplitude,requested_amplitude_mm=float(amplitude),phase=phase,xsr=value))
@@ -370,18 +455,30 @@ class CouplingService:
             point=dict(amplitude_mm=actual_amplitude,requested_amplitude_mm=float(amplitude),phase=phase,xsr=xsr,orbit=observed)
             result['points'].append(point);event(dict(kind='point',point=point))
             return point
+        def fit_points(keep_on_failure):
+            try:fit=fit_size(result['points'],opt.amplitude_mm,selected['bounds_mm'])
+            except ValueError:
+                result['resume_from']=keep_on_failure
+                raise
+            result['fits'].append(fit);event(dict(kind='fit',fit=fit))
+            return fit
         try:
-            selected=self.select_scan_range(g,opt,result,progress,event)
+            if resume and 'scan_range' in resume:
+                for key in ('range_checks','range_attempts','scan_range'):
+                    result[key]=resume[key]
+                selected=result['scan_range']
+                event(dict(kind='range',scan_range=selected))
+            else:selected=self.select_scan_range(g,opt,result,progress,event)
             low,high=selected['bounds_mm']
             for i,a in enumerate(np.linspace(low,high,5)):
                 measure(a,'coarse');progress(10+10*i,f'XSR scan {a:+.3f} mm: 10 updates')
             result['observed_coarse_range_mm']=[min(p['amplitude_mm'] for p in result['points']),max(p['amplitude_mm'] for p in result['points'])]
-            fit=fit_size(result['points'],opt.amplitude_mm,selected['bounds_mm']);result['fits'].append(fit);event(dict(kind='fit',fit=fit))
+            fit=fit_points(0)
             # Near a boundary the additional points stay within the authorized range.
             refinement=np.clip([fit['best_mm']-opt.refine_mm,fit['best_mm']+opt.refine_mm],low,high)
             result['refinement_mm']=refinement
             for a in refinement:measure(a,'refinement')
-            fit=fit_size(result['points'],opt.amplitude_mm,selected['bounds_mm']);result['fits'].append(fit);event(dict(kind='fit',fit=fit))
+            fit=fit_points(5)
             final=measure(fit['best_mm'],'final verification')
             best_measured=min(result['points'][:-1],key=lambda p:p['xsr']['mean'])
             tolerance=3*np.hypot(final['xsr']['sem'],best_measured['xsr']['sem'])+1.e-3
@@ -398,7 +495,9 @@ class CouplingService:
                 result.update(restoration_error=str(restore_error),restored=False)
                 raise
             raise
-        finally:result['orbit_measurements']=copy.deepcopy(self.reader.orbit_measurements)
+        finally:
+            previous=resume.get('orbit_measurements',[]) if resume else []
+            result['orbit_measurements']=previous+copy.deepcopy(self.reader.orbit_measurements)
         return result
 
     def reset(self,result):

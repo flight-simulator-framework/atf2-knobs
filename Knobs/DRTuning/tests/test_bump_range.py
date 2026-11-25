@@ -150,7 +150,9 @@ class BumpRangeGuiTests(unittest.TestCase):
         try:
             panel=window.coupling_panel
             self.assertEqual(panel.amplitude.value(),.8);self.assertEqual(panel.options().amplitude_mm,.4)
-            self.assertEqual(panel.step.value(),4.)
+            self.assertEqual(panel.step.value(),2.)
+            self.assertEqual(panel.options().outside_max_mm,.030)
+            self.assertEqual(panel.options().outside_rms_mm,.020)
             panel.on_update(dict(kind='range',scan_range=dict(bounds_mm=[-.2,.6],width_mm=.8,fallback=False)))
             self.assertIn('-0.200 to +0.600',panel.range_status.text())
             panel.on_update(dict(kind='range',scan_range=dict(bounds_mm=[-.2,.2],width_mm=.4,fallback=True)))

@@ -8,6 +8,7 @@ from .acquisition import TBTController,ReadbackTBTController,tbt_orbit_mode
 from .calibration import coil_k1l
 from .hardware import main_supply_mappings,quadrupole_supply
 from . import power_pause
+from .fresh import AcquisitionUnavailable
 
 
 class LiveBackend(EpicsBackend):
@@ -33,6 +34,12 @@ class LiveBackend(EpicsBackend):
         pvs=[p['packed_pv']] if p.get('packed_pv') else [p[k] for k in ('x','y','tmit')]
         for records in updates(self.metadata,pvs,count,cancel,
                 timeout_s=self.profile.get('update_timeout_s',15.),interval_s=interval_s):
+            if p.get('packed_pv'):
+                size=np.size(records[p['packed_pv']]['value'])
+                if size%p['row_width'] or size//p['row_width']<=max(p['row_indices']):
+                    raise AcquisitionUnavailable('Incomplete BPM waveform: '+p['packed_pv'])
+            elif any(np.size(records[pv]['value'])!=len(self.bpm_names) for pv in pvs):
+                raise AcquisitionUnavailable('Incomplete BPM waveform')
             result=self.orbit({pv:r['value'] for pv,r in records.items()})
             result.update(timestamps={pv:float(r['timestamp']) for pv,r in records.items()},
                           freshness_verified=True,same_shot_verified=False)
@@ -40,12 +47,46 @@ class LiveBackend(EpicsBackend):
     @power_pause.fresh_measurement()
     def sample_xsr(self,cancel,count=10,callback=lambda *_:None):
         from .fresh import updates,scalar_statistics
+        if int(count)!=count or not 1<=count<=1000:
+            raise ValueError('Sample count must be an integer in 1..1000')
         pv='XSR:PROJ_V_SIGMA';values=[];stamps=[]
-        for records in updates(self.metadata,[pv],count,cancel,interval_s=1.,poll_s=1.,
-                               timeout_s=self.profile.get('update_timeout_s',15.)):
-            values.append(float(records[pv]['value']));stamps.append(float(records[pv]['timestamp']))
+        retries=0;stream=None
+        while len(values)<count:
+            if stream is None:
+                stream=updates(self.metadata,[pv],min(1000,count-len(values)+3-retries),cancel,interval_s=1.,poll_s=1.,
+                               timeout_s=self.profile.get('update_timeout_s',15.))
+            try:
+                record=next(stream)[pv]
+            except StopIteration:
+                stream=None
+                continue
+            except AcquisitionUnavailable:
+                if retries>=3:raise
+                retries+=1;stream=None
+                if cancel.wait(1.):
+                    from Knobs.DRCorrection.core import Cancelled
+                    raise Cancelled('XSR acquisition cancelled')
+                continue
+            except TimeoutError:
+                retries+=1
+                if retries>3:raise
+                stream=None
+                continue
+            value=float(record['value'])
+            if not np.isfinite(value) or value<=0:
+                retries+=1
+            else:
+                values.append(value);stamps.append(float(record['timestamp']))
+                if len(values)>=count:
+                    median=np.median(values)
+                    deviations=np.abs(np.asarray(values)-median)
+                    keep=deviations<=max(.10*median,6*1.4826*np.median(deviations))
+                    retries+=int(np.count_nonzero(~keep))
+                    values=list(np.asarray(values)[keep]);stamps=list(np.asarray(stamps)[keep])
+            if retries>3:raise ValueError('XSR size invalid or unstable after 3 replacement updates')
+            if not values:continue
             result=scalar_statistics(values,stamps,pv);callback(result)
-        return result
+        return dict(result,rejected_or_timed_out=retries)
     def put(self,pv,value):
         power_pause.checkpoint()
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
@@ -152,8 +193,8 @@ class LiveBackend(EpicsBackend):
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         result=self.client.get_pv(pv,form='time',connect=True).get_with_metadata(use_monitor=False,form='time',timeout=3.)
         if result is None or result.get('value') is None or not np.isfinite(result.get('timestamp',np.nan)):
-            raise RuntimeError('PV timestamp/data unavailable: '+pv)
-        if result.get('severity',0)>=2:raise RuntimeError('PV alarm: '+pv)
+            raise AcquisitionUnavailable('PV timestamp/data unavailable: '+pv)
+        if result.get('severity',0)>=2:raise AcquisitionUnavailable('PV alarm: '+pv)
         return result
     def tbt_snapshot(self,turns,*,cancel=None,progress=lambda *_:None):
         p=self.profile['tbt'];names=p.get('names') or self.bpm_names;arrays={};evidence={}

@@ -6,10 +6,10 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 import numpy as np
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal,Qt,QTimer
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar)
-from Knobs.DRCorrection.core import serial
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar,QListWidget,QListWidgetItem,QMessageBox)
+from Knobs.DRCorrection.core import serial,Cancelled
 from Knobs.DRCorrection.gui import Plot
 from .dispersion_plot import DispersionPlot
 from .coupling import CouplingService,BumpOptions
@@ -87,15 +87,30 @@ class CouplingPanel(CorrectionTool):
         for widget in (self.activity_label,self.activity_currents,self.acquisition_progress,self.closure_status):activity_layout.addWidget(widget)
         self.right.insertWidget(0,activity)
         self.availability=None
+        self.after_task=None;self.queue=[];self.running_queue=False;self.completed=[]
+        self.rank_started=False;self.scan_resume=None;self.plot_target=''
+        self.tempfiles_directory=Path('/mnt/nas1/atf-data/op/tempfiles')
+        self.run_data_directory=Path('/mnt/nas1/atf-data/flight-simulator/DRTuning')
+        targets=QGroupBox('SD/SF by |trim current|')
+        target_layout=QVBoxLayout(targets)
+        self.queue_list=QListWidget()
+        self.queue_list.setMinimumHeight(125)
+        target_layout.addWidget(self.queue_list)
+        target_actions=QHBoxLayout();target_layout.addLayout(target_actions)
+        rank_button=QPushButton('Refresh ranking');rank_button.clicked.connect(self.rank)
+        self.queue_button=QPushButton('Run checked in order');self.queue_button.clicked.connect(self.start_queue)
+        target_actions.addWidget(rank_button);target_actions.addWidget(self.queue_button)
+        self.queue_button.setEnabled(False)
+        self.queue_list.itemChanged.connect(self.refresh_queue_button)
         self.target=QComboBox();self.target.addItems([f'{f}.{i}' for f in ('SD1R','SF1R') for i in range(1,35)])
         self.form.addRow('SD / SF bump position',self.target)
         self.amplitude=control(self.form,'Scan width [mm]',.8,.02,4.)
         self.amplitude.setToolTip('Full scan width. Try centered, then shifted windows containing zero; if none closes, use half this width. A shifted endpoint can reach the full width from zero.')
         self.refine=control(self.form,'Refinement ± [mm]',.1,.001,1.)
         self.probe=control(self.form,'Corrector probe ± [A]',.05,.001,.5)
-        self.step=control(self.form,'Max change from baseline [A]',4.,.001,5.)
-        self.leak=control(self.form,'Outside COD max [mm]',.01,.0001,1.,4)
-        self.rms=control(self.form,'Outside COD RMS [mm]',.005,.0001,1.,4)
+        self.step=control(self.form,'Max change from baseline [A]',2.,.001,5.)
+        self.leak=control(self.form,'Outside COD max [µm]',30.,.1,1000.,1)
+        self.rms=control(self.form,'Outside COD RMS [µm]',20.,.1,1000.,1)
         self.settle=control(self.form,'Settle before acquisition [s]',1.,0.,60.)
         self.controls.insertWidget(0,QLabel('BPM: 10 updates / XSR: 10 updates\nXSR:PROJ_V_SIGMA — vertical size [µm]'))
         self.range_status=QLabel('Requested width 0.800 mm; fallback 0.400 mm. Center may shift.')
@@ -103,7 +118,7 @@ class CouplingPanel(CorrectionTool):
         self.preset_status=QLabel();self.preset_status.setWordWrap(True);self.controls.insertWidget(2,self.preset_status)
         self.availability_status=QLabel('Positions not checked against current BPMs / currents.');self.availability_status.setWordWrap(True)
         self.controls.insertWidget(3,self.availability_status)
-        self.add_button('Rank SD/SF by |trim current|',self.rank)
+        self.controls.insertWidget(0,targets)
         self.add_button('Check BPMs / current limits',self.check_positions)
         self.calibrate_button=self.add_button('1. Calibrate and close bump',self.calibrate)
         self.scan_button=self.add_button('2. Scan → fit → set optimum',self.scan)
@@ -116,7 +131,7 @@ class CouplingPanel(CorrectionTool):
     def options(self):
         return BumpOptions(amplitude_mm=self.amplitude.value()/2,refine_mm=self.refine.value(),
             calibration_mm=min(.1,self.amplitude.value()/2),probe_A=self.probe.value(),max_step_A=self.step.value(),
-            outside_max_mm=self.leak.value(),outside_rms_mm=self.rms.value(),settle_s=self.settle.value())
+            outside_max_mm=self.leak.value()/1000,outside_rms_mm=self.rms.value()/1000,settle_s=self.settle.value())
     def model_options(self):
         options=copy.deepcopy(self.window.panels['dispersion'].options)
         options.model_match_tunes=False
@@ -128,6 +143,9 @@ class CouplingPanel(CorrectionTool):
             '\nSaved nominal transport; calibration measures the current response.' if preset else 'No bump position selected.')
     def clear_availability(self):
         self.availability=None
+        for i in range(self.queue_list.count()):
+            item=self.queue_list.item(i)
+            item.setFlags(item.flags()|Qt.ItemFlag.ItemIsEnabled)
         for i in range(self.target.count()):
             item=self.target.model().item(i);item.setEnabled(True);item.setToolTip('Not checked against current BPMs / currents')
         self.availability_status.setText('Positions not checked against current BPMs / currents.')
@@ -161,27 +179,163 @@ class CouplingPanel(CorrectionTool):
             else:item.setToolTip(row.get('reason','Not checked') if row else 'Not checked')
         if self.target.currentIndex() not in enabled:self.target.setCurrentIndex(enabled[0] if enabled else -1)
         self.target.blockSignals(False);self.calibrate_button.setEnabled(bool(enabled));self.preview_preset()
+        for i in range(self.queue_list.count()):
+            item=self.queue_list.item(i)
+            entry=rows.get(item.data(Qt.ItemDataRole.UserRole),{})
+            if not entry.get('available'):
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                item.setToolTip(entry.get('reason','Not checked'))
         self.availability_status.setText(f'Last check: {len(enabled)}/{self.target.count()} positions available. Gray = unavailable.\nRecheck after machine settings change; scan width still requires measured closure.')
         self.set_table(['Target','Available','Reason / BPMs'],[(r['target'],'Yes' if r['available'] else 'No',
             ', '.join(r['internal_bpms']) if r['available'] else r['reason']) for r in report['rows']])
         self.status.setText('Preset BPMs and current budget checked. Minimum predicted scan width '+f'{self.options().amplitude_mm:.3f} mm. No magnet changed.')
     def rank(self):
         def done(rows):
+            previous=set(self.checked_targets()) if self.queue_list.count() else None
             self.clear_availability();self.invalidate();self.target.blockSignals(True);self.target.clear()
+            self.queue_list.clear()
             for row in rows:
-                if row['available']:self.target.addItem(f"{row['name']}   {row['current_A']:+.4f} A",row['name'])
+                if not row['available']:continue
+                label=f"{row['name']}   {row['current_A']:+.4f} A"
+                self.target.addItem(label,row['name'])
+                item=QListWidgetItem(label,self.queue_list)
+                item.setData(Qt.ItemDataRole.UserRole,row['name'])
+                checked=row['name'] in previous if previous is not None else self.queue_list.count()<=5
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            self.refresh_queue_button()
             self.target.blockSignals(False)
             self.invalidate()
-            self.set_table(['Trim','Readback [A]','Status'],[(r['name'],r['current_A'],r.get('error','Available')) for r in rows])
+            for row in rows:
+                if not row['available']:self.window.log(row['name']+': '+row.get('error','Readback unavailable'))
             self.status.setText('Sorted by absolute trim readback current, descending; signed currents shown.')
         self.activity_label.setText('Reading SD/SF currents and ranking by magnitude; no magnet writes')
         self.run(lambda _:self.service.ranked_targets(),done,'Read SD/SF trim currents')
+
+    def showEvent(self,event):
+        super().showEvent(event)
+        if not self.rank_started and self.window.backend.unit('skews')=='A':
+            self.rank_started=True
+            QTimer.singleShot(0,self.rank)
+
+    def checked_targets(self):
+        items=(self.queue_list.item(i) for i in range(self.queue_list.count()))
+        return [item.data(Qt.ItemDataRole.UserRole) for item in items if item.checkState()==Qt.CheckState.Checked]
+
+    def refresh_queue_button(self,*_):
+        self.queue_button.setEnabled(bool(self.checked_targets()) and not self.running_queue)
+
+    def start_queue(self):
+        self.queue=self.checked_targets()
+        if not self.queue:return
+        self.completed=[];self.running_queue=True;self.refresh_queue_button()
+        self.next_target()
+
+    def next_target(self):
+        if not self.queue:
+            self.running_queue=False;self.refresh_queue_button()
+            self.status.setText('Completed: '+', '.join(row['target'] for row in self.completed))
+            return
+        index=self.target.findData(self.queue[0])
+        if index<0 or not self.target.model().item(index).isEnabled():
+            self.recovery('Selected target unavailable: '+self.queue[0],self.next_target)
+            return
+        self.target.setCurrentIndex(index)
+        for i in range(self.queue_list.count()):
+            if self.queue_list.item(i).data(Qt.ItemDataRole.UserRole)==self.queue[0]:
+                self.queue_list.setCurrentRow(i)
+                break
+        self.calibrate()
+
+    def after_worker(self,action):
+        if self.window.tabs.isEnabled():QTimer.singleShot(0,action)
+        else:self.after_task=action
+
+    def run(self,action,done,label):
+        recovery_data=None
+        def work(progress):
+            try:
+                if recovery_data and recovery_data.get('restoration_error'):
+                    self.service.reset(recovery_data)
+                    self.service.verify_geometry(recovery_data.get('calibration',recovery_data))
+                    recovery_data.pop('restoration_error',None)
+                return action(progress)
+            except Exception as exc:
+                return dict(bump_error=str(exc),cancelled=isinstance(exc,Cancelled),partial=self.service.last_result)
+        def finished(value):
+            nonlocal recovery_data
+            if not isinstance(value,dict) or 'bump_error' not in value:
+                done(value);return
+            partial=value['partial']
+            recovery_data=partial
+            self.on_update(dict(kind='failure',data=partial))
+            self.window.error(value['bump_error'])
+            if value['cancelled']:
+                self.running_queue=False;self.queue=[];self.refresh_queue_button();self.invalidate();return
+            if partial and partial.get('schema')=='dr-coupling-bump-1' and (partial.get('restored') or partial.get('restoration_error')):
+                self.scan_resume=partial
+            self.after_worker(lambda:self.recovery(value['bump_error'],lambda:self.window.start(work,finished,label=label)))
+        self.window.start(work,finished,label=label)
+
+    def recovery(self,message,retry):
+        box=QMessageBox(self)
+        box.setWindowTitle('Bump paused')
+        box.setText((self.plot_target+'\n' if self.plot_target else '')+message)
+        end=box.addButton('Save and end',QMessageBox.ButtonRole.RejectRole)
+        resume=box.addButton('Resume',QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(end);box.exec()
+        if box.clickedButton() is resume:
+            retry();return
+        data=dict(error=message,completed=self.completed,pending=self.queue,partial=self.result,
+                  live_samples=[dict(phase=phase,amplitude_mm=a,xsr=xsr) for (phase,a),xsr in self.samples.items()])
+        directory=self.run_data_directory/f'{datetime.now():%Y}'
+        dest=directory/f'bump_{datetime.now():%Y%m%d_%H%M%S_%f}.json'
+        while True:
+            try:
+                dest.parent.mkdir(parents=True,exist_ok=True)
+                temporary=dest.with_name(dest.name+'.part')
+                temporary.write_text(json.dumps(serial(data),allow_nan=False),encoding='utf-8')
+                temporary.replace(dest)
+                self.window.log('Saved '+str(dest))
+                break
+            except OSError as exc:
+                self.window.error(str(exc))
+                path,_=QFileDialog.getSaveFileName(self,'Save interrupted bump run',dest.name,'JSON (*.json)')
+                if not path:
+                    QTimer.singleShot(0,lambda:self.recovery(message,retry))
+                    return
+                dest=Path(path)
+        self.running_queue=False;self.queue=[];self.refresh_queue_button();self.invalidate()
+
+    def finish_scan(self,result):
+        from matplotlib.figure import Figure
+        target=result['calibration']['target']
+        try:
+            figure=Figure(figsize=(8,5),layout='constrained')
+            self.draw_xsr(figure.subplots(),target,result['points'],result['fits'],
+                          [(p['amplitude_mm'],p['xsr']) for p in result['points']])
+            self.tempfiles_directory.mkdir(parents=True,exist_ok=True)
+            dest=self.tempfiles_directory/f'bump_{target}_{datetime.now():%Y%m%d_%H%M%S_%f}.png'
+            figure.savefig(dest,dpi=150)
+        except Exception as exc:
+            message='Optimum applied. XSR plot export failed: '+str(exc)
+            self.after_worker(lambda:self.recovery(message,lambda:self.finish_scan(result)))
+            return
+        self.window.log('Saved '+str(dest))
+        self.completed.append(dict(target=target,result=result,plot=str(dest)))
+        self.scan_resume=None
+        if self.running_queue:
+            self.queue.pop(0)
+            self.after_worker(self.next_target)
     def calibrate(self):
         if self.target.currentIndex()<0 or not self.target.model().item(self.target.currentIndex()).isEnabled():
             self.window.error('Choose an available bump position; recheck BPMs / current limits');return
         target=self.target.currentData() or self.target.currentText();opt=self.options();options=self.model_options()
-        self.geometry=None;self.calibration=None;self.scan_button.setEnabled(False)
-        self.last_orbit=None;self.last_stage_message=None
+        self.plot_target=target;self.scan_resume=None
+        if not self.running_queue:self.completed=[]
+        self.geometry=None;self.calibration=None;self.result=None;self.scan_button.setEnabled(False)
+        self.points=[];self.fits=[];self.samples={};self.last_orbit=None;self.last_stage_message=None
+        self.redraw()
         self.activity_label.setText(target+': Starting calibration — Checking preset and BPMs.')
         self.activity_currents.clear();self.acquisition_progress.setValue(0)
         self.closure_status.setText('Single-corrector probes also move outside COD. Y bump closure follows response measurement.')
@@ -190,16 +344,22 @@ class CouplingPanel(CorrectionTool):
             self.set_table(['Corrector','Baseline [A]','Measured knob [A/mm]'],zip(value['actuators'],value['centers'],value['knob_A_per_mm']))
             self.status.setText('Preset '+value['target']+' calibrated in both signs; original currents restored. Ready for XSR scan.')
             self.activity_label.setText(value['target']+': Calibration complete; baseline currents verified. Ready to scan.')
+            if self.running_queue:self.after_task=self.scan
         self.run(lambda p:self.service.calibrate_target(target,opt,options,p,self.update.emit),done,'Calibrate preset bump')
     def scan(self):
         if self.calibration is None:return
         opt=self.options();g=copy.deepcopy(self.calibration)
         self.points=[];self.samples={};self.fits=[];self.redraw()
         def done(value):
+            self.calibration=value['calibration']
             self.result=value;self.scan_button.setEnabled(False);self.calibrate_button.setEnabled(False);self.reset_button.setEnabled(True)
             self.status.setText(f"Set {value['final_amplitude_mm']:+.4f} mm; XSR {value['final']['xsr']['mean']:.3f} µm.\nCalibrate again before another scan.")
             self.activity_label.setText(f"Scan complete — Optimum Y {value['final_amplitude_mm']:+.4f} mm applied; currents remain at the optimum.")
-        self.run(lambda p:self.service.scan(g,opt,p,self.update.emit),done,'Local bump / XSR minimization')
+            self.finish_scan(value)
+        def measure(p):
+            self.update.emit(dict(kind='scan_restart',target=g['target']))
+            return self.service.scan(g,opt,p,self.update.emit,resume=self.scan_resume)
+        self.run(measure,done,'Local bump / XSR minimization')
     def reset(self):
         if self.result is None:return
         data=self.result
@@ -210,6 +370,9 @@ class CouplingPanel(CorrectionTool):
         self.run(lambda _:self.service.reset(data),done,'Restore local bump currents')
     def on_update(self,event):
         kind=event['kind']
+        if kind=='scan_restart':
+            self.plot_target=event['target'];self.points=[];self.samples={};self.fits=[];self.last_orbit=None
+            self.redraw();return
         if kind=='status':
             self.activity_label.setText(event['message'])
             if 'samples' in event:
@@ -238,15 +401,17 @@ class CouplingPanel(CorrectionTool):
             self.activity_label.setText(f"Acquiring XSR: {event['phase']} / Y {event['amplitude_mm']:+.4f} mm")
             self.acquisition_progress.setRange(0,10);self.acquisition_progress.setValue(event['xsr']['count'])
             self.acquisition_progress.setFormat(f"XSR updates: {event['xsr']['count']}/10")
-        elif kind=='point':self.points.append(event['point'])
+        elif kind=='point':
+            point=event['point'];self.points.append(point)
+            self.samples[(point['phase'],point['amplitude_mm'])]=point['xsr']
         elif kind=='fit':self.fits.append(event['fit'])
         elif kind=='orbit':
             self.last_orbit=event
             state=event['state'];closed='Closure passed' if event.get('closed') else 'Checking / correcting closure'
             self.closure_status.setText(f"{closed} / correction {event['iteration']}\n"
                 f"Estimated delta Y {state[2]:+.4f} mm (target {event['amplitude_mm']:+.4f}) / delta X {state[0]:+.4f} mm\n"
-                f"Outside COD: max {event['outside_max_mm']*1000:.2f} µm (limit {self.leak.value()*1000:g}) / "
-                f"RMS {event['outside_rms_mm']*1000:.2f} µm (limit {self.rms.value()*1000:g})")
+                f"Outside COD: max {event['outside_max_mm']*1000:.2f} µm (limit {self.leak.value():g}) / "
+                f"RMS {event['outside_rms_mm']*1000:.2f} µm (limit {self.rms.value():g})")
         elif kind=='range':
             selected=event['scan_range'];low,high=selected['bounds_mm']
             self.range_status.setText(f'Scan range {low:+.3f} to {high:+.3f} mm; width {selected["width_mm"]:.3f} mm'+
@@ -264,19 +429,23 @@ class CouplingPanel(CorrectionTool):
             self.activity_label.setText('Stopped / '+restoration+'\nLast operation: '+previous+('\n'+str(data['error']) if data.get('error') else ''))
             self.acquisition_progress.setFormat('Acquisition stopped')
         self.redraw()
-    def redraw(self):
-        figure=self.plot.figure;figure.clear();ax,orbit=figure.subplots(2,1)
-        for (phase,a),xsr in self.samples.items():
+    @staticmethod
+    def draw_xsr(ax,target,points,fits,samples):
+        for a,xsr in samples:
             ax.scatter(np.full(xsr['count'],a),xsr['values'],s=9,alpha=.3,color='C0')
-        for i,p in enumerate(self.points):
+        for i,p in enumerate(points):
             ax.errorbar(p['amplitude_mm'],p['xsr']['mean'],yerr=p['xsr']['sem'],fmt='o',color='C0',
                         label='10-update mean ± SEM' if i==0 else None)
-        for i,fit in enumerate(self.fits):
+        for i,fit in enumerate(fits):
             ax.plot(fit['amplitude_mm'],fit['size_um'],'--' if i==0 else '-',label=f'Fit {i+1}: {fit["best_mm"]:+.4f} mm')
             ax.axvline(fit['best_mm'],color=f'C{i+1}',alpha=.4)
-        ax.set(xlabel='Vertical displacement at SD/SF [mm]',ylabel='XSR σy [µm]',title='Raw updates, mean and size² fit')
-        if self.points or self.fits:ax.legend(fontsize=8)
+        ax.set(xlabel='Vertical displacement at SD/SF [mm]',ylabel='XSR σy [µm]',title=f'{target}  XSR σy')
+        if points or fits:ax.legend(fontsize=8)
         ax.grid(alpha=.2)
+
+    def redraw(self):
+        figure=self.plot.figure;figure.clear();ax,orbit=figure.subplots(2,1)
+        self.draw_xsr(ax,self.plot_target,self.points,self.fits,[(a,xsr) for (_,a),xsr in self.samples.items()])
         if self.last_orbit is not None:
             event=self.last_orbit;g=self.calibration or self.geometry
             if g is not None:
@@ -284,7 +453,7 @@ class CouplingPanel(CorrectionTool):
                 orbit.plot(s,event['outside'][:n],'.',label='Outside ΔX');orbit.plot(s,event['outside'][n:],'.',label='Outside ΔY')
                 orbit.legend(fontsize=8)
             orbit.set_title(f"a={event['amplitude_mm']:+.3f} mm / max {event['outside_max_mm']:.4f} mm / RMS {event['outside_rms_mm']:.4f} mm")
-        orbit.axhline(self.leak.value(),color='gray',ls=':');orbit.axhline(-self.leak.value(),color='gray',ls=':')
+        orbit.axhline(self.leak.value()/1000,color='gray',ls=':');orbit.axhline(-self.leak.value()/1000,color='gray',ls=':')
         orbit.set(xlabel='Outside BPM s [m]',ylabel='COD change [mm]');orbit.grid(alpha=.2)
         self.plot.canvas.draw_idle()
 

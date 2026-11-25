@@ -204,7 +204,7 @@ class CorrectionService:
         validate_bpm_sampling(opt)
         samples=[];diagnostics=[];timestamps=[];fresh=[]
         required=np.asarray(required_bpms,dtype=int)
-        budget=int(count)+(extra_updates if required.size else 0)
+        budget=int(count)+extra_updates
         stream=iter(self.backend.orbit_samples(budget,self.cancel,interval)) if hasattr(self.backend,'orbit_samples') else None
         rejected=0
         for _ in range(budget):
@@ -217,13 +217,16 @@ class CorrectionService:
             self.check_cancel()
             x,y,valid=checked_orbit(result,self.backend.bpm_names)
             missing=required[~valid[required]]
-            if missing.size:
+            widespread=bool(extra_updates and (2*np.count_nonzero(valid)<len(valid)
+                            or missing.size>=5 or (missing.size>=2 and 4*missing.size>=required.size)))
+            if missing.size or widespread:
                 rejected+=1
-                names=', '.join(self.backend.bpm_names[i] for i in missing)
+                affected=missing if missing.size else np.flatnonzero(~valid)
+                names=', '.join(self.backend.bpm_names[i] for i in affected)
                 if rejected>extra_updates:
                     raise ValueError(f'Required BPM invalid after {extra_updates} retries: {names} '
                                      f'({len(samples)}/{int(count)} valid updates)')
-                if on_retry is not None:on_retry(rejected,names,len(samples))
+                if on_retry is not None:on_retry(rejected,names,len(samples),widespread)
                 continue
             samples.append(dict(x=x.copy(),y=y.copy(),tmit=np.asarray(result['tmit'],float).copy(),valid=valid.copy()))
             diagnostics.append(result.get('validity_diagnostics',{}))

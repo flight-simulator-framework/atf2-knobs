@@ -457,6 +457,9 @@ class TuningSession(DRCorrectionWindow):
         self.timer.stop();self.tick();self.tabs.setEnabled(True);self.navigation.setEnabled(True);self.cancel_button.setEnabled(False)
         self.progress.setRange(0,100);self.progress.setValue(0 if self._failed else 100)
         for panel in self.panels.values():panel.refresh()
+        action=self.coupling_panel.after_task
+        self.coupling_panel.after_task=None
+        if action is not None:QTimer.singleShot(0,action)
     def hardware_checklist(self):
         from Knobs.DRCorrection.backends import profile_issues
         p=getattr(self.backend,'profile',None)

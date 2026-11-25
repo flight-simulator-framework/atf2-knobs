@@ -127,7 +127,7 @@ class CouplingTests(unittest.TestCase):
         g=self.s.calibrate(self.b.geometry(),self.o);events=[]
         result=self.s.scan(g,self.o,event=events.append)
         self.assertTrue(any(e['kind']=='orbit' and e['iteration']>0 for e in events))
-        self.assertLess(result['final']['orbit']['outside_max_mm'],.01)
+        self.assertLessEqual(result['final']['orbit']['outside_max_mm'],self.o.outside_max_mm)
         self.assertAlmostEqual(self.b.vector()[8],result['final_amplitude_mm'],places=6)
     def test_stale_xsr_and_cancel_restore_all_currents(self):
         for cancel in (False,True):
@@ -518,11 +518,11 @@ class CorrectionGuiTests(unittest.TestCase):
             for a in np.linspace(-.4,.4,5):
                 xsr=scalar_statistics(np.full(10,np.sqrt(100+300*(a-.13)**2)),range(10),'XSR:PROJ_V_SIGMA')
                 bump.on_update(dict(kind='sample',phase='coarse',amplitude_mm=a,xsr=xsr))
-                point=dict(amplitude_mm=a,xsr=xsr);points.append(point);bump.on_update(dict(kind='point',point=point))
+                point=dict(phase='coarse',amplitude_mm=a,xsr=xsr);points.append(point);bump.on_update(dict(kind='point',point=point))
             fit=fit_size(points,.4);bump.on_update(dict(kind='fit',fit=fit))
             self.assertTrue(any('Fit 1:' in label for label in bump.plot.figure.axes[0].get_legend_handles_labels()[1]))
             self.assertEqual(len(bump.samples),5);self.assertEqual(bump.amplitude.value(),.8);self.assertEqual(bump.refine.value(),.1)
-            self.assertEqual(bump.options().amplitude_mm,.4);self.assertEqual(bump.step.value(),4.)
+            self.assertEqual(bump.options().amplitude_mm,.4);self.assertEqual(bump.step.value(),2.)
             w.open_tool('coupling');self.assertIs(w.tabs.currentWidget(),bump)
         finally:w.close();self.app.processEvents()
 

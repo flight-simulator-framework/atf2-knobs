@@ -4,6 +4,10 @@ import numpy as np
 from Knobs.DRCorrection.core import Cancelled
 
 
+class AcquisitionUnavailable(RuntimeError):
+    """A channel update is missing, incomplete or marked invalid by the IOC."""
+
+
 def updates(metadata, pvs, count, cancel, *, timeout_s=15., interval_s=0., poll_s=.02):
     if int(count) != count or not 1 <= count <= 1000:
         raise ValueError('Sample count must be an integer in 1..1000')
@@ -13,7 +17,7 @@ def updates(metadata, pvs, count, cancel, *, timeout_s=15., interval_s=0., poll_
         if cancel.is_set():raise Cancelled('Acquisition cancelled')
         r=metadata(pv)
         if r.get('value') is None or not np.isfinite(r.get('timestamp',np.nan)) or r.get('severity',0)>=2:
-            raise RuntimeError('Invalid timestamp / alarm: '+pv)
+            raise AcquisitionUnavailable('Invalid timestamp / alarm: '+pv)
         return r
     previous={pv:float(read(pv)['timestamp']) for pv in pvs}
     for _ in range(int(count)):

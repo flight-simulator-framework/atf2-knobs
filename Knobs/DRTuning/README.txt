@@ -328,22 +328,28 @@ Bump / XSR coupling:
   positions without magnet writes. Missing/invalid required BPMs, insufficient
   outside BPMs, excluded/missing correctors and inadequate current budget make
   a position gray and unselectable, with the reason in the table and tooltip.
-  Presets do not silently switch to another combination or invoke RFTrack.
+  Each target starts with its preset. If measured outside COD cannot be closed,
+  the scan can add up to two correctors, one at a time. Candidates come from
+  other presets outside the internal BPM interval. Their nominal responses
+  rank them against the measured leakage. The enlarged set is calibrated on
+  beam and both signs must close before starting a new scan.
   Eligibility uses current readbacks, parameter A/B and max change from
   baseline, with nominal response only to estimate the reachable interval.
   A shifted interval with the fallback width (default 0.4 mm) is sufficient;
   the bidirectional calibration probe must also fit. Measured closure still
   determines the actual scan interval. Recheck after machine settings change.
-  Rank SD/SF by |trim current| optionally sorts positions by signed current's
-  absolute value; failed readbacks are listed separately.
+  Opening the live bump panel ranks targets by absolute trim current and checks
+  the first five with available readbacks. Run checked in order calibrates
+  and scans each checked target with the previous target's optimum in place.
   1. Calibrate and close bump automatically checks the selected preset against
      current BPMs and limits, then measures X/Y corrector response columns with
      10-update BPM averages. At each setting, a sample with an invalid required
      BPM is discarded and replaced at the same currents, up to three extra
-     updates. A fourth invalid sample stops the measurement and reports the
+     updates. Widespread invalid readings wait three seconds before retrying.
+     A fourth invalid sample stops the measurement and reports the
      affected BPMs. Both signs are tested and baseline currents are
-     restored. Default max baseline current change is 4 A, outside max .01 mm
-     and outside RMS .005 mm. Calibration uses the small +/-0.1 mm probe.
+     restored. Default max current change from each target's baseline is 2 A,
+     outside max 30 µm and outside RMS 20 µm. Calibration uses +/-0.1 mm.
   2. Scan width [mm] is the FULL width, default 0.8 mm. Scan -> fit -> set optimum
      first checks COD closure for a centered [-0.4,+0.4] mm window. If unavailable,
      it tries shifted windows of the same 0.8 mm width, nearest zero first with
@@ -365,8 +371,10 @@ Bump / XSR coupling:
      Before XSR acquisition at each point, the scan checks outside X/Y and
      the reconstructed target state. Only if needed, bounded beam-based iterations close leakage while
      retaining target amplitude/angle. No clipping or cumulative amplitude steps.
-     XSR polls once per second and takes 10 timestamp advances at each point;
-     raw values, means +/- SEM and fit
+     XSR polls once per second and collects 10 fresh accepted readings. Up to
+     three invalid readings, spikes or timeouts per point are retried. Spikes
+     exceed both 10% of the point median and six scaled median absolute deviations.
+     Raw values, means +/- SEM and fit
      curves are plotted live. The fitted horizontal coordinate is the observed
      local displacement; requested amplitudes are saved separately. A weighted
      quadratic fits sigma_y squared and is
@@ -378,6 +386,11 @@ Bump / XSR coupling:
      Final size must be consistent with the best
      measured point. Successful completion leaves the optimum currents set.
      Normal runs have 5 coarse + 2 refinement + 1 final points = 80 XSR updates.
+  The SD/SF-labelled XSR plot for each completed target is saved under
+  /mnt/nas1/atf-data/op/tempfiles/. On error, Resume retries the interrupted
+  stage. A scan restored to its baseline reuses completed XSR points. A failed
+  fit repeats the affected fit measurements. Save and end writes completed and
+  partial measurements under /mnt/nas1/atf-data/flight-simulator/DRTuning/<year>/.
   Cancel, stalled acquisition, invalid fit or failed closure restores the
   pre-scan selected currents. Restoration attempts all supplies and reports
   failures; a failed restoration is never reported as success. Baseline reset
