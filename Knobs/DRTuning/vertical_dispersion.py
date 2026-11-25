@@ -1,6 +1,8 @@
 """Vertical dispersion correction with RFTrack selection and measured ZV response."""
 
 import copy
+from datetime import datetime
+from uuid import uuid4
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
@@ -129,9 +131,16 @@ class VerticalDispersionPanel(CorrectionPanel):
         self.window.start(lambda p: self.window.service.measure_selected_zvs(preview, p),
                           self.display, label='Measure selected ZVs', pausable=True)
 
+    def data_directory(self):
+        return f'/mnt/nas1/atf-data/flight-simulator/DRTuning/{datetime.now():%Y}'
+
+    def save_bundle(self, path=None):
+        stem = f'vertical_dispersion_{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}'
+        return super().save_bundle(path, stem=stem)
+
     def load_measured_response(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Load measured vertical dispersion response',
-                                              '', 'Correction session (*.json)')
+                                              self.data_directory(), 'Correction session (*.json)')
         if not path:
             return
         options = copy.deepcopy(self.options)
@@ -141,7 +150,7 @@ class VerticalDispersionPanel(CorrectionPanel):
             data = load_session(path)
             if (data.get('mode') != 'dispersion' or not data.get('rftrack_candidates')
                     or data['options']['plane'] != 'y' or data['options']['response_source'] != 'measured'):
-                raise ValueError('Select dispersion.json saved after Measure selected ZVs.')
+                raise ValueError('Select the correction JSON saved after Measure selected ZVs.')
             return self.window.service.recalculate(data, options, progress)
 
         self.window.start(refit, self.display, label='Recalculate saved ZV response')

@@ -406,22 +406,27 @@ class CorrectionPanel(QWidget):
             self.window.log('RESET: pre-SET currents and RF restored')
         self.window.start(lambda _:self.window.service.reset(),finished)
 
-    def save_bundle(self,path=None):
+    def data_directory(self):
+        return ''
+
+    def save_bundle(self,path=None,*,stem=None):
         if not self.data:self.window.error('CALC first');return
-        if not path:path=QFileDialog.getExistingDirectory(self,'Save data + graphs')
+        if not path:path=QFileDialog.getExistingDirectory(self,'Save data + graphs',self.data_directory())
         if path:
             root=Path(path);root.mkdir(parents=True,exist_ok=True)
-            save_session(root/f'{self.mode}.json',self.data)
-            export_curves(root/f'{self.mode}.csv',self.data)
-            for ext in ('png','pdf'):self.plot.save(root/f'{self.mode}.{ext}')
-            self.window.log('Saved '+str(root))
+            stem=stem or self.mode
+            save_session(root/f'{stem}.json',self.data)
+            export_curves(root/f'{stem}.csv',self.data)
+            for ext in ('png','pdf'):self.plot.save(root/f'{stem}.{ext}')
+            self.window.log('Saved '+str(root/f'{stem}.json'))
+            return root
 
     def save_figure(self):
         path,_=QFileDialog.getSaveFileName(self,'Save graph',self.mode+'.png','PNG (*.png);;PDF (*.pdf);;SVG (*.svg)')
         if path:self.plot.save(path)
 
     def load_target(self):
-        path,_=QFileDialog.getOpenFileName(self,'Public nominal dispersion: names, x, y in mm','','JSON (*.json)')
+        path,_=QFileDialog.getOpenFileName(self,'Public nominal dispersion: names, x, y in mm',self.data_directory(),'JSON (*.json)')
         if path:
             try:
                 data=json.loads(Path(path).read_text());backend=self.window.backend

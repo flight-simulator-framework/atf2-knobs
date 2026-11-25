@@ -562,9 +562,11 @@ class ModelGuiTests(unittest.TestCase):
     def test_load_legacy_measured_zvs_refits_for_dispersion_without_scanning(self):
         from Knobs.DRCorrection.core import save_session
         from Knobs.DRTuning.gui import TuningSession
+        from PyQt6.QtCore import QSettings
         from PyQt6.QtWidgets import QFileDialog
         machine = CountedBackend()
-        window = TuningSession(machine)
+        settings_path = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'prefs.ini'
+        window = TuningSession(machine, QSettings(str(settings_path), QSettings.Format.IniFormat))
         try:
             panel = window.panels['dispersion']
             machine.errors['y'][:] = .05
@@ -583,20 +585,49 @@ class ModelGuiTests(unittest.TestCase):
             self.assertLess(saved['delta'][0], 0.)
             saved['options'].pop('preserve_vertical_dispersion_orbit')
             saved['acquisition_options'].pop('preserve_vertical_dispersion_orbit')
+            # An unavailable BPM is saved as JSON null in each signal block.
+            bpm_count = len(saved['names'])
+            saved['valid'][0] = saved['acquisition_valid'][0] = False
+            for key in ('measured', 'full_measured'):
+                saved[key][:, 0] = np.nan
+            for key in ('response', 'full_response'):
+                saved[key][::bpm_count] = np.nan
             reads = machine.acquisitions
             machine.commands.clear()
             with tempfile.TemporaryDirectory() as root:
+                from datetime import date
+                year = date.today().year
+                expected_directory = f'/mnt/nas1/atf-data/flight-simulator/DRTuning/{year}'
+                window.bpm_settings.setValue(f'vertical_dispersion/directory/{machine.identity}/{year}', root)
                 path = Path(root) / 'dispersion.json'
                 save_session(path, saved)
                 def run(action, finished, **kwargs):
                     finished(action(lambda *_: None))
-                with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(path), '')), patch.object(window, 'start', run):
+                with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(path), '')) as dialog, patch.object(window, 'start', run):
                     panel.load_measured_response()
+                self.assertEqual(dialog.call_args.args[2], expected_directory)
+                folder = Path(root) / 'other'
+                with patch.object(QFileDialog, 'getExistingDirectory', return_value=str(folder)) as chooser:
+                    panel.save_bundle()
+                self.assertEqual(chooser.call_args.args[2], expected_directory)
+                panel.save_bundle(str(folder))
+                bundles = list(folder.glob('*.json'))
+                self.assertEqual(len(bundles), 2)
+                for bundle in bundles:
+                    self.assertRegex(bundle.stem, r'^vertical_dispersion_\d{8}_\d{6}_\d{6}_[0-9a-f]{8}$')
+                    for ext in ('.json', '.csv', '.png', '.pdf'):
+                        self.assertGreater(bundle.with_suffix(ext).stat().st_size, 0)
+                window.bpm_settings.sync()
+                window.bpm_settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
+                self.assertEqual(panel.data_directory(), expected_directory)
             result = panel.data
             self.assertTrue(panel.apply_button.isEnabled())
             self.assertTrue(result['reused_response'])
             np.testing.assert_array_equal(result['target'][1], saved['measured'][1])
             np.testing.assert_array_equal(result['response'], saved['response'])
+            self.assertFalse(result['valid'][0])
+            self.assertTrue(np.isnan(result['full_predicted'][:, 0]).all())
+            self.assertTrue(np.isfinite(result['full_predicted'][:, 1:]).all())
             np.testing.assert_allclose(result['delta'], [.05 / (1. + .05**2)], atol=1e-9)
             self.assertEqual(machine.acquisitions, reads)
             self.assertEqual(machine.commands, [])

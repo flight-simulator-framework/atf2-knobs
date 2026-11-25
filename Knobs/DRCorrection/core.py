@@ -566,7 +566,9 @@ class CorrectionService:
         if mode=='dispersion' and opt.plane=='y' and opt.preserve_vertical_dispersion_orbit:
             # Both model screening and measured fits use the beam orbit at nominal RF.
             target=np.stack((target[0],measured[1]))
-            data['target']=target
+        # Saved JSON represents missing BPM samples as null. Give every solver
+        # the same numeric arrays, with NaN at those positions.
+        data.update(measured=measured,target=target,response=response)
         if response.shape!=(measured.size,len(actuators)):
             raise ValueError('Invalid response matrix')
         selected=copy.deepcopy(opt)
@@ -656,7 +658,8 @@ class CorrectionService:
         if constraints is not None:data['constraints']['predicted_change']=cm@delta
         if 'full_response' in data:
             full=np.asarray(data['full_measured'],float)
-            data['full_predicted']=full+(np.asarray(data['full_response'])@delta).reshape(full.shape)
+            full_response=np.asarray(data['full_response'],float)
+            data['full_predicted']=full+(full_response@delta).reshape(full.shape)
             data['full_fitted']=full-data['full_predicted']
         return data
 

@@ -34,8 +34,11 @@ Measure selected ZVs measures only those response columns. Review the proposed
 currents and predicted curves, then click Apply / remeasure to see the measured
 after curves. Select BPMs / magnets and Recalculate reuse the measured columns.
 To reuse a completed measurement after restarting DRTuning, save it with
-Save data + plots, then use Load measured response to open dispersion.json.
-This recalculates the proposal using the current fit settings.
+Save data + plots, then use Load measured response to open the timestamped
+vertical_dispersion JSON (older saves use dispersion.json). JSON, CSV, PNG
+and PDF share the same filename stem. The Vertical Dispersion save and load
+dialogs open in /mnt/nas1/atf-data/flight-simulator/DRTuning/<year>/ each time.
+Loading recalculates the proposal using the current fit settings.
 For a valid ZV probe pair, the default acceptance threshold is 0.075 mm
 (0.1 mm target with 25% tolerance) in peak vertical COD half-difference over
 eligible BPMs. The scan accepts any response at or above this threshold immediately.
