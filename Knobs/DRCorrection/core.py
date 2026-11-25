@@ -694,7 +694,7 @@ class CorrectionService:
             data['full_fitted']=full-data['full_predicted']
         return data
 
-    def measure_selected_zvs(self,proposal,progress=lambda *_:None):
+    def measure_selected_zvs(self,proposal,progress=lambda *_:None,*,group_rf=False):
         """Probe only the ZVs selected by a vertical RFTrack dispersion fit."""
         opt=Options(**proposal['options'])
         if (proposal['mode']!='dispersion' or opt.plane!='y' or opt.response_source not in ('rftrack','rftrack_nominal')
@@ -714,7 +714,10 @@ class CorrectionService:
         opt.response_source='measured'
         scan=copy.deepcopy(opt)
         scan.fixed_actuators=tuple(sorted(set(opt.fixed_actuators) | (set(self.backend.vcorrectors)-set(names))))
-        data=self.acquire('dispersion',scan,progress,retry_zv_probes=True)
+        if group_rf:
+            from Knobs.DRTuning.zv_rf_scan import acquire_zvs
+            data=acquire_zvs(self,scan,progress)
+        else:data=self.acquire('dispersion',scan,progress,retry_zv_probes=True)
         data['rftrack_candidates']=names
         if 'reference_matrix' in proposal:
             data['reference_matrix']=copy.deepcopy(proposal['reference_matrix'])

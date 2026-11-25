@@ -137,6 +137,13 @@ def probe_pair(magnet,center,limits,opt,width):
     return targets,max(reference-lower,upper-reference)
 
 
+def probe_scheme(center,targets):
+    low,high=targets
+    if not low<=center<=high:return 'shifted inside probe range'
+    if np.isclose(center-low,high-center,rtol=0,atol=1.e-12):return 'symmetric'
+    return 'asymmetric / one-sided'
+
+
 def estimated_probe_width(center,limits,measured_span,quality,opt):
     """Infer a target width from measured span and S/N, including clipped pairs."""
     lo,hi=probe_bounds(limits);reference=float(np.clip(center,lo,hi))
@@ -270,7 +277,7 @@ class DispersionService:
         data['checkpoint_file']=str(path)
         data['checkpoint_saved_at']=datetime.now(timezone.utc).isoformat()
         save_checkpoint(path,data)
-        event(dict(kind='checkpoint',path=str(path),completed=data['scan_state']['completed'],total=len(data['actuators']),
+        event(dict(kind='checkpoint',path=str(path),completed=len(data['rf_results']) if 'rf_results' in data else data['scan_state']['completed'],total=len(data['actuators']),
                    skipped=len(data.get('skipped_qms',[]))))
 
     def width_context(self,data,opt):
@@ -300,13 +307,27 @@ class DispersionService:
     def probe_quality(self,frames,variances,mask,opt):
         dx=(frames[1]-frames[0])[0,mask];noise2=(variances[1]+variances[0])[0,mask]
         signal=float(np.sqrt(np.mean(dx**2)));noise=float(np.sqrt(np.mean(noise2)))
+        return self.quality_record(signal,noise,int(mask.sum()),opt)
+
+    def quality_record(self,signal,noise,bpms,opt):
         if not np.isfinite([signal,noise]).all():raise ValueError('Invalid QM response noise estimate')
         dp=opt.frequency_change_khz*1000/(self.backend.nominal_frequency_hz*opt.momentum_compaction)
         return dict(signal_rms=signal,noise_rms=noise,snr=signal/noise if noise>0 else None,
             target_snr=opt.target_snr,usable=bool(signal>1.e-12 and signal>=opt.target_snr*noise),
             orbit_response_rms_mm=signal*abs(dp),orbit_noise_rms_mm=noise*abs(dp),
-            target_change_mm=opt.target_snr*noise*abs(dp),bpm_count=int(mask.sum()),
+            target_change_mm=opt.target_snr*noise*abs(dp),bpm_count=bpms,
             definition='RMS straight Dx change between the two measured QM currents; uncertainty from valid-sample SEM at RF +/- offsets')
+
+    def remember_width(self,n,data,opt,h,center,limits,measured_span,quality,failed_width):
+        if quality['signal_rms']<=1.e-12:
+            self.successful_widths.pop(n,None)
+            return
+        estimate=estimated_probe_width(center,limits,measured_span,quality,opt)
+        estimate=h if estimate is None else min(estimate,probe_floor(h*opt.probe_max_growth))
+        if quality['usable']:estimate=min(estimate,h)
+        if failed_width is not None:estimate=min(estimate,round(failed_width-PROBE_INCREMENT_A,12))
+        self.successful_widths[n]=dict(width_A=estimate,measured_width_A=h,quality=copy.deepcopy(quality),
+            context=self.width_context(data,opt),baseline=copy.deepcopy(data['baseline']))
 
     def snapshot(self,names,include_other_mains=False):
         snapshot=self.backend.snapshot()
@@ -322,7 +343,7 @@ class DispersionService:
                     except MagnetReadbackError:continue
         return snapshot
 
-    def calculate(self,opt,progress=lambda *_:None,event=lambda *_:None,checkpoint_path=None):
+    def calculate(self,opt,progress=lambda *_:None,event=lambda *_:None,checkpoint_path=None,*,group_rf=False):
         opt.validate();self.check();b=self.backend;b.validate_mode('dispersion')
         if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
         if not opt.measure_tunes:progress(0,'Tune acquisition / tune constraints skipped; measuring dispersion and COD')
@@ -341,7 +362,11 @@ class DispersionService:
             b.validate_quadrupole_targets(n,[targets[0],c,targets[1]])
         if checkpoint_path is not None:prepare_destination(checkpoint_path)
         baseline=self.snapshot(names,include_other_mains=opt.coil=='trim');self.reader.reset_sampling()
-        measured,valid,tunes,tune_evidence=self.signal(opt)
+        if group_rf and not opt.measure_tunes:
+            valid=np.zeros(len(b.bpm_names),bool)
+            measured=np.full((4,len(valid)),np.nan)
+            tunes=None;tune_evidence=dict(source='skipped')
+        else:measured,valid,tunes,tune_evidence=self.signal(opt)
         self.reader.sync_dispersion_selection('dispersion',opt)
         enabled=np.array([n not in opt.excluded_bpms for n in b.bpm_names])
         data=dict(schema='dr-qm-dispersion-1',mode='dispersion',backend_id=b.identity,
@@ -355,7 +380,12 @@ class DispersionService:
                   created_at=datetime.now(timezone.utc).isoformat(),probe_quality=[],probe_attempts=[],skipped_qms=[],
                   scan_state=dict(completed=0,columns=[],tune_columns=[],common_valid=valid.copy(),
                                   status='running',active_magnet=None))
-        self.last_result=data;event(dict(kind='dispersion',data=copy.deepcopy(data)))
+        self.last_result=data
+        if group_rf and not opt.measure_tunes:
+            from .qm_rf_scan import measure_qms
+            data['rf_blocks']=[]
+            return measure_qms(self,data,opt,progress,event,checkpoint_path)
+        event(dict(kind='dispersion',data=copy.deepcopy(data)))
         diagnostic=self.validity_report(valid,np.ones_like(valid),enabled,straight,0,'Initial baseline',opt)
         data['validity_history'].append(diagnostic);progress(0,diagnostic['message'])
         return self.measure_remaining(data,opt,progress,event,checkpoint_path)
@@ -459,17 +489,8 @@ class DispersionService:
                     columns.append(((frames[1]-frames[0])/measured_span).ravel())
                     if opt.measure_tunes:qcolumns.append(((qs[1]-qs[0]+.5)%1-.5)/measured_span)
                     data['probe_quality'].append(quality)
-                    scheme=('shifted inside probe range' if c<targets[0] or c>targets[1] else
-                            'symmetric' if np.isclose(c-targets[0],targets[1]-c,rtol=0,atol=1.e-12) else 'asymmetric / one-sided')
-                    data['probe_readbacks'].append(dict(magnet=n,requested=targets.copy(),actual=readbacks,scheme=scheme))
-                    if quality['signal_rms']>1.e-12:
-                        estimate=estimated_probe_width(c,limits[:,j],measured_span,quality,opt)
-                        estimate=h if estimate is None else min(estimate,probe_floor(h*opt.probe_max_growth))
-                        if quality['usable']:estimate=min(estimate,h)
-                        if failed_width is not None:estimate=min(estimate,round(failed_width-PROBE_INCREMENT_A,12))
-                        self.successful_widths[n]=dict(width_A=estimate,measured_width_A=h,quality=copy.deepcopy(quality),
-                            context=self.width_context(data,opt),baseline=copy.deepcopy(data['baseline']))
-                    else:self.successful_widths.pop(n,None)
+                    data['probe_readbacks'].append(dict(magnet=n,requested=targets.copy(),actual=readbacks,scheme=probe_scheme(c,targets)))
+                    self.remember_width(n,data,opt,h,c,limits[:,j],measured_span,quality,failed_width)
                 state.update(completed=j+1,columns=columns.copy(),tune_columns=qcolumns.copy(),common_valid=valid.copy(),
                              active_magnet=None,status='running')
                 self.checkpoint(data,checkpoint_path,event)
@@ -517,7 +538,10 @@ class DispersionService:
             if len(state['tune_columns'])!=(done if acquired.measure_tunes else 0):raise ValueError('Incomplete tune response')
             if any(np.asarray(column).shape!=(2,) for column in state['tune_columns']):raise ValueError('Invalid tune response shape')
             measured=sum(not r.get('skipped') for r in data['probe_readbacks'])
-            if len(data['orbit_measurements'])<3+6*measured:raise ValueError('Missing raw measurements')
+            if ('rf_blocks' not in data or measured) and len(data['orbit_measurements'])<3+6*measured:raise ValueError('Missing raw measurements')
+            if 'rf_blocks' in data:
+                from .qm_rf_scan import validate_rf_checkpoint
+                validate_rf_checkpoint(data,DispersionOptions(**data['options']))
             if state['status']=='complete' and done!=m:raise ValueError('Incomplete scan marked complete')
         except (KeyError,TypeError,IndexError) as exc:raise ValueError('Malformed QM scan checkpoint: '+str(exc)) from exc
         return data
@@ -555,6 +579,7 @@ class DispersionService:
             progress(0,f"Resume: {data['scan_state']['completed']}/{len(names)} QM responses retained; remeasuring baseline")
             frame,mask,tunes,evidence=self.signal(opt)
             valid=np.asarray(data['scan_state']['common_valid'],bool)&mask
+            if 'rf_blocks' in data and not np.any(data['scan_state']['common_valid']):valid=mask.copy()
             enabled=np.array([n not in opt.excluded_bpms for n in data['names']])
             if not np.any(valid&enabled&np.asarray(data['straight'],bool)):raise ValueError('No common valid straight BPM at resume baseline')
             data.setdefault('resume_checks',[]).append(dict(timestamp=datetime.now(timezone.utc).isoformat(),
@@ -568,6 +593,16 @@ class DispersionService:
             try:self.checkpoint(data,checkpoint_path,event)
             except Exception as save_error:data['checkpoint_error']=str(save_error)
             raise
+        if 'rf_blocks' in data:
+            from .qm_rf_scan import measure_qms
+            # A new probe definition invalidates unfinished RF pairs. Keep the
+            # committed responses and re-plan only the outstanding magnets.
+            if any(data['options'].get(k)!=getattr(opt,k) for k in (
+                    'probe_A','target_snr','maximum_probe_pairs','use_probe_presets','adaptive_probe','constrain_cod',
+                    'orbit_tolerance_mm','characterize_first_scan','reuse_probe_widths','probe_max_growth')):
+                data.pop('rf_round',None)
+                data['rf_pending'].clear()
+            return measure_qms(self,data,opt,progress,event,checkpoint_path)
         return self.measure_remaining(data,opt,progress,event,checkpoint_path)
 
     def recalculate(self,data,opt,progress=lambda *_:None):

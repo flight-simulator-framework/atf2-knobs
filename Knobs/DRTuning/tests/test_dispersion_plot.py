@@ -142,16 +142,19 @@ class DispersionPlotTests(unittest.TestCase):
                 panel = window.qm_dispersion
                 panel.autosave_directory = Path(root)
                 panel.excluded.setText(', '.join(list(window.backend.quadrupoles)[1:]))
-                original = panel.service.measure_remaining
+                original = window.backend.set_quadrupole_current
                 waiting = threading.Event()
-                def hold(*args):
-                    waiting.set()
-                    if not release.wait(10):
-                        raise RuntimeError('test worker timed out')
-                    return original(*args)
-                panel.service.measure_remaining = hold
+                def hold(name, value):
+                    # Dispersion becomes available at the positive RF reference.
+                    if window.backend.offset > 0 and not waiting.is_set():
+                        waiting.set()
+                        if not release.wait(10):
+                            raise RuntimeError('test worker timed out')
+                    return original(name, value)
+                window.backend.set_quadrupole_current = hold
                 panel.calc_button.click()
-                self.wait_for(lambda: waiting.is_set() and panel.plot.data is not None)
+                self.wait_for(lambda: waiting.is_set() and panel.plot.data is not None and
+                              np.isfinite(panel.plot.data['full_measured'][0]).any())
                 self.assertFalse(panel.calc_button.isEnabled())
                 self.assertTrue(panel.plot.canvas.isEnabled())
                 plot = panel.plot

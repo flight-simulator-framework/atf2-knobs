@@ -42,15 +42,22 @@ Loading recalculates the proposal using the current fit settings.
 For a valid ZV probe pair, the default acceptance threshold is 0.075 mm
 (0.1 mm target with 25% tolerance) in peak vertical COD half-difference over
 eligible BPMs. The scan accepts any response at or above this threshold immediately.
+Measure selected ZVs and QM CALC group probes by RF setting. At nominal RF
+measure the baseline orbit and all low/high current pairs, then repeat at the
+negative and positive RF offsets. Each probe moves one magnet and restores it
+before the next magnet. Each RF block starts and ends with a reference orbit
+at the original magnet settings. The JSON stores both reference frames and
+the RMS change in X and Y. The solver uses the measured current span at each RF.
+One successful pass takes three RF changes including return to the initial
+RF state. Candidate selection and post-Apply measurements are separate.
 If an initial ZV probe loses all common enabled BPMs, the scan restores that
-ZV and checks BPM coverage at the original current across all three RF settings.
+ZV and checks BPM coverage at the RF setting where the loss occurred.
 On recovery it repeats both endpoints at a smaller width (e.g. ±0.05, ±0.02,
 ±0.01 A) and uses the first valid reduced pair for that ZV. If no width works
 within the retry range or pair limit, that ZV is skipped. Loss of BPM coverage
 at the restored current stops the scan.
 From the second pair on each ZV, a loss of all common enabled BPMs triggers
-one repeat of that endpoint's three RF measurements after a 3-second wait at
-the same ZV current and original RF setting. A repeated failure during the
+one repeat of that endpoint after a 3-second wait at the same current and RF. A repeated failure during the
 initial width search returns to the shrinking procedure above. A repeated
 failure after a successful pair restores the ZV and stops the scan. Cancel
 also works during the wait.
@@ -181,10 +188,10 @@ QM dispersion:
   usable, no correction proposal is produced. S/N is adjustable in the panel.
   Each dispersion observation measures nominal COD plus symmetric RF offsets,
   with 10 BPM updates at each setting; RF and temporary currents are restored.
-  With one pair per default 13 active trims: 27 dispersion observations, 81 COD settings,
-  810 BPM frames. Enabling all 16 gives 33 observations / 99 settings / 990 frames.
-  Each extra adaptive pair adds 6 COD settings / 60 BPM updates. This can take
-  several minutes with live settling.
+  With one pair per default 13 active trims, three RF blocks acquire
+  3 x (2 reference orbits + 26 probe orbits) x 10 BPM updates = 840 updates.
+  The next pass measures only magnets that need a different probe width.
+  Magnet settling and BPM averaging still contribute to total acquisition time.
   "Lost all common valid straight-section BPMs" means no enabled straight BPM
   remained usable through every accepted observation, not necessarily that all
   BPMs failed simultaneously. QM dispersion excludes a BPM after FIVE consecutive
@@ -197,10 +204,10 @@ QM dispersion:
   Thus an accepted average can contain fewer than 10 samples. Saved data include
   valid_sample_count, max_invalid_streak, trailing_invalid_streak and the limit.
   Other correction tools retain their previous sampling/validity rules.
-  Show detailed log now records "BPM validity:" for each observation, including
-  QM/current, current versus cumulative valid counts, lost BPM names, and
-  per-RF/per-update counts. The saved JSON validity_history retains these
-  diagnostics plus source status evidence and links to raw orbit measurements.
+  For grouped scans, rf_blocks links each reference and probe to the raw
+  orbit_measurements entry, including the RF setting, current readback, BPM
+  names, sample counts and status diagnostics. probe_attempts records rejected
+  trials and their next widths.
   Once excluded during a scan, a BPM stays out of that scan's common response.
   Dx is targeted to zero at legacy straight BPMs MB19R–MB31R / MB66R–MB80R.
   Arc Dx, Dy and COD target their measured baselines. These are named physical
@@ -253,16 +260,15 @@ QM dispersion:
   optics changes is an approximation; use CALC again if prediction and measurement
   diverge. Next probe [A] is for a subsequent CALC at matching settings, not Apply.
   CALC automatically writes qm_scan_*.checkpoint.json under /atf/data/flight-simulator/DRTuning/<year>/
-  (or the chosen save folder). Baseline and each completed QM pair are saved;
-  adaptive attempts and available raw frames are also recorded. A pair is
-  committed only after both observations and current restoration succeed.
+  (or the chosen save folder). Each complete RF block is checkpointed, followed
+  by the accepted columns and new probe widths when that pass completes.
   Writes use a temporary file, flush/fsync, and atomic replacement so an
   interrupted write preserves the previous checkpoint. Saving failure stops
   the scan after restoration; it does not continue accumulating unsaved pairs.
   Resume unfinished QM scan uses the current partial result, or first choose
   Load QM scan checkpoint after restarting the GUI. Completed response columns
-  are reused; the unfinished QM starts from a matching saved estimate, its
-  enabled per-QM preset, or the uniform/fallback width. Loading a scan never overwrites the
+  and complete RF blocks of the pending pass are reused. An interrupted block
+  is repeated. Changing the probe definition replans the pending magnets. Loading a scan never overwrites the
   current initial-width control.
   Resume checks machine identity/profile, BPM order, acquisition RF/tune
   settings, QM selection, supply limits and original machine settings before

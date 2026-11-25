@@ -23,6 +23,7 @@ class VerticalDispersionPanel(CorrectionPanel):
         super().__init__(window, mode)
         self.baseline_observed.connect(self.plot.correction)
         self.options.count_v = 5
+        self.options.bpm_samples = 10
         self.options.preserve_vertical_dispersion_orbit = True
         self.options.dispersion_weight = 1.
         self.options.orbit_weight = .05
@@ -57,6 +58,7 @@ class VerticalDispersionPanel(CorrectionPanel):
         left.addWidget(self.proposal_summary)
         self.find_button = QPushButton('1. Find ZVs (RFTrack)')
         self.measure_button = QPushButton('2. Measure selected ZVs')
+        self.measure_button.setToolTip('Probe all selected ZVs at each RF setting, then restore the initial RF.')
         self.apply_button = QPushButton('3. Apply / remeasure')
         for widget, action in ((self.find_button, self.calculate),
                                (self.measure_button, self.measure_candidates),
@@ -128,7 +130,7 @@ class VerticalDispersionPanel(CorrectionPanel):
         preview = self.data
         if not preview or preview['options']['response_source'] not in ('rftrack', 'rftrack_nominal') or not preview['selected']:
             return
-        self.window.start(lambda p: self.window.service.measure_selected_zvs(preview, p),
+        self.window.start(lambda p: self.window.service.measure_selected_zvs(preview, p, group_rf=True),
                           self.display, label='Measure selected ZVs', pausable=True)
 
     def data_directory(self):

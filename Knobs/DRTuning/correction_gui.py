@@ -632,6 +632,7 @@ class QMDispersionPanel(CorrectionTool):
             return buttons
         self.calc_button,self.set_button=button_row([
             ('1. CALC',self.calculate),('2. Apply',self.apply)])
+        self.calc_button.setToolTip('Measure all selected QMs at each RF setting. Repeat only probes that need a different width.')
         self.calc_button.setStyleSheet('font-weight: 600;')
         self.set_button.setStyleSheet('font-weight: 600;')
         self.bpm_button,self.recalculate_button=button_row([
@@ -743,7 +744,7 @@ class QMDispersionPanel(CorrectionTool):
             excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(sorted(set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()})))
     def calculate(self):
         opt=self.options();path=self.new_checkpoint_path();self.set_button.setEnabled(False)
-        self.run(lambda p:self.service.calculate(opt,p,self.update.emit,checkpoint_path=path),self.display,'QM dispersion')
+        self.run(lambda p:self.service.calculate(opt,p,self.update.emit,checkpoint_path=path,group_rf=True),self.display,'QM dispersion')
     def recalculate(self):
         if self.result is None:return
         data=self.result;opt=self.options();self.set_button.setEnabled(False)
@@ -788,15 +789,16 @@ class QMDispersionPanel(CorrectionTool):
             self.status.setText(message+f'\nFit BPMs: {valid.sum()} / {len(valid)}')
         else:
             self.set_button.setEnabled(False)
-            state=data.get('scan_state',{});done=state.get('completed',0)
+            state=data.get('scan_state',{});done=len(data['rf_results']) if 'rf_results' in data else state.get('completed',0)
             self.status.setText(f"Measured: {done}/{len(data['actuators'])} QMs.")
-            qualities=data.get('probe_quality',[])
+            qualities=dict(zip(data['actuators'],data.get('probe_quality',[])))
+            qualities.update({n:r['quality'] for n,r in data.get('rf_results',{}).items()})
             estimates=data.get('successful_probe_widths',{})
             self.set_table(['QM '+self.active_coil,'Scan','Response / target [µm]','Next probe [A]'],
-                [(n,('Skipped' if qualities[i].get('skipped') else 'Complete') if i<done else 'Pending',
-                  probe_quality_text(qualities[i]) if i<len(qualities) else '',
+                [(n,('Skipped' if qualities[n].get('skipped') else 'Complete') if n in qualities else 'Pending',
+                  probe_quality_text(qualities.get(n)),
                   f"{estimates[n]['width_A']:.2f}" if n in estimates else '')
-                 for i,n in enumerate(data['actuators'])])
+                 for n in data['actuators']])
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
         elif data.get('proposal_unavailable_reason'):self.status.setText('S/N below target. Run CALC to remeasure.')
