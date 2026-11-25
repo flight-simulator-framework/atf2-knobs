@@ -1,7 +1,7 @@
 """Vertical dispersion correction with RFTrack selection and measured ZV response."""
 
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import (QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
+from PyQt6.QtWidgets import (QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
                              QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget)
 
 from Knobs.DRCorrection.assessment import changed_indices
@@ -17,7 +17,6 @@ class VerticalDispersionPanel(CorrectionPanel):
     def __init__(self, window, mode):
         super().__init__(window, mode)
         self.baseline_observed.connect(self.plot.correction)
-        self.options.response_source = 'rftrack'
         self.options.count_v = 5
         old = self.layout().takeAt(0).widget()
         old.hide()
@@ -28,6 +27,13 @@ class VerticalDispersionPanel(CorrectionPanel):
         settings = QGroupBox('Measurement')
         form = QFormLayout(settings)
         left.addWidget(settings)
+        self.screening = QComboBox()
+        self.screening.addItem('Current optics (no tune fit)', 'imported')
+        self.screening.addItem('Current optics + tune fit', 'fit')
+        self.screening.addItem('Saved nominal RFTrack', 'nominal')
+        self.set_screening_options()
+        self.screening.currentIndexChanged.connect(self.change_screening)
+        form.addRow('ZV selection model', self.screening)
         maximum = QSpinBox()
         maximum.setRange(1, max(1, len(window.backend.vcorrectors)))
         maximum.setValue(self.options.count_v)
@@ -92,20 +98,32 @@ class VerticalDispersionPanel(CorrectionPanel):
             self.plot.clear_data()
         super().invalidate(clear_model_response)
 
+    def change_screening(self):
+        self.response_cache.clear()
+        self.set_screening_options()
+        self.invalidate()
+
+    def set_screening_options(self):
+        choice = self.screening.currentData()
+        self.options.model_match_tunes = choice == 'fit'
+        self.options.response_source = 'rftrack_nominal' if choice == 'nominal' else 'rftrack'
+
     def calculate(self, dataset=None):
-        self.options.response_source = 'rftrack'
+        self.set_screening_options()
         self.response_cache.clear()
         super().calculate(dataset)
 
     def measure_candidates(self):
         preview = self.data
-        if not preview or preview['options']['response_source'] != 'rftrack' or not preview['selected']:
+        if not preview or preview['options']['response_source'] not in ('rftrack', 'rftrack_nominal') or not preview['selected']:
             return
         self.window.start(lambda p: self.window.service.measure_selected_zvs(preview, p),
                           self.display, label='Measure selected ZVs', pausable=True)
 
     def display(self, data):
         self.options.response_source = data['options']['response_source']
+        if self.options.response_source in ('rftrack', 'rftrack_nominal') and not data.get('set_blocked_reason'):
+            data['set_blocked_reason'] = 'Measure the selected ZVs before Apply.'
         super().display(data)
         if data.get('applied'):
             self.response_cache.clear()
@@ -116,11 +134,13 @@ class VerticalDispersionPanel(CorrectionPanel):
         if not hasattr(self, 'undo_button'):
             return
         data = self.data
-        model = bool(data and data['options']['response_source'] == 'rftrack')
+        model = bool(data and data['options']['response_source'] in ('rftrack', 'rftrack_nominal'))
         measured = bool(data and data.get('rftrack_candidates') and
                         data['options']['response_source'] == 'measured')
         matches = bool(data and set(data['options']['excluded_bpms']) == self.plot.excluded)
         missing = set(self.window.backend.bpm_names) - self.plot.excluded - set(data['names']) if model else set()
+        reference = data.get('reference_matrix', {}) if model else {}
+        missing.difference_update(reference.get('unmapped_bpms', ()))
         candidates = data['selected'] if model and matches and not missing else []
         self.measure_button.setEnabled(bool(candidates))
         ready = measured and matches and not data.get('applied') and not data.get('set_blocked_reason') and bool(len(changed_indices(data)))
@@ -142,6 +162,10 @@ class VerticalDispersionPanel(CorrectionPanel):
             message = 'Measured response available. Recalculate after changing BPMs.'
         else:
             message = 'Ready to select ZVs.'
+        if model and reference:
+            unmapped = reference['unmapped_bpms'] + reference['unmapped_zvs']
+            if unmapped:
+                message += '\nOutside reference: ' + ', '.join(unmapped)
         self.proposal_summary.setText(message)
 
     def apply(self):

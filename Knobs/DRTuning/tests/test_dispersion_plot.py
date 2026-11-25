@@ -58,6 +58,9 @@ class DispersionPlotTests(unittest.TestCase):
                 panel.find_button.click()
                 self.wait_for(lambda: not window.task.isRunning() and panel.find_button.isEnabled())
                 self.assertTrue(panel.measure_button.isEnabled())
+                self.assertFalse(panel.apply_button.isEnabled())
+                with self.assertRaisesRegex(ValueError, 'Measure the selected ZVs'):
+                    window.service.apply(panel.data)
                 waiting = threading.Event()
                 def baseline(data):
                     panel.baseline_observed.emit(data)

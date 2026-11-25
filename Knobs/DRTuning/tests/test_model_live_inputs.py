@@ -50,6 +50,20 @@ class LiveModelInputTests(unittest.TestCase):
         self.assertTrue(all(v<=0 for n,v in settings['sextupoles_k2l'].items() if n.startswith('SD1R')))
         np.testing.assert_allclose(model.tunes(),[.0625,.1361],atol=1.e-4)
         self.assertEqual(self.client.writes,[])
+    def test_imported_optics_work_without_live_tune_targets(self):
+        from Knobs.DRTuning.model import ModelManager
+        options=Options(model_match_tunes=False,excluded_bpms=('MB97R','MB98R'),
+                        fixed_actuators=('ZH15R','ZV16R'))
+        for pv in ('SAD:DR_TUNE_X','SAD:DR_TUNE_Y'):
+            del self.values_live[pv]
+        manager=ModelManager(self.backend)
+        with patch.object(self.backend,'snapshot',return_value=self.baseline):
+            model=manager.prepare(options,lambda:None)
+        self.assertIsNone(model.match_report)
+        self.assertIsNone(manager.settings['tunes'])
+        self.assertTrue(np.isfinite(manager.last_attempt['initial_tunes']).all())
+        self.assertEqual(self.client.writes,[])
+
     def test_sad_reference_factors_trim_policy_and_absolute_current_centers(self):
         from Knobs.DRTuning.model import capture_settings,OpticsModel
         for n in ('QF1R.1','QM7R.1','QM8R.1'):

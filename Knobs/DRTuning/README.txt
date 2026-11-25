@@ -16,6 +16,17 @@ Set rf.verify_frequency_readback=true to restore the physical-frequency checks.
 
 Vertical dispersion and RF power pause
 --------------------------------------
+Current optics (no tune fit) is the default for ZV selection. Find ZVs imports
+the magnet settings and checks closed-orbit stability before calculating ZV
+responses in RFTrack. This mode works without a tune reading. An unstable
+model stops selection before the RF measurement.
+Choose Current optics + tune fit when the configured tune targets are known
+to represent the current operating point. The default fit allows ±5% change
+in model QF1R/QF2R strength with a tolerance of 1e-5 in each fractional tune.
+Saved nominal RFTrack uses the bundled 4 kHz reference matrix.
+For mapped-channel differences use RFTrack model > Exclude unmapped BPMs /
+magnets. Measure selected ZVs measures the actual response before Apply.
+
 Vertical dispersion uses the current vertical dispersion and COD to rank ZVs
 with the RFTrack response. Set Maximum ZVs (default 5) and click Find ZVs.
 Measure selected ZVs measures only those response columns. Review the proposed

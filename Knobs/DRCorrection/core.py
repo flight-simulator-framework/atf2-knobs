@@ -285,6 +285,9 @@ class CorrectionService:
     def acquire(self,mode,opt,progress=lambda *_:None):
         validate_bpm_sampling(opt)
         validate_adaptive_probe(opt)
+        if opt.response_source=='rftrack_nominal':
+            from Knobs.DRTuning.nominal_zv import acquire
+            return acquire(self,mode,opt,progress)
         if opt.response_source=='rftrack':
             try:return self.model_manager.acquire(self,mode,opt,progress)
             except Exception:
@@ -575,7 +578,7 @@ class CorrectionService:
     def measure_selected_zvs(self,proposal,progress=lambda *_:None):
         """Probe only the ZVs selected by a vertical RFTrack dispersion fit."""
         opt=Options(**proposal['options'])
-        if (proposal['mode']!='dispersion' or opt.plane!='y' or opt.response_source!='rftrack'
+        if (proposal['mode']!='dispersion' or opt.plane!='y' or opt.response_source not in ('rftrack','rftrack_nominal')
                 or opt.selection_method!='greedy' or proposal.get('applied')
                 or proposal['backend_id']!=self.backend.identity):
             raise ValueError('Run vertical dispersion CALC with RFTrack and Greedy first')
@@ -586,14 +589,18 @@ class CorrectionService:
         self.check_cancel()
         if not self.backend.same_settings(self.backend.snapshot(),proposal['baseline']):
             raise ValueError('Settings changed since RFTrack selection. Run CALC again.')
-        from Knobs.DRTuning.model import verify_inputs
-        verify_inputs(self.backend,proposal['model_settings'])
+        if opt.response_source=='rftrack':
+            from Knobs.DRTuning.model import verify_inputs
+            verify_inputs(self.backend,proposal['model_settings'])
         opt.response_source='measured'
         scan=copy.deepcopy(opt)
         scan.fixed_actuators=tuple(sorted(set(opt.fixed_actuators) | (set(self.backend.vcorrectors)-set(names))))
         data=self.acquire('dispersion',scan,progress)
         data['rftrack_candidates']=names
-        data['selection_model_sha256']=proposal.get('model_settings_sha256')
+        if 'reference_matrix' in proposal:
+            data['reference_matrix']=copy.deepcopy(proposal['reference_matrix'])
+        else:
+            data['selection_model_sha256']=proposal.get('model_settings_sha256')
         if proposal.get('constraints') is not None:
             constraints=copy.deepcopy(proposal['constraints'])
             columns=[proposal['actuators'].index(n) for n in data['actuators']]
@@ -645,6 +652,8 @@ class CorrectionService:
         self.check_cancel()
         validate_bpm_sampling(Options(**data['options']))
         if data.get('backend_id')!=self.backend.identity:raise ValueError('Proposal belongs to another backend')
+        if data['options'].get('response_source')=='rftrack_nominal':
+            raise ValueError('Measure the selected ZVs before Apply')
         if data.get('applied'):raise ValueError('Already applied; CALC again before another SET')
         changed=changed_indices(data)
         if not len(changed):raise ValueError('No magnet settings change; CALC already proposes zero correction')

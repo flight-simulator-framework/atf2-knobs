@@ -82,6 +82,8 @@ class DispersionPlot(Plot):
                                       ('full_target','Target',':')]:
                 if key in data:
                     curve = np.asarray(data[key][i], float)
+                elif key == 'full_predicted' and data.get('reference_matrix') and 'predicted' in data and i in (1, 3):
+                    curve = np.asarray(data['predicted'][i//2], float)
                 elif key == 'full_target' and 'target' in data and i in (1, 3):
                     curve = np.asarray(data['target'][i//2], float)
                 else:

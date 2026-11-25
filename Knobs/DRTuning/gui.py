@@ -246,7 +246,7 @@ class TuningSession(DRCorrectionWindow):
             if backend.identity.startswith('epics:') or backend.label.startswith('RFTrack'):
                 panel.options.adaptive_probe=True
             if backend.identity.startswith('epics:'):
-                panel.options.response_source='rftrack'
+                if mode!='dispersion':panel.options.response_source='rftrack'
                 if mode in ('orbit','dispersion'):
                     panel.options.count_h=5 if mode=='orbit' else 10
                     panel.options.count_v=5

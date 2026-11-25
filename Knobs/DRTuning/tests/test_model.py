@@ -95,6 +95,28 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertTrue(result['applied'])
         self.assertTrue(all(set(c[1])<=names for c in self.machine.commands if c[0]=='correctors'))
 
+    def test_nominal_zv_selection_bypasses_tune_fit_and_requires_measured_response(self):
+        self.opt.response_source='rftrack_nominal'
+        self.opt.count_v=3
+        self.manager.prepare=Mock(side_effect=AssertionError('No live tune fit expected'))
+        self.machine.bpm_names[-1]='unmapped BPM'
+        self.opt.fixed_actuators=(self.machine.vcorrectors[0],)
+        preview=self.service.calculate('dispersion',self.opt)
+        self.assertEqual(preview['reference_matrix']['unmapped_bpms'],['unmapped BPM'])
+        self.assertEqual(preview['full_measured'].shape,(4,95))
+        self.assertEqual(preview['bpm_observations']['full_measured'].shape,(4,96))
+        self.assertEqual(len(preview['selected']),3)
+        self.assertNotIn(self.machine.vcorrectors[0],preview['selected'])
+        self.assertTrue(all(c[0]=='rf' for c in self.machine.commands))
+        with self.assertRaisesRegex(ValueError,'Measure the selected ZVs'):
+            self.service.apply(preview)
+        measured=self.service.measure_selected_zvs(preview)
+        self.assertEqual(set(measured['actuators']),set(preview['selected']))
+        self.assertEqual(measured['options']['response_source'],'measured')
+        self.assertEqual(measured['reference_matrix'],preview['reference_matrix'])
+        self.assertEqual(measured['full_measured'].shape,(4,96))
+        self.manager.prepare.assert_not_called()
+
     def test_stale_zv_selection_stops_before_measuring(self):
         preview=self.service.calculate('dispersion',self.opt)
         self.machine.currents[self.machine.vcorrectors[0]]+=.02
@@ -384,6 +406,14 @@ class ModelGuiTests(unittest.TestCase):
                 p=window.panels[mode]
                 self.assertEqual(p.options.response_source,'rftrack')
                 self.assertEqual((p.options.count_h,p.options.count_v),(h,5))
+            vertical=window.panels['dispersion']
+            self.assertEqual(vertical.screening.currentData(),'imported')
+            self.assertFalse(vertical.options.model_match_tunes)
+            for choice,source,fit in [('imported','rftrack',False),('nominal','rftrack_nominal',False),('fit','rftrack',True)]:
+                vertical.screening.setCurrentIndex(vertical.screening.findData(choice))
+                self.assertEqual(vertical.options.response_source,source)
+                self.assertEqual(vertical.options.model_match_tunes,fit)
+            self.assertTrue(panel.options.model_match_tunes)
             window.model_panel.preparation.setCurrentIndex(1)
             self.assertEqual(b.model_config['preparation'],'all_currents')
             self.assertEqual(window.model_panel.match_limit.value(),5.)

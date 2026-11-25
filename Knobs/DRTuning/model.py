@@ -388,7 +388,9 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
                 scale=field['field']*field['efflen']*1000/(-p)*.299792458
                 family='hcorrector' if n in backend.hcorrectors else 'vcorrector'
             actuators[n]=dict(kind=family,value=baseline[kind][n],unit=backend.unit(kind),scale=scale,limits=[lo[i],hi[i]])
-    if live:
+    if not opt.model_match_tunes:
+        tunes=None;tune_source=None;alias=False
+    elif live:
         tunes=[read(pv) for pv in config.get('tune_pvs',['SAD:DR_TUNE_X','SAD:DR_TUNE_Y'])]
         tune_source='SAD tune target PVs (not claimed fresh TBT measurements)';alias=False
     else:
