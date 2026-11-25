@@ -145,6 +145,10 @@ def reflow_correction(panel):
         w=getattr(panel.form,prefix+suffix);w.setMinimumSize(0,0);w.setMaximumSize(16777215,16777215)
         w.setText(title);layout.addWidget(w)
         if suffix=='Calc':
+            if panel.mode=='dispersion':
+                panel.zv_candidates_label=QLabel();panel.zv_candidates_label.setWordWrap(True)
+                panel.measure_zvs_button=button('Measure selected ZVs',panel.measure_selected_zvs)
+                layout.addWidget(panel.zv_candidates_label);layout.addWidget(panel.measure_zvs_button)
             layout.addWidget(panel.recalculate_button);layout.addWidget(panel.response_cache_label)
     box,layout=group('3. Save and analyze');left.addWidget(box)
     layout.addWidget(button('Save data and plots',panel.save_bundle))

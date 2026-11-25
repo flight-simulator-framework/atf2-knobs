@@ -224,11 +224,34 @@ class GuiTests(unittest.TestCase):
             baseline=window.backend.snapshot()
             for mode,panel in window.panels.items():
                 window.tabs.setCurrentWidget(panel)
-                prefix='pushButtonDispersion' if mode=='dispersion' else 'pushButton'
-                getattr(panel.form,prefix+'Calc').click();self.wait(window)
-                self.assertIsNotNone(panel.data,window.messages.toPlainText())
-                getattr(panel.form,prefix+'Set').click();self.wait(window);self.assertTrue(panel.data['applied'])
-                getattr(panel.form,prefix+'Reset').click();self.wait(window)
+                if mode=='dispersion':
+                    # Use an independent deterministic model for RFTrack screening.
+                    model=DemoBackend();model.match_report={}
+                    manager=window.service.model_manager
+                    def prepare(options,cancel,progress):
+                        manager.baseline=window.backend.snapshot()
+                        manager.settings={'raw_pvs':{}}
+                        return model
+                    manager.prepare=prepare
+                    panel.find_button.click();self.wait(window)
+                    self.assertIsNotNone(panel.data,window.messages.toPlainText())
+                    self.assertFalse(panel.apply_button.isEnabled())
+                    shortlist=set(panel.data['selected'])
+                    panel.measure_button.click();self.wait(window)
+                    self.assertEqual(set(panel.data['actuators']),shortlist)
+                    self.assertTrue(panel.apply_button.isEnabled())
+                    panel.apply_button.click();self.wait(window)
+                    self.assertTrue(panel.data['applied'])
+                    axes=panel.plot.figure.axes
+                    self.assertEqual([ax.get_title() for ax in axes],['Dispersion X','Dispersion Y','COD X','COD Y'])
+                    self.assertIn('Measured after SET',axes[1].get_legend_handles_labels()[1])
+                    self.assertFalse(panel.apply_button.isEnabled())
+                    panel.undo_button.click();self.wait(window)
+                else:
+                    panel.form.pushButtonCalc.click();self.wait(window)
+                    self.assertIsNotNone(panel.data,window.messages.toPlainText())
+                    panel.form.pushButtonSet.click();self.wait(window);self.assertTrue(panel.data['applied'])
+                    panel.form.pushButtonReset.click();self.wait(window)
                 self.assertEqual(window.backend.snapshot(),baseline)
                 self.assertNotIn('Failed',window.operation_status.text())
         finally:window.close()

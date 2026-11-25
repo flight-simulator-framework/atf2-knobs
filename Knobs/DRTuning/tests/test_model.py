@@ -64,6 +64,44 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual([c[0] for c in self.machine.commands],['rf','rf','rf'])
         self.assertEqual(self.machine.acquisitions,3)
         self.assertEqual(len(data['orbit_measurements']),3)
+
+    def test_selected_zvs_only_are_probed_and_applied(self):
+        self.opt.count_v=3
+        target=np.linspace(-2.,2.,len(self.machine.bpm_names))
+        original_target=self.machine.target_dispersion
+        self.machine.target_dispersion=lambda plane:target if plane=='y' else original_target(plane)
+        self.opt.fixed_actuators=(self.machine.vcorrectors[0],)
+        preview=self.service.calculate('dispersion',self.opt)
+        np.testing.assert_allclose(preview['target'][0],target)
+        names=set(preview['selected'])
+        self.assertTrue(0<len(names)<=3)
+        self.assertNotIn(self.machine.vcorrectors[0],names)
+        self.assertTrue(all(c[0]=='rf' for c in self.machine.commands))
+        # Distinguish the independently measured matrix from the screening model.
+        self.machine.dispr*=.8
+        result=self.service.measure_selected_zvs(preview)
+        probed={n for c in self.machine.commands if c[0]=='correctors' for n in c[1]}
+        self.assertEqual(probed,names)
+        self.assertEqual(set(result['actuators']),names)
+        self.assertEqual(result['options']['response_source'],'measured')
+        cols=[preview['actuators'].index(n) for n in result['actuators']]
+        np.testing.assert_allclose(result['response'][:96],.8*preview['response'][:96,cols],atol=1.e-7)
+        self.assertEqual(result['baseline'],self.machine.snapshot())
+        self.assertFalse(result['applied'])
+        measured=Options(**result['options'])
+        result=self.service.recalculate(result,measured)
+        self.machine.commands.clear()
+        self.service.apply(result)
+        self.assertTrue(result['applied'])
+        self.assertTrue(all(set(c[1])<=names for c in self.machine.commands if c[0]=='correctors'))
+
+    def test_stale_zv_selection_stops_before_measuring(self):
+        preview=self.service.calculate('dispersion',self.opt)
+        self.machine.currents[self.machine.vcorrectors[0]]+=.02
+        self.machine.commands.clear()
+        with self.assertRaisesRegex(ValueError,'Settings changed'):
+            self.service.measure_selected_zvs(preview)
+        self.assertEqual(self.machine.commands,[])
     def test_skew_only_two_horizontal_diagnostic_probes(self):
         self.service.calculate('skew',self.opt)
         self.assertEqual(len(self.machine.commands),6)
@@ -360,9 +398,11 @@ class ModelGuiTests(unittest.TestCase):
         try:
             window.tool_actions['model'].trigger()
             self.assertIs(window.tabs.currentWidget(),window.model_panel)
-            panel=window.panels['dispersion'];panel.response_source_box.setCurrentIndex(1)
+            panel=window.panels['dispersion']
             self.assertEqual(panel.options.response_source,'rftrack')
-            self.assertIn('one RF scan pair',panel.selection_label.text())
+            self.assertEqual(panel.options.plane,'y')
+            self.assertFalse(panel.measure_button.isEnabled())
+            self.assertEqual(window.tabs.indexOf(window.qm_dispersion),window.tabs.indexOf(panel)+1)
             self.assertEqual(b.commands,[]);self.assertEqual(b.acquisitions,0)
             window.model_panel.fields['tune_x'].setText('CUSTOM:TUNE:X')
             window.model_panel.inputs_changed()

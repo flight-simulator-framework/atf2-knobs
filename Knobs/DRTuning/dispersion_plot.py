@@ -1,0 +1,143 @@
+"""Interactive measured dispersion and orbit plots shared by both dispersion tools."""
+import numpy as np
+from matplotlib.backend_bases import MouseButton
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtGui import QCursor
+from PyQt6.QtWidgets import QToolTip
+
+from Knobs.DRCorrection.gui import Plot
+
+
+class DispersionPlot(Plot):
+    bpm_clicked = pyqtSignal(str)
+    save_selection = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.data = None
+        self.excluded = frozenset()
+        self.points = {}
+        self.hovered = None
+        self.canvas.toolbar.addSeparator()
+        action = self.canvas.toolbar.addAction('Save BPM selection')
+        action.setToolTip('Overwrite the BPM selection for the next session on this interface')
+        action.triggered.connect(lambda: self.save_selection.emit())
+        self.canvas.mpl_connect('motion_notify_event', self.hover)
+        self.canvas.mpl_connect('figure_leave_event', self.hide_tip)
+        self.canvas.mpl_connect('button_press_event', self.click)
+
+    def set_excluded(self, names):
+        names = frozenset(names)
+        if self.excluded != names:
+            self.excluded = names
+            if self.data is not None:
+                self.correction(self.data, preserve_view=True)
+
+    def clear_data(self):
+        self.hide_tip()
+        self.points.clear()
+        self.data = None
+        self.figure.clear()
+        self.canvas.draw_idle()
+
+    def correction(self, data, preserve_view=False):
+        limits = [(ax.get_xlim(), ax.get_ylim()) for ax in self.figure.axes] if preserve_view else []
+        self.clear_data()
+        self.data = data
+        self.figure.set_layout_engine('constrained')
+        axes = self.figure.subplots(2, 2).ravel()
+        before = data.get('bpm_observations', data)
+        names = np.asarray(before['names'])
+        positions = np.asarray(before['positions_m'], float)
+        known = np.isfinite(positions).all()
+        x = positions if known else np.arange(1, len(names) + 1)
+        indices = {name: i for i, name in enumerate(names)}
+        rows = np.array([indices[n] for n in data['names']])
+        excluded = np.isin(names, list(self.excluded))
+        valid = np.asarray(data.get('acquisition_valid', data.get('scan_state', {}).get('common_valid', data['valid'])), bool)
+        valid = valid & np.asarray(data.get('iteration_valid', True), bool)
+        observed = valid if before is data else np.asarray(before['valid'], bool)
+        order = np.argsort(x, kind='stable')
+        active = order[~excluded[order]]
+        curve_order = np.argsort(x[rows], kind='stable')
+        curve_rows = curve_order[~excluded[rows][curve_order]]
+        for i, ax in enumerate(axes):
+            values = np.asarray(before['full_measured'][i], float)
+            title = data['full_signal_labels'][i]
+            unit = 'mm / (dp/p)' if i < 2 else 'mm'
+            ax.plot(x[active], np.where(observed, values, np.nan)[active], 'k.-',
+                    linewidth=.65, markersize=4, label='Measured before')
+            grey = excluded & np.isfinite(values)
+            if grey.any():
+                ax.plot(x[grey], values[grey], '.', color='0.65', label='Excluded', zorder=4)
+            invalid = ~observed & ~excluded & np.isfinite(values)
+            if invalid.any():
+                ax.plot(x[invalid], values[invalid], 'o', color='0.6', fillstyle='none',
+                        markersize=3, label='Invalid for fit')
+            visible = np.isfinite(values)
+            self.points[ax] = (names[visible], np.column_stack((x[visible], values[visible])),
+                               positions[visible], title, unit)
+            for key, label, style in [('full_predicted','Predicted','C2--'),
+                                      ('full_after','Measured after SET','C3-'),
+                                      ('full_target','Target',':')]:
+                if key in data:
+                    curve = np.asarray(data[key][i], float)
+                elif key == 'full_target' and 'target' in data and i in (1, 3):
+                    curve = np.asarray(data['target'][i//2], float)
+                else:
+                    continue
+                mask = valid
+                if key == 'full_after':
+                    mask = valid & np.asarray(data['after_valid'], bool)
+                    if data.get('restored'):
+                        label = 'After SET (since restored)'
+                ax.plot(x[rows][curve_rows], np.where(mask, curve, np.nan)[curve_rows], style,
+                        label=label, **({'color':'gray'} if key == 'full_target' else {}))
+            ax.set(xlabel='s [m]' if known else 'BPM index (measurement order)',
+                   ylabel='η [mm / (dp/p)]' if i < 2 else 'COD [mm]', title=title)
+            ax.grid(alpha=.2)
+            if limits:
+                ax.set_xlim(limits[i][0])
+                ax.set_ylim(limits[i][1])
+        entries = {}
+        for ax in axes:
+            handles, labels = ax.get_legend_handles_labels()
+            entries.update(zip(labels, handles))
+        self.figure.legend(list(entries.values()), list(entries), loc='outside upper center', ncol=3, fontsize=8)
+        self.canvas.draw_idle()
+
+    def hit(self, event):
+        if event.inaxes not in self.points or self.canvas.toolbar.mode:
+            return None
+        names, coordinates, positions, title, unit = self.points[event.inaxes]
+        if not len(names):
+            return None
+        pixels = event.inaxes.transData.transform(coordinates)
+        dist = np.sum((pixels - [event.x, event.y])**2, axis=1)
+        i = int(dist.argmin())
+        if dist[i] > (7 * self.canvas.device_pixel_ratio)**2:
+            return None
+        x, y = coordinates[i]
+        position = f's = {positions[i]:.4f} m' if np.isfinite(positions[i]) else f'BPM index = {x:g}'
+        name = str(names[i])
+        status = 'Excluded · click to include' if name in self.excluded else 'Included · click to exclude'
+        return name, f'{name}\n{position}\n{title} = {y:.5g} {unit}\n{status}'
+
+    def hide_tip(self, event=None):
+        if self.hovered is not None:
+            QToolTip.hideText()
+            self.hovered = None
+
+    def hover(self, event):
+        point = self.hit(event)
+        if point is None:
+            self.hide_tip()
+        elif self.hovered != point:
+            self.hovered = point
+            QToolTip.showText(QCursor.pos(), point[1], self.canvas)
+
+    def click(self, event):
+        if event.button == MouseButton.LEFT and not event.dblclick:
+            point = self.hit(event)
+            if point is not None:
+                self.bpm_clicked.emit(point[0])

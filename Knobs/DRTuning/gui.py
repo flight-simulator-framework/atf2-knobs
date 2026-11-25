@@ -4,7 +4,7 @@ import re
 import time
 import traceback
 from pathlib import Path
-from PyQt6.QtCore import Qt,QTimer
+from PyQt6.QtCore import Qt,QTimer,QSettings,pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QLabel,
     QComboBox,QLineEdit,QPushButton,QFileDialog,QSpinBox,QCheckBox,QMessageBox,QDialog,QListWidget,QSplitter)
 from Knobs.DRCorrection.gui import DRCorrectionWindow,TBTPanel,Task
@@ -13,6 +13,7 @@ from Knobs.DRCorrection.core import serial
 from .qmod_gui import QModPanel,HERE,FAMILIES
 from .optics import phase_beta
 from .hardware import load_hardware_profile
+from .vertical_dispersion import VerticalDispersionPanel
 
 
 class TuningTBTPanel(TBTPanel):
@@ -223,7 +224,9 @@ class TuningTBTPanel(TBTPanel):
 
 
 class TuningSession(DRCorrectionWindow):
-    def __init__(self,backend):
+    dispersion_panel_type = VerticalDispersionPanel
+    rf_pause_changed = pyqtSignal(object,str)
+    def __init__(self,backend,bpm_settings=None):
         super().__init__(backend);self.setWindowTitle('DRTuning — '+backend.label)
         index=self.tabs.indexOf(self.tbt);old=self.tbt;self.tabs.removeTab(index);old.deleteLater()
         self.tbt=TuningTBTPanel(self);self.tabs.addTab(self.tbt,'Turn1024 / TBT beta')
@@ -235,7 +238,7 @@ class TuningSession(DRCorrectionWindow):
         from .emittance_gui import EmittancePanel
         self.emittance_panel=EmittancePanel(self);self.tabs.addTab(self.emittance_panel,'XSR emittance')
         from .correction_gui import QMDispersionPanel,CouplingPanel
-        self.qm_dispersion=QMDispersionPanel(self);self.tabs.addTab(self.qm_dispersion,'QM horizontal dispersion')
+        self.qm_dispersion=QMDispersionPanel(self);self.tabs.insertTab(self.tabs.indexOf(self.panels['dispersion'])+1,self.qm_dispersion,'QM horizontal dispersion')
         self.coupling_panel=CouplingPanel(self);self.tabs.addTab(self.coupling_panel,'Local bump / XSR coupling')
         from .presentation import STYLE,reflow_correction
         self.setStyleSheet(STYLE);self.resize(1280,820)
@@ -247,10 +250,10 @@ class TuningSession(DRCorrectionWindow):
                 if mode in ('orbit','dispersion'):
                     panel.options.count_h=5 if mode=='orbit' else 10
                     panel.options.count_v=5
-            reflow_correction(panel)
+            if mode!='dispersion':reflow_correction(panel)
         layout=self.centralWidget().layout();layout.removeWidget(self.tabs)
         self.navigation=QListWidget();self.navigation.setMinimumWidth(160);self.navigation.setMaximumWidth(185)
-        self.navigation.addItems(['COD correction','Dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance','QM dispersion','Bump / XSR coupling'])
+        self.navigation.addItems(['COD correction','Vertical dispersion','QM dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance','Bump / XSR coupling'])
         self.tabs.tabBar().hide();self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
         self.tabs.currentChanged.connect(self.navigation.setCurrentRow);self.navigation.setCurrentRow(0)
         content=QSplitter();content.addWidget(self.navigation);content.addWidget(self.tabs);content.setStretchFactor(1,1)
@@ -269,15 +272,56 @@ class TuningSession(DRCorrectionWindow):
         self.progress.setRange(0,100);self.progress.setValue(0)
         self.timer=QTimer(self);self.timer.setInterval(250);self.timer.timeout.connect(self.tick)
         self._failed=False;self._active_label=''
+        self._rf_monitor=None
+        self._rf_paused=False
+        self._rf_popup=None
+        self.rf_pause_changed.connect(self.show_rf_pause)
         self.tool_actions={}
         for title,tools in (
             ('Measurements',[('TBT waveform / beta','tbt'),('QF1R beta','qf1'),('QF2R beta','qf2'),('QM trim 1 beta','qm1'),('QM trim 2 beta','qm2'),('XSR emittance','emittance')]),
-            ('Corrections',[('COD correction','orbit'),('Dispersion','dispersion'),('Skew correction','skew'),('QM horizontal dispersion','qm_dispersion'),('Local bump / XSR coupling','coupling')]),
+            ('Corrections',[('COD correction','orbit'),('Vertical dispersion','dispersion'),('QM horizontal dispersion','qm_dispersion'),('Skew correction','skew'),('Local bump / XSR coupling','coupling')]),
             ('Utilities',[('RFTrack model / optics','model'),('Orbit buffers','buffers'),('BPM / magnet selection','selection'),('Delta-f Ramp','frequency_dialog'),('SR / SR2 dispersion fit','sr'),('SR / SR2 beta fit','sr_beta')])):
             menu=self.menuBar().addMenu(title)
             for label,key in tools:
                 action=menu.addAction(label);action.triggered.connect(lambda checked=False,k=key:self.open_tool(k))
                 self.tool_actions[key]=action
+        self.bpm_settings = bpm_settings if bpm_settings is not None else QSettings('ATF', 'DRTuning')
+        self.bpm_settings_key = 'excluded_bpms/' + backend.identity
+        vertical = self.panels['dispersion']
+        options = vertical.options
+        self.service.dispersion_exclusions = lambda: options.excluded_bpms
+        self.service.dispersion_observed = vertical.baseline_observed.emit
+        self.qm_dispersion.service.reader.dispersion_exclusions = self.service.dispersion_exclusions
+        for plot in (vertical.plot, self.qm_dispersion.plot):
+            plot.bpm_clicked.connect(self.toggle_dispersion_bpm)
+            plot.save_selection.connect(self.save_bpm_selection)
+        saved = self.bpm_settings.value(self.bpm_settings_key, [], type=list)
+        if saved:
+            self.set_bpm_selection(saved)
+        self._active_plot_controls = None
+
+    def toggle_dispersion_bpm(self, name):
+        excluded = set(self.panels['dispersion'].options.excluded_bpms)
+        self.set_bpm_selection(excluded.symmetric_difference({name}))
+
+    def set_bpm_selection(self, excluded):
+        excluded = tuple(n for n in self.backend.bpm_names if n in excluded)
+        for panel in self.panels.values():
+            panel.options.excluded_bpms = excluded
+            panel.invalidate()
+        self.correction_selection_changed()
+
+    def save_bpm_selection(self):
+        excluded = self.panels['dispersion'].options.excluded_bpms
+        self.bpm_settings.setValue(self.bpm_settings_key, list(excluded))
+        self.bpm_settings.sync()
+        if self.bpm_settings.status() != QSettings.Status.NoError:
+            message = 'Could not save BPM selection to ' + self.bpm_settings.fileName()
+            self.log(message)
+            self.statusBar().showMessage(message)
+            return
+        self.statusBar().showMessage(f'BPM selection saved ({len(excluded)} excluded).', 5000)
+
     def correction_selection_changed(self):
         self.qm_dispersion.invalidate()
         self.coupling_panel.settings_changed()
@@ -312,6 +356,40 @@ class TuningSession(DRCorrectionWindow):
             self.operation_status.setStyleSheet('color:#b42318;font-weight:bold;')
             self.log_toggle.setChecked(True)
             if self.tabs.currentWidget() is self.tbt:self.tbt.acquisition_status.setText('Failed: '+message+'\nSee the detailed log below.')
+    def toggle_pause(self):
+        if self._rf_paused and self._rf_monitor is not None:
+            self._rf_monitor.resume.set()
+        else:
+            super().toggle_pause()
+
+    def show_rf_pause(self,monitor,reason):
+        if self._rf_monitor is not monitor:
+            return
+        if self._rf_popup is not None:
+            self._rf_popup.close()
+            self._rf_popup.deleteLater()
+            self._rf_popup=None
+        self._rf_paused=bool(reason)
+        if not reason:
+            self.operation_status.setText('RF recovered. Continuing measurement.')
+            self.pause_button.setText('Resume' if self.service.pause_requested.is_set() else 'Pause')
+            self.pause_button.setEnabled(self._manual_pause_enabled)
+            self.log('RF power pause resumed.')
+            return
+        self.operation_status.setText('RF power low. Measurement paused.')
+        self.log('RF power pause: '+reason)
+        self.pause_button.setText('Resume after RF recovery')
+        self.pause_button.setEnabled(True)
+        box=QMessageBox(QMessageBox.Icon.Warning,'RF Power Auto Pause',reason,parent=self)
+        box.setInformativeText('Resolve the RF fault, then resume this run.')
+        resume=box.addButton('Resume',QMessageBox.ButtonRole.AcceptRole)
+        keep=box.addButton('Keep paused',QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.buttonClicked.connect(lambda button:monitor.resume.set() if button is resume else None)
+        self._rf_popup=box
+        box.open()
+
     def start(self,action,finished,label=None,pausable=False):
         if self.task is not None and self.task.isRunning():
             self.log('An operation is running. Wait for completion or cancel.');return
@@ -319,8 +397,22 @@ class TuningSession(DRCorrectionWindow):
         self._failed=False;self._started=time.monotonic();self._active_label=label or self.navigation.currentItem().text()
         self.operation_status.setStyleSheet('color:#175c91;font-weight:bold;')
         self.operation_status.setText(self._active_label+': working...');self.log(self._active_label+': started')
-        self.service.cancel.clear();self.tabs.setEnabled(False);self.navigation.setEnabled(False);self.cancel_button.setEnabled(True)
+        self.service.cancel.clear()
+        active_panel=self.tabs.currentWidget()
+        if active_panel in (self.panels['dispersion'],self.qm_dispersion):
+            self._active_plot_controls=active_panel.splitter.widget(0)
+            self._active_plot_controls.setEnabled(False)
+        else:
+            self.tabs.setEnabled(False)
+        self.navigation.setEnabled(False);self.cancel_button.setEnabled(True)
         self.progress.setRange(0,0);self.timer.start();self.tick()
+        self._manual_pause_enabled=pausable
+        if getattr(self.backend,'monitor_klystrons',False):
+            from .power_pause import PowerPause
+            self._rf_monitor=PowerPause(self.service.cancel,self.rf_pause_changed.emit)
+            work=action
+            monitor=self._rf_monitor
+            action=lambda progress:monitor.run(work,progress)
         self.task=Task(action,getattr(self.backend,'ramp',None))
         self.task.message.connect(self.log)
         def done(result):
@@ -361,6 +453,15 @@ class TuningSession(DRCorrectionWindow):
         self.operation_status.setText((summary or self._active_label+'：'+message)+pending)
         if message.startswith(('SKIP ','PAUSED:','RESUMED:','BPM validity:','QM probe:','Resume:')):self.log(message)
     def task_finished(self):
+        if self._active_plot_controls is not None:
+            self._active_plot_controls.setEnabled(True)
+            self._active_plot_controls=None
+        self._rf_monitor=None
+        self._rf_paused=False
+        if self._rf_popup is not None:
+            self._rf_popup.close()
+            self._rf_popup.deleteLater()
+            self._rf_popup=None
         self.prepare_pause(False)
         self.timer.stop();self.tick();self.tabs.setEnabled(True);self.navigation.setEnabled(True);self.cancel_button.setEnabled(False)
         self.progress.setRange(0,100);self.progress.setValue(0 if self._failed else 100)

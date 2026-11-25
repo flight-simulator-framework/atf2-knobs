@@ -314,6 +314,8 @@ class DispersionService:
         if checkpoint_path is not None:prepare_destination(checkpoint_path)
         baseline=b.snapshot();self.reader.reset_sampling()
         measured,valid,tunes,tune_evidence=self.signal(opt)
+        self.reader.sync_dispersion_selection('dispersion',opt)
+        enabled=np.array([n not in opt.excluded_bpms for n in b.bpm_names])
         data=dict(schema='dr-qm-dispersion-1',mode='dispersion',backend_id=b.identity,
                   names=list(b.bpm_names),positions_m=np.asarray(b.positions_m),actuators=names,
                   centers=centers,limits=limits,baseline=baseline,full_measured=measured,valid=valid&enabled,
@@ -365,6 +367,9 @@ class DispersionService:
                                 if not np.isfinite(reading):raise ValueError('Invalid QM current readback: '+n)
                                 readbacks.append(reading);start=len(self.reader.orbit_measurements)
                                 frame,mask,q,evidence=self.signal(opt)
+                                self.reader.sync_dispersion_selection('dispersion',opt)
+                                enabled=np.array([n not in opt.excluded_bpms for n in data['names']])
+                                data['options']['excluded_bpms']=opt.excluded_bpms
                                 diagnostic=self.validity_report(mask,pair_valid,enabled,straight,start,
                                     f'{n} probe {target-c:+g} A (readback {reading:+g} A)',opt)
                                 data['validity_history'].append(diagnostic);pair_valid &= mask;data['valid']=pair_valid&enabled
@@ -399,6 +404,8 @@ class DispersionService:
                         data['probe_attempts'].append(dict(magnet=n,half_span_A=h,requested=targets.copy(),actual=readbacks,
                             accepted=False,reason=skip_reason,signal_frames=frames,signal_variances=variances))
                         break
+                    self.reader.sync_dispersion_selection('dispersion',opt)
+                    enabled=np.array([n not in opt.excluded_bpms for n in data['names']])
                     quality=self.probe_quality(frames,variances,pair_valid&enabled&straight,opt)
                     next_width=next_probe_width(h,c,limits[:,j],measured_span,quality,opt,failed_width) if opt.adaptive_probe and not quality['usable'] else None
                     finished=(not opt.adaptive_probe or characterize or quality['usable'] or next_width is None or attempt+1==opt.maximum_probe_pairs)
@@ -597,6 +604,7 @@ class DispersionService:
                     iteration_index=data.get('iteration_index',0)+1)
 
     def solve(self,data,opt):
+        self.reader.sync_dispersion_selection('dispersion',opt)
         opt.validate();valid=np.asarray(data.get('acquisition_valid',data['valid']),bool).copy()
         valid &= np.asarray(data.get('iteration_valid',np.ones_like(valid)),bool)
         valid &= np.array([n not in opt.excluded_bpms for n in data['names']])

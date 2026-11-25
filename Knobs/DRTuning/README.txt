@@ -14,6 +14,35 @@ check was skipped; snapshots record frequency_readback_verified=false without
 inventing an RF readback. Dispersion uses the requested preset frequency span.
 Set rf.verify_frequency_readback=true to restore the physical-frequency checks.
 
+Vertical dispersion and RF power pause
+--------------------------------------
+Vertical dispersion uses the current vertical dispersion and COD to rank ZVs
+with the RFTrack response. Set Maximum ZVs (default 5) and click Find ZVs.
+Measure selected ZVs measures only those response columns. Review the proposed
+currents and predicted curves, then click Apply / remeasure to see the measured
+after curves. Select BPMs / magnets and Recalculate reuse the measured columns.
+QM horizontal dispersion is directly below this page in the navigation.
+On either plot, hover over a measured point to read its BPM name, position
+and signal value. Click the point to exclude it or the grey point to include
+it again. The curves join the remaining points across operator exclusions.
+The toolbar pan and zoom tools temporarily take precedence over selection.
+During a scan, the plot stays interactive after the baseline arrives. New
+probe evaluations and the final fit use the current selection. An Apply
+already in progress retains its proposed magnet settings. After editing a
+finished measurement, Recalculate before Apply (Find ZVs again for a model
+shortlist). Save BPM selection in the plot toolbar overwrites the defaults
+for this user and interface. The shared BPM / magnet selection shows the same
+BPM mask, including in COD and skew correction.
+
+On the Machine interface, each measurement or correction worker monitors klystrons 0–8 starting at
+its first machine access. A reading at or below 50% of that klystron's initial
+positive power pauses the worker at a machine I/O checkpoint. The popup
+identifies the klystron. Keep paused leaves the operation suspended. After
+power recovers, use Resume in the popup or the main window. Interrupted BPM
+and XSR sample groups are collected again. Cancel / restore follows the active
+operation's restoration procedure. If initial RF readings are unavailable for
+15 seconds, the operation reports an error.
+
 Measured dispersion and local-bump / XSR correction (2026-11-19)
 ---------------------------------------------------------------
 SysID is unchanged. DRTuning LiveBackend waits for advancing EPICS timestamps:

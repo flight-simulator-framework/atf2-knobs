@@ -6,19 +6,25 @@ from Knobs.DRCorrection.backends import EpicsBackend
 from Knobs.DRCorrection.tbt import analyze_tbt
 from .acquisition import TBTController,ReadbackTBTController,tbt_orbit_mode
 from .calibration import coil_k1l
+from . import power_pause
 
 
 class LiveBackend(EpicsBackend):
     def __init__(self,profile,client=None):
         super().__init__(profile,client)
+        self.monitor_klystrons = client is None
         self.quadrupoles={n:p for n,p in profile.get('quadrupoles',{}).items() if p.get('mapping_confirmed')}
         self._calibration={}
     def get(self,pv):
+        power_pause.checkpoint()
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         return super().get(pv)
+    @power_pause.fresh_measurement()
     def read_xsr_sizes(self):
         from .emittance import read_xsr_sizes
         return read_xsr_sizes(self.get)
+    stable_beam_read = staticmethod(power_pause.stable_read)
+
     def orbit_samples(self,count,cancel,interval_s=0.):
         from .fresh import updates
         p=self.profile['orbit']
@@ -29,6 +35,7 @@ class LiveBackend(EpicsBackend):
             result.update(timestamps={pv:float(r['timestamp']) for pv,r in records.items()},
                           freshness_verified=True,same_shot_verified=False)
             yield result
+    @power_pause.fresh_measurement()
     def sample_xsr(self,cancel,count=10,callback=lambda *_:None):
         from .fresh import updates,scalar_statistics
         pv='XSR:PROJ_V_SIGMA';values=[];stamps=[]
@@ -37,8 +44,17 @@ class LiveBackend(EpicsBackend):
             result=scalar_statistics(values,stamps,pv);callback(result)
         return result
     def put(self,pv,value):
+        power_pause.checkpoint()
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         return super().put(pv,value)
+    @power_pause.restoration
+    def restore_probe(self,kind,name,value):
+        return super().restore_probe(kind,name,value)
+
+    @power_pause.restoration
+    def restore_frequency(self,state):
+        return super().restore_frequency(state)
+
     def quadrupole_current(self,name):
         return self.magnet_readback(name,self.quadrupoles[name]['read'])
     def quadrupole_k1l(self,name,current):
@@ -95,6 +111,7 @@ class LiveBackend(EpicsBackend):
             time.sleep(delay)
         except Exception:
             self.put(p['set'],original);wait(original);raise
+    @power_pause.restoration
     def restore_quadrupole_current(self,name,value):
         """Known original current can be commanded even after a readback failure."""
         self.validate_quadrupole_targets(name,[value]);p=self.quadrupoles[name]
@@ -105,6 +122,7 @@ class LiveBackend(EpicsBackend):
             if time.monotonic()>=deadline:raise TimeoutError('QM restoration readback did not settle: '+name)
             time.sleep(.05)
         time.sleep(float(p['settle_s']))
+    @power_pause.fresh_measurement(retry_errors=())
     def tbt_acquire(self,turns=1024,start_turn=1,cancel=None,progress=lambda *_:None):
         self.validate_tbt_acquisition()
         progress(0,'New shot: checking acquisition mode and waveform updates')
@@ -118,6 +136,7 @@ class LiveBackend(EpicsBackend):
                 result=controller.acquire(lambda:self.read_tbt(turns,cancel=cancel,progress=progress),start_turn=start_turn,cancel=cancel)
         result['orbit_mode_control']=mode
         return result
+    @power_pause.fresh_measurement()
     def read_tbt(self,turns=1024,*,cancel=None,progress=lambda *_:None):
         """Read existing waveforms only; no trigger, PROC or machine write."""
         p=self.profile.get('tbt',{})
@@ -126,6 +145,7 @@ class LiveBackend(EpicsBackend):
         wave.update(fresh_acquisition=False,same_shot_verified=False,waveform_evidence=evidence)
         return wave
     def metadata(self,pv):
+        power_pause.checkpoint()
         if hasattr(self.client,'ca'):self.client.ca.use_initial_context()
         result=self.client.get_pv(pv,form='time',connect=True).get_with_metadata(use_monitor=False,form='time',timeout=3.)
         if result is None or result.get('value') is None or not np.isfinite(result.get('timestamp',np.nan)):
@@ -183,6 +203,7 @@ class LiveBackend(EpicsBackend):
         a=left.get('quadrupoles',{});b=right.get('quadrupoles',{})
         return (super().same_settings(left,right) and set(a)==set(b) and
                 all(abs(a[n]-b[n])<=self.profile['current_tolerance_A'] for n in a))
+    @power_pause.restoration
     def restore(self,snapshot):
         super().restore(snapshot)
         for n,value in snapshot.get('quadrupoles',{}).items():
@@ -190,30 +211,7 @@ class LiveBackend(EpicsBackend):
     def measure_tunes(self,cancel=None):
         p=self.profile.get('qmod_tunes',{})
         if p.get('mode')=='pvs':
-            self.validate_tune_measurement()
-            if cancel is not None and cancel.is_set():raise RuntimeError('Tune acquisition cancelled')
-            initial=[self.metadata(p[a]) for a in ('x','y')];deadline=time.monotonic()+float(p['timeout_s'])
-            while True:
-                if cancel is not None and cancel.is_set():raise RuntimeError('Tune acquisition cancelled')
-                readings=[self.metadata(p[a]) for a in ('x','y')]
-                stamps=[r['timestamp'] for r in readings];values=[float(r['value']) for r in readings]
-                updated=[stamps[i]>initial[i]['timestamp'] for i in range(2)]
-                valid=[bool(np.isfinite(v) and 0<v<1) for v in values]
-                skew=abs(stamps[0]-stamps[1])
-                if all(updated) and skew<=p['max_timestamp_skew_s'] and all(valid):
-                    return dict(tunes=values,source='existing TuneDR PVs',pvs=[p['x'],p['y']],timestamps=stamps,
-                        initial_timestamps=[r['timestamp'] for r in initial],timestamp_skew_s=skew,
-                        same_shot_verified=False,readback_update_verified=True,
-                        acquisition_quality='both tune readbacks updated after request; common shot ID unavailable')
-                if time.monotonic()>deadline:
-                    details='; '.join(f'{axis} {p[key]}: value={values[i]:.9g}, updated={updated[i]}, '
-                        f'valid_0_to_1={valid[i]}, timestamp={stamps[i]:.6f}, initial={initial[i]["timestamp"]:.6f}'
-                        for i,(axis,key) in enumerate((('H','x'),('V','y'))))
-                    raise TimeoutError(f'No fresh H/V tune pair after {p["timeout_s"]:g} s; {details}; '
-                        f'H/V timestamp skew={skew:.6g} s (limit {p["max_timestamp_skew_s"]:g} s). '
-                        'Check TuneDR acquisition/reader and H/V FFT peak results; BPM COD updates alone do not update tune PVs.')
-                if cancel is None:time.sleep(.02)
-                elif cancel.wait(.02):raise RuntimeError('Tune acquisition cancelled')
+            return self._measure_tune_pvs(p,cancel)
         wave=self.tbt_acquire(1024,cancel=cancel)
         fit=analyze_tbt(wave,start_turn=wave['turns'][0])
         if not all(fit['planes'][a].get('valid') for a in ('x','y')):
@@ -223,3 +221,30 @@ class LiveBackend(EpicsBackend):
                     same_shot_verified=wave.get('same_shot_verified',wave.get('fresh_acquisition',False)),
                     acquisition_quality=wave.get('acquisition_quality','completion generation'),
                     waveform_evidence=wave.get('waveform_evidence'))
+
+    @power_pause.fresh_measurement()
+    def _measure_tune_pvs(self,p,cancel):
+        self.validate_tune_measurement()
+        if cancel is not None and cancel.is_set():raise RuntimeError('Tune acquisition cancelled')
+        initial=[self.metadata(p[a]) for a in ('x','y')];deadline=time.monotonic()+float(p['timeout_s'])
+        while True:
+            if cancel is not None and cancel.is_set():raise RuntimeError('Tune acquisition cancelled')
+            readings=[self.metadata(p[a]) for a in ('x','y')]
+            stamps=[r['timestamp'] for r in readings];values=[float(r['value']) for r in readings]
+            updated=[stamps[i]>initial[i]['timestamp'] for i in range(2)]
+            valid=[bool(np.isfinite(v) and 0<v<1) for v in values]
+            skew=abs(stamps[0]-stamps[1])
+            if all(updated) and skew<=p['max_timestamp_skew_s'] and all(valid):
+                return dict(tunes=values,source='existing TuneDR PVs',pvs=[p['x'],p['y']],timestamps=stamps,
+                    initial_timestamps=[r['timestamp'] for r in initial],timestamp_skew_s=skew,
+                    same_shot_verified=False,readback_update_verified=True,
+                    acquisition_quality='both tune readbacks updated after request; common shot ID unavailable')
+            if time.monotonic()>deadline:
+                details='; '.join(f'{axis} {p[key]}: value={values[i]:.9g}, updated={updated[i]}, '
+                    f'valid_0_to_1={valid[i]}, timestamp={stamps[i]:.6f}, initial={initial[i]["timestamp"]:.6f}'
+                    for i,(axis,key) in enumerate((('H','x'),('V','y'))))
+                raise TimeoutError(f'No fresh H/V tune pair after {p["timeout_s"]:g} s; {details}; '
+                    f'H/V timestamp skew={skew:.6g} s (limit {p["max_timestamp_skew_s"]:g} s). '
+                    'Check TuneDR acquisition/reader and H/V FFT peak results; BPM COD updates alone do not update tune PVs.')
+            if cancel is None:time.sleep(.02)
+            elif cancel.wait(.02):raise RuntimeError('Tune acquisition cancelled')

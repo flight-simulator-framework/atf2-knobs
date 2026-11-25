@@ -457,6 +457,11 @@ class ModelManager:
         return model
     def acquire(self,service,mode,opt,progress):
         b=self.backend;model=self.prepare(opt,service.check_cancel,progress)
+        if mode=='dispersion' and opt.plane=='y':
+            target_y=np.asarray(b.target_dispersion('y'),float)
+            if target_y.shape!=(len(b.bpm_names),) or not np.isfinite(target_y).all():
+                raise ValueError('Invalid vertical dispersion target. Load one finite value per BPM.')
+
         # Compute response before any real RF/probe movement; invalid mappings,
         # unstable optics and calibration errors therefore fail read-only.
         virtual=CorrectionService(model);virtual.cancel=service.cancel
@@ -473,14 +478,19 @@ class ModelManager:
         if not b.same_settings(b.snapshot(),self.baseline):raise ValueError('Machine settings changed during model response calculation')
         verify_inputs(b,self.settings)
         measured,valid=service._signal(mode,opt);full=service.full_signal.copy()
+        service.publish_dispersion_baseline(mode,valid)
         index=[b.bpm_names.index(n) for n in model.bpm_names]
+        if mode=='dispersion' and len(index)!=len(b.bpm_names):
+            data['bpm_observations']=dict(names=list(b.bpm_names),positions_m=np.array(b.positions_m),
+                                          full_measured=full.copy(),valid=valid.copy())
         data.update(backend_id=b.identity,baseline=self.baseline,options=vars(opt).copy(),
                     measured=measured[:,index],full_measured=full[:,index],valid=valid[index],
                     orbit_measurements=service.orbit_measurements,source='RFTrack model response + measured signal',
                     model_settings=self.settings,model_settings_sha256=digest(self.settings),
                     tune_match=model.match_report)
         # A model target is legitimate design information, not measured optics.
-        if mode=='dispersion' and opt.plane=='x':data['target'][0]=model.target_dispersion('x')
+        if mode=='dispersion':
+            data['target'][0]=target_y[index] if opt.plane=='y' else model.target_dispersion('x')
         if opt.model_regional_targets and mode in ('orbit','dispersion') and opt.plane=='x':
             from .model_optics import regional_targets
             data['target']=regional_targets(data,model)

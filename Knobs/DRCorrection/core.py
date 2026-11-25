@@ -136,6 +136,20 @@ class CorrectionService:
             self._model_manager=ModelManager(self.backend)
         return self._model_manager
 
+    dispersion_exclusions = None
+    dispersion_observed = None
+
+    def sync_dispersion_selection(self, mode, opt):
+        if mode == 'dispersion' and self.dispersion_exclusions is not None:
+            opt.excluded_bpms = self.dispersion_exclusions()
+
+    def publish_dispersion_baseline(self, mode, valid):
+        if mode == 'dispersion' and self.dispersion_observed is not None:
+            self.dispersion_observed(dict(names=list(self.backend.bpm_names),
+                positions_m=np.array(self.backend.positions_m), valid=valid.copy(),
+                full_measured=self.full_signal.copy(),
+                full_signal_labels=['Dispersion X','Dispersion Y','COD X','COD Y']))
+
     def check_cancel(self):
         if self.cancel.is_set():raise Cancelled('Cancelled; temporary scan settings restored')
 
@@ -165,6 +179,19 @@ class CorrectionService:
                     stdx=np.std(arrays['x'],axis=0),stdy=np.std(arrays['y'],axis=0))
 
     def _orbit(self,opt,on_sample=None):
+        collect=lambda:self._collect_orbit_samples(opt,on_sample)
+        stable_read=getattr(self.backend,'stable_beam_read',None)
+        arrays,diagnostics,timestamps,fresh=stable_read(collect) if stable_read else collect()
+        count=opt.bpm_samples
+        interval=opt.bpm_interval_s
+        summary=self.summarize_orbit(arrays)
+        self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**summary,
+            nshots=int(count),sample_interval_s=float(interval),samples=arrays,
+            position_unit='mm',freshness_verified=all(fresh),timestamps=timestamps,
+            same_shot_verified=False,validity_diagnostics=diagnostics))
+        return summary['x'],summary['y'],summary['valid']
+
+    def _collect_orbit_samples(self,opt,on_sample):
         count=opt.bpm_samples;interval=opt.bpm_interval_s
         validate_bpm_sampling(opt)
         samples=[];diagnostics=[];timestamps=[];fresh=[]
@@ -183,12 +210,7 @@ class CorrectionService:
             timestamps.append(result.get('timestamps',{}));fresh.append(result.get('freshness_verified',False))
             if on_sample is not None:on_sample(len(samples),int(count))
         arrays={key:np.stack([s[key] for s in samples]) for key in ('x','y','tmit','valid')}
-        summary=self.summarize_orbit(arrays)
-        self.orbit_measurements.append(dict(names=list(self.backend.bpm_names),**summary,
-            nshots=int(count),sample_interval_s=float(interval),samples=arrays,
-            position_unit='mm',freshness_verified=all(fresh),timestamps=timestamps,
-            same_shot_verified=False,validity_diagnostics=diagnostics))
-        return summary['x'],summary['y'],summary['valid']
+        return arrays,diagnostics,timestamps,fresh
 
     def require_usable(self,names,measured,target,acquisition_valid,actuators,opt,measurements=None):
         enabled=np.array([n not in opt.excluded_bpms for n in names],bool)
@@ -306,6 +328,8 @@ class CorrectionService:
         low,high=self.backend.limits(kind,names)
         self.pause_checkpoint(progress,0,baseline,ignored)
         measured,valid=self._signal(mode,opt)
+        self.publish_dispersion_baseline(mode,valid)
+        self.sync_dispersion_selection(mode,opt)
         self.require_usable(self.backend.bpm_names,measured,np.zeros_like(measured),valid,names,opt)
         full_measured=self.full_signal.copy();columns=[];full_columns=[];probe_history=[]
         self.last_probe_history=probe_history
@@ -332,6 +356,7 @@ class CorrectionService:
                             self.backend.write(kind,[name],[setting])
                             value,mask=self._signal(mode,opt);values.append(value);full_values.append(self.full_signal.copy());valid &= mask
                             if opt.adaptive_probe:readbacks.append(float(self.backend.read(kind,[name])[0]))
+                            self.sync_dispersion_selection(mode,opt)
                             self.require_usable(self.backend.bpm_names,value,np.zeros_like(value),valid,names,opt)
                     except BaseException as exc:
                         try:
@@ -355,6 +380,9 @@ class CorrectionService:
                     # Dispersion acquisition contains eta and nominal COD. Target
                     # a position response in mm, never eta in mm/(dp/p).
                     signal=difference[1] if mode=='dispersion' else difference
+                    if mode=='dispersion':
+                        self.sync_dispersion_selection(mode,opt)
+                        enabled=np.array([n not in opt.excluded_bpms for n in self.backend.bpm_names])
                     observed=finite_abs_max(signal[...,valid & enabled])
                     reached=abs(observed/opt.adaptive_target_mm-1)<=opt.adaptive_target_tolerance
                     record=dict(magnet=name,pair=attempt+1,amplitude=amplitude,unit=self.backend.unit(kind),
@@ -434,6 +462,7 @@ class CorrectionService:
         if min(opt.dispersion_weight,opt.orbit_weight)<0 or opt.dispersion_weight+opt.orbit_weight<=0:
             raise ValueError('Nonnegative correction weights, at least one positive, required')
         data=self.acquire(mode,opt,progress) if dataset is None else copy.deepcopy(dataset)
+        self.sync_dispersion_selection(mode,opt)
         if data.get('schema')!='dr-correction-1' or data['mode']!=mode:
             raise ValueError('File is not a matching correction dataset')
         if data['options']['plane']!=opt.plane and mode!='skew':
@@ -450,13 +479,15 @@ class CorrectionService:
         response=np.asarray(data['response'],float)
         if measured.shape!=target.shape or measured.ndim!=2 or measured.shape[1]!=len(names):
             raise ValueError('Signal shape mismatch')
-        if response.shape!=(measured.size,len(actuators)) or not np.isfinite(response).all():
+        if response.shape!=(measured.size,len(actuators)):
             raise ValueError('Invalid response matrix')
         selected=copy.deepcopy(opt)
         if mode=='skew':selected.fixed_actuators=tuple(set(opt.fixed_actuators)|{
             n for n in actuators if not ((opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF')))})
         valid,available=self.require_usable(names,measured,target,data['valid'],actuators,selected,data.get('orbit_measurements',[]))
         mask=np.tile(valid,measured.shape[0])
+        if not np.isfinite(response[mask] if mode=='dispersion' else response).all():
+            raise ValueError('Invalid response matrix')
         weights=np.ones_like(measured)
         if mode=='dispersion':weights[0]*=opt.dispersion_weight;weights[1]*=opt.orbit_weight
         a=(response*weights.reshape(-1,1))[mask]
@@ -541,6 +572,37 @@ class CorrectionService:
             data['full_fitted']=full-data['full_predicted']
         return data
 
+    def measure_selected_zvs(self,proposal,progress=lambda *_:None):
+        """Probe only the ZVs selected by a vertical RFTrack dispersion fit."""
+        opt=Options(**proposal['options'])
+        if (proposal['mode']!='dispersion' or opt.plane!='y' or opt.response_source!='rftrack'
+                or opt.selection_method!='greedy' or proposal.get('applied')
+                or proposal['backend_id']!=self.backend.identity):
+            raise ValueError('Run vertical dispersion CALC with RFTrack and Greedy first')
+        names=list(proposal['selected'])
+        allowed=set(self.backend.vcorrectors).intersection(proposal['actuators']).difference(opt.fixed_actuators)
+        if not names or len(set(names))!=len(names) or len(names)>opt.count_v or not set(names)<=allowed:
+            raise ValueError('No valid RFTrack ZV shortlist. Run CALC again.')
+        self.check_cancel()
+        if not self.backend.same_settings(self.backend.snapshot(),proposal['baseline']):
+            raise ValueError('Settings changed since RFTrack selection. Run CALC again.')
+        from Knobs.DRTuning.model import verify_inputs
+        verify_inputs(self.backend,proposal['model_settings'])
+        opt.response_source='measured'
+        scan=copy.deepcopy(opt)
+        scan.fixed_actuators=tuple(sorted(set(opt.fixed_actuators) | (set(self.backend.vcorrectors)-set(names))))
+        data=self.acquire('dispersion',scan,progress)
+        data['rftrack_candidates']=names
+        data['selection_model_sha256']=proposal.get('model_settings_sha256')
+        if proposal.get('constraints') is not None:
+            constraints=copy.deepcopy(proposal['constraints'])
+            columns=[proposal['actuators'].index(n) for n in data['actuators']]
+            constraints['matrix']=np.asarray(constraints['matrix'])[:,columns]
+            data['constraints']=constraints
+            data['model_settings']=copy.deepcopy(proposal['model_settings'])
+        self.check_cancel()
+        return self.calculate('dispersion',opt,progress,dataset=data)
+
     def response_reuse_issue(self,data,opt):
         if data.get('backend_id')!=self.backend.identity:return 'Response belongs to another backend.'
         original=Options(**data.get('acquisition_options',data['options']))
@@ -558,6 +620,8 @@ class CorrectionService:
         if data['mode']=='skew':
             names=[n for n in self.backend.skews if (opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF'))]
         else:names=self.backend.hcorrectors if opt.plane=='x' else self.backend.vcorrectors
+        if 'rftrack_candidates' in data:
+            names=set(names).intersection(data['rftrack_candidates'])
         missing=set(names)-set(opt.fixed_actuators)-set(data['actuators'])-{e['magnet'] for e in data.get('scan_errors',[])}
         if missing:return 'No measured columns for: '+', '.join(sorted(missing))+'. Measure again.'
         return ''

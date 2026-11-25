@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,
                             QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar)
 from Knobs.DRCorrection.core import serial
 from Knobs.DRCorrection.gui import Plot
+from .dispersion_plot import DispersionPlot
 from .coupling import CouplingService,BumpOptions
 from .bump_presets import bump_preset
 from .dispersion import DispersionService,DispersionOptions,QM_PROBE_PRESETS_A
@@ -30,12 +31,13 @@ def probe_quality_text(quality):
 
 
 class CorrectionTool(QWidget):
+    plot_type=Plot
     update=pyqtSignal(object)
     def __init__(self,window):
         super().__init__();self.window=window;self.result=None
         layout=QVBoxLayout(self);split=QSplitter();self.splitter=split;layout.addWidget(split)
         left=QWidget();self.controls=QVBoxLayout(left);self.form=QFormLayout();self.controls.addLayout(self.form)
-        right=QWidget();self.right=QVBoxLayout(right);self.plot=Plot();self.right.addWidget(self.plot,1)
+        right=QWidget();self.right=QVBoxLayout(right);self.plot=self.plot_type();self.right.addWidget(self.plot,1)
         self.table=QTableWidget();self.table.setMaximumHeight(170);self.right.addWidget(self.table)
         self.status=QLabel();self.status.setWordWrap(True);self.controls.addWidget(self.status)
         self.buttons=QVBoxLayout();self.controls.addLayout(self.buttons)
@@ -288,6 +290,7 @@ class CouplingPanel(CorrectionTool):
 
 
 class QMDispersionPanel(CorrectionTool):
+    plot_type=DispersionPlot
     def __init__(self,window):
         super().__init__(window);self.service=DispersionService(window.backend,window.service.cancel)
         defaults=DispersionOptions()
@@ -355,6 +358,7 @@ class QMDispersionPanel(CorrectionTool):
         self.selection.currentIndexChanged.connect(self.invalidate)
         self.excluded.textChanged.connect(self.invalidate)
     def invalidate(self,*_):
+        self.plot.set_excluded(self.window.panels['dispersion'].options.excluded_bpms)
         self.set_button.setEnabled(False)
         if self.result is not None and 'response' in self.result:
             self.status.setText('Selection / options changed. Recalculate from measured response before Apply.\n'
@@ -434,24 +438,9 @@ class QMDispersionPanel(CorrectionTool):
         if event.get('data') is not None:self.display(event['data'])
         if event['kind']=='failure':self.set_button.setEnabled(False)
     def display(self,data):
-        self.result=data;figure=self.plot.figure;figure.clear();figure.set_layout_engine('constrained',rect=(0,0,1,.89))
-        axes=figure.subplots(2,2).ravel()
-        valid=np.asarray(data['valid'],bool);s=np.asarray(data['positions_m'],float)
-        known=np.isfinite(s).all()
-        if not known:s=np.arange(1,len(data['names'])+1)
-        order=np.argsort(s)
-        for i,ax in enumerate(axes):
-            for key,label,style in [('full_measured','Measured before','k.'),('full_predicted','Predicted','C2--'),('full_after','Measured after SET','C3-'),('full_target','Target',':')]:
-                if key not in data:continue
-                mask=valid.copy()
-                if key=='full_after':mask &= np.asarray(data['after_valid'],bool)
-                if key=='full_after' and data.get('restored'):label='After SET (since restored)'
-                ax.plot(s[order],np.where(mask,np.asarray(data[key],float)[i],np.nan)[order],style,label=label,
-                        **({'color':'gray'} if key=='full_target' else {}))
-            ax.set(xlabel='s [m]' if known else 'BPM index (measurement order)',ylabel='η [mm / (dp/p)]' if i<2 else 'COD [mm]',title=data['full_signal_labels'][i]);ax.grid(alpha=.2)
-        handles,labels=axes[0].get_legend_handles_labels()
-        figure.legend(handles,labels,loc='upper center',ncol=2,fontsize=8)
-        self.plot.canvas.draw_idle()
+        self.result=data
+        self.plot.correction(data)
+        valid=np.asarray(data['valid'],bool)
         if 'delta' in data:
             rows=[]
             for i,(n,c,d) in enumerate(zip(data['actuators'],data['centers'],data['delta'])):

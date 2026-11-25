@@ -107,6 +107,7 @@ PV_FIELDS={
 
 
 class CorrectionPanel(QWidget):
+    plot_type=Plot
     def __init__(self,window,mode):
         super().__init__();self.window=window;self.mode=mode;self.data=None;self.response_cache={}
         backend=window.backend
@@ -128,7 +129,7 @@ class CorrectionPanel(QWidget):
         left_layout.addWidget(self.recalculate_button)
         self.response_cache_label=QLabel();self.response_cache_label.setWordWrap(True);left_layout.addWidget(self.response_cache_label)
         left_layout.addStretch()
-        self.plot=Plot();self.table=QTableWidget(0,6)
+        self.plot=self.plot_type();self.table=QTableWidget(0,6)
         self.table.setHorizontalHeaderLabels(['Magnet','Before','Delta','Proposed','Unit','SET action'])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.proposal_summary=QLabel();self.proposal_summary.setWordWrap(True)
@@ -212,6 +213,14 @@ class CorrectionPanel(QWidget):
         if ok:self.set_option(name,value)
 
     def refresh(self):
+        if hasattr(self,'measure_zvs_button'):
+            o=self.options
+            eligible=o.plane=='y' and o.response_source=='rftrack' and o.selection_method=='greedy'
+            self.measure_zvs_button.setVisible(eligible)
+            candidates=self.data.get('selected',[]) if eligible and self.data and not self.data.get('applied') and self.data['options']['response_source']=='rftrack' else []
+            self.measure_zvs_button.setEnabled(bool(candidates))
+            self.zv_candidates_label.setText('RFTrack candidates: '+', '.join(candidates) if candidates else '')
+            self.zv_candidates_label.setVisible(bool(candidates))
         if hasattr(self,'adaptive_targets_label'):
             targets=dict(self.plane_probe_targets);targets[self.options.plane]=self.options.adaptive_target_mm
             self.adaptive_targets_label.setText(f'H: {targets["x"]:g} mm / V: {targets["y"]:g} mm (remembered separately)')
@@ -326,6 +335,16 @@ class CorrectionPanel(QWidget):
         if path:
             try:self.calculate(load_session(path))
             except Exception as e:self.window.error(str(e))
+
+    def measure_selected_zvs(self):
+        proposal=self.data
+        if proposal is None:return
+        self.invalidate()
+        def finished(data):
+            self.response_source_box.setCurrentIndex(self.response_source_box.findData('measured'))
+            self.display(data)
+        self.window.start(lambda progress:self.window.service.measure_selected_zvs(proposal,progress),
+                          finished,label='Measure selected ZV responses',pausable=True)
 
     def recalculate(self):
         saved=self.response_cache.get((self.options.response_source,self.options.plane))
@@ -530,6 +549,7 @@ class TBTPanel(QWidget):
 
 
 class DRCorrectionWindow(QMainWindow):
+    dispersion_panel_type=CorrectionPanel
     def __init__(self,backend=None):
         super().__init__();self.backend=backend or DemoBackend();self.service=CorrectionService(self.backend);self.task=None;self.orbit_buffers={}
         from .input_guard import protect_settings_from_wheel
@@ -539,7 +559,8 @@ class DRCorrectionWindow(QMainWindow):
         self.banner=QLabel(self.backend.label);self.banner.setStyleSheet('font-weight:bold;padding:8px;background:#dbeafe;color:#12243b;');layout.addWidget(self.banner)
         self.tabs=QTabWidget();layout.addWidget(self.tabs,1);self.panels={}
         for mode,title in [('orbit','DR COD Correction'),('dispersion','DR Dispersion Correction'),('skew','DR Skew Correction')]:
-            panel=CorrectionPanel(self,mode);self.panels[mode]=panel;self.tabs.addTab(panel,title)
+            panel_type=self.dispersion_panel_type if mode=='dispersion' else CorrectionPanel
+            panel=panel_type(self,mode);self.panels[mode]=panel;self.tabs.addTab(panel,title)
         self.tbt=TBTPanel(self);self.tabs.addTab(self.tbt,'Turn1024 / TBT beta')
         row=QHBoxLayout();self.progress=QProgressBar();row.addWidget(self.progress)
         self.pause_button=QPushButton('Pause');self.pause_button.setEnabled(False)
