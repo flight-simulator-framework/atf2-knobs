@@ -311,6 +311,10 @@ class QMDispersionPanel(CorrectionTool):
         self.step.setToolTip('Maximum absolute current change per Apply. Absolute current limits come from parameter A/B.')
         self.selection=QComboBox();self.selection.addItem('SVD — all QMs','all');self.selection.addItem('Greedy — select QMs','greedy')
         correction.addRow('Solver',self.selection)
+        self.coil=QComboBox();self.coil.addItem('Trim','trim');self.coil.addItem('Main','main')
+        correction.addRow('QM coil',self.coil)
+        self.active_coil='trim'
+        self.coil_exclusions={'trim':', '.join(defaults.fixed_actuators),'main':''}
         self.maximum=control(correction,'Maximum QMs',defaults.maximum,1,16,0)
         correction.setRowVisible(self.maximum,False)
         self.excluded=QLineEdit(', '.join(defaults.fixed_actuators));correction.addRow('Exclude QMs',self.excluded)
@@ -350,21 +354,38 @@ class QMDispersionPanel(CorrectionTool):
         self.status.setText('Ready to measure.')
         self.status.setStyleSheet('padding: 6px; font-weight: 600;')
         self.table.setMaximumHeight(260)
-        self.set_table(['QM trim','Initial probe [A]'],
-            [(name,f'{width:.2f}') for name,width in QM_PROBE_PRESETS_A.items() if name not in defaults.fixed_actuators])
+        self.show_initial_probes()
+        self.coil.currentIndexChanged.connect(self.change_coil)
         for w in (self.maximum,self.probe,self.step,self.target_snr,self.rf,self.ridge):
             w.setMaximumWidth(105);w.valueChanged.connect(self.invalidate)
         self.selection.currentIndexChanged.connect(lambda _:correction.setRowVisible(self.maximum,self.selection.currentData()=='greedy'))
         self.selection.currentIndexChanged.connect(self.invalidate)
         self.excluded.textChanged.connect(self.invalidate)
+    def show_initial_probes(self):
+        opt=self.options()
+        self.set_table(['QM '+opt.coil,'Initial probe [A]'],[(n,f'{QM_PROBE_PRESETS_A.get(n,opt.probe_A):.2f}')
+                       for n in opt.actuators()])
+    def change_coil(self):
+        self.coil_exclusions[self.active_coil]=self.excluded.text()
+        self.active_coil=self.coil.currentData()
+        self.excluded.setText(self.coil_exclusions[self.active_coil])
+        if self.result and self.result['options'].get('coil','trim')==self.active_coil:
+            self.display(self.result)
+        else:
+            self.plot.clear_data();self.show_initial_probes()
+            for button in (self.set_button,self.recalculate_button,self.resume_button,self.reset_button,self.save_button):
+                button.setEnabled(False)
+            self.status.setText(f'{self.coil.currentText()} selected. Run CALC to measure the response.')
     def invalidate(self,*_):
         self.plot.set_excluded(self.window.panels['dispersion'].options.excluded_bpms)
         self.set_button.setEnabled(False)
-        if self.result is not None and 'response' in self.result:
+        if self.result is None or self.result['options'].get('coil','trim')!=self.active_coil:
+            self.show_initial_probes();return
+        if 'response' in self.result:
             self.status.setText('Selection / options changed. Recalculate from measured response before Apply.\n'
                                 'Changing RF settings or QM selection requires a new CALC.')
     def proposal_matches_options(self,data):
-        saved=dict(data['options']);current=asdict(self.options())
+        saved=dict(data['options']);saved.setdefault('coil','trim');current=asdict(self.options())
         for key in ('excluded_bpms','fixed_actuators'):
             saved[key]=sorted(saved.get(key,()));current[key]=sorted(current[key])
         return saved==current
@@ -381,6 +402,9 @@ class QMDispersionPanel(CorrectionTool):
         if not path:return
         try:
             data=self.service.validate_checkpoint(load_checkpoint(path))
+            saved=data['options'];self.coil.setCurrentIndex(self.coil.findData(saved.get('coil','trim')))
+            shared=set(self.window.panels['dispersion'].options.fixed_actuators)
+            self.excluded.setText(', '.join(n for n in saved['fixed_actuators'] if n not in shared))
             self.service.restore_width_cache(data);self.service.last_result=data;self.display(data)
             self.save_status.setText('Loaded: '+Path(path).name)
             self.window.log('Loaded QM scan: '+path)
@@ -407,7 +431,7 @@ class QMDispersionPanel(CorrectionTool):
             self.save_status.setText(message);self.window.log(message)
     def options(self):
         shared=self.window.panels['dispersion'].options
-        return DispersionOptions(probe_A=self.probe.value(),step_A=self.step.value(),frequency_change_khz=self.rf.value(),
+        return DispersionOptions(coil=self.coil.currentData(),probe_A=self.probe.value(),step_A=self.step.value(),frequency_change_khz=self.rf.value(),
             use_probe_presets=True,adaptive_probe=True,reuse_probe_widths=True,characterize_first_scan=False,
             target_snr=self.target_snr.value(),
             momentum_compaction=shared.momentum_compaction,measure_tunes=False,constrain_cod=False,
@@ -438,7 +462,8 @@ class QMDispersionPanel(CorrectionTool):
         if event.get('data') is not None:self.display(event['data'])
         if event['kind']=='failure':self.set_button.setEnabled(False)
     def display(self,data):
-        self.result=data
+        if data['options'].get('coil','trim')!=self.active_coil:return
+        self.result=data;self.save_button.setEnabled(True)
         self.plot.correction(data)
         valid=np.asarray(data['valid'],bool)
         if 'delta' in data:
@@ -449,7 +474,7 @@ class QMDispersionPanel(CorrectionTool):
                 snr=('Not measured' if q.get('skipped') else f"{q['snr']:.3g}" if q['snr'] is not None else 'No measured scatter') if q else ''
                 estimate=data.get('successful_probe_widths',{}).get(n,{}).get('width_A')
                 rows.append((n,f'{c:.5f}',f'{d:+.5f}',f'{c+d:.5f}',quality,snr,f'{estimate:.2f}' if estimate is not None else ''))
-            self.set_table(['QM trim','Before [A]','Delta [A]','Proposed [A]','Response / target [µm]','S/N','Next probe [A]'],rows)
+            self.set_table(['QM '+self.active_coil,'Before [A]','Delta [A]','Proposed [A]','Response / target [µm]','S/N','Next probe [A]'],rows)
             self.set_button.setEnabled(bool(not data.get('applied') and not data.get('error') and
                                        self.proposal_matches_options(data) and np.any(abs(np.asarray(data['delta']))>1.e-12)))
             if data.get('applied'):message='Applied. Dispersion remeasured. Recalculate for the next iteration.'
@@ -463,7 +488,7 @@ class QMDispersionPanel(CorrectionTool):
             self.status.setText(f"Measured: {done}/{len(data['actuators'])} QMs.")
             qualities=data.get('probe_quality',[])
             estimates=data.get('successful_probe_widths',{})
-            self.set_table(['QM trim','Scan','Response / target [µm]','Next probe [A]'],
+            self.set_table(['QM '+self.active_coil,'Scan','Response / target [µm]','Next probe [A]'],
                 [(n,('Skipped' if qualities[i].get('skipped') else 'Complete') if i<done else 'Pending',
                   probe_quality_text(qualities[i]) if i<len(qualities) else '',
                   f"{estimates[n]['width_A']:.2f}" if n in estimates else '')

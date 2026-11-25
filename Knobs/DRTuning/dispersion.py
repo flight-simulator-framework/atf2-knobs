@@ -1,4 +1,4 @@
-"""Measured straight-section horizontal dispersion correction with QM trims."""
+"""Measured straight-section horizontal dispersion correction with QM trim or main supplies."""
 from dataclasses import dataclass,asdict
 from datetime import datetime,timezone
 import copy
@@ -7,11 +7,12 @@ import json
 import re
 import numpy as np
 from scipy.optimize import minimize,LinearConstraint
+from Knobs.DRCorrection.backends import MagnetReadbackError
 from Knobs.DRCorrection.core import CorrectionService,Options,serial
 from .model import name
 from .qm_checkpoint import prepare_destination,save_checkpoint
+from .hardware import QM_CANDIDATES,QM_MAIN_CANDIDATES,quadrupole_supply
 
-QM_CANDIDATES=tuple(f'QM{i}R.{j}' for j in (1,2) for i in (1,2,3,4,20,21,22,23))
 PROBE_INCREMENT_A=.01
 # Initial widths inferred from the 2026-11-19 13:58 DR scan, for S/N 6.5.
 # These are probe widths, not absolute current targets or measured responses.
@@ -48,9 +49,20 @@ class DispersionOptions:
     selection: str = 'all'
     maximum: int = 8
     excluded_bpms: tuple = ()
-    fixed_actuators: tuple = ('QM2R.1','QM2R.2','QM3R.2')
+    fixed_actuators: tuple = None
+    coil: str = 'trim'
+
+    def __post_init__(self):
+        if self.fixed_actuators is None:
+            self.fixed_actuators=('QM2R.1','QM2R.2','QM3R.2') if self.coil=='trim' else ()
+
+    def actuators(self):
+        candidates=QM_MAIN_CANDIDATES if self.coil=='main' else QM_CANDIDATES
+        excluded={n.replace('_','.') for n in self.fixed_actuators}
+        return [n for n in candidates if n not in excluded]
 
     def validate(self):
+        if self.coil not in ('trim','main'):raise ValueError('Unknown QM coil')
         for k in ('probe_A','target_snr','step_A','frequency_change_khz','momentum_compaction','orbit_tolerance_mm','dispersion_weight'):
             if not np.isfinite(getattr(self,k)) or getattr(self,k)<=0:raise ValueError('Invalid '+k)
         if not isinstance(self.measure_tunes,bool):raise ValueError('Invalid measure_tunes option')
@@ -78,7 +90,7 @@ def straight_bpms(names):
 
 
 def quad_limits(backend,n):
-    p=backend.quadrupoles[n]
+    p=quadrupole_supply(backend,n)
     if p.get('lower_limit_pv') and p.get('upper_limit_pv'):
         return float(backend.get(p['lower_limit_pv'])),float(backend.get(p['upper_limit_pv']))
     if 'limits_A' in p:return tuple(map(float,p['limits_A']))
@@ -266,12 +278,13 @@ class DispersionService:
             frequency_change_khz=opt.frequency_change_khz,momentum_compaction=opt.momentum_compaction,
             excluded_bpms=sorted(opt.excluded_bpms),initial_probe_A=opt.probe_A,probe_limits='supply',
             measure_tunes=opt.measure_tunes,constrain_cod=opt.constrain_cod,orbit_tolerance_mm=opt.orbit_tolerance_mm)
-        if opt.use_probe_presets:context['probe_presets']='20261119-snr6p5'
+        if opt.coil=='main':context['coil']='main'
+        elif opt.use_probe_presets:context['probe_presets']='20261119-snr6p5'
         return context
 
     def restore_width_cache(self,data):
         for n,entry in data.get('successful_probe_widths',{}).items():
-            if n not in QM_CANDIDATES or not isinstance(entry,dict):continue
+            if n not in QM_CANDIDATES+QM_MAIN_CANDIDATES or not isinstance(entry,dict):continue
             width=entry.get('width_A')
             if isinstance(width,(int,float)) and np.isfinite(width) and width>=PROBE_INCREMENT_A and 'context' in entry and 'baseline' in entry:
                 self.successful_widths[n]=copy.deepcopy(entry)
@@ -295,14 +308,29 @@ class DispersionService:
             target_change_mm=opt.target_snr*noise*abs(dp),bpm_count=int(mask.sum()),
             definition='RMS straight Dx change between the two measured QM currents; uncertainty from valid-sample SEM at RF +/- offsets')
 
+    def snapshot(self,names,include_other_mains=False):
+        snapshot=self.backend.snapshot()
+        for n in names:
+            if n in QM_MAIN_CANDIDATES and n not in snapshot['quadrupoles']:
+                snapshot['quadrupoles'][n]=self.backend.quadrupole_current(n)
+        if include_other_mains:
+            # Keep a trim response from being reused after a main supply changes.
+            # An unavailable, unused main PV must not prevent the trim scan.
+            for n in getattr(self.backend,'main_quadrupoles',{}):
+                if n not in snapshot['quadrupoles']:
+                    try:snapshot['quadrupoles'][n]=self.backend.quadrupole_current(n)
+                    except MagnetReadbackError:continue
+        return snapshot
+
     def calculate(self,opt,progress=lambda *_:None,event=lambda *_:None,checkpoint_path=None):
         opt.validate();self.check();b=self.backend;b.validate_mode('dispersion')
         if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
         if not opt.measure_tunes:progress(0,'Tune acquisition / tune constraints skipped; measuring dispersion and COD')
-        names=[n for n in QM_CANDIDATES if n not in opt.fixed_actuators]
-        missing=set(names)-set(getattr(b,'quadrupoles',{}))
-        if missing:raise ValueError('Confirmed QM trim mapping / calibration missing: '+', '.join(sorted(missing)))
-        if not names:raise ValueError('No enabled QM trims')
+        names=opt.actuators()
+        supplies=getattr(b,'main_quadrupoles' if opt.coil=='main' else 'quadrupoles',{})
+        missing=set(names)-set(supplies)
+        if missing:raise ValueError(f'Confirmed QM {opt.coil} mapping / calibration missing: '+', '.join(sorted(missing)))
+        if not names:raise ValueError(f'No enabled QM {opt.coil} supplies')
         enabled=np.array([n not in opt.excluded_bpms for n in b.bpm_names]);straight=straight_bpms(b.bpm_names)
         if not np.any(straight&enabled):raise ValueError('No enabled BPM in MB19R–MB31R / MB66R–MB80R')
         centers=np.array([b.quadrupole_current(n) for n in names]);limits=np.array([quad_limits(b,n) for n in names]).T
@@ -312,7 +340,7 @@ class DispersionService:
             except ProbeRangeUnavailable:continue
             b.validate_quadrupole_targets(n,[targets[0],c,targets[1]])
         if checkpoint_path is not None:prepare_destination(checkpoint_path)
-        baseline=b.snapshot();self.reader.reset_sampling()
+        baseline=self.snapshot(names,include_other_mains=opt.coil=='trim');self.reader.reset_sampling()
         measured,valid,tunes,tune_evidence=self.signal(opt)
         self.reader.sync_dispersion_selection('dispersion',opt)
         enabled=np.array([n not in opt.excluded_bpms for n in b.bpm_names])
@@ -447,7 +475,7 @@ class DispersionService:
                 self.checkpoint(data,checkpoint_path,event)
                 progress(round(90*(j+1)/len(names)),f'QM dispersion response {n} ({j+1}/{len(names)})')
             self.check()
-            if not b.same_settings(b.snapshot(),data['baseline']):raise ValueError('Settings changed during QM response scan; calculate again')
+            if not b.same_settings(self.snapshot(data['baseline']['quadrupoles']),data['baseline']):raise ValueError('Settings changed during QM response scan; calculate again')
             data.update(response=np.column_stack(columns),tune_response=np.column_stack(qcolumns) if opt.measure_tunes else None,
                         acquisition_valid=valid.copy(),valid=valid&enabled,
                         response_column_measured=[not r.get('skipped',False) for r in data['probe_readbacks']],
@@ -462,7 +490,7 @@ class DispersionService:
             return data
         except BaseException as exc:
             data['error']=str(exc);state['status']='interrupted'
-            try:data['restored']=bool(b.same_settings(b.snapshot(),data['baseline']))
+            try:data['restored']=bool(b.same_settings(self.snapshot(data['baseline']['quadrupoles']),data['baseline']))
             except Exception as restoration_error:data['restoration_error']=str(restoration_error);data['restored']=False
             try:self.checkpoint(data,checkpoint_path,event)
             except Exception as save_error:data['checkpoint_error']=str(save_error)
@@ -473,7 +501,8 @@ class DispersionService:
         if data.get('checkpoint_schema')!='dr-qm-scan-1':raise ValueError('No resumable QM scan state in this file')
         try:
             state=data['scan_state'];names=data['actuators'];n=len(data['names']);m=len(names);done=state['completed']
-            if type(done) is not int or not 0<=done<=m or not m or len(set(names))!=m or not set(names)<=set(QM_CANDIDATES):
+            acquired=DispersionOptions(**data['acquisition_options']);acquired.validate()
+            if type(done) is not int or not 0<=done<=m or not m or names!=acquired.actuators() or acquired.coil!=data['options'].get('coil','trim'):
                 raise ValueError('Invalid completed QM count / names')
             if state['status'] not in ('running','probing','interrupted','complete'):raise ValueError('Invalid scan status')
             if len(state['columns'])!=done or len(data['probe_quality'])!=done or len(data['probe_readbacks'])!=done:
@@ -485,7 +514,6 @@ class DispersionService:
             if np.asarray(state['common_valid']).shape!=(n,):raise ValueError('Invalid checkpoint BPM mask')
             if not np.isfinite(np.r_[np.asarray(data['centers']),np.asarray(data['limits']).ravel()]).all():
                 raise ValueError('Nonfinite checkpoint currents / limits')
-            acquired=DispersionOptions(**data['acquisition_options']);acquired.validate()
             if len(state['tune_columns'])!=(done if acquired.measure_tunes else 0):raise ValueError('Incomplete tune response')
             if any(np.asarray(column).shape!=(2,) for column in state['tune_columns']):raise ValueError('Invalid tune response shape')
             measured=sum(not r.get('skipped') for r in data['probe_readbacks'])
@@ -503,13 +531,13 @@ class DispersionService:
             raise ValueError('Machine / BPM order / hardware profile differs from the saved scan')
         for key in ('frequency_change_khz','momentum_compaction','measure_tunes'):
             if getattr(opt,key)!=acquired[key]:raise ValueError(key+' differs from the saved acquisition; restore the option or CALC again')
-        if names!=[n for n in QM_CANDIDATES if n not in opt.fixed_actuators]:
+        if names!=opt.actuators():
             raise ValueError('QM selection differs from the saved scan; restore the selection or CALC again')
         if saved.get('bpm_invalid_streak_limit')!=self.reader.invalid_streak_limit:
             raise ValueError('BPM validity policy differs from the saved scan; CALC again')
         b.validate_mode('dispersion')
         if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
-        if not b.same_settings(b.snapshot(),saved['baseline']):
+        if not b.same_settings(self.snapshot(saved['baseline']['quadrupoles']),saved['baseline']):
             raise ValueError('Settings differ from the scan baseline. Restore original QM currents / RF and other changed settings before Resume.')
         centers=np.asarray(saved['centers'],float)
         tolerance=getattr(b,'profile',{}).get('current_tolerance_A',1.e-6)
@@ -551,7 +579,7 @@ class DispersionService:
         acquired=data.get('acquisition_options',data['options'])
         for key in ('frequency_change_khz','momentum_compaction'):
             if getattr(opt,key)!=acquired[key]:raise ValueError('RF / momentum settings changed; CALC again')
-        expected=[n for n in QM_CANDIDATES if n not in opt.fixed_actuators]
+        expected=opt.actuators()
         if expected!=list(data['actuators']):raise ValueError('QM selection changed; CALC again')
         result=copy.deepcopy(data)
         if data.get('applied'):
@@ -671,8 +699,10 @@ class DispersionService:
         self.check();b=self.backend;saved_options=dict(data['options']);saved_options.setdefault('measure_tunes',True)
         opt=DispersionOptions(**saved_options);opt.validate();b.validate_mode('dispersion')
         if data.get('applied') or data['backend_id']!=b.identity:raise ValueError('Stale or already applied QM proposal')
-        if not b.same_settings(b.snapshot(),data['baseline']):raise ValueError('Settings changed since QM CALC')
-        names=data['actuators'];centers=np.asarray(data['centers']);delta=np.asarray(data['delta']);changed=np.flatnonzero(abs(delta)>1.e-12)
+        names=data['actuators']
+        if names!=opt.actuators():raise ValueError('QM selection differs from the measured response')
+        if not b.same_settings(self.snapshot(data['baseline']['quadrupoles']),data['baseline']):raise ValueError('Settings changed since QM CALC')
+        centers=np.asarray(data['centers']);delta=np.asarray(data['delta']);changed=np.flatnonzero(abs(delta)>1.e-12)
         if not len(changed):raise ValueError('No QM correction proposed')
         if np.any(abs(delta[changed])>opt.step_A+1.e-9):
             raise ValueError('QM proposal exceeds the per-Apply current change limit; recalculate')
@@ -699,9 +729,9 @@ class DispersionService:
             self.check()
             expected=copy.deepcopy(data['baseline'])
             expected['quadrupoles'].update(zip(names,(centers+delta).tolist()))
-            applied_baseline=b.snapshot()
+            applied_baseline=self.snapshot(data['baseline']['quadrupoles'])
             if not b.same_settings(applied_baseline,expected):
-                raise ValueError('Settings changed or QM targets were not reached after Apply; restored changed trims')
+                raise ValueError('Settings changed or QM targets were not reached after Apply; restored changed currents')
             data['applied_currents_A']=[applied_baseline['quadrupoles'][n] for n in names]
             data['applied_baseline']=applied_baseline
             data['applied_at']=datetime.now(timezone.utc).isoformat()
@@ -719,6 +749,8 @@ class DispersionService:
 
     def reset(self,data):
         self.last_result=data;errors=[]
+        if data['backend_id']!=self.backend.identity or data['actuators']!=DispersionOptions(**data['options']).actuators():
+            raise ValueError('Machine or QM selection differs from the saved scan')
         origin=data.get('iteration_origin',data)
         skipped={r['magnet'] for r in data.get('probe_readbacks',[]) if r.get('skipped')}
         restore=[(n,c) for n,c in zip(data['actuators'],origin['centers']) if n not in skipped]

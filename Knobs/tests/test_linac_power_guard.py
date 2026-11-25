@@ -91,7 +91,7 @@ class PowerGuardTests(unittest.TestCase):
             channel.remove_callback.assert_called_once_with(7)
             channel.put.assert_not_called()
 
-    def test_main_blocks_commands_until_operator_resumes_after_recovery(self):
+    def test_main_blocks_commands_until_automatic_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             machine = Mock()
             worker = opt.OptimizationWorker({}, directory, interface=machine)
@@ -116,17 +116,15 @@ class PowerGuardTests(unittest.TestCase):
                 self.assertTrue(paused.wait(2))
                 machine.pv_put.assert_not_called()
                 self.assertIn("Klystron 3", worker.pause_reason)
-                # Resume while still low must return to the forced pause.
-                paused.clear()
+                # A manual resume cannot bypass the RF hold.
                 worker.resume()
-                self.assertTrue(paused.wait(2))
+                self.assertTrue(worker.is_paused)
                 machine.pv_put.assert_not_called()
                 worker.power_guard.update(pvname=POWER_PVS[3], value=20., timestamp=103.)
                 worker.power_guard.update(pvname=POWER_PVS[3], value=103., timestamp=104.)
                 self.assertTrue(worker.is_paused)
                 machine.pv_put.assert_not_called()
-                worker.resume()
-                thread.join(2)
+                thread.join(5)
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(errors, [])
                 machine.pv_put.assert_called_once_with(TIMING_PV, 100.)
@@ -168,20 +166,38 @@ class PowerGuardTests(unittest.TestCase):
             self.assertEqual(worker._measure_objective(), "fresh")
             self.assertEqual(len(results), 2)
 
-    def test_closing_main_rf_warning_keeps_pause_until_explicit_resume(self):
-        for click_resume in (False, True):
-            worker = SimpleNamespace(is_paused=True, is_running=True, pause_reason="Klystron 8 RF power is too low",
-                                     resume=Mock(), save_and_end=Mock())
-            window = SimpleNamespace(worker=worker)
-            with patch.object(opt, "QMessageBox") as factory:
-                resume, keep = object(), object()
-                box = factory.return_value
-                box.addButton.side_effect = [resume, keep]
-                box.clickedButton.return_value = resume if click_resume else None
-                opt.MainWindow._show_pause_choices(window)
-                box.setEscapeButton.assert_called_once_with(keep)
-            self.assertEqual(worker.resume.call_count, int(click_resume))
-            worker.save_and_end.assert_not_called()
+    def test_main_rf_popup_is_informational(self):
+        worker = SimpleNamespace(is_paused=True, is_running=True, pause_reason="Klystron 8 RF power is too low",
+                                 resume=Mock())
+        window = SimpleNamespace(worker=worker, _rf_popup=None)
+        with patch("Knobs.rf_power_popup.show_power_pause") as show:
+            opt.MainWindow._show_pause_choices(window)
+            show.assert_called_once_with(window, worker.pause_reason)
+        worker.resume.assert_not_called()
+
+    def test_recovery_restarts_after_a_second_trip_or_invalid_read(self):
+        with patch("Knobs.linac_power_guard.time.monotonic") as clock:
+            clock.return_value = 0.
+            m = guard()
+            a, b = POWER_PVS[:2]
+            m.update(a, 49., 102.)
+            m.update(a, 100., 103.)
+            clock.return_value = 2.99
+            self.assertFalse(m.resume_if_recovered())
+            m.update(b, 10., 102.)
+            m.update(b, 101., 103.)
+            clock.return_value = 5.98
+            self.assertFalse(m.resume_if_recovered())
+            m.update(a, 101., 104., severity=3)
+            clock.return_value = 10.
+            self.assertFalse(m.resume_if_recovered())
+            m.update(a, 100., 105.)
+            clock.return_value = 13.
+            self.assertTrue(m.resume_if_recovered())
+            m.check()
+            m.update(a, 50., 106.)
+            with self.assertRaises(KlystronPowerLoss):
+                m.check()
 
     def test_feedback_power_loss_restores_probe_then_uses_auto_pause_path(self):
         plant = Plant()

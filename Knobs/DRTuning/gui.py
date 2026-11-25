@@ -357,9 +357,7 @@ class TuningSession(DRCorrectionWindow):
             self.log_toggle.setChecked(True)
             if self.tabs.currentWidget() is self.tbt:self.tbt.acquisition_status.setText('Failed: '+message+'\nSee the detailed log below.')
     def toggle_pause(self):
-        if self._rf_paused and self._rf_monitor is not None:
-            self._rf_monitor.resume.set()
-        else:
+        if not self._rf_paused:
             super().toggle_pause()
 
     def show_rf_pause(self,monitor,reason):
@@ -378,17 +376,10 @@ class TuningSession(DRCorrectionWindow):
             return
         self.operation_status.setText('RF power low. Measurement paused.')
         self.log('RF power pause: '+reason)
-        self.pause_button.setText('Resume after RF recovery')
-        self.pause_button.setEnabled(True)
-        box=QMessageBox(QMessageBox.Icon.Warning,'RF Power Auto Pause',reason,parent=self)
-        box.setInformativeText('Resolve the RF fault, then resume this run.')
-        resume=box.addButton('Resume',QMessageBox.ButtonRole.AcceptRole)
-        keep=box.addButton('Keep paused',QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(keep)
-        box.setEscapeButton(keep)
-        box.buttonClicked.connect(lambda button:monitor.resume.set() if button is resume else None)
-        self._rf_popup=box
-        box.open()
+        self.pause_button.setText('RF paused')
+        self.pause_button.setEnabled(False)
+        from Knobs.rf_power_popup import show_power_pause
+        self._rf_popup=show_power_pause(self,reason)
 
     def start(self,action,finished,label=None,pausable=False):
         if self.task is not None and self.task.isRunning():

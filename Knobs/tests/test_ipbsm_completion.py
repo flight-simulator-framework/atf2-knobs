@@ -49,6 +49,47 @@ class CompletionTests(unittest.TestCase):
         self.app.processEvents()
         self.tmp.cleanup()
 
+    def test_rf_interrupted_fringe_is_repeated_and_other_errors_still_pause(self):
+        from Knobs.linac_power_guard import KlystronPowerGuard, POWER_PVS
+        guard = KlystronPowerGuard(pv_factory=Mock())
+        guard.started = 100.
+        for pv in POWER_PVS:
+            guard.update(pv, 100., 101.)
+        interface = Mock()
+        controller = gui.EPICSIPBSMController(interface)
+        pauses = []
+        def progress(step, info):
+            if info["phase"] == "rf_pause":
+                self.window._on_progress(dict(step=step, info=info))
+                if info["message"]:
+                    self.assertTrue(self.window._rf_popup.isVisible())
+                    buttons = self.window._rf_popup.buttons()
+                    self.assertNotIn("Resume", [button.text() for button in buttons])
+                    self.window._rf_popup.close()
+                    guard.update(POWER_PVS[2], 100., 103.)
+        def measure(*, checkpoint):
+            if interface.get_ipbsm_full.call_count == 1:
+                guard.update(POWER_PVS[2], 50., 102.)
+                checkpoint()
+                return dict(modulation=.95, error=.01)
+            if interface.get_ipbsm_full.call_count == 2:
+                raise TimeoutError("Fringe scan timeout")
+            return dict(modulation=.2, error=.01)
+        interface.get_ipbsm_full.side_effect = measure
+        def operator_pause(data):
+            pauses.append(data["reason"])
+            return True
+        with patch.object(guard, "start"), patch("Knobs.IPBSM_Opt.KlystronPowerGuard", return_value=guard), \
+             patch("Knobs.linac_power_guard.RECOVERY_SECONDS", .02), patch.object(controller, "apply_knobs"):
+            opt = Optimizer(controller, config(), self.root, progress_cb=progress, pause_hook=operator_pause)
+            opt.run()
+        self.assertTrue(guard.closed)
+        self.assertIsNone(self.window._rf_popup)
+        self.assertEqual(pauses, ["operation_error"])
+        self.assertEqual(opt.rf_interruptions, 1)
+        self.assertTrue(opt.y)
+        self.assertEqual(set(opt.y), {.2})
+
     def test_custom_ei_roundtrip_and_presets(self):
         w = self.window
         w._set_config_to_ui(asdict(config(bo_low_acq_threshold=0.000789, bo_low_acq_patience=4)))

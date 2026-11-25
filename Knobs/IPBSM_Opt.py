@@ -23,6 +23,7 @@ for _path in (str(_KNOBS_DIR), str(_REPO_ROOT)):
 
 from machine_interfaces_atf2.InterfaceATF2_Ext import InterfaceATF2_Ext
 from machine_interfaces_atf2.InterfaceATF2_Ext import CurrentDropToZeroError
+from Knobs.linac_power_guard import KlystronPowerGuard, KlystronPowerLoss
 
 def now_tag() -> str:
     # Asia/Tokyo not enforced here; GUI passes local time anyway.
@@ -113,6 +114,7 @@ class EPICSIPBSMController:
         scan_mode_label: str = "30",
         baseline_state: Optional[Dict[str, Any]] = None,
     ):
+        self.rf_checkpoint = None
         self.interface = interface
         self.mode_name = str(mode_name).lower()
         self.scan_mode_label = str(scan_mode_label or "30")
@@ -300,18 +302,26 @@ class EPICSIPBSMController:
         linear_payload, nonlinear_payload, corrector_payload, zscan_payload = self._split_knob_payload(knob_values)
 
         if linear_payload:
+            if self.rf_checkpoint is not None:
+                self.rf_checkpoint()
             self.interface.apply_linear_knobs(
                 linear_payload,
                 base_positions=self.linear_base_positions or None,
             )
         if nonlinear_payload:
+            if self.rf_checkpoint is not None:
+                self.rf_checkpoint()
             self.interface.apply_nonlinear_knobs(
                 nonlinear_payload,
                 base_currents=self.nonlinear_base_currents or None,
             )
         if corrector_payload:
+            if self.rf_checkpoint is not None:
+                self.rf_checkpoint()
             self.interface.apply_corrector_knobs(corrector_payload)
         if zscan_payload:
+            if self.rf_checkpoint is not None:
+                self.rf_checkpoint()
             self.interface.apply_zscan_knobs(
                 zscan_payload,
                 scan_mode_label=self.scan_mode_label,
@@ -322,7 +332,9 @@ class EPICSIPBSMController:
         return self.interface.get_ipbsm()
 
     def get_ipbsm_full(self) -> Dict[str, Any]:
-        return self.interface.get_ipbsm_full()
+        if self.rf_checkpoint is None:
+            return self.interface.get_ipbsm_full()
+        return self.interface.get_ipbsm_full(checkpoint=self.rf_checkpoint)
 
 try:
     from .ipbsm_opt_math import (
@@ -441,7 +453,7 @@ class StopFlag:
         return self._stop
 
 
-class GracefulStopRequested(Exception):
+class GracefulStopRequested(InterruptedError):
     pass
 
 class Optimizer:
@@ -546,6 +558,9 @@ class Optimizer:
         self.out_dir = ensure_dir(out_dir)
         self.progress_cb = progress_cb
         self.stop_flag = stop_flag or StopFlag()
+        self.power_guard = None
+        self.rf_interruptions = 0
+        self._stopped_during_rf_pause = False
         self.pause_hook = pause_hook
         self.rng = np.random.default_rng()
         self._manual_pause_requested = False
@@ -584,6 +599,10 @@ class Optimizer:
 
     def request_manual_pause(self) -> None:
         self._manual_pause_requested = True
+
+    def stop_during_rf_pause(self):
+        self._stopped_during_rf_pause = True
+        self.stop_flag.request_stop()
 
     def request_remeasure_current_point(self) -> None:
         self._remeasure_current_point_requested = True
@@ -1436,9 +1455,12 @@ class Optimizer:
 
         while True:
             while True:
+                self._check_rf_power()
                 try:
                     self.controller.apply_knobs(self._x_dict(xq))
                     break
+                except GracefulStopRequested:
+                    raise
                 except CurrentDropToZeroError as exc:
                     payload = {
                         "reason": "current_drop_to_zero",
@@ -1472,6 +1494,8 @@ class Optimizer:
                         raise GracefulStopRequested("apply_knobs_error") from exc
 
             while True:
+                self._check_rf_power()
+                generation = self.rf_interruptions
                 try:
                     dat_raw: Dict[str, Any] = {}
                     if hasattr(self.controller, "get_ipbsm_full"):
@@ -1479,8 +1503,12 @@ class Optimizer:
                     else:
                         y0, yerr0 = self.controller.get_ipbsm()
                         dat_raw = {"modulation": y0, "error": yerr0}
-                    break
+                except GracefulStopRequested:
+                    raise
                 except Exception as exc:
+                    self._check_rf_power()
+                    if generation != self.rf_interruptions:
+                        continue
                     payload = {
                         "reason": "operation_error",
                         "operation": "get_ipbsm",
@@ -1495,6 +1523,10 @@ class Optimizer:
                     if not should_continue:
                         self.stop_flag.request_stop()
                         raise GracefulStopRequested("get_ipbsm_error") from exc
+                    continue
+                self._check_rf_power()
+                if generation == self.rf_interruptions:
+                    break
 
             def _f(v: Any) -> float:
                 try:
@@ -2114,7 +2146,49 @@ class Optimizer:
         x_next = cand[int(np.argmax(score))]
         return clamp(x_next, lo, hi)
 
+    def _check_rf_power(self):
+        if self.power_guard is None:
+            return
+        if self._stopped_during_rf_pause:
+            raise GracefulStopRequested("Stopped during RF power pause")
+        try:
+            self.power_guard.check()
+        except KlystronPowerLoss as exc:
+            already_stopping = self.stop_flag.is_stopped()
+            self.rf_interruptions += 1
+            self._emit(len(self.X), {"phase": "rf_pause", "message": str(exc)})
+            try:
+                while not self._stopped_during_rf_pause:
+                    if self.stop_flag.is_stopped() and not already_stopping:
+                        break
+                    if self.power_guard.resume_if_recovered():
+                        return
+                    time.sleep(.05)
+                self._stopped_during_rf_pause = True
+                raise GracefulStopRequested("Stopped during RF power pause")
+            finally:
+                self._emit(len(self.X), {"phase": "rf_pause", "message": ""})
+
     def run(self) -> Dict:
+        if not isinstance(self.controller, EPICSIPBSMController):
+            return self._run_scan()
+        self.power_guard = KlystronPowerGuard()
+        try:
+            self.power_guard.start()
+            deadline = time.monotonic() + 15.
+            while not self.power_guard.ready:
+                self._check_rf_power()
+                if not self.power_guard.ready and time.monotonic() >= deadline:
+                    raise TimeoutError("No start RF power readings from all klystrons 0–8")
+                time.sleep(.05)
+            self.controller.rf_checkpoint = self._check_rf_power
+            return self._run_scan()
+        finally:
+            self.controller.rf_checkpoint = None
+            self.power_guard.close()
+            self.power_guard = None
+
+    def _run_scan(self) -> Dict:
         lo, hi = self._bounds_arrays()
         method_raw = str(self.cfg.method).upper()
         method = "GF" if method_raw in {"GF", "SEQUENTIAL"} else method_raw
@@ -2702,6 +2776,7 @@ class Optimizer:
                 "final_strategy": final_strategy,
             })
             try:
+                self._check_rf_power()
                 self.controller.apply_knobs(final_x)
                 best_apply_ok = True
             except Exception as exc:

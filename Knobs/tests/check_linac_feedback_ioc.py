@@ -191,6 +191,7 @@ def main():
                 from Knobs.linac_feedback_gui import FeedbackWorker
                 beam = factory("test:beam")
                 paused, monitoring = threading.Event(), threading.Event()
+                rf_recovered = threading.Event()
                 bpm_invalid = threading.Event()
                 injected = []
                 worker_events = []
@@ -210,6 +211,8 @@ def main():
                 def record(event):
                     emit(event)
                     worker_events.append(event)
+                    if event["kind"] == "rf_pause_ended":
+                        rf_recovered.set()
                     if event["kind"] == "auto_pause":
                         paused.set()
                     if event["kind"] == "bpm_invalid" and event["consecutive"] >= 5:
@@ -246,13 +249,11 @@ def main():
                     monitoring.clear()
                     assert factory("test:rf_scale").put([1., 1., 1., .5, 1., 1., 1., 1., 1.], wait=True) == 1
                     assert paused.wait(10), worker_events[-5:]
-                    power_pause = [e for e in worker_events if e["kind"] == "auto_pause"][-1]
-                    assert "Klystron 3" in power_pause["state"], power_pause
+                    power_pause = [e for e in worker_events if e.get("cause") == "rf_power"][-1]
+                    assert "Klystron 3" in power_pause["message"], power_pause
                     assert factory("test:rf_scale").put([1.] * 9, wait=True) == 1
-                    time.sleep(.2)
-                    assert worker.paused.is_set(), "RF recovery must not automatically resume"
-                    monitoring.clear()
-                    worker.paused.clear()
+                    assert not rf_recovered.wait(2.5), "RF hold ended too early"
+                    assert rf_recovered.wait(2.), "RF hold did not end automatically"
                     assert monitoring.wait(15), worker_events[-5:]
                     assert sum(e["kind"] == "auto_pause" for e in worker_events) == 2
                     references = [e for e in worker_events if e["kind"] == "klystron_power_reference"]

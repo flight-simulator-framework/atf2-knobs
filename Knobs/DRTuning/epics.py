@@ -6,6 +6,7 @@ from Knobs.DRCorrection.backends import EpicsBackend
 from Knobs.DRCorrection.tbt import analyze_tbt
 from .acquisition import TBTController,ReadbackTBTController,tbt_orbit_mode
 from .calibration import coil_k1l
+from .hardware import main_supply_mappings,quadrupole_supply
 from . import power_pause
 
 
@@ -14,6 +15,7 @@ class LiveBackend(EpicsBackend):
         super().__init__(profile,client)
         self.monitor_klystrons = client is None
         self.quadrupoles={n:p for n,p in profile.get('quadrupoles',{}).items() if p.get('mapping_confirmed')}
+        self.main_quadrupoles=main_supply_mappings(self.quadrupoles)
         self._calibration={}
     def get(self,pv):
         power_pause.checkpoint()
@@ -56,9 +58,9 @@ class LiveBackend(EpicsBackend):
         return super().restore_frequency(state)
 
     def quadrupole_current(self,name):
-        return self.magnet_readback(name,self.quadrupoles[name]['read'])
+        return self.magnet_readback(name,quadrupole_supply(self,name)['read'])
     def quadrupole_k1l(self,name,current):
-        p=self.quadrupoles[name];cal=p['calibration']
+        p=quadrupole_supply(self,name);cal=p['calibration']
         if not cal.get('confirmed'):raise ValueError('Confirm current-to-K1L calibration for '+name)
         if cal['kind']=='polynomial':
             value=float(np.polynomial.polynomial.polyval(current,cal['coefficients']))
@@ -76,7 +78,7 @@ class LiveBackend(EpicsBackend):
         if not np.isfinite(value):raise ValueError('Nonfinite calibrated K1L')
         return value
     def quadrupole_field_check(self,name,current):
-        p=self.quadrupoles[name].get('field_check')
+        p=quadrupole_supply(self,name).get('field_check')
         if not p or not p.get('read_pv'):return None
         factor=float(p['k1l_per_unit']);tolerance=float(p['tolerance_per_m'])
         if not np.isfinite([factor,tolerance]).all() or factor==0 or tolerance<0:raise ValueError('Configure field-PV unit conversion and tolerance')
@@ -87,7 +89,7 @@ class LiveBackend(EpicsBackend):
         return dict(pv=p['read_pv'],raw=raw,k1l_per_unit=factor,pv_k1l=measured,
                     calibrated_k1l=calibrated,within_tolerance=abs(measured-calibrated)<=tolerance)
     def validate_quadrupole_targets(self,name,values):
-        p=self.quadrupoles[name]
+        p=quadrupole_supply(self,name)
         if not p.get('mapping_confirmed'):raise ValueError('Confirm quadrupole PV/coil mapping for '+name)
         delay=float(p['settle_s'])
         if not np.isfinite(delay) or delay<0:raise ValueError('Invalid quadrupole settling time')
@@ -97,7 +99,7 @@ class LiveBackend(EpicsBackend):
             raise ValueError('Quadrupole outside supply current limits')
         for value in v:self.quadrupole_k1l(name,float(value))
     def set_quadrupole_current(self,name,value):
-        self.validate_quadrupole_targets(name,[value]);p=self.quadrupoles[name]
+        self.validate_quadrupole_targets(name,[value]);p=quadrupole_supply(self,name)
         original=self.quadrupole_current(name)
         def wait(target):
             deadline=time.monotonic()+self.profile['readback_timeout_s']
@@ -114,7 +116,7 @@ class LiveBackend(EpicsBackend):
     @power_pause.restoration
     def restore_quadrupole_current(self,name,value):
         """Known original current can be commanded even after a readback failure."""
-        self.validate_quadrupole_targets(name,[value]);p=self.quadrupoles[name]
+        self.validate_quadrupole_targets(name,[value]);p=quadrupole_supply(self,name)
         self.put(p['set'],float(value));deadline=time.monotonic()+self.profile['readback_timeout_s']
         while True:
             reading=self.quadrupole_current(name)

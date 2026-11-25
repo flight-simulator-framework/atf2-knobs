@@ -74,18 +74,16 @@ class PowerPauseTests(unittest.TestCase):
                     self.until(lambda: window._rf_popup is not None)
                     box = window._rf_popup
                     self.assertIn('Klystron 3', box.text())
-                    # Recovery is required even when Resume is explicitly pressed.
-                    next(b for b in box.buttons() if b.text() == 'Resume').click()
-                    self.until(lambda: box is not window._rf_popup)
-                    window._rf_popup.escapeButton().click()
-                    self.assertFalse(window._rf_popup.isVisible())
+                    self.assertNotIn("Resume", [button.text() for button in box.buttons()])
+                    self.assertFalse(window.pause_button.isEnabled())
+                    box.close()
+                    self.assertFalse(box.isVisible())
                     if cancel:
                         window.cancel_button.click()
                     else:
                         channels.update(POWER_PVS[3], 100.)
                         self.assertEqual(reads, [1])
                         self.assertTrue(window.task.isRunning())
-                        window.pause_button.click()
                     self.until(lambda: not window.task.isRunning() and window.tabs.isEnabled())
                     self.assertEqual(restored, [True])
                     self.assertEqual(results, [] if cancel else [2])
@@ -112,7 +110,6 @@ class PowerPauseTests(unittest.TestCase):
                 def recover(monitor, reason):
                     if reason:
                         channels.update(POWER_PVS[1], 100.)
-                        monitor.resume.set()
                 cancel = threading.Event()
                 monitor = power_pause.PowerPause(cancel, recover, lambda: KlystronPowerGuard(channels.channel))
                 profile = load_hardware_profile()

@@ -48,8 +48,8 @@ BPM mask, including in COD and skew correction.
 On the Machine interface, each measurement or correction worker monitors klystrons 0–8 starting at
 its first machine access. A reading at or below 50% of that klystron's initial
 positive power pauses the worker at a machine I/O checkpoint. The popup
-identifies the klystron. Keep paused leaves the operation suspended. After
-power recovers, use Resume in the popup or the main window. Interrupted BPM
+identifies the klystron. The worker resumes automatically once all nine powers
+stay above threshold for three seconds. Closing the popup dismisses the notice. Interrupted BPM
 and XSR sample groups are collected again. Cancel / restore follows the active
 operation's restoration procedure. If initial RF readings are unavailable for
 15 seconds, the operation reports an error.
@@ -72,8 +72,12 @@ QM dispersion:
   before/predicted curves, then Apply / remeasure dispersion. Candidates are
   QM1R–QM4R and QM20R–QM23R, both .1/.2 (16 individually mapped trims, including
   QM2). QM2R.1, QM2R.2 and QM3R.2 are excluded by default (13 active candidates); the
-  Exclude QM trims field contains these actual selections, not placeholder text.
-  Defaults: per-QM initial widths inferred from the 2026-11-19 13:58 scan,
+  Exclude QMs field lists these trims. Select QM coil beside Solver to switch
+  from Trim (default) to Main. Main starts with all eight shared supplies,
+  including QM2R. CALC measures one response per main supply. Apply and Restore
+  use the same coil as the scan. Exclusions are independent for Trim and Main.
+  Older scans load as Trim.
+  Trim defaults: per-QM initial widths inferred from the 2026-11-19 13:58 scan,
   targeting S/N 6.5 (30% above acceptance threshold 5), in A:
                  QM1R QM3R QM4R QM20R QM21R QM22R QM23R
              .1  .16  .34  .13   .62   .50   .28   .16
@@ -81,7 +85,7 @@ QM dispersion:
   No checkpoint load is required. The GUI always uses per-QM starting widths.
   These are widths around the current allowed reference, not absolute currents.
   The fallback width is 0.1 A, used for a QM without an individual width
-  (QM2R if explicitly enabled). It is editable in Measurement.
+  (all main supplies on the first scan, and QM2R trims if enabled). It is editable in Measurement.
   Maximum current change per Apply is 3 A and RF full span is 4 kHz
   (baseline +/-2 kHz). Absolute currents are bounded by the supply limits.
   The existing confirmed site mappings, coil calibration, current limits

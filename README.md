@@ -366,7 +366,7 @@ or an excessively wide sheet, preserving each plot's aspect ratio.
 
 ## Optimizer workspace
 
-Main and Active Feedback automatically monitor `CM0L:poutReadPeak`,
+Main, Developer and Active Feedback automatically monitor `CM0L:poutReadPeak`,
 `CM1L:poutPeakRead` through `CM4L:poutPeakRead`, and `CM5L:poutReadPeak` through
 `CM8L:poutReadPeak`, regardless of the selected tuning targets. Before the first
 adjustment, each channel's first valid post-start shot establishes its fixed RF
@@ -376,11 +376,11 @@ for example: **Klystron 3 RF power is too low**. Short drops remain latched even
 if power recovers before the controller next checks. An unavailable baseline
 blocks startup; zero initial RF power pauses instead of becoming a usable reference.
 
-Power recovery does not resume either mode automatically. Resolve the fault and
-press **Resume**; a channel still below threshold pauses again. Main retains its
-settings, interrupts settling/acquisition at checkpoints, and discards averages
-that span a power pause. Closing its RF warning keeps it paused. Active Feedback
-restores temporary probes before pausing. Its ICT-triggered automatic pause is enabled after 20 consecutive nonpositive shots.
+LinacOpt, DRTuning and IPBSMOpt resume automatically once all nine
+channels stay above threshold for three seconds. Another low shot restarts the
+timer. The RF popup can be dismissed while the worker waits. Main discards
+averages that span the RF pause. Active Feedback restores temporary probes
+before pausing. Its ICT-triggered automatic pause is enabled after 20 consecutive nonpositive shots.
 RF references remain fixed across Resume and response-matrix measurement and are
 recaptured on a new Start. Main records reference/trip events in
 `KlystronPower.jsonl`; Active Feedback uses `events.jsonl`.

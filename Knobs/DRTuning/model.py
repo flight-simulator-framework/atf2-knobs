@@ -359,11 +359,13 @@ def capture_settings(backend,opt,baseline=None,cancel=lambda:None):
                 coil_records[n]=dict(main_A=main,trim_A=trim,main_k1l=main_k,trim_k1l=trim_k,
                     trim_included=include_trim,magnet=mag,hardware_name=hardware_name,library=library)
             else:
-                # Reconstruct from independent public design + commanded trim.
+                # Reconstruct the design and the commanded main and trim changes.
                 mag='QM7AR' if n=='QM7R.1' else n.split('.')[0]
                 k=e.get_K1L(-p);main=cal.mag.k1l_to_current(mag,k,energy);trim=backend.quadrupole_current(n)
                 include_trim=not sad or (n.startswith('QM') and not n.startswith('QM7'))
-                quads[n]=k+(coil_k1l(cal.mag,mag,energy,main,trim,'trim')-coil_k1l(cal.mag,mag,energy,main,0.,'trim') if include_trim else 0.)
+                shift=backend.main_current_delta(mag) if hasattr(backend,'main_current_delta') else 0.
+                if shift:k+=coil_k1l(cal.mag,mag,energy,main+shift)-coil_k1l(cal.mag,mag,energy,main)
+                quads[n]=k+(coil_k1l(cal.mag,mag,energy,main+shift,trim,'trim')-coil_k1l(cal.mag,mag,energy,main,0.,'trim') if include_trim else 0.)
         elif kind=='Sextupole':
             family=n.split('.')[0]
             sexts[n]=coil_k1l(cal.mag,family,energy,read(family+':internalCurrentWrite')) if live else float(e.get_K2L(-p))

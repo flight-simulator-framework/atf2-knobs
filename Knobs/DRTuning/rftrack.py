@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from Knobs.DRCorrection.backends import DemoBackend
 from Knobs.DRCorrection.tbt import analyze_tbt
+from .hardware import QM_MAIN_CANDIDATES,quadrupole_supply
 from .calibration import coil_k1l,MagnetCalibration
 
 
@@ -30,6 +31,7 @@ class RFTrackBackend(DemoBackend):
         self.kick_cal={n:self.cal.corrector_tmm_per_A(n[3:])/(-1299.9999)*.299792458 for n in self.currents}
         self.skews=list(self.solver.get_skew_corrector_names());self.skew_values={n:0. for n in self.skews}
         self.quadrupoles={};self.qelements={};self.qcurrents={};self.qreference={}
+        self.main_quadrupoles={};self.main_currents={}
         for e in self.lattice.get_quadrupoles():
             n=e.get_name()
             if n in self.quadrupoles:continue
@@ -37,8 +39,6 @@ class RFTrackBackend(DemoBackend):
             try:
                 k=float(e.get_K1L(-1299.9999));current=self.cal.quad_current(base,k)
                 if not np.isfinite(current):continue
-                # The design main current is held fixed while the trim is scanned,
-                # exactly the coil selection used by the legacy beta calculation.
                 self.quadrupoles[n]=dict(calibration_name=base,main_A=current,limits_A=[-2.,2.],
                     family='QF1R' if n.startswith('QF1R.') else 'QF2R' if n.startswith('QF2R.') else
                     'QMTRIM2' if n.endswith('.2') else 'QMTRIM1',unit='A',
@@ -46,6 +46,13 @@ class RFTrackBackend(DemoBackend):
                 self.qelements[n]=e;self.qcurrents[n]=0.
                 self.qreference[n]=(0.,k,self.quadrupole_k1l(n,0.))
             except RuntimeError:continue
+        for family in QM_MAIN_CANDIDATES:
+            members=(family+'.1',family+'.2')
+            if all(n in self.quadrupoles for n in members):
+                reference=self.quadrupoles[members[0]]['main_A']
+                self.main_quadrupoles[family]=dict(members=members,reference_A=reference,
+                    limits_A=[reference-3.,reference+3.])  # Simulator range around the design current.
+                self.main_currents[family]=reference
         self.positions_m=np.arange(len(self.bpm_names),dtype=float)
         try:
             from machine_interfaces_atf2.DR_ATF2.ATF_DR_RFTrack_twiss import load_atf_dr_twiss
@@ -65,23 +72,47 @@ class RFTrackBackend(DemoBackend):
                 kick=[0.,0.];kick[int(n in self.vcorrectors)]=self.kick_cal[n]*value
                 self.solver._set_corrector_kick(self.solver._single_element(n[3:]),kick)
     def snapshot(self):
-        out=super().snapshot();out['quadrupoles']=dict(self.qcurrents);return out
+        out=super().snapshot();out['quadrupoles']=dict(self.qcurrents)
+        out['quadrupoles'].update({n:v for n,v in self.main_currents.items() if self.main_current_delta(n)})
+        return out
     def restore(self,snapshot):
         super().restore(snapshot)
-        for n,v in snapshot.get('quadrupoles',{}).items():self.set_quadrupole_current(n,v)
-    def quadrupole_current(self,name):return self.qcurrents[name]
+        if 'quadrupoles' in snapshot:
+            saved=snapshot['quadrupoles']
+            for n in self.main_quadrupoles:
+                if n not in saved and self.main_current_delta(n):
+                    self.set_quadrupole_current(n,self.main_quadrupoles[n]['reference_A'])
+            for n,v in saved.items():self.set_quadrupole_current(n,v)
+    def quadrupole_current(self,name):
+        return self.main_currents[name] if name in self.main_quadrupoles else self.qcurrents[name]
+    def main_current_delta(self,family):
+        if family not in self.main_quadrupoles:return 0.
+        return self.main_currents[family]-self.main_quadrupoles[family]['reference_A']
     def quadrupole_k1l(self,name,current):
-        p=self.quadrupoles[name]
-        return coil_k1l(self.cal.mag,p['calibration_name'],1.3,p['main_A'],current,'trim')
+        if name in self.main_quadrupoles:return coil_k1l(self.cal.mag,name,1.3,current)
+        p=self.quadrupoles[name];mag=p['calibration_name']
+        return coil_k1l(self.cal.mag,mag,1.3,p['main_A']+self.main_current_delta(mag),current,'trim')
     def validate_quadrupole_targets(self,name,values):
-        low,high=self.quadrupoles[name]['limits_A']
+        low,high=quadrupole_supply(self,name)['limits_A']
         if not np.isfinite(values).all() or np.any(np.asarray(values)<low) or np.any(np.asarray(values)>high):
             raise ValueError('Quadrupole outside simulated current limits')
     def set_quadrupole_current(self,name,value):
-        self.validate_quadrupole_targets(name,[value]);e=self.qelements[name]
-        _,k0,cal0=self.qreference[name]
-        e.set_K1(-1299.9999,(k0+self.quadrupole_k1l(name,value)-cal0)/e.get_length())
-        self.qcurrents[name]=float(value)
+        self.validate_quadrupole_targets(name,[value])
+        main=self.main_quadrupoles.get(name)
+        members=main['members'] if main else (name,)
+        strengths=[]
+        for member in members:
+            p=self.quadrupoles[member];mag=p['calibration_name'];design=p['main_A']
+            shift=value-main['reference_A'] if main else self.main_current_delta(mag)
+            trim=self.qcurrents[member] if main else value
+            _,k0,trim0=self.qreference[member]
+            main_change=coil_k1l(self.cal.mag,mag,1.3,design+shift)-coil_k1l(self.cal.mag,mag,1.3,design) if shift else 0.
+            trim_change=coil_k1l(self.cal.mag,mag,1.3,design+shift,trim,'trim')-trim0
+            strengths.append(k0+main_change+trim_change)
+        for member,strength in zip(members,strengths):
+            e=self.qelements[member];e.set_K1(-1299.9999,strength/e.get_length())
+        currents=self.main_currents if main else self.qcurrents
+        currents[name]=float(value)
     def _momentum(self):return 1299.9999*(1-self.offset/(714e6*.0021))
     def orbit(self):
         result=self.solver.find_closed_orbit(momentum_mev_c=self._momentum())

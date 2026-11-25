@@ -1,7 +1,6 @@
 """Per-operation RF power monitoring on the live DRTuning worker thread."""
 from contextvars import ContextVar
 from functools import wraps
-import threading
 import time
 
 from Knobs.DRCorrection.core import Cancelled
@@ -16,7 +15,6 @@ class PowerPause:
         self.notify = notify
         self.factory = factory
         self.guard = None
-        self.resume = threading.Event()
         self.generation = 0
         self.unwinding = False
         self.start_error = None
@@ -65,24 +63,14 @@ class PowerPause:
         except KlystronPowerLoss as exc:
             reason = str(exc)
         self.generation += 1
-        self.resume.clear()
         self.notify(self, reason)
-        while True:
-            if self.cancel.is_set():
-                self.unwinding = True
-                raise Cancelled('RF pause cancelled; restoring temporary settings')
-            if not self.resume.wait(.05):
-                continue
-            self.resume.clear()
-            self.guard.acknowledge()
-            try:
-                self.guard.check()
-                if self.guard.ready:
-                    break
-                reason = 'Waiting for positive RF power from all klystrons.'
-            except KlystronPowerLoss as exc:
-                reason = str(exc)
-            self.notify(self, reason)
+        while not self.cancel.is_set():
+            if self.guard.resume_if_recovered():
+                break
+            self.cancel.wait(.05)
+        if self.cancel.is_set():
+            self.unwinding = True
+            raise Cancelled('RF pause cancelled; restoring temporary settings')
         self.notify(self, '')
         return True
 

@@ -37,7 +37,7 @@ class FeedbackWorker(QThread):
         self.pause_reason = ""
         self.stage, self.cycle_number = "Starting", 0
         self.on_pause = None
-        self.on_resume = None
+        self.power_guard = None
         self._targets_lock = threading.Lock()
         self._requested_targets = {name: getattr(config, name) for name in
                                    ("adjust_timing", "adjust_phase", "adjust_correctors")}
@@ -64,12 +64,21 @@ class FeedbackWorker(QThread):
             while self.paused.is_set() and not self.cancelled.wait(.05):
                 pass
             if not self.cancelled.is_set():
-                if self.pause_reason.startswith("Klystron ") and self.on_resume is not None:
-                    self.on_resume()
                 self.pause_reason = ""
                 self.emit_event(dict(kind="state", state="Resuming"))
         if self.cancelled.is_set():
             raise InterruptedError("Feedback stopped")
+
+    def pause_for_rf(self, reason):
+        self.emit_event(dict(kind="auto_pause", cause="rf_power", state="Auto-paused: " + reason, message=reason))
+        try:
+            while not self.cancelled.is_set():
+                if self.power_guard.resume_if_recovered():
+                    return
+                self.cancelled.wait(.05)
+            raise InterruptedError("Feedback stopped")
+        finally:
+            self.emit_event(dict(kind="rf_pause_ended", state="Stopped" if self.cancelled.is_set() else "Resuming"))
 
     def pause_for_loss(self, reason):
         self.pause_reason = reason
@@ -119,7 +128,7 @@ class FeedbackWorker(QThread):
             machine = self.machine_factory(self.config, self.cancelled.is_set, self.checkpoint, self.emit_event)
             if hasattr(machine, "start_power_monitor"):
                 machine.start_power_monitor()
-                self.on_resume = machine.acknowledge_power_alarm
+                self.power_guard = machine.power_guard
             controller = FeedbackController(machine, self.config, machine.limits(), self.emit_event)
             controller.target_provider = self.target_selection
             self.on_pause = controller.reset_baseline_candidate
@@ -131,7 +140,7 @@ class FeedbackWorker(QThread):
                     controller.report_response()
                 except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
                     self.emit_event(dict(kind="log", message=f"Stored response unavailable; learn from 0.005 A correction attempts: {exc}"))
-            controller.run(pause_for_loss=self.pause_for_loss)
+            controller.run(pause_for_loss=self.pause_for_loss, pause_for_rf=self.pause_for_rf)
         except InterruptedError:
             self.emit_event(dict(kind="state", state="Stopped; accepted settings retained"))
         except Exception as exc:
@@ -142,7 +151,7 @@ class FeedbackWorker(QThread):
                 self.event_signal.emit(dict(kind="error", message=str(exc)))
         finally:
             self.on_pause = None
-            self.on_resume = None
+            self.power_guard = None
             try:
                 if machine is not None:
                     machine.close()
@@ -212,6 +221,7 @@ class FeedbackPanel(QWidget):
             row.addWidget(button)
         run_layout.addLayout(row)
         left.addWidget(run_group)
+        self._rf_popup = None
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.start_button.clicked.connect(self.start)
@@ -492,6 +502,19 @@ class FeedbackPanel(QWidget):
         elif kind == "waiting":
             self.plot_waiting = True
             self.set_status(f"RUNNING | Next {event.get('next_action', 'Timing scan').lower()} in {math.ceil(event['remaining_sec'])} s")
+        elif kind == "rf_pause_ended" or (kind == "auto_pause" and event.get("cause") == "rf_power"):
+            if self._rf_popup is not None:
+                self._rf_popup.close()
+                self._rf_popup.deleteLater()
+                self._rf_popup = None
+            if kind == "auto_pause":
+                from Knobs.rf_power_popup import show_power_pause
+                self._rf_popup = show_power_pause(self, event["message"])
+                self.pause_button.setEnabled(False)
+                self.set_status(event["message"], "paused")
+            elif self.worker is not None and not self.worker.cancelled.is_set():
+                self.pause_button.setEnabled(True)
+                self.set_status("RF power recovered")
         elif kind == "auto_pause":
             self.operation = ""
             self.plot_waiting = False

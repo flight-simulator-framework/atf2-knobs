@@ -253,6 +253,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("IPBSM Bayesian Optimization")
 
+        self._rf_popup = None
         self.interface = IPBSMInterface()
         self.stop_flag = StopFlag()
         self.worker: Optional[OptimizerWorker] = None
@@ -2361,6 +2362,9 @@ class MainWindow(QMainWindow):
     def _on_stop(self):
         if self.worker is None or (not self.worker.isRunning()):
             return
+        if self._rf_popup is not None:
+            self.worker.optimizer.stop_during_rf_pause()
+            return
         self.worker.request_manual_pause()
         self._set_status("Status: pause requested after current measurement", state="paused")
 
@@ -2519,6 +2523,24 @@ class MainWindow(QMainWindow):
         if "overall_progress" in info:
             self.total_progress.update_progress(info["overall_progress"])
         phase = str(info.get("phase", ""))
+        if phase == "rf_pause":
+            if self._rf_popup is not None:
+                self._rf_popup.close()
+                self._rf_popup.deleteLater()
+                self._rf_popup = None
+            reason = info["message"]
+            if reason:
+                from Knobs.rf_power_popup import show_power_pause
+                self._rf_popup = show_power_pause(self, reason)
+                self.stop_btn.setText("STOP")
+                self._set_status(reason, state="paused")
+            else:
+                self.stop_btn.setText("PAUSE")
+                if self.stop_flag.is_stopped():
+                    self._set_status("Status: finishing run", state="info")
+                else:
+                    self._set_status("Status: continuing after RF recovery", state="running")
+            return
         bo1d_trace = dict(info.get("bo1d_trace", {}) or {})
         if bo1d_trace:
             self._set_bo1d_trace(bo1d_trace)

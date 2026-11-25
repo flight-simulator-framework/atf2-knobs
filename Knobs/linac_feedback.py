@@ -736,7 +736,7 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
                 return
             self.io.wait(min(1., remaining))
 
-    def run(self, pause_for_loss=None):
+    def run(self, pause_for_loss=None, pause_for_rf=None):
         initialized = False
         response_ready = not (self.config.measure_response_on_start and self.config.adjust_correctors)
         feedback_ready = response_ready
@@ -767,11 +767,12 @@ fails, try individual +/-0.005 A corrections. Fixed models are never retrained.
                 # Keep the original reference and accepted machine settings;
                 # discard the interrupted search; retain response observations
                 # and update them only through subsequent correction attempts.
-                if pause_for_loss is None:
+                pause = pause_for_rf if isinstance(exc, KlystronPowerLoss) and pause_for_rf is not None else pause_for_loss
+                if pause is None:
                     raise
                 self.reset_baseline_candidate("RF power loss" if isinstance(exc, KlystronPowerLoss) else "Beam loss")
                 self.transmission_history.clear()
                 self.report_response()
                 self.event("klystron_power_pause" if isinstance(exc, KlystronPowerLoss) else "beam_loss",
                            message=str(exc), settings=dict(getattr(self, "current", {})))
-                pause_for_loss(str(exc))
+                pause(str(exc))

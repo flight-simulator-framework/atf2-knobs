@@ -1011,6 +1011,7 @@ class OptimizationWorker(QThread):
         self._initial_snapshot = None
         self.power_guard = None
         self.pause_reason = ""
+        self._manual_pause_requested = False
         self._power_trip_count = 0
         self._initial_eval_consumed = False
         self._eval_counter = 0
@@ -1541,13 +1542,15 @@ class OptimizationWorker(QThread):
     def request_pause(self):
         with self._pause_condition:
             if self.is_running:
+                self._manual_pause_requested = True
                 self.pause_requested = True
         self.log_signal.emit("[PAUSE] Requested; finish the current evaluation before waiting.")
 
     def resume(self, remeasure_current_point=True):
         with self._pause_condition:
-            if self.pause_reason and self.power_guard is not None:
-                self.power_guard.acknowledge()
+            if self.pause_reason:
+                return
+            self._manual_pause_requested = False
             self._remeasure_after_pause = bool(remeasure_current_point and self._pause_can_remeasure)
             self.pause_requested = False
             self._pause_condition.notify_all()
@@ -1598,7 +1601,15 @@ class OptimizationWorker(QThread):
                 self._emit_progress({"kind": "pause_state", "paused": True, "reason": self.pause_reason})
                 try:
                     while self.pause_requested and self.is_running:
-                        self._pause_condition.wait()
+                        if not self.pause_reason:
+                            self._pause_condition.wait()
+                        elif self.power_guard.resume_if_recovered():
+                            self.pause_reason = ""
+                            self._remeasure_after_pause = remeasure
+                            self.pause_requested = self._manual_pause_requested
+                            break
+                        else:
+                            self._pause_condition.wait(.05)
                 finally:
                     self.is_paused = False
                 if self._save_and_end and self.is_running:
@@ -1615,7 +1626,7 @@ class OptimizationWorker(QThread):
                 raise InterruptedError("Optimization stopped")
 
     def _start_power_monitor(self):
-        if self.run_profile != RUN_PROFILE_MAIN or self._interface_injected:
+        if self._interface_injected:
             return
         def report(event):
             event = dict(event, timestamp=datetime.datetime.now().astimezone().isoformat())
@@ -3575,6 +3586,7 @@ class MainWindow(QMainWindow):
             RUN_PROFILE_MAIN: None,
             RUN_PROFILE_DEVELOPER: None,
         }
+        self._rf_popup = None
         self.resume_snapshot_state: Optional[Dict[str, Any]] = None
         self._plot_state: Dict[str, Dict[str, Any]] = {
             RUN_PROFILE_MAIN: {
@@ -5650,10 +5662,14 @@ class MainWindow(QMainWindow):
             if self.worker is not None and not self.worker.is_running:
                 return  # A queued pause acknowledgement must not undo STOP.
             paused = bool(payload.get("paused"))
-            for button in (self.btn_stop, self.dev_btn_stop):
-                button.setText("RESUME" if paused else "PAUSE")
-                button.setEnabled(True)
             reason = str(payload.get("reason", ""))
+            if self._rf_popup is not None:
+                self._rf_popup.close()
+                self._rf_popup.deleteLater()
+                self._rf_popup = None
+            for button in (self.btn_stop, self.dev_btn_stop):
+                button.setText("RF PAUSED" if reason else "RESUME" if paused else "PAUSE")
+                button.setEnabled(not reason)
             self._set_status((("Status: AUTO-PAUSED | " + reason if reason else "Status: PAUSED — settings retained") if paused else "Status: RUNNING")
                              + f" | {self._scan_progress_text(context)}",
                              state="paused" if paused else "running", profile=context)
@@ -6716,17 +6732,9 @@ class MainWindow(QMainWindow):
         if worker is None or not worker.is_paused or not worker.is_running:
             return
         if getattr(worker, "pause_reason", ""):
-            box = QMessageBox(self)
-            box.setWindowTitle("RF Power Auto Pause")
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setText(worker.pause_reason + "\n\nResolve the RF fault, then press Resume. Closing this message keeps the optimizer paused.")
-            resume_button = box.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
-            keep_button = box.addButton("Keep Paused", QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(keep_button)
-            box.setEscapeButton(keep_button)
-            box.exec()
-            if self.worker is worker and worker.is_running and box.clickedButton() is resume_button:
-                worker.resume()
+            from Knobs.rf_power_popup import show_power_pause
+            if self._rf_popup is None:
+                self._rf_popup = show_power_pause(self, worker.pause_reason)
             return
         best = worker._best_recorded
         box = QMessageBox(self)
@@ -6809,6 +6817,10 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def optimization_finished(self):
+        if self._rf_popup is not None:
+            self._rf_popup.close()
+            self._rf_popup.deleteLater()
+            self._rf_popup = None
         finished_profile = self._run_profile
         stopped = self.worker is not None and not self.worker.is_running
         if self.worker is not None:
