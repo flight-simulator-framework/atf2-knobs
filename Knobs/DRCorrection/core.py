@@ -207,6 +207,14 @@ class CorrectionService:
         budget=int(count)+extra_updates
         stream=iter(self.backend.orbit_samples(budget,self.cancel,interval)) if hasattr(self.backend,'orbit_samples') else None
         rejected=0
+        def replace_invalid(affected,widespread):
+            nonlocal rejected
+            rejected+=1
+            names=', '.join(self.backend.bpm_names[i] for i in affected)
+            if rejected>extra_updates:
+                raise ValueError(f'Required BPM invalid after {extra_updates} retries: {names} '
+                                 f'({len(samples)}/{int(count)} valid updates)')
+            if on_retry is not None:on_retry(rejected,names,len(samples),widespread)
         for _ in range(budget):
             self.check_cancel()
             # Same sampling cadence as SysID, but wait BEFORE each sample
@@ -217,16 +225,23 @@ class CorrectionService:
             self.check_cancel()
             x,y,valid=checked_orbit(result,self.backend.bpm_names)
             missing=required[~valid[required]]
-            widespread=bool(extra_updates and (2*np.count_nonzero(valid)<len(valid)
+            healthy=np.count_nonzero(valid)
+            if extra_updates and required.size<5 and not missing.size and samples:
+                # During preset discovery the outside BPM list is not known yet.
+                # A later healthy frame can reveal that the very first shot was sparse.
+                for i in reversed(range(len(samples))):
+                    if healthy-np.count_nonzero(samples[i]['valid'])>=5:
+                        earlier=samples.pop(i)
+                        for field in (diagnostics,timestamps,fresh):field.pop(i)
+                        replace_invalid(np.flatnonzero(valid & ~earlier['valid']),True)
+                if samples and np.count_nonzero(samples[-1]['valid'])-healthy>=5:
+                    replace_invalid(np.flatnonzero(samples[-1]['valid'] & ~valid),True)
+                    continue
+            widespread=bool(extra_updates and (2*healthy<len(valid)
                             or missing.size>=5 or (missing.size>=2 and 4*missing.size>=required.size)))
             if missing.size or widespread:
-                rejected+=1
                 affected=missing if missing.size else np.flatnonzero(~valid)
-                names=', '.join(self.backend.bpm_names[i] for i in affected)
-                if rejected>extra_updates:
-                    raise ValueError(f'Required BPM invalid after {extra_updates} retries: {names} '
-                                     f'({len(samples)}/{int(count)} valid updates)')
-                if on_retry is not None:on_retry(rejected,names,len(samples),widespread)
+                replace_invalid(affected,widespread)
                 continue
             samples.append(dict(x=x.copy(),y=y.copy(),tmit=np.asarray(result['tmit'],float).copy(),valid=valid.copy()))
             diagnostics.append(result.get('validity_diagnostics',{}))

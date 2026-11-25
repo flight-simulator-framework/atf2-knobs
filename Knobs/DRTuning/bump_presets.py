@@ -30,16 +30,22 @@ def _responses():
     with np.load(Path(__file__).with_name('bump_preset_responses.npz'),allow_pickle=False) as archive:
         return {target:archive[target] for target in bump_targets()}
 
-def ranked_closure_helpers(backend, geometry, leakage):
-    """Rank unused correctors by their nominal response to the observed leakage."""
+def ranked_closure_helpers(backend, geometry, leakage, opt, measured=None):
+    """Rank same-plane correctors, starting with the largest normalized violation."""
     catalog=_catalog()
     saved={n:i for i,n in enumerate(catalog['bpm_names'])}
     internal={name(n) for n in geometry['internal_bpms']}
     outside=[name(geometry['bpm_names'][i]) for i in geometry['outside_indices']]
     if not set(outside)<=saved.keys():return []
     rows=np.array([saved[n] for n in outside])
-    rows=np.r_[rows,rows+len(saved)]
-    magnets={name(n):n for n in backend.hcorrectors+backend.vcorrectors}
+    residual=np.asarray(leakage,float).reshape(2,len(outside))
+    usable=np.isfinite(residual).all(axis=0)
+    if not usable.any():return []
+    rows=rows[usable]
+    residual=residual[:,usable]
+    severity=np.maximum(np.max(abs(residual),axis=1)/opt.outside_max_mm,
+                        np.sqrt(np.mean(residual**2,axis=1))/opt.outside_rms_mm)
+    families=({name(n):n for n in backend.hcorrectors},{name(n):n for n in backend.vcorrectors})
     used={name(n) for n in [*geometry['actuators'],*geometry.get('fixed_actuators',())]}
     scores={}
     for target,preset in catalog['presets'].items():
@@ -47,13 +53,20 @@ def ranked_closure_helpers(backend, geometry, leakage):
         # presets in a disjoint section, checked in both directions.
         if not internal.issubset(preset['outside_bpms']) or not set(preset['internal_bpms']).issubset(outside):continue
         for i,n in enumerate(preset['actuators']):
-            if n in used or n not in magnets or n in scores:continue
-            column=_responses()[target][rows,i]
+            if n in used or n in scores:continue
+            plane=0 if n in families[0] else 1
+            if n not in families[plane] or severity[plane]<=1:continue
+            magnet=families[plane][n]
+            column=_responses()[target][rows+plane*len(saved),i]
+            if measured and magnet in measured:
+                actual=np.asarray(measured[magnet]['response_mm_per_A'],float)
+                selected=actual[np.asarray(geometry['outside_indices'])[usable]+plane*len(geometry['bpm_names'])]
+                if np.isfinite(selected).all():column=selected
             norm=np.linalg.norm(column)
             if norm:
-                score=abs(column@leakage)/norm
-                if score>1.e-12:scores[n]=score
-    return [magnets[n] for n in sorted(scores,key=scores.get,reverse=True)]
+                score=abs(column@residual[plane])/norm
+                if score>1.e-12:scores[n]=(severity[plane],score,magnet)
+    return [entry[2] for entry in sorted(scores.values(),reverse=True)]
 
 
 def preset_geometry(backend,target,valid,opt,options):

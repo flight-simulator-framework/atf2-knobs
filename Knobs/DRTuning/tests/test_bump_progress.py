@@ -94,7 +94,7 @@ class BumpProgressGuiTests(unittest.TestCase):
             self.assertIn('ZV30R',panel.activity_label.text());self.assertIn('+0.2499',panel.activity_currents.text())
             self.assertEqual(panel.acquisition_progress.value(),10)
             panel.on_update(dict(kind='orbit',state=np.array([.001,0,.098,0]),amplitude_mm=.1,iteration=2,
-                closed=True,outside_max_mm=.004,outside_rms_mm=.002,outside=np.zeros(2)))
+                closed=True,outside_max_mm=.004,outside_rms_mm=.004,outside=np.array([.004,.001])))
             self.assertIn('4.00 µm',panel.closure_status.text());self.assertIn('correction 2',panel.closure_status.text())
             panel.on_update(dict(kind='failure',data=dict(restored=False,restoration_error='supply offline',error='readback failed')))
             self.assertIn('Restoration failed',panel.activity_label.text());self.assertIn('ZV30R',panel.activity_label.text())

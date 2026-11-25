@@ -99,6 +99,16 @@ class LiveBackend(EpicsBackend):
     def restore_frequency(self,state):
         return super().restore_frequency(state)
 
+    def bump_optics_currents(self):
+        """Main supply setpoints not already included in the steering snapshot."""
+        pvs={entry['calibration']['main_current_pv'] for entry in self.quadrupoles.values()
+             if entry.get('calibration',{}).get('main_current_pv')}
+        pvs.update(family+':internalCurrentWrite' for family in ('SD1R','SF1R')
+                   if any(n.removeprefix('dr:').startswith(family+'.') for n in self.skews))
+        result={pv:float(self.get(pv)) for pv in sorted(pvs)}
+        if not np.isfinite(list(result.values())).all():raise ValueError('Invalid main supply current for bump response')
+        return result
+
     def quadrupole_current(self,name):
         return self.magnet_readback(name,quadrupole_supply(self,name)['read'])
     def quadrupole_k1l(self,name,current):

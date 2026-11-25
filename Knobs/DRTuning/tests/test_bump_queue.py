@@ -20,6 +20,21 @@ from Knobs.DRTuning.tests.test_bump_presets import PresetBackend
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_discovery_replaces_sparse_first_shot_with_internal_bpms_still_valid(self):
+        backend = PresetBackend()
+        cancel = threading.Event()
+        service = CouplingService(backend,cancel)
+        orbit = backend.orbit
+        def first_shot_sparse():
+            shot = orbit()
+            if backend.acquisitions==1:shot['valid'][10:30]=False
+            return shot
+        with patch.object(backend,'orbit',side_effect=first_shot_sparse), patch.object(cancel,'wait',return_value=False) as wait:
+            _,valid=service.orbit(BumpOptions(),required=[0,1])
+        wait.assert_called_once_with(3.)
+        np.testing.assert_array_equal(valid,backend.valid)
+        self.assertEqual(backend.acquisitions,11)
+
     def test_truncated_live_waveform_is_retried_after_three_seconds(self):
         backend = object.__new__(LiveBackend)
         backend.profile = {'orbit': dict(packed_pv='bpm',row_width=4,row_indices=[0],
@@ -29,14 +44,14 @@ class RecoveryTests(unittest.TestCase):
         stamps = iter(range(20))
         def read(_):
             stamp = next(stamps)
-            return dict(value=[] if stamp==1 else [1,2.,3.,1],timestamp=stamp)
+            return dict(value=[] if stamp==1 else [1,2.,3.+(stamp%2)*.001,1],timestamp=stamp)
         backend.metadata = read
         cancel = threading.Event()
         with patch.object(cancel,'wait',return_value=False) as wait:
             orbit, valid = CouplingService(backend,cancel).orbit(BumpOptions(),required=[0])
         self.assertIn(((3.,),{}), wait.call_args_list)
         self.assertEqual(backend.acquisitions,10)
-        np.testing.assert_allclose(orbit,[2.,3.])
+        np.testing.assert_allclose(orbit,[2.,3.0005])
         self.assertTrue(valid.all())
 
     def test_many_missing_waits_three_seconds_before_next_sample(self):
@@ -93,6 +108,46 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(len(calls), 9)
         self.assertAlmostEqual(calls[3], calls[4])
 
+    def test_scan_preserves_xsr_through_two_helpers_and_interrupted_calibration(self):
+        backend=PresetBackend()
+        service=CouplingService(backend,threading.Event())
+        opt=BumpOptions(settle_s=0.)
+        g=service.calibrate_target('SF1R.2',opt,Options())
+        def vector():
+            orbit=backend.response@backend.read('correctors',backend.hcorrectors+backend.vcorrectors)
+            return np.r_[np.zeros(8),(g['reconstruction']@orbit)[2]]
+        backend.vector=vector
+        close=service.close_at
+        probe=service.probe_column
+        fault=[True]
+        def flaky_probe(n,*args,**kwargs):
+            if n not in g['actuators'] and fault:
+                fault.pop()
+                raise TimeoutError('helper probe interrupted')
+            return probe(n,*args,**kwargs)
+        def leak(geometry,*args):
+            if (len(geometry['actuators']),read.call_count) in ((8,3),(9,6)):
+                outside=np.zeros(len(g['outside_rows']))
+                outside[:len(outside)//2]=np.linspace(.03,.08,len(outside)//2)
+                raise BumpLeakage(dict(outside=outside,outside_max_mm=.08,outside_rms_mm=.05))
+            return close(geometry,*args)
+        with patch.object(backend,'sample_xsr',wraps=backend.sample_xsr) as read, \
+             patch.object(service,'close_at',side_effect=leak),patch.object(service,'probe_column',side_effect=flaky_probe):
+            with self.assertRaisesRegex(TimeoutError,'helper probe interrupted'):
+                service.scan(g,opt)
+            partial=service.last_result
+            self.assertTrue(partial['restored'])
+            self.assertEqual(len(partial['pending_geometry']['actuators']),9)
+            self.assertEqual(len(partial['points']),3)
+            first=partial['points'][0]
+            result=service.scan(g,opt,resume=partial)
+        self.assertEqual(read.call_count,8)  # 5 coarse, 2 refinement, 1 final
+        self.assertEqual([len(p['actuators']) for p in result['points']],[8]*3+[9]*3+[10]*2)
+        self.assertIs(result['points'][0],first)
+        self.assertEqual(result['started_unix_s'],partial['started_unix_s'])
+        self.assertTrue(result['applied'])
+        self.assertAlmostEqual(result['final_amplitude_mm'],backend.minimum,places=4)
+
     def test_extra_columns_measured_and_fixed_magnets_excluded(self):
         backend = PresetBackend()
         service = CouplingService(backend, threading.Event())
@@ -134,6 +189,63 @@ class RecoveryTests(unittest.TestCase):
 
 
 class QueueGuiTests(unittest.TestCase):
+    def test_exhausted_closure_saves_points_and_runs_next_checked_target(self):
+        app=QApplication.instance() or QApplication([])
+        backend=DispersionFixture()
+        window=TuningSession(backend);panel=window.coupling_panel
+        targets=['SF1R.2','SD1R.16']
+        def calibrated(target,*args):
+            return dict(target=target,actuators=['H1','H2','V1'],centers=[0.]*3,
+                        closure_helpers=['H2','V1'],knob_A_per_mm=[1.]*3,
+                        baseline=backend.snapshot(),bpm_names=list(backend.bpm_names))
+        def scan(g,*args,**kwargs):
+            point=dict(amplitude_mm=.1,xsr=dict(mean=12.,sem=.01,count=10,values=[12.]*10))
+            if g['target']==targets[0]:
+                panel.service.last_result=dict(calibration=g,restored=True,applied=False,points=[point])
+                raise BumpLeakage(dict(outside=np.array([.08,0.]),outside_max_mm=.08,outside_rms_mm=.08))
+            return dict(calibration=g,applied=True,points=[point],fits=[],final=point,final_amplitude_mm=.1)
+        try:
+            with tempfile.TemporaryDirectory() as tmp, patch.object(panel.service,'calibrate_target',side_effect=calibrated), \
+                 patch.object(panel.service,'scan',side_effect=scan) as scans,patch.object(panel,'recovery') as popup:
+                panel.run_data_directory=panel.tempfiles_directory=Path(tmp)
+                panel.target.clear()
+                for t in targets:panel.target.addItem(t,t)
+                panel.queue=targets.copy();panel.running_queue=True
+                panel.next_target()
+                deadline=time.monotonic()+12.
+                while panel.running_queue and time.monotonic()<deadline:
+                    app.processEvents();time.sleep(.005)
+                self.assertFalse(panel.running_queue)
+                popup.assert_not_called()
+                self.assertEqual(scans.call_count,2)
+                self.assertEqual([r['target'] for r in panel.completed],targets[1:])
+                self.assertEqual([r['target'] for r in panel.skipped],targets[:1])
+                path,=Path(tmp).glob('*/bump_skipped_*.json')
+                saved=json.loads(path.read_text())
+                self.assertTrue(saved['baseline_verified']);self.assertEqual(len(saved['result']['points']),1)
+                self.assertIn('Outside COD',saved['reason'])
+        finally:
+            if window.task:window.task.wait(10000)
+            window.close();app.processEvents()
+
+    def test_queue_pauses_when_exhausted_but_restoration_is_unverified(self):
+        app=QApplication.instance() or QApplication([])
+        b=DispersionFixture();window=TuningSession(b);panel=window.coupling_panel
+        target='SD1R.2';panel.queue=[target];panel.running_queue=True
+        g=dict(target=target,actuators=['H0','V0'],closure_helpers=['H0','V0'],
+               baseline=b.snapshot(),bpm_names=list(b.bpm_names))
+        def interrupted(_):
+            panel.service.last_result=dict(calibration=g,restored=True,points=[])
+            raise BumpLeakage(dict(outside=np.array([.06,0.]),outside_max_mm=.06,outside_rms_mm=.06))
+        try:
+            with patch.object(window,'start',side_effect=lambda work,done,label:done(work(None))), \
+                 patch.object(panel.service,'verify_geometry',side_effect=ValueError('readback mismatch')), \
+                 patch.object(panel,'after_worker',side_effect=lambda f:f()),patch.object(panel,'recovery') as popup:
+                panel.run(interrupted,lambda _:self.fail('unexpected completion'),'scan')
+                self.assertEqual(panel.queue,[target]);self.assertFalse(panel.skipped)
+                self.assertIn('Baseline verification failed',popup.call_args.args[0])
+        finally:window.close();app.processEvents()
+
     def test_save_and_end_archives_partial_and_pending_targets(self):
         from datetime import date
         app = QApplication.instance() or QApplication([])

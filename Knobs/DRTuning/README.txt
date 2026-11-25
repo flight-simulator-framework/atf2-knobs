@@ -330,9 +330,20 @@ Bump / XSR coupling:
   a position gray and unselectable, with the reason in the table and tooltip.
   Each target starts with its preset. If measured outside COD cannot be closed,
   the scan can add up to two correctors, one at a time. Candidates come from
-  other presets outside the internal BPM interval. Their nominal responses
-  rank them against the measured leakage. The enlarged set is calibrated on
-  beam and both signs must close before starting a new scan.
+  other presets outside the internal BPM interval. Max and RMS limits apply
+  per plane. Horizontal violations use ZH and vertical violations use ZV.
+  If both exceed a limit, the larger ratio to its limit takes priority.
+  Candidates are ranked against the leakage in their own plane using the
+  shared measured response when available, otherwise the nominal response.
+  The enlarged set is calibrated on beam and both signs must close. During
+  XSR optimization the previously selected window, displacement reference and
+  completed XSR points carry forward. The scan continues at the unfinished
+  amplitude with a fresh closure check. Each point records its correctors.
+  Resume also retains the points if the extra corrector calibration is interrupted.
+  If two added correctors still cannot close the bump, a queued run verifies
+  restoration to that target's baseline, archives its partial data and reason
+  in bump_skipped_<target>_<timestamp>.json, then advances to the next target.
+  Readback, acquisition and restoration failures pause for operator recovery.
   Eligibility uses current readbacks, parameter A/B and max change from
   baseline, with nominal response only to estimate the reachable interval.
   A shifted interval with the fallback width (default 0.4 mm) is sufficient;
@@ -341,6 +352,16 @@ Bump / XSR coupling:
   Opening the live bump panel ranks targets by absolute trim current and checks
   the first five with available readbacks. Run checked in order calibrates
   and scans each checked target with the previous target's optimum in place.
+  For many targets, Measure all ZH/ZV measures each enabled corrector with
+  symmetric probes, ten fresh BPM updates per polarity, and a verified restore.
+  Supplies without symmetric current margin are listed as skipped. The result
+  is saved in flight-simulator/DRTuning/<year>/bump_response_<timestamp>.json
+  under atf-data. Measure or Load matrix enables Use shared matrix for single
+  and queued bumps, including extra closure correctors. Each target keeps a
+  fresh baseline and verifies closure in both signs. Missing columns or invalid
+  required BPM rows trigger fresh probes for the affected correctors only.
+  Reuse checks machine identity, BPM order and recorded non-steering settings.
+  Clear Use shared matrix to return to per-target response measurement.
   1. Calibrate and close bump automatically checks the selected preset against
      current BPMs and limits, then measures X/Y corrector response columns with
      10-update BPM averages. At each setting, a sample with an invalid required
@@ -350,6 +371,16 @@ Bump / XSR coupling:
      affected BPMs. Both signs are tested and baseline currents are
      restored. Default max current change from each target's baseline is 2 A,
      outside max 30 µm and outside RMS 20 µm. Calibration uses +/-0.1 mm.
+     A BPM whose X and Y both stay exactly constant for ten timestamp-verified
+     updates is temporarily excluded, even when intensity changes. Its name
+     appears in Current operation. A complete valid batch with varying position
+     restores the BPM; a mixed batch starting with the frozen value is discarded
+     for that channel. Frozen rows do not enter COD, response fits or closure
+     helper ranking. Recovered rows require a valid baseline for COD and valid
+     probe data for the response fit. Missing references are filled at baseline
+     currents. If the internal BPM pair or four usable outside BPMs needed for
+     closure are unavailable due to freezing, the scan waits and retries for
+     about 90 s before reporting the interruption.
   2. Scan width [mm] is the FULL width, default 0.8 mm. Scan -> fit -> set optimum
      first checks COD closure for a centered [-0.4,+0.4] mm window. If unavailable,
      it tries shifted windows of the same 0.8 mm width, nearest zero first with

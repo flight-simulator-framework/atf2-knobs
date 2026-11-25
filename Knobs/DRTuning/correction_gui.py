@@ -7,15 +7,15 @@ from pathlib import Path
 from uuid import uuid4
 import numpy as np
 from PyQt6.QtCore import pyqtSignal,Qt,QTimer
-from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,
+from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,QCheckBox,
                             QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar,QListWidget,QListWidgetItem,QMessageBox)
 from Knobs.DRCorrection.core import serial,Cancelled
 from Knobs.DRCorrection.gui import Plot
 from .dispersion_plot import DispersionPlot
-from .coupling import CouplingService,BumpOptions
+from .coupling import CouplingService,BumpOptions,BumpRangeUnavailable
 from .bump_presets import bump_preset
 from .dispersion import DispersionService,DispersionOptions,QM_PROBE_PRESETS_A
-from .qm_checkpoint import load_checkpoint
+from .qm_checkpoint import load_checkpoint,prepare_destination,save_checkpoint
 
 
 def control(form,label,value,minimum,maximum,decimals=3):
@@ -85,9 +85,11 @@ class CouplingPanel(CorrectionTool):
         self.closure_status=QLabel('Calibration: 1 Baseline → 2 Measure 8 correctors → 3 Solve currents → 4 Close ±Y bumps → 5 Restore')
         self.closure_status.setWordWrap(True)
         for widget in (self.activity_label,self.activity_currents,self.acquisition_progress,self.closure_status):activity_layout.addWidget(widget)
+        self.bpm_health=QLabel();self.bpm_health.setWordWrap(True)
+        activity_layout.addWidget(self.bpm_health);self.bpm_health.hide()
         self.right.insertWidget(0,activity)
         self.availability=None
-        self.after_task=None;self.queue=[];self.running_queue=False;self.completed=[]
+        self.after_task=None;self.queue=[];self.running_queue=False;self.completed=[];self.skipped=[]
         self.rank_started=False;self.scan_resume=None;self.plot_target=''
         self.tempfiles_directory=Path('/mnt/nas1/atf-data/op/tempfiles')
         self.run_data_directory=Path('/mnt/nas1/atf-data/flight-simulator/DRTuning')
@@ -119,6 +121,17 @@ class CouplingPanel(CorrectionTool):
         self.availability_status=QLabel('Positions not checked against current BPMs / currents.');self.availability_status.setWordWrap(True)
         self.controls.insertWidget(3,self.availability_status)
         self.controls.insertWidget(0,targets)
+        matrix_box=QGroupBox('Shared corrector response')
+        matrix_layout=QVBoxLayout(matrix_box)
+        actions=QHBoxLayout();matrix_layout.addLayout(actions)
+        measure_matrix=QPushButton('Measure all ZH/ZV')
+        measure_matrix.clicked.connect(self.measure_matrix);actions.addWidget(measure_matrix)
+        load_matrix=QPushButton('Load matrix…')
+        load_matrix.clicked.connect(self.load_matrix);actions.addWidget(load_matrix)
+        self.matrix=None
+        self.use_matrix=QCheckBox('Use shared matrix');self.use_matrix.setEnabled(False)
+        self.use_matrix.toggled.connect(self.toggle_matrix);matrix_layout.addWidget(self.use_matrix)
+        self.controls.insertWidget(1,matrix_box)
         self.add_button('Check BPMs / current limits',self.check_positions)
         self.calibrate_button=self.add_button('1. Calibrate and close bump',self.calibrate)
         self.scan_button=self.add_button('2. Scan → fit → set optimum',self.scan)
@@ -128,6 +141,45 @@ class CouplingPanel(CorrectionTool):
         self.target.currentIndexChanged.connect(self.invalidate)
         self.status.setText('Choose a bump position, then calibrate its preset BPMs / correctors.\nTarget mm uses saved nominal transport; corrector response is measured here.')
         self.preview_preset();self.redraw()
+    def toggle_matrix(self,enabled):
+        self.service.response_matrix=self.matrix if enabled else None
+        self.invalidate()
+
+    def matrix_ready(self,matrix,path):
+        self.matrix=matrix
+        self.use_matrix.setText(f"Use shared matrix ({len(matrix['columns'])} correctors)")
+        skipped=matrix.get('skipped',{})
+        summary=str(path)
+        if skipped:summary+='\nSkipped (current limits): '+', '.join(skipped)
+        self.use_matrix.setToolTip(summary);self.use_matrix.setEnabled(True)
+        if self.use_matrix.isChecked():self.toggle_matrix(True)
+        else:self.use_matrix.setChecked(True)
+        self.status.setText(summary);self.window.log(summary)
+
+    def measure_matrix(self):
+        opt=self.options();options=self.model_options()
+        directory=self.run_data_directory/f'{datetime.now():%Y}'
+        path=directory/f'bump_response_{datetime.now():%Y%m%d_%H%M%S_%f}.json'
+        state={}
+        def work(progress):
+            self.service.last_result=None
+            prepare_destination(path)
+            matrix=self.service.measure_response_matrix(opt,options,state,progress,self.update.emit)
+            save_checkpoint(path,matrix)
+            return matrix
+        self.run(work,lambda matrix:self.matrix_ready(matrix,path),'Measure shared bump response')
+
+    def load_matrix(self):
+        path,_=QFileDialog.getOpenFileName(self,'Load measured bump response',
+            str(self.run_data_directory/f'{datetime.now():%Y}'),'Bump response (bump_response_*.json);;JSON (*.json)')
+        if not path:return
+        def work(_):
+            self.service.last_result=None
+            matrix=json.loads(Path(path).read_text(encoding='utf-8'))
+            self.service.use_response_matrix(matrix)
+            return matrix
+        self.run(work,lambda matrix:self.matrix_ready(matrix,path),'Load shared bump response')
+
     def options(self):
         return BumpOptions(amplitude_mm=self.amplitude.value()/2,refine_mm=self.refine.value(),
             calibration_mm=min(.1,self.amplitude.value()/2),probe_A=self.probe.value(),max_step_A=self.step.value(),
@@ -166,7 +218,7 @@ class CouplingPanel(CorrectionTool):
         opt=self.options();model_options=self.model_options()
         self.clear_availability();self.invalidate()
         self.activity_label.setText('Checking BPMs and current margins for all positions; no magnet writes')
-        self.run(lambda p:self.service.available_targets(opt,model_options,p),self.positions_checked,'Check bump positions (read-only)')
+        self.run(lambda p:self.service.available_targets(opt,model_options,p,self.update.emit),self.positions_checked,'Check bump positions (read-only)')
     def positions_checked(self,report):
         self.invalidate();self.availability=report
         rows={row['target']:row for row in report['rows']};enabled=[]
@@ -228,13 +280,15 @@ class CouplingPanel(CorrectionTool):
     def start_queue(self):
         self.queue=self.checked_targets()
         if not self.queue:return
-        self.completed=[];self.running_queue=True;self.refresh_queue_button()
+        self.completed=[];self.skipped=[];self.running_queue=True;self.refresh_queue_button()
         self.next_target()
 
     def next_target(self):
         if not self.queue:
             self.running_queue=False;self.refresh_queue_button()
-            self.status.setText('Completed: '+', '.join(row['target'] for row in self.completed))
+            summary='Completed: '+(', '.join(row['target'] for row in self.completed) or '0')
+            if self.skipped:summary+='\nSkipped: '+', '.join(row['target'] for row in self.skipped)
+            self.status.setText(summary);self.activity_label.setText(summary)
             return
         index=self.target.findData(self.queue[0])
         if index<0 or not self.target.model().item(index).isEnabled():
@@ -257,13 +311,28 @@ class CouplingPanel(CorrectionTool):
             try:
                 if recovery_data and recovery_data.get('restoration_error'):
                     self.service.reset(recovery_data)
-                    self.service.verify_geometry(recovery_data.get('calibration',recovery_data))
+                    self.service.verify_geometry(recovery_data.get('pending_geometry') or recovery_data.get('calibration',recovery_data))
                     recovery_data.pop('restoration_error',None)
                 return action(progress)
             except Exception as exc:
-                return dict(bump_error=str(exc),cancelled=isinstance(exc,Cancelled),partial=self.service.last_result)
+                partial=self.service.last_result
+                if self.running_queue and isinstance(exc,BumpRangeUnavailable) and partial and partial.get('restored') and not partial.get('restoration_error'):
+                    g=partial.get('pending_geometry') or partial.get('calibration',partial)
+                    if g.get('target')==self.queue[0] and len(g.get('closure_helpers',()))==2:
+                        try:
+                            self.service.verify_geometry(g)
+                            self.service.check()
+                        except Cancelled as cancel:
+                            return dict(bump_error=str(cancel),cancelled=True,partial=partial)
+                        except Exception as check:
+                            partial.update(restored=False,restoration_error=str(check))
+                            return dict(bump_error='Baseline verification failed: '+str(check),cancelled=False,partial=partial)
+                        return dict(skip_target=g['target'],reason=str(exc),partial=partial)
+                return dict(bump_error=str(exc),cancelled=isinstance(exc,Cancelled),partial=partial)
         def finished(value):
             nonlocal recovery_data
+            if isinstance(value,dict) and 'skip_target' in value:
+                self.finish_skipped(value);return
             if not isinstance(value,dict) or 'bump_error' not in value:
                 done(value);return
             partial=value['partial']
@@ -277,6 +346,25 @@ class CouplingPanel(CorrectionTool):
             self.after_worker(lambda:self.recovery(value['bump_error'],lambda:self.window.start(work,finished,label=label)))
         self.window.start(work,finished,label=label)
 
+    def finish_skipped(self,value):
+        target=value['skip_target'];reason=value['reason']
+        self.result=value['partial']
+        directory=self.run_data_directory/f'{datetime.now():%Y}'
+        path=directory/f'bump_skipped_{target}_{datetime.now():%Y%m%d_%H%M%S_%f}.json'
+        record=dict(target=target,status='skipped',reason=reason,baseline_verified=True)
+        try:
+            directory.mkdir(parents=True,exist_ok=True)
+            save_checkpoint(path,dict(record,result=self.result))
+        except OSError as exc:
+            message=f'{target}: failed to save skipped target: {exc}'
+            self.after_worker(lambda:self.recovery(message,lambda:self.finish_skipped(value)))
+            return
+        self.skipped.append(dict(record,path=str(path)))
+        self.window.log(f'{target} skipped after two extra correctors. Baseline verified. {reason}\n{path}')
+        self.queue.pop(0);self.scan_resume=None
+        self.invalidate();self.reset_button.setEnabled(False)
+        self.after_worker(self.next_target)
+
     def recovery(self,message,retry):
         box=QMessageBox(self)
         box.setWindowTitle('Bump paused')
@@ -286,7 +374,7 @@ class CouplingPanel(CorrectionTool):
         box.setDefaultButton(end);box.exec()
         if box.clickedButton() is resume:
             retry();return
-        data=dict(error=message,completed=self.completed,pending=self.queue,partial=self.result,
+        data=dict(error=message,completed=self.completed,skipped=self.skipped,pending=self.queue,partial=self.result,
                   live_samples=[dict(phase=phase,amplitude_mm=a,xsr=xsr) for (phase,a),xsr in self.samples.items()])
         directory=self.run_data_directory/f'{datetime.now():%Y}'
         dest=directory/f'bump_{datetime.now():%Y%m%d_%H%M%S_%f}.json'
@@ -332,7 +420,7 @@ class CouplingPanel(CorrectionTool):
             self.window.error('Choose an available bump position; recheck BPMs / current limits');return
         target=self.target.currentData() or self.target.currentText();opt=self.options();options=self.model_options()
         self.plot_target=target;self.scan_resume=None
-        if not self.running_queue:self.completed=[]
+        if not self.running_queue:self.completed=[];self.skipped=[]
         self.geometry=None;self.calibration=None;self.result=None;self.scan_button.setEnabled(False)
         self.points=[];self.fits=[];self.samples={};self.last_orbit=None;self.last_stage_message=None
         self.redraw()
@@ -342,7 +430,9 @@ class CouplingPanel(CorrectionTool):
         def done(value):
             self.geometry=value;self.calibration=value;self.result=value;self.scan_button.setEnabled(True)
             self.set_table(['Corrector','Baseline [A]','Measured knob [A/mm]'],zip(value['actuators'],value['centers'],value['knob_A_per_mm']))
-            self.status.setText('Preset '+value['target']+' calibrated in both signs; original currents restored. Ready for XSR scan.')
+            shared=len(value.get('shared_columns',[]));total=len(value['actuators'])
+            self.status.setText(f"{value['target']} calibrated in both signs. Response: {shared} shared, "
+                                f"{total-shared} measured here. Baseline restored. Ready for XSR scan.")
             self.activity_label.setText(value['target']+': Calibration complete; baseline currents verified. Ready to scan.')
             if self.running_queue:self.after_task=self.scan
         self.run(lambda p:self.service.calibrate_target(target,opt,options,p,self.update.emit),done,'Calibrate preset bump')
@@ -357,7 +447,7 @@ class CouplingPanel(CorrectionTool):
             self.activity_label.setText(f"Scan complete — Optimum Y {value['final_amplitude_mm']:+.4f} mm applied; currents remain at the optimum.")
             self.finish_scan(value)
         def measure(p):
-            self.update.emit(dict(kind='scan_restart',target=g['target']))
+            if not self.scan_resume:self.update.emit(dict(kind='scan_restart',target=g['target']))
             return self.service.scan(g,opt,p,self.update.emit,resume=self.scan_resume)
         self.run(measure,done,'Local bump / XSR minimization')
     def reset(self):
@@ -370,8 +460,19 @@ class CouplingPanel(CorrectionTool):
         self.run(lambda _:self.service.reset(data),done,'Restore local bump currents')
     def on_update(self,event):
         kind=event['kind']
+        if kind=='bpm_health':
+            held=', '.join(event['frozen'])
+            self.bpm_health.setText('Temporarily excluded BPMs: '+held)
+            self.bpm_health.setVisible(bool(held))
+            if held:self.window.log(self.bpm_health.text())
+            if event['recovered']:self.window.log('BPM updates resumed: '+', '.join(event['recovered']))
+            return
         if kind=='scan_restart':
             self.plot_target=event['target'];self.points=[];self.samples={};self.fits=[];self.last_orbit=None
+            self.redraw();return
+        if kind=='scan_history':
+            self.plot_target=event['target'];self.points=list(event['points']);self.fits=list(event['fits'])
+            self.samples={(p['phase'],p['amplitude_mm']):p['xsr'] for p in self.points}
             self.redraw();return
         if kind=='status':
             self.activity_label.setText(event['message'])
@@ -404,14 +505,18 @@ class CouplingPanel(CorrectionTool):
         elif kind=='point':
             point=event['point'];self.points.append(point)
             self.samples[(point['phase'],point['amplitude_mm'])]=point['xsr']
-        elif kind=='fit':self.fits.append(event['fit'])
+        elif kind=='fit':self.fits[event.get('index',len(self.fits)):]=[event['fit']]
         elif kind=='orbit':
             self.last_orbit=event
             state=event['state'];closed='Closure passed' if event.get('closed') else 'Checking / correcting closure'
+            limits=f"Limits: max {self.leak.value():g} µm / RMS {self.rms.value():g} µm"
+            planes=np.asarray(event['outside']).reshape(2,-1)*1000
+            planes=planes[:,np.isfinite(planes).all(axis=0)]
+            cod='\n'.join(f'{axis}: max {max(abs(row)):.2f} µm / RMS {np.sqrt(np.mean(row**2)):.2f} µm'
+                           for axis,row in zip(('H','V'),planes))
             self.closure_status.setText(f"{closed} / correction {event['iteration']}\n"
                 f"Estimated delta Y {state[2]:+.4f} mm (target {event['amplitude_mm']:+.4f}) / delta X {state[0]:+.4f} mm\n"
-                f"Outside COD: max {event['outside_max_mm']*1000:.2f} µm (limit {self.leak.value():g}) / "
-                f"RMS {event['outside_rms_mm']*1000:.2f} µm (limit {self.rms.value():g})")
+                f"Outside COD\n{cod}\n{limits}")
         elif kind=='range':
             selected=event['scan_range'];low,high=selected['bounds_mm']
             self.range_status.setText(f'Scan range {low:+.3f} to {high:+.3f} mm; width {selected["width_mm"]:.3f} mm'+
