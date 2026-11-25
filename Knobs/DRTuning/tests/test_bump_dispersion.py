@@ -105,12 +105,21 @@ class CouplingTests(unittest.TestCase):
         initial=self.b.snapshot();g=self.s.calibrate(self.b.geometry(),self.o)
         self.assertEqual(self.b.snapshot(),initial)
         self.assertTrue(g['calibrated']);events=[]
-        result=self.s.scan(g,self.o,event=events.append)
+        bpm_counts_at_xsr_end=[]
+        def event(value):
+            events.append(value)
+            if value['kind']=='sample' and value['xsr']['count']==10:
+                bpm_counts_at_xsr_end.append(self.b.acquisitions)
+            if value['kind']=='point':
+                self.assertEqual(self.b.acquisitions,bpm_counts_at_xsr_end[-1])
+                self.assertTrue(value['point']['orbit']['closed'])
+        result=self.s.scan(g,self.o,event=event)
         self.assertTrue(result['applied']);self.assertAlmostEqual(result['final_amplitude_mm'],.13,places=5)
         np.testing.assert_allclose(result['refinement_mm'],[.03,.23],atol=1.e-6)
         self.assertEqual(len(result['points']),8);self.assertEqual(len(result['fits']),2)
         self.assertEqual(sum(e['kind']=='sample' for e in events),80)
-        self.assertLess(result['final']['orbit_after_xsr']['outside_max_mm'],1.e-6)
+        self.assertEqual(self.b.acquisitions,bpm_counts_at_xsr_end[-1])
+        self.assertLess(result['final']['orbit']['outside_max_mm'],1.e-6)
         np.testing.assert_allclose(self.b.vector()[[0,1,8,9]],[0,0,.13,0],atol=1.e-6)
         self.s.reset(result);self.assertEqual(self.b.snapshot(),initial)
     def test_leakage_from_nonlinearity_is_refined_without_losing_amplitude(self):
@@ -118,7 +127,7 @@ class CouplingTests(unittest.TestCase):
         g=self.s.calibrate(self.b.geometry(),self.o);events=[]
         result=self.s.scan(g,self.o,event=events.append)
         self.assertTrue(any(e['kind']=='orbit' and e['iteration']>0 for e in events))
-        self.assertLess(result['final']['orbit_after_xsr']['outside_max_mm'],.01)
+        self.assertLess(result['final']['orbit']['outside_max_mm'],.01)
         self.assertAlmostEqual(self.b.vector()[8],result['final_amplitude_mm'],places=6)
     def test_stale_xsr_and_cancel_restore_all_currents(self):
         for cancel in (False,True):

@@ -362,8 +362,8 @@ Bump / XSR coupling:
      half-width window means stop and restore; no further automatic narrowing.
      The accepted window is scanned at five equally spaced points using
      I(a)=I0+a*k (e.g. -.4,-.2,0,.2,.4 mm if the original window closes).
-     Actual outside X/Y and reconstructed target state are checked at every
-     point. Only if needed, bounded beam-based iterations close leakage while
+     Before XSR acquisition at each point, the scan checks outside X/Y and
+     the reconstructed target state. Only if needed, bounded beam-based iterations close leakage while
      retaining target amplitude/angle. No clipping or cumulative amplitude steps.
      XSR polls once per second and takes 10 timestamp advances at each point;
      raw values, means +/- SEM and fit
@@ -373,8 +373,9 @@ Bump / XSR coupling:
      displayed as sigma_y. The minimum must have resolved positive curvature
      and be inside the measured scan range. Additional measurements at the
      first fitted best +/- .1 mm (clamped to the selected window) are
-     followed by a refit. The final fitted optimum is set, with another 10 XSR
-     updates and COD verification. Final size must be consistent with the best
+     followed by a refit. Each point is recorded immediately after its tenth
+     fresh XSR update. The final fitted optimum uses the same sequence.
+     Final size must be consistent with the best
      measured point. Successful completion leaves the optimum currents set.
      Normal runs have 5 coarse + 2 refinement + 1 final points = 80 XSR updates.
   Cancel, stalled acquisition, invalid fit or failed closure restores the

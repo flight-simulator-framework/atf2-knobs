@@ -197,7 +197,7 @@ class CouplingPanel(CorrectionTool):
         self.points=[];self.samples={};self.fits=[];self.redraw()
         def done(value):
             self.result=value;self.scan_button.setEnabled(False);self.calibrate_button.setEnabled(False);self.reset_button.setEnabled(True)
-            self.status.setText(f"Set {value['final_amplitude_mm']:+.4f} mm; XSR {value['final']['xsr']['mean']:.3f} µm.\nFinal XSR and outside COD verified. Calibrate again before another scan.")
+            self.status.setText(f"Set {value['final_amplitude_mm']:+.4f} mm; XSR {value['final']['xsr']['mean']:.3f} µm.\nCalibrate again before another scan.")
             self.activity_label.setText(f"Scan complete — Optimum Y {value['final_amplitude_mm']:+.4f} mm applied; currents remain at the optimum.")
         self.run(lambda p:self.service.scan(g,opt,p,self.update.emit),done,'Local bump / XSR minimization')
     def reset(self):

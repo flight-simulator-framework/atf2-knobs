@@ -316,7 +316,7 @@ class CouplingService:
                 progress(0,f'Checking bump scan range {low:+.3f} to {high:+.3f} mm (width {width:.3f} mm)')
                 # Endpoints first, then midpoint and quarters. Reuse only the
                 # range-search evidence; coarse/refinement/final measurements
-                # always move and recheck COD before and after their XSR reads.
+                # always move and recheck COD before their XSR reads.
                 grid=np.round(np.linspace(low,high,5),12)
                 for index in (0,4,2,1,3):
                     amplitude=float(grid[index])
@@ -367,10 +367,7 @@ class CouplingService:
             xsr=self.backend.sample_xsr(self.cancel,count=10,callback=sample)
             self.check()
             if xsr['count']!=10 or not xsr.get('update_verified'):raise ValueError('Ten fresh XSR updates required')
-            # Verify closure after the XSR integration as well as before it.
-            after=self.observe(g,baseline,opt,event=event)
-            if not self.closed(after,amplitude,opt):raise ValueError('COD drifted during XSR acquisition; baseline restored')
-            point=dict(amplitude_mm=actual_amplitude,requested_amplitude_mm=float(amplitude),phase=phase,xsr=xsr,orbit=observed,orbit_after_xsr=after)
+            point=dict(amplitude_mm=actual_amplitude,requested_amplitude_mm=float(amplitude),phase=phase,xsr=xsr,orbit=observed)
             result['points'].append(point);event(dict(kind='point',point=point))
             return point
         try:
@@ -393,7 +390,7 @@ class CouplingService:
             result.update(applied=True,final_amplitude_mm=fit['best_mm'],final=final,
                           final_observed_amplitude_mm=final['amplitude_mm'],
                           final_currents_A=self.backend.read('correctors',g['actuators']))
-            self.check();progress(100,f"Set fitted optimum {fit['best_mm']:+.4f} mm; XSR and COD verified")
+            self.check();progress(100,f"Set fitted optimum {fit['best_mm']:+.4f} mm; final XSR verified")
         except BaseException as exc:
             result.update(error=str(exc),applied=False)
             try:restore_correctors(self.backend,g['actuators'],g['centers']);result['restored']=True
