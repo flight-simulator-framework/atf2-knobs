@@ -3,6 +3,7 @@ from dataclasses import dataclass,asdict
 import copy
 import time
 import numpy as np
+from .rf_blocks import orbit_slope
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
 from Knobs.DRCorrection.backends import MagnetCurrentLimitError
 from .bump_maps import constrained_step,BumpGeometryUnavailable,BumpRangeUnavailable,BumpLimitUnavailable
@@ -70,6 +71,7 @@ class CouplingService:
         self.backend=backend;self.cancel=cancel;self.reader=CorrectionService(backend);self.reader.cancel=cancel
         self.last_result=None
         self.response_matrix=None
+        self.matrix_on_current_beam=False
         self.frozen_bpms={}
         self.xsr_history_floor_um=0.
 
@@ -194,7 +196,7 @@ class CouplingService:
             geometry={key:copy.deepcopy(g[key]) for key in (
                 'target','actuators','bpm_names','positions_m','outside_indices','outside_rows','internal_indices',
                 'internal_bpms','reconstruction','centers','limits','baseline','options','selection','fixed_actuators',
-                'model_settings','source','predicted_range_mm','target_position_note') if key in g}
+                'model_settings','main_currents_A','source','predicted_range_mm','target_position_note') if key in g}
             geometry['actuators']=[*g['actuators'],n]
             geometry['centers']=np.r_[g['centers'],center]
             geometry['limits']=[np.r_[g['limits'][0],low],np.r_[g['limits'][1],high]]
@@ -238,6 +240,12 @@ class CouplingService:
         if list(self.backend.bpm_names)!=list(geometry['bpm_names']):raise ValueError('BPM mapping changed')
         if not self.backend.same_settings(self.backend.snapshot(),geometry['baseline']):
             raise ValueError('Settings changed since calibration; calibrate again')
+        if 'main_currents_A' in geometry:
+            current=self.backend.bump_optics_currents()
+            tolerance=getattr(self.backend,'profile',{}).get('current_tolerance_A',1.e-5)
+            saved=geometry['main_currents_A']
+            if current.keys()!=saved.keys() or any(not np.isfinite(current[n]) or abs(current[n]-v)>tolerance for n,v in saved.items()):
+                raise ValueError('Main optics changed since current-beam bump calibration')
         if geometry.get('model_settings'):verify_inputs(self.backend,geometry['model_settings'])
 
     def move(self,names,values,opt):
@@ -335,7 +343,7 @@ class CouplingService:
             restore_correctors(self.backend,[n],[center])
         measured_span=readbacks[1]-readbacks[0]
         if measured_span<=max(1.e-6,span*.2):raise ValueError('No resolved corrector current probe: '+n)
-        return (values[1]-values[0])/measured_span, dict(magnet=n,requested=[center-span,center+span],actual=readbacks)
+        return orbit_slope(values[0],values[1],readbacks), dict(magnet=n,requested=[center-span,center+span],actual=readbacks)
 
     def check_matrix_settings(self,matrix,baseline):
         if (matrix.get('schema')!='dr-bump-response-1' or matrix.get('machine')!=self.backend.identity
@@ -351,8 +359,10 @@ class CouplingService:
                 or not self.backend.same_settings(baseline,dict(saved,correctors=baseline['correctors']))):
             raise ValueError('Optics or RF settings changed since response measurement. Remeasure the shared matrix or use per-target probes.')
 
-    def use_response_matrix(self,matrix):
-        self.check_matrix_settings(matrix,self.backend.snapshot())
+    def validate_response_matrix(self,matrix):
+        if (matrix.get('schema')!='dr-bump-response-1' or matrix.get('machine')!=self.backend.identity
+                or matrix.get('bpm_names')!=list(self.backend.bpm_names) or self.backend.unit('correctors')!='A'):
+            raise ValueError('Bump response matrix machine, units or BPM mapping differs')
         size=2*len(self.backend.bpm_names)
         magnets=set(self.backend.hcorrectors+self.backend.vcorrectors)
         if not matrix.get('columns') or not np.isfinite(matrix['measured_unix_s']):
@@ -363,7 +373,11 @@ class CouplingService:
             if (n not in magnets or entry['readback']['magnet']!=n or column.shape!=(size,)
                     or np.isinf(column).any() or actual.shape!=(2,) or not np.isfinite(actual).all() or actual[1]<=actual[0]):
                 raise ValueError('Invalid measured response column: '+n)
+    def use_response_matrix(self,matrix,*,current_beam=False):
+        self.validate_response_matrix(matrix)
+        if not current_beam:self.check_matrix_settings(matrix,self.backend.snapshot())
         self.response_matrix=matrix
+        self.matrix_on_current_beam=current_beam
 
     def measure_response_matrix(self,opt,options,state,progress,event):
         opt.validate();self.backend.validate_mode('orbit');self.check()
@@ -425,6 +439,9 @@ class CouplingService:
         self.last_result=g
         centers=np.asarray(g['centers']);lower,upper=np.asarray(g['limits'])
         required=np.unique(np.r_[g['outside_indices'],g['internal_indices']])
+        if self.response_matrix is not None and self.matrix_on_current_beam and hasattr(self.backend,'bump_optics_currents'):
+            g['main_currents_A']=self.backend.bump_optics_currents()
+            if not np.isfinite(list(g['main_currents_A'].values())).all():raise ValueError('Invalid current bump optics')
         baseline,baseline_valid=self.orbit(opt,self.acquisition_status(event,'baseline',f"1/5 {g['target']}: Measuring baseline orbit"),required=required,essential=g['internal_indices'],outside=g['outside_indices'],event=event)
         columns=[];g['probe_readbacks']=[];self.reader.orbit_measurements=[]
         previous=g.pop('previous_columns',None)
@@ -436,7 +453,7 @@ class CouplingService:
         cached={}
         g['shared_columns']=[r['magnet'] for r in g['probe_readbacks'] if r.get('source')=='shared matrix']
         if self.response_matrix is not None:
-            self.check_matrix_settings(self.response_matrix,g['baseline'])
+            if not self.matrix_on_current_beam:self.check_matrix_settings(self.response_matrix,g['baseline'])
             cached=self.response_matrix['columns']
         spans=np.minimum(min(opt.probe_A,opt.max_step_A),np.minimum(centers-lower,upper-centers))
         if (spans<=1.e-6).any():
@@ -500,7 +517,7 @@ class CouplingService:
                 self.status(event,'restore_failed','Restoration failed: '+str(exc))
                 raise
         self.status(event,'restore_verify','5/5 Restore commands sent — Verifying baseline readbacks')
-        self.check();self.verify_geometry(geometry)
+        self.check();self.verify_geometry(g)
         if not baseline_valid[np.asarray(g['outside_indices'])].all():
             orbit,valid=self.orbit(opt,required=required,essential=g['internal_indices'],event=event)
             missing=~np.isfinite(baseline)&np.tile(valid,2)

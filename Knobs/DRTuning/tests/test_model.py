@@ -560,7 +560,6 @@ class ModelGuiTests(unittest.TestCase):
         cls.app=QApplication.instance() or QApplication([])
 
     def test_full_zv_mode_measures_without_model_and_reloads_for_refit(self):
-        from Knobs.DRCorrection.core import save_session
         from Knobs.DRTuning.gui import TuningSession
         from PyQt6.QtWidgets import QFileDialog
         machine=CountedBackend()
@@ -568,6 +567,8 @@ class ModelGuiTests(unittest.TestCase):
         try:
             panel=window.panels['dispersion']
             panel.options.fixed_actuators=('dr:ZV3R',)
+            directory=Path(self.enterContext(tempfile.TemporaryDirectory()))
+            self.enterContext(patch.object(panel,'data_directory',return_value=str(directory)))
             pool=set(machine.vcorrectors[:8])
             # Screening also excludes outside the pool, independently of the shared selection.
             self.assertEqual(set(panel.calculation_options().fixed_actuators),
@@ -579,32 +580,35 @@ class ModelGuiTests(unittest.TestCase):
                 panel.find_button.click()
                 self.assertEqual(set(panel.data['actuators']),pool-{'dr:ZV3R'})
                 self.assertTrue(panel.apply_button.isEnabled())
-                with tempfile.TemporaryDirectory() as root:
-                    path=Path(root)/'vertical.json'
-                    save_session(path,panel.data)
-                    panel.screening.setCurrentIndex(panel.screening.findData('nominal'))
-                    before=machine.acquisitions;machine.commands.clear()
-                    with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'')):
-                        panel.load_measured_response()
-                    self.assertEqual(panel.screening.currentData(),'all')
-                    panel.recalculate_button.click()
-                    self.assertTrue(panel.data['reused_response'])
-                    self.assertEqual(set(panel.data['selected']),pool-{'dr:ZV3R'})
-                    self.assertTrue(panel.apply_button.isEnabled())
-                    self.assertEqual(machine.acquisitions,before);self.assertEqual(machine.commands,[])
-                    with patch.object(window.service.cancel,'wait',return_value=False):
-                        panel.apply_button.click()
-                    self.assertTrue(panel.data['applied'])
-                    after=np.array(panel.data['after'])
-                    before=machine.acquisitions
-                    machine.commands.clear()
-                    self.assertTrue(panel.recalculate_button.isEnabled())
-                    panel.recalculate_button.click()
-                    np.testing.assert_array_equal(panel.data['measured'],after)
-                    self.assertEqual(machine.acquisitions,before);self.assertEqual(machine.commands,[])
-                    panel.options.fixed_actuators=()
-                    panel.invalidate()
-                    self.assertFalse(panel.recalculate_button.isEnabled())
+                path,=directory.glob('vertical_dispersion_*.json')
+                panel.screening.setCurrentIndex(panel.screening.findData('nominal'))
+                before=machine.acquisitions;machine.commands.clear()
+                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'')):
+                    panel.load_measured_response()
+                self.assertEqual(panel.screening.currentData(),'all')
+                panel.recalculate_button.click()
+                self.assertTrue(panel.data['reused_response'])
+                self.assertEqual(set(panel.data['selected']),pool-{'dr:ZV3R'})
+                self.assertTrue(panel.apply_button.isEnabled())
+                self.assertEqual(machine.acquisitions,before);self.assertEqual(machine.commands,[])
+                panel.set_option('orbit_weight',.1)
+                self.assertTrue(panel.current_beam_button.isEnabled())
+                panel.current_beam_button.click()
+                self.assertEqual(machine.acquisitions-before,30)
+                self.assertEqual(panel.data['options']['orbit_weight'],.1)
+                with patch.object(window.service.cancel,'wait',return_value=False):
+                    panel.apply_button.click()
+                self.assertTrue(panel.data['applied'])
+                after=np.array(panel.data['after'])
+                before=machine.acquisitions
+                machine.commands.clear()
+                self.assertTrue(panel.recalculate_button.isEnabled())
+                panel.recalculate_button.click()
+                np.testing.assert_array_equal(panel.data['measured'],after)
+                self.assertEqual(machine.acquisitions,before);self.assertEqual(machine.commands,[])
+                panel.options.fixed_actuators=()
+                panel.invalidate()
+                self.assertFalse(panel.recalculate_button.isEnabled())
         finally:
             window.close();window.deleteLater();self.app.processEvents()
 

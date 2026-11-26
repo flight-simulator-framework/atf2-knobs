@@ -1,6 +1,7 @@
 """Vertical dispersion correction with RFTrack selection and measured ZV response."""
 
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from PyQt6.QtCore import pyqtSignal
@@ -12,6 +13,7 @@ from Knobs.DRCorrection.core import load_session
 from Knobs.DRCorrection.gui import CorrectionPanel
 from .correction_gui import DispersionPlot, control
 from .presentation import scroll, table_style
+from .qm_checkpoint import save_checkpoint
 from .zv_rf_scan import eligible_zv, measure_all_zvs
 
 
@@ -59,6 +61,13 @@ class VerticalDispersionPanel(CorrectionPanel):
             field = control(form, label, getattr(self.options, key), low, high)
             field.valueChanged.connect(lambda value, k=key: self.set_option(k, value))
 
+        fit_box=QGroupBox('Correction weights')
+        fit=QFormLayout(fit_box)
+        left.addWidget(fit_box)
+        for key,label in (('dispersion_weight','Vertical dispersion'),('orbit_weight','Vertical COD change')):
+            spin=control(fit,label,getattr(self.options,key),0.,1000.,4)
+            spin.setSingleStep(.01)
+            spin.valueChanged.connect(lambda value,k=key:self.set_option(k,value))
         left.addWidget(self.proposal_summary)
         self.find_button = QPushButton('1. Find ZVs (RFTrack)')
         self.measure_button = QPushButton('2. Measure selected ZVs')
@@ -82,6 +91,9 @@ class VerticalDispersionPanel(CorrectionPanel):
         load_response = QPushButton('Load measured response…')
         load_response.clicked.connect(self.load_measured_response)
         left.addWidget(load_response)
+        self.current_beam_button=QPushButton('Use matrix with current beam')
+        self.current_beam_button.clicked.connect(self.use_current_beam)
+        left.addWidget(self.current_beam_button)
         row = QHBoxLayout()
         left.addLayout(row)
         for label, action in [('Load target…', self.load_target), ('Save data + plots…', self.save_bundle)]:
@@ -139,8 +151,7 @@ class VerticalDispersionPanel(CorrectionPanel):
         if self.screening.currentData() == 'all' and dataset is None:
             options = self.calculation_options()
             self.invalidate()
-            self.window.start(lambda p: measure_all_zvs(self.window.service, options, p),
-                              self.display, label='Measure full ZV matrix', pausable=True)
+            self.measure_and_save(lambda p:measure_all_zvs(self.window.service,options,p),'Measure full ZV matrix')
         else:
             super().calculate(dataset)
 
@@ -148,8 +159,25 @@ class VerticalDispersionPanel(CorrectionPanel):
         preview = self.data
         if not preview or preview['options']['response_source'] not in ('rftrack', 'rftrack_nominal') or not preview['selected']:
             return
-        self.window.start(lambda p: self.window.service.measure_selected_zvs(preview, p, group_rf=True),
-                          self.display, label='Measure selected ZVs', pausable=True)
+        self.measure_and_save(lambda p:self.window.service.measure_selected_zvs(preview,p,group_rf=True),'Measure selected ZVs')
+
+    def measure_and_save(self, acquisition, label):
+        directory=Path(self.data_directory())
+        def work(progress):
+            data=acquisition(progress)
+            path=directory/f'vertical_dispersion_{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}.json'
+            try:
+                directory.mkdir(parents=True,exist_ok=True)
+                save_checkpoint(path,data)
+                return data,f'Saved ZV matrix: {path}'
+            except OSError as exc:
+                return data,f'Matrix measured. Automatic save failed: {exc}. Use Save data + plots.'
+        def done(result):
+            data,message=result
+            self.display(data)
+            self.proposal_summary.setText(self.proposal_summary.text()+'\n'+message)
+            self.window.log(message)
+        self.window.start(work,done,label=label,pausable=True)
 
     def data_directory(self):
         return f'/mnt/nas1/atf-data/flight-simulator/DRTuning/{datetime.now():%Y}'
@@ -179,6 +207,14 @@ class VerticalDispersionPanel(CorrectionPanel):
 
         self.window.start(refit, self.display, label='Recalculate saved ZV response')
 
+    def use_current_beam(self):
+        data=self.response_cache.get(('measured','y'))
+        if data is None:return
+        options=self.calculation_options()
+        self.invalidate()
+        self.window.start(lambda p:self.window.service.reuse_on_current_beam(data,options,p),
+                          self.display,label='Measure current vertical dispersion')
+
     def display(self, data):
         full = bool(data.get('full_zv_candidates'))
         if full or (data.get('rftrack_candidates') and self.screening.currentData() == 'all'):
@@ -192,13 +228,13 @@ class VerticalDispersionPanel(CorrectionPanel):
         super().display(data)
         if data.get('applied'):
             self.response_cache.clear()
-            if full:
+            if full or data.get('rftrack_candidates'):
                 self.response_cache[('measured', 'y')] = data
             self.refresh()
 
     def refresh(self):
         super().refresh()
-        if not hasattr(self, 'undo_button'):
+        if not hasattr(self, 'current_beam_button'):
             return
         full = self.screening.currentData() == 'all'
         self.measurement_form.setRowVisible(self.maximum, not full)
@@ -220,6 +256,7 @@ class VerticalDispersionPanel(CorrectionPanel):
         self.undo_button.setEnabled(bool(self.window.service.undo))
         if not self.response_cache.get(('measured', 'y')) or model:
             self.recalculate_button.setEnabled(False)
+        self.current_beam_button.setEnabled(self.recalculate_button.isEnabled())
         if model and (not matches or missing):
             message = 'BPM selection changed. Find ZVs again.'
         elif measured and not matches and not data.get('applied'):

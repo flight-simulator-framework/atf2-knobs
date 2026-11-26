@@ -116,6 +116,34 @@ class QMIterationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Settings changed'):self.s.apply(proposal)
         self.assertEqual(self.b.commands,[])
 
+    def test_arc_objective_uses_physical_mb_parity_and_refits_without_beam(self):
+        from Knobs.DRTuning.dispersion import arc_bpms
+        names=['MB0R','dr:MB1R','MB18R','MB19R','MB31R','MB32R','MB65R',
+               'MB66R','MB80R','MB81R','MB96R','MB97R','other']
+        self.assertEqual(np.flatnonzero(arc_bpms(names,'odd')).tolist(),[1,6,9])
+        self.assertEqual(np.flatnonzero(arc_bpms(names,'even')).tolist(),[2,5,10])
+        self.opt.fixed_actuators=QM_CANDIDATES[1:];self.opt.measure_tunes=False
+        odd=arc_bpms(self.b.bpm_names,'odd');even=arc_bpms(self.b.bpm_names,'even')
+        self.b.dr[odd|even,0]=1.
+        self.b.d0[odd]=.4;self.b.d0[even]=-.3
+        self.opt.regularization=0.
+        data=self.s.calculate(self.opt,group_rf=True)
+        self.opt.arc_weight=1.;self.opt.dispersion_weight=0.;self.opt.orbit_weight=0.
+        self.opt.excluded_bpms=(self.b.bpm_names[0],)
+        with patch.object(self.b,'orbit',side_effect=AssertionError),patch.object(self.b,'set_frequency',side_effect=AssertionError):
+            first=self.s.recalculate(data,self.opt)
+            self.assertAlmostEqual(first['delta'][0],-.4)
+            self.assertNotIn(self.b.bpm_names[0],first['arc_bpms'])
+            self.opt.arc_parity='even'
+            second=self.s.recalculate(data,self.opt)
+            self.assertAlmostEqual(second['delta'][0],.3)
+            self.assertEqual(set(second['arc_bpms']),set(np.asarray(self.b.bpm_names)[even]))
+        self.s.apply(second)
+        self.assertTrue(second['applied'])
+        np.testing.assert_allclose(second['full_after'][0,even],0.,atol=1e-10)
+        self.opt.excluded_bpms=tuple(np.asarray(self.b.bpm_names)[even])
+        with self.assertRaisesRegex(ValueError,'No valid even arc'):self.s.recalculate(data,self.opt)
+
     def test_three_amp_steps_accumulate_until_the_hardware_limit(self):
         name=QM_CANDIDATES[0]
         self.b.quadrupoles[name]['limits_A']=[-5.,5.]
@@ -225,6 +253,30 @@ class QMIterationGuiTests(unittest.TestCase):
                 self.assertFalse(np.allclose(panel.result['full_measured'],source['full_measured']))
                 self.assertEqual(path.read_bytes(),original)
         finally:w.close();self.app.processEvents()
+
+    def test_legacy_proposal_requires_refit_for_new_qm_weights(self):
+        from Knobs.DRTuning.gui import TuningSession
+        window=TuningSession(DispersionFixture())
+        try:
+            panel=window.qm_dispersion
+            self.assertEqual((panel.dispersion_weight.value(),panel.orbit_weight.value(),panel.arc_weight.value()),(1.,.1,0.))
+            old=DispersionOptions.from_saved({})
+            self.assertEqual((old.dispersion_weight,old.orbit_weight,old.arc_weight),(.05,1.,0.))
+            options=panel.options();options.dispersion_weight=old.dispersion_weight;options.orbit_weight=old.orbit_weight
+            saved=panel.service.calculate(options,group_rf=True)
+            for key in ('orbit_weight','arc_weight','arc_parity'):saved['options'].pop(key)
+            panel.display(saved)
+            self.assertFalse(panel.set_button.isEnabled())
+            panel.dispersion_weight.setValue(.05)
+            self.assertFalse(panel.proposal_matches_options(saved))
+            panel.orbit_weight.setValue(1.)
+            self.assertTrue(panel.proposal_matches_options(saved))
+            panel.orbit_weight.setValue(.1);panel.dispersion_weight.setValue(1.)
+            with patch.object(window.backend,'orbit',side_effect=AssertionError),patch.object(window.backend,'set_frequency',side_effect=AssertionError):
+                panel.display(panel.service.recalculate(saved,panel.options()))
+            self.assertTrue(panel.set_button.isEnabled())
+            self.assertEqual(panel.result['options']['orbit_weight'],.1)
+        finally:window.close();self.app.processEvents()
 
     def test_apply_recalculate_apply_saves_both_iterations_and_can_reload(self):
         from Knobs.DRTuning.gui import TuningSession

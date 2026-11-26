@@ -45,6 +45,20 @@ class SharedResponseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Optics or RF'):
             self.s.calibrate(dict(g,baseline=self.b.snapshot()),self.opt)
 
+    def test_current_beam_matrix_reuses_columns_after_optics_change(self):
+        matrix=self.measure()
+        self.b.offset=500.
+        self.b.currents['H0']=.01
+        with patch.object(self.b,'snapshot',side_effect=AssertionError):
+            self.s.use_response_matrix(matrix,current_beam=True)
+        geometry=self.b.geometry()
+        geometry['centers']=self.b.read('correctors',geometry['actuators'])
+        with patch.object(self.s,'probe_column',side_effect=AssertionError):
+            result=self.s.calibrate(geometry,self.opt)
+        self.assertEqual(result['baseline'],geometry['baseline'])
+        self.assertEqual(result['shared_columns'],geometry['actuators'])
+        self.assertEqual(len(result['calibration_checks']),2)
+
     def test_missing_column_and_invalid_required_row_remeasured(self):
         matrix=self.measure(Options(fixed_actuators=('H0',)))
         self.assertNotIn('H0',matrix['columns'])

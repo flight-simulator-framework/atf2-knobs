@@ -131,7 +131,7 @@ class CouplingPanel(CorrectionTool):
         load_matrix=QPushButton('Load matrix…')
         load_matrix.clicked.connect(self.load_matrix);actions.addWidget(load_matrix)
         self.matrix=None
-        self.use_matrix=QCheckBox('Use shared matrix');self.use_matrix.setEnabled(False)
+        self.use_matrix=QCheckBox('Use matrix with current beam');self.use_matrix.setEnabled(False)
         self.use_matrix.toggled.connect(self.toggle_matrix);matrix_layout.addWidget(self.use_matrix)
         self.controls.insertWidget(1,matrix_box)
         self.add_button('Check BPMs / current limits',self.check_positions)
@@ -144,12 +144,13 @@ class CouplingPanel(CorrectionTool):
         self.status.setText('Choose a bump position, then calibrate its preset BPMs / correctors.\nTarget mm uses saved nominal transport; corrector response is measured here.')
         self.preview_preset();self.redraw()
     def toggle_matrix(self,enabled):
-        self.service.response_matrix=self.matrix if enabled else None
+        if enabled:self.service.use_response_matrix(self.matrix,current_beam=True)
+        else:self.service.response_matrix=None
         self.invalidate()
 
     def matrix_ready(self,matrix,path):
         self.matrix=matrix
-        self.use_matrix.setText(f"Use shared matrix ({len(matrix['columns'])} correctors)")
+        self.use_matrix.setText(f"Use matrix with current beam ({len(matrix['columns'])} correctors)")
         skipped=matrix.get('skipped',{})
         summary=str(path)
         if skipped:summary+='\nSkipped (current limits): '+', '.join(skipped)
@@ -178,7 +179,7 @@ class CouplingPanel(CorrectionTool):
         def work(_):
             self.service.last_result=None
             matrix=json.loads(Path(path).read_text(encoding='utf-8'))
-            self.service.use_response_matrix(matrix)
+            self.service.validate_response_matrix(matrix)
             return matrix
         self.run(work,lambda matrix:self.matrix_ready(matrix,path),'Load shared bump response')
 
@@ -622,6 +623,15 @@ class QMDispersionPanel(CorrectionTool):
         self.maximum=control(correction,'Maximum QMs',defaults.maximum,1,16,0)
         correction.setRowVisible(self.maximum,False)
         self.excluded=QLineEdit(', '.join(defaults.fixed_actuators));correction.addRow('Exclude QMs',self.excluded)
+        self.dispersion_weight=control(correction,'Straight dispersion weight',defaults.dispersion_weight,0.,1000.,4)
+        self.orbit_weight=control(correction,'COD change weight',defaults.orbit_weight,0.,1000.,4)
+        self.arc_weight=control(correction,'Arc dispersion RMS weight',defaults.arc_weight,0.,1000.,4)
+        for field in (self.dispersion_weight,self.orbit_weight,self.arc_weight):field.setSingleStep(.01)
+        self.arc_weight.setToolTip('Zero disables the arc target. Recalculate fits the changed weights using the same measurements.')
+        self.arc_parity=QComboBox()
+        self.arc_parity.addItem('Odd MB numbers','odd');self.arc_parity.addItem('Even MB numbers','even')
+        correction.addRow('Arc BPMs',self.arc_parity)
+        self.arc_parity.currentIndexChanged.connect(self.invalidate)
         self.ridge=control(correction,'Regularization',defaults.regularization,0.,1.,4)
         self.ridge.setToolTip('Larger values reduce correction from weak responses.')
         def button_row(items):
@@ -664,7 +674,7 @@ class QMDispersionPanel(CorrectionTool):
         self.table.setMaximumHeight(260)
         self.show_initial_probes()
         self.coil.currentIndexChanged.connect(self.change_coil)
-        for w in (self.maximum,self.probe,self.step,self.target_snr,self.rf,self.ridge):
+        for w in (self.maximum,self.probe,self.step,self.target_snr,self.rf,self.ridge,self.dispersion_weight,self.orbit_weight,self.arc_weight):
             w.setMaximumWidth(105);w.valueChanged.connect(self.invalidate)
         self.selection.currentIndexChanged.connect(lambda _:correction.setRowVisible(self.maximum,self.selection.currentData()=='greedy'))
         self.selection.currentIndexChanged.connect(self.invalidate)
@@ -693,7 +703,7 @@ class QMDispersionPanel(CorrectionTool):
             self.status.setText('Selection / options changed. Recalculate from measured response before Apply.\n'
                                 'Changing RF settings or QM selection requires a new CALC.')
     def proposal_matches_options(self,data):
-        saved=dict(data['options']);saved.setdefault('coil','trim');current=asdict(self.options())
+        saved=asdict(DispersionOptions.from_saved(data['options']));current=asdict(self.options())
         for key in ('excluded_bpms','fixed_actuators'):
             saved[key]=sorted(saved.get(key,()));current[key]=sorted(current[key])
         return saved==current
@@ -749,6 +759,8 @@ class QMDispersionPanel(CorrectionTool):
             use_probe_presets=True,adaptive_probe=True,reuse_probe_widths=True,characterize_first_scan=False,
             target_snr=self.target_snr.value(),
             momentum_compaction=shared.momentum_compaction,measure_tunes=False,constrain_cod=False,
+            dispersion_weight=self.dispersion_weight.value(),orbit_weight=self.orbit_weight.value(),
+            arc_weight=self.arc_weight.value(),arc_parity=self.arc_parity.currentData(),
             regularization=self.ridge.value(),selection=self.selection.currentData(),maximum=int(self.maximum.value()),
             excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(sorted(set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()})))
     def calculate(self):
@@ -811,6 +823,16 @@ class QMDispersionPanel(CorrectionTool):
                   probe_quality_text(qualities.get(n)),
                   f"{estimates[n]['width_A']:.2f}" if n in estimates else '')
                  for n in data['actuators']])
+        arc=data.get('arc_bpms',[])
+        self.arc_parity.setToolTip(', '.join(arc))
+        if arc and 'delta' in data:
+            rows=np.isin(data['names'],arc)
+            rms=[np.sqrt(np.mean(np.asarray(data[k],float)[0,rows]**2)) for k in ('full_measured','full_predicted')]
+            summary=f'Arc ηx RMS ({len(arc)} BPMs, mm): {rms[0]:.3g} before, {rms[1]:.3g} predicted'
+            if data.get('applied'):
+                actual=np.asarray(data['full_after'],float)[0,rows]
+                summary+=f', {np.sqrt(np.mean(actual**2)):.3g} measured'
+            self.status.setText(self.status.text()+'\n'+summary)
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
         elif data.get('proposal_unavailable_reason'):self.status.setText('S/N below target. Run CALC to remeasure.')

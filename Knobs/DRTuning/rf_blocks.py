@@ -150,6 +150,13 @@ def reference_signal(frames,indices,sampling,backend):
     return np.vstack(((plus-minus)/momentum_span(sampling,backend),nominal))
 
 
+def orbit_slope(first,last,readbacks):
+    """Orbit change per ampere, using the achieved low and high currents."""
+    low,high=readbacks
+    if not np.isfinite([low,high]).all() or high<=low:raise ValueError('Unresolved current span')
+    return (last-first)/(high-low)
+
+
 def response_column(frames,blocks,n,sampling,backend):
     """Normalize each orbit difference by the span actually read at that RF."""
     slopes=[]
@@ -157,8 +164,7 @@ def response_column(frames,blocks,n,sampling,backend):
     for block in blocks:
         entry=block['pairs'][n]
         first,last=[frames[i] for i in entry['indices']]
-        low,high=entry['readbacks']
-        slopes.append((orbit_xy(last)-orbit_xy(first))/(high-low))
+        slopes.append(orbit_slope(orbit_xy(first),orbit_xy(last),entry['readbacks']))
         valid &= np.asarray(first['valid'],bool) & np.asarray(last['valid'],bool)
     central,minus,plus=slopes
     return np.vstack(((plus-minus)/momentum_span(sampling,backend),central)),valid

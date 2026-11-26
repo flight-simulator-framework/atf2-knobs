@@ -64,7 +64,7 @@ def acquire_zvs(service,opt,progress):
         blocks=[]
         valid=measure_blocks(service,opt,pairs,centers,blocks,write=lambda n,v:b.write('correctors',[n],[v]),
             read=lambda n:b.read('correctors',[n])[0],restore=restore,selection=selected,strict_loss=False,
-            retry_names=set(pairs) if attempt>1 else set(),progress=progress,pause=pause,
+            retry_names=pairs,progress=progress,pause=pause,
             baseline_ready=preview if attempt==1 else None)
         rounds.append(blocks)
         common &= valid
@@ -88,7 +88,7 @@ def acquire_zvs(service,opt,progress):
                 errors.append(dict(magnet=n,stage='ZV probe',error=reason,restored=True,restoration='baseline restored'))
                 continue
             readbacks=[r['pairs'][n]['readbacks'] for r in blocks]
-            if min(v[1]-v[0] for v in readbacks)<=1.e-12:
+            if min(v[1]-v[0] for v in readbacks)<=max(1.e-6,(hi-lo)*.1):
                 errors.append(dict(magnet=n,stage='ZV probe',error='Unresolved current span',restored=True,restoration='baseline restored'))
                 continue
             col,mask=response_column(frames,blocks,n,opt,b)

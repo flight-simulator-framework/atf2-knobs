@@ -42,8 +42,8 @@ orbit at nominal RF. Set Maximum ZVs (default 5) and click Find ZVs.
 Measure selected ZVs measures only those response columns. Review the proposed
 currents and predicted curves, then click Apply / remeasure to see the measured
 after curves. Select BPMs / magnets and Recalculate reuse the measured columns.
-To reuse a completed measurement after restarting DRTuning, save it with
-Save data + plots, then use Load measured response to open the timestamped
+The full and shortlisted ZV measurements automatically save their matrix JSON.
+Use Load measured response to open the timestamped
 vertical_dispersion JSON (older saves use dispersion.json). JSON, CSV, PNG
 and PDF share the same filename stem. The Vertical Dispersion save and load
 dialogs open in /mnt/nas1/atf-data/flight-simulator/DRTuning/<year>/ each time.
@@ -59,17 +59,13 @@ at the original magnet settings. The JSON stores both reference frames and
 the RMS change in X and Y. The solver uses the measured current span at each RF.
 One successful pass takes three RF changes including return to the initial
 RF state. Candidate selection and post-Apply measurements are separate.
-If an initial ZV probe loses all common enabled BPMs, the scan restores that
-ZV and checks BPM coverage at the RF setting where the loss occurred.
-On recovery it repeats both endpoints at a smaller width (e.g. ±0.05, ±0.02,
-±0.01 A) and uses the first valid reduced pair for that ZV. If no width works
-within the retry range or pair limit, that ZV is skipped. Loss of BPM coverage
-at the restored current stops the scan.
-From the second pair on each ZV, a loss of all common enabled BPMs triggers
-one repeat of that endpoint after a 3-second wait at the same current and RF. A repeated failure during the
-initial width search returns to the shrinking procedure above. A repeated
-failure after a successful pair restores the ZV and stops the scan. Cancel
-also works during the wait.
+The grouped ZV scan waits three seconds and repeats the same BPM acquisition
+once if common coverage is lost at a probe endpoint. Persistent loss during
+the initial width search restores the ZV and retries it at a smaller width.
+Use matrix with current beam measures dispersion and COD once at the three RF
+settings, reads current ZV settings/limits, and calculates a proposal.
+Recalculate changes weights or exclusions on the displayed baseline offline.
+The vertical weights default to 1 for dispersion and 0.05 for COD change.
 QM horizontal dispersion is directly below this page in the navigation.
 On either plot, hover over a measured point to read its BPM name, position
 and signal value. Click the point to exclude it or the grey point to include
@@ -226,8 +222,15 @@ QM dispersion:
   trials and their next widths.
   Once excluded during a scan, a BPM stays out of that scan's common response.
   Dx is targeted to zero at legacy straight BPMs MB19R–MB31R / MB66R–MB80R.
-  Arc Dx, Dy and COD target their measured baselines. These are named physical
-  BPM regions, not an assumption that the entire ring has zero dispersion.
+  QM weights default to 1 for dispersion, 0.1 for COD change and 0 for arc
+  horizontal dispersion. A positive arc weight targets zero horizontal
+  dispersion at odd (default) or even MB numbers in MB1–18, MB32–65 and
+  MB81–96. Remaining arc Dx and all Dy target their measured baselines.
+  Invalid and excluded BPMs are omitted before computing the RMS. The arc
+  row multiplier is w_arc * sqrt(N_straight/N_arc), giving equal straight
+  and arc weights equal influence for equal RMS errors. Recalculate uses
+  the stored matrix, and Apply verifies the weighted measured dispersion
+  improvement. The panel shows the selected arc BPMs in the parity tooltip.
   The default uses all enabled trims in bounded regularized SVD; Greedy chooses
   the best response columns up to the selected maximum. At the operator's
   request, the COD hard limit is OFF by default for probing, solving and SET.
@@ -388,12 +391,15 @@ Bump / XSR coupling:
   symmetric probes, ten fresh BPM updates per polarity, and a verified restore.
   Supplies without symmetric current margin are listed as skipped. The result
   is saved in flight-simulator/DRTuning/<year>/bump_response_<timestamp>.json
-  under atf-data. Measure or Load matrix enables Use shared matrix for single
+  under atf-data. Measure or Load matrix enables Use matrix with current beam for single
   and queued bumps, including extra closure correctors. Each target keeps a
   fresh baseline and verifies closure in both signs. Missing columns or invalid
   required BPM rows trigger fresh probes for the affected correctors only.
-  Reuse checks machine identity, BPM order and recorded non-steering settings.
-  Clear Use shared matrix to return to per-target response measurement.
+  File loading checks machine identity, BPM order and measured orbit columns.
+  Calibration uses present corrector currents, limits and orbit, and verifies
+  present optics during calibration. Clear Use matrix with current beam to
+  measure each target independently. Bump orbit columns use achieved current
+  spans as in both dispersion tools and require no RF changes.
   1. Calibrate and close bump automatically checks the selected preset against
      current BPMs and limits, then measures X/Y corrector response columns with
      10-update BPM averages. At each setting, a sample with an invalid required

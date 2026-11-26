@@ -43,7 +43,10 @@ class DispersionOptions:
     tune_tolerance: float = .002
     constrain_cod: bool = False
     orbit_tolerance_mm: float = .05
-    dispersion_weight: float = .05
+    dispersion_weight: float = 1.
+    orbit_weight: float = .1
+    arc_weight: float = 0.
+    arc_parity: str = 'odd'
     regularization: float = .01
     svd_cut: float = .04
     selection: str = 'all'
@@ -56,6 +59,11 @@ class DispersionOptions:
         if self.fixed_actuators is None:
             self.fixed_actuators=('QM2R.1','QM2R.2','QM3R.2') if self.coil=='trim' else ()
 
+    @classmethod
+    def from_saved(cls,options):
+        # Older QM proposals used fixed weights for fields absent from their JSON.
+        return cls(**{'dispersion_weight':.05,'orbit_weight':1.,'arc_weight':0.,**options})
+
     def actuators(self):
         candidates=QM_MAIN_CANDIDATES if self.coil=='main' else QM_CANDIDATES
         excluded={n.replace('_','.') for n in self.fixed_actuators}
@@ -63,8 +71,12 @@ class DispersionOptions:
 
     def validate(self):
         if self.coil not in ('trim','main'):raise ValueError('Unknown QM coil')
-        for k in ('probe_A','target_snr','step_A','frequency_change_khz','momentum_compaction','orbit_tolerance_mm','dispersion_weight'):
+        for k in ('probe_A','target_snr','step_A','frequency_change_khz','momentum_compaction','orbit_tolerance_mm'):
             if not np.isfinite(getattr(self,k)) or getattr(self,k)<=0:raise ValueError('Invalid '+k)
+        weights=(self.dispersion_weight,self.orbit_weight,self.arc_weight)
+        if not np.isfinite(weights).all() or min(weights)<0 or max(weights)==0:
+            raise ValueError('At least one positive correction weight is required')
+        if self.arc_parity not in ('odd','even'):raise ValueError('Choose odd or even arc BPM numbers')
         if not isinstance(self.measure_tunes,bool):raise ValueError('Invalid measure_tunes option')
         if not isinstance(self.constrain_cod,bool):raise ValueError('Invalid constrain_cod option')
         if not isinstance(self.adaptive_probe,bool) or int(self.maximum_probe_pairs)!=self.maximum_probe_pairs or not 1<=self.maximum_probe_pairs<=20:
@@ -81,12 +93,40 @@ class DispersionOptions:
                 int(self.maximum)!=self.maximum or not 1<=self.maximum<=16):raise ValueError('Invalid dispersion solver options')
 
 
+def mb_numbers(names):
+    numbers=[]
+    for bpm in names:
+        match=re.fullmatch(r'MB(\d+)R',name(bpm))
+        numbers.append(int(match[1]) if match else -1)
+    return np.asarray(numbers,int)
+
+
 def straight_bpms(names):
-    result=[]
-    for n in names:
-        match=re.fullmatch(r'MB(\d+)R',name(n));i=int(match[1]) if match else -1
-        result.append(19<=i<=31 or 66<=i<=80)
-    return np.asarray(result,bool)
+    n=mb_numbers(names)
+    return ((19<=n)&(n<=31)) | ((66<=n)&(n<=80))
+
+
+def arc_bpms(names,parity):
+    n=mb_numbers(names)
+    in_arc=((1<=n)&(n<=18)) | ((32<=n)&(n<=65)) | ((81<=n)&(n<=96))
+    return in_arc & (n%2==int(parity=='odd'))
+
+
+def qm_objective(data,opt,valid):
+    measured=np.asarray(data['full_measured'],float)
+    straight=np.asarray(data['straight'],bool)
+    arc=arc_bpms(data['names'],opt.arc_parity)&valid
+    target=measured.copy()
+    target[0,straight]=0.
+    weights=np.empty_like(measured)
+    weights[:2]=opt.dispersion_weight
+    weights[2:]=opt.orbit_weight
+    if opt.arc_weight:
+        if not arc.any():raise ValueError('No valid '+opt.arc_parity+' arc BPMs for the dispersion objective')
+        target[0,arc]=0.
+        # Match the scale of the straight RMS even when the two groups differ in size.
+        weights[0,arc]=opt.arc_weight*np.sqrt(np.count_nonzero(straight&valid)/arc.sum())
+    return target,weights,arc
 
 
 def quad_limits(backend,n):
@@ -527,7 +567,7 @@ class DispersionService:
         if data.get('checkpoint_schema')!='dr-qm-scan-1':raise ValueError('No resumable QM scan state in this file')
         try:
             state=data['scan_state'];names=data['actuators'];n=len(data['names']);m=len(names);done=state['completed']
-            acquired=DispersionOptions(**data['acquisition_options']);acquired.validate()
+            acquired=DispersionOptions.from_saved(data['acquisition_options']);acquired.validate()
             if type(done) is not int or not 0<=done<=m or not m or names!=acquired.actuators() or acquired.coil!=data['options'].get('coil','trim'):
                 raise ValueError('Invalid completed QM count / names')
             if state['status'] not in ('running','probing','interrupted','complete'):raise ValueError('Invalid scan status')
@@ -546,7 +586,7 @@ class DispersionService:
             if ('rf_blocks' not in data or measured) and len(data['orbit_measurements'])<3+6*measured:raise ValueError('Missing raw measurements')
             if 'rf_blocks' in data:
                 from .qm_rf_scan import validate_rf_checkpoint
-                validate_rf_checkpoint(data,DispersionOptions(**data['options']))
+                validate_rf_checkpoint(data,DispersionOptions.from_saved(data['options']))
             if state['status']=='complete' and done!=m:raise ValueError('Incomplete scan marked complete')
         except (KeyError,TypeError,IndexError) as exc:raise ValueError('Malformed QM scan checkpoint: '+str(exc)) from exc
         return data
@@ -736,10 +776,10 @@ class DispersionService:
         if not np.any(valid&straight):raise ValueError('No common valid straight-section BPM across scan')
         # JSON stores unavailable BPM values as null; preserve them as NaN and
         # apply the recorded validity mask before checking the fitted rows.
-        measured=np.asarray(data['full_measured'],float);target=measured.copy();target[0,straight]=0.
+        measured=np.asarray(data['full_measured'],float)
+        target,weights,arc=qm_objective(data,opt,valid)
         response=np.asarray(data['response'],float);mask=np.tile(valid,4)
-        weights=np.repeat([opt.dispersion_weight,opt.dispersion_weight,1.,1.],len(valid))
-        a=(response*weights[:,None])[mask];residual=((measured-target).ravel()*weights)[mask]
+        a=(response*weights.reshape(-1,1))[mask];residual=((measured-target)*weights).ravel()[mask]
         c=np.asarray(data['centers']);lo,hi=np.asarray(data['limits'])
         lower=np.maximum(lo-c,-opt.step_A);upper=np.minimum(hi-c,opt.step_A)
         constraints=response[2*len(valid):][np.tile(valid,2)] if opt.constrain_cod else np.empty((0,len(c)))
@@ -771,7 +811,8 @@ class DispersionService:
             available=[i for i in available if data['probe_quality'][i]['signal_rms']>1.e-12 and
                        data['probe_quality'][i]['signal_rms']>=opt.target_snr*data['probe_quality'][i]['noise_rms']]
         if not available:raise InsufficientProbeQuality('No QM response reaches the target signal/noise ratio; review probe quality / limits')
-        if opt.selection=='all':selected=available;step,_,singular=fit(selected)
+        if not np.any(residual):step=np.zeros(0);singular=np.zeros(0)
+        elif opt.selection=='all':selected=available;step,_,singular=fit(selected)
         else:
             score=float(np.linalg.norm(residual));step=np.zeros(0);singular=np.zeros(0)
             for _ in range(min(opt.maximum,len(available))):
@@ -787,13 +828,14 @@ class DispersionService:
                     singular_values=singular,solver='bounded regularized SVD; '+
                     ('COD constraints; ' if opt.constrain_cod else 'COD hard limit disabled; ')+
                     ('tune constraints; ' if opt.measure_tunes else 'tune acquisition / tune constraints skipped; ')+opt.selection)
+        data['arc_bpms']=np.asarray(data['names'])[arc].tolist() if opt.arc_weight else []
         data.pop('proposal_unavailable_reason',None)
         return data
 
     def apply(self,data,progress=lambda *_:None,event=lambda *_:None):
         self.last_result=data
         self.check();b=self.backend;saved_options=dict(data['options']);saved_options.setdefault('measure_tunes',True)
-        opt=DispersionOptions(**saved_options);opt.validate();b.validate_mode('dispersion')
+        opt=DispersionOptions.from_saved(saved_options);opt.validate();b.validate_mode('dispersion')
         if data.get('applied') or data['backend_id']!=b.identity:raise ValueError('Stale or already applied QM proposal')
         names=data['actuators']
         if names!=opt.actuators():raise ValueError('QM selection differs from the measured response')
@@ -819,9 +861,11 @@ class DispersionService:
                 raise ValueError('Measured tune change exceeds QM correction tolerance; restored')
             if opt.constrain_cod and np.max(abs(orbit_change))>opt.orbit_tolerance_mm:
                 raise ValueError('Measured COD change exceeds QM correction tolerance; restored')
-            straight=mask&np.asarray(data['straight'],bool)
-            if np.linalg.norm(after[0,straight])>np.linalg.norm(np.asarray(data['full_measured'],float)[0,straight]):
-                raise ValueError('Measured horizontal straight dispersion did not improve; restored')
+            _,weights,arc=qm_objective(data,opt,mask)
+            targets=mask & (np.asarray(data['straight'],bool) | (arc & bool(opt.arc_weight)))
+            before=np.asarray(data['full_measured'],float)
+            if np.linalg.norm(after[0,targets]*weights[0,targets])>np.linalg.norm(before[0,targets]*weights[0,targets]):
+                raise ValueError('Measured weighted horizontal dispersion did not improve; restored')
             self.check()
             expected=copy.deepcopy(data['baseline'])
             expected['quadrupoles'].update(zip(names,(centers+delta).tolist()))
@@ -845,7 +889,7 @@ class DispersionService:
 
     def reset(self,data):
         self.last_result=data;errors=[]
-        if data['backend_id']!=self.backend.identity or data['actuators']!=DispersionOptions(**data['options']).actuators():
+        if data['backend_id']!=self.backend.identity or data['actuators']!=DispersionOptions.from_saved(data['options']).actuators():
             raise ValueError('Machine or QM selection differs from the saved scan')
         origin=data.get('iteration_origin',data)
         skipped={r['magnet'] for r in data.get('probe_readbacks',[]) if r.get('skipped')}

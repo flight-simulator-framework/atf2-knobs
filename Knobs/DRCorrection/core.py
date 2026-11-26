@@ -755,12 +755,50 @@ class CorrectionService:
         if missing:return 'No measured columns for: '+', '.join(sorted(missing))+'. Measure again.'
         return ''
 
+    def reuse_on_current_beam(self,data,opt,progress=lambda *_:None):
+        """Use measured ZV slopes with a fresh three-frequency observation and current limits."""
+        if (data['mode']!='dispersion' or opt.plane!='y' or opt.response_source!='measured'
+                or not (data.get('rftrack_candidates') or data.get('full_zv_candidates'))):
+            raise ValueError('Load a measured vertical ZV response')
+        issue=self.response_reuse_issue(data,opt)
+        if issue:raise ValueError(issue)
+        b=self.backend
+        if (list(data['names'])!=list(b.bpm_names) or not set(data['actuators'])<=set(b.vcorrectors)
+                or data.get('actuator_unit')!=b.unit('correctors')):
+            raise ValueError('BPM or corrector mapping / units differ from the saved response')
+        if data.get('set_blocked_reason'):raise ValueError(data['set_blocked_reason'])
+        if data.get('model_settings'):
+            from Knobs.DRTuning.model import verify_inputs
+            verify_inputs(b,data['model_settings'])
+        b.validate_mode('dispersion')
+        validate_bpm_sampling(opt)
+        ignored=data.get('ignored_readbacks')
+        def snapshot():return b.snapshot(excluded=ignored) if ignored else b.snapshot()
+        before=snapshot()
+        self.check_cancel()
+        self.orbit_measurements=[]
+        progress(0,'Measuring current vertical dispersion / COD')
+        measured,valid=self._signal('dispersion',opt)
+        actual=snapshot()
+        if not b.same_settings(before,actual):raise ValueError('Settings changed during vertical dispersion measurement')
+        saved=dict(data)
+        saved.setdefault('response_baseline',data['baseline'])
+        saved.setdefault('response_valid',data.get('acquisition_valid',data['valid']))
+        saved.update(applied=False,baseline=actual,centers=[actual['correctors'][n] for n in data['actuators']],
+                     limits=b.limits('correctors',data['actuators']),full_measured=self.full_signal.copy(),measured=measured,
+                     baseline_orbit_measurements=self.orbit_measurements,
+                     acquisition_valid=np.asarray(saved['response_valid'],bool)&valid)
+        saved.pop('applied_baseline',None)
+        saved.pop('bpm_observations',None)
+        self.check_cancel()
+        return self.recalculate(saved,opt,progress)
+
     def recalculate(self,data,opt,progress=lambda *_:None):
         """Refit saved measurements only; no orbit reads or machine writes."""
         issue=self.response_reuse_issue(data,opt)
         if issue:raise ValueError(issue)
         saved=copy.deepcopy(data)
-        if saved.get('full_zv_candidates') and saved.get('applied'):
+        if saved.get('applied') and saved.get('applied_baseline') and (saved.get('full_zv_candidates') or saved.get('rftrack_candidates')):
             # Reuse the measured slopes about the latest verified operating point.
             state=saved['applied_baseline']
             saved.setdefault('response_baseline',saved['baseline'])
@@ -768,6 +806,7 @@ class CorrectionService:
             saved['centers']=[state['correctors'][n] for n in saved['actuators']]
             saved['full_measured']=np.asarray(saved['full_after'],float)
             saved['measured']=np.asarray(saved['after'],float)
+            saved.setdefault('response_valid',saved['acquisition_valid'])
             saved['acquisition_valid']=np.asarray(saved['acquisition_valid'],bool)&np.asarray(saved['after_valid'],bool)
             saved.pop('applied_baseline')
         if saved['mode']=='dispersion' and opt.response_source=='measured':
@@ -818,7 +857,7 @@ class CorrectionService:
             self.check_cancel()
             progress(0,'Measuring after SET')
             measured,valid=self._signal(data['mode'],Options(**data['options']))
-            if data.get('full_zv_candidates'):
+            if data.get('full_zv_candidates') or data.get('rftrack_candidates'):
                 expected=copy.deepcopy(data['baseline'])
                 expected['correctors'].update((data['actuators'][i],values[i]) for i in changed)
                 actual=(self.backend.snapshot(excluded=data['ignored_readbacks']) if data.get('ignored_readbacks')

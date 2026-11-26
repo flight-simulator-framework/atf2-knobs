@@ -80,6 +80,7 @@ class DispersionPlotTests(unittest.TestCase):
             window.show()
             window.open_tool('dispersion')
             panel = window.panels['dispersion']
+            panel.data_directory=lambda:root
             manager = window.service.model_manager
             def prepare(opt, cancel, progress):
                 manager.baseline = machine.snapshot()

@@ -78,6 +78,26 @@ class RFBlockTests(unittest.TestCase):
             self.assertLessEqual(touched,set(expected)-{'ZV51R'})
             self.assertEqual(b.snapshot(),baseline)
 
+    def test_vertical_current_beam_reads_three_settings_and_refits_weights_offline(self):
+        from Knobs.DRTuning.zv_rf_scan import measure_all_zvs
+        b=DemoBackend();s=CorrectionService(b)
+        opt=Options(plane='y',selection_method='all',bpm_samples=10,frequency_change_khz=4.,
+                    preserve_vertical_dispersion_orbit=True,dispersion_weight=1.,orbit_weight=0.)
+        data=measure_all_zvs(s,opt,lambda *_:None)
+        n=data['actuators'][0];b.currents[n]=.2;b.disp0*=.7
+        before=b.snapshot();start=b.acquisitions
+        with patch.object(b,'write',side_effect=AssertionError),patch.object(b,'set_frequency',wraps=b.set_frequency) as rf:
+            current=s.reuse_on_current_beam(data,opt)
+            self.assertEqual([c.args[0] for c in rf.call_args_list],[-2000,2000,0])
+            self.assertEqual(b.acquisitions-start,30);self.assertEqual(current['baseline'],before)
+            np.testing.assert_allclose(current['response'],data['response'])
+            self.assertEqual(current['centers'][0],.2)
+            opt.orbit_weight=100.
+            fit=s.recalculate(current,opt)
+            self.assertEqual(b.acquisitions-start,30);self.assertEqual(rf.call_count,3)
+            self.assertFalse(np.allclose(fit['delta'],current['delta']))
+            np.testing.assert_array_equal(fit['target'][1],current['measured'][1])
+
     def test_vertical_shortlist_and_recalculate(self):
         b=DemoBackend();s=CorrectionService(b)
         opt=Options(plane='y',bpm_samples=10,frequency_change_khz=4.,count_v=5)

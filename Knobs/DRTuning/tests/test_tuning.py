@@ -225,6 +225,8 @@ class GuiTests(unittest.TestCase):
             for mode,panel in window.panels.items():
                 window.tabs.setCurrentWidget(panel)
                 if mode=='dispersion':
+                    root=self.enterContext(tempfile.TemporaryDirectory())
+                    panel.data_directory=lambda:root
                     # Use an independent deterministic model for RFTrack screening.
                     model=DemoBackend();model.match_report={}
                     manager=window.service.model_manager
