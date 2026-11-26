@@ -2,7 +2,7 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QGroupBox,
     QScrollArea,QSplitter,QPushButton,QLabel,QComboBox,QDoubleSpinBox,QHeaderView,
-    QAbstractItemView,QSpinBox)
+    QAbstractItemView,QProgressBar,QSpinBox)
 
 
 STYLE = '''
@@ -89,7 +89,8 @@ def reflow_correction(panel):
         panel.compaction_label=QLabel();panel.compaction_label.setWordWrap(True)
         form.addRow('Momentum compaction',panel.compaction_label)
     if panel.mode=='skew':
-        keys=[('skew_probe','Initial skew probe ± [A]'),('skew_step','Max correction [A]'),('change1_A','H probe 1 span [A]'),('change2_A','H probe 2 span [A]')]
+        skew_unit=panel.window.backend.unit('skews')
+        keys=[('skew_probe',f'Initial skew probe ± [{skew_unit}]'),('skew_step',f'Max correction [{skew_unit}]'),('change1_A','H probe 1 span [A]'),('change2_A','H probe 2 span [A]')]
         from PyQt6.QtWidgets import QCheckBox
         for key in ('sd','sf'):
             check=QCheckBox(key.upper());check.setChecked(getattr(panel.options,key))
@@ -103,16 +104,17 @@ def reflow_correction(panel):
             spin.setToolTip('Starting amplitude for adaptive scans; fixed amplitude when adaptation is off. Supply limits always apply.')
         spin.valueChanged.connect(lambda v,k=key:panel.set_option(k,v));form.addRow(label,spin)
         panel.modern_fields[key]=spin
-    adaptive=QCheckBox('Adapt probe to BPM response (SysID rule)')
+    snr_probe=panel.options.orbit_target_snr is not None and panel.mode in ('orbit','skew')
+    adaptive=QCheckBox('Adapt probe using measured S/N' if snr_probe else 'Adapt probe to BPM response')
     adaptive.setChecked(panel.options.adaptive_probe)
     adaptive.toggled.connect(lambda v:panel.set_option('adaptive_probe',v))
     form.addRow(adaptive);panel.modern_fields['adaptive_probe']=adaptive
     adaptive_widgets=[]
     unit=panel.window.backend.unit('skews' if panel.mode=='skew' else 'correctors')
-    for key,label,factor,low,high in [
+    probe_controls=[('orbit_target_snr','Minimum response S/N',1.,1.,100.)] if snr_probe else [
         ('adaptive_target_mm','Target BPM response [mm]',1.,.00001,10.),
-        ('adaptive_target_tolerance','Target tolerance [%]',100.,1.,99.),
-        ('adaptive_max_probe',f'Max probe ± [{unit}]',1.,.000001,5.)]:
+        ('adaptive_target_tolerance','Target tolerance [%]',100.,1.,99.)]
+    for key,label,factor,low,high in probe_controls+[('adaptive_max_probe',f'Max probe ± [{unit}]',1.,.000001,5.)]:
         spin=QDoubleSpinBox();spin.setDecimals(6 if key=='adaptive_max_probe' else 4)
         spin.setProperty('option_scale',factor)
         spin.setRange(low,high);spin.setValue(getattr(panel.options,key)*factor)
@@ -121,13 +123,8 @@ def reflow_correction(panel):
     pairs=QSpinBox();pairs.setRange(1,100);pairs.setValue(panel.options.adaptive_max_pairs)
     pairs.valueChanged.connect(lambda v:panel.set_option('adaptive_max_pairs',v))
     form.addRow('Max pairs per magnet',pairs);panel.modern_fields['adaptive_max_pairs']=pairs;adaptive_widgets.append(pairs)
-    helptext=QLabel('Response = max |BPM(+) − BPM(−)| / 2 on enabled valid BPMs.\n'
-        'Dispersion uses nominal COD; skew uses the vertical probe-response change.\n'
-        'Each pair restores the magnet. Limits / unreached targets are reported.')
+    helptext=QLabel('Only weak columns are retried. Columns below minimum S/N at the probe limit are skipped.' if snr_probe else 'Each probe pair restores the magnet before retrying.')
     helptext.setWordWrap(True);form.addRow(helptext)
-    if panel.mode!='skew':
-        panel.adaptive_targets_label=QLabel();panel.adaptive_targets_label.setWordWrap(True)
-        form.addRow('Remembered response targets',panel.adaptive_targets_label)
     def update_adaptive_controls(*_):
         measured=source.currentData()=='measured';adaptive.setEnabled(measured)
         for widget in adaptive_widgets:widget.setEnabled(measured and adaptive.isChecked())
@@ -149,7 +146,11 @@ def reflow_correction(panel):
                 panel.zv_candidates_label=QLabel();panel.zv_candidates_label.setWordWrap(True)
                 panel.measure_zvs_button=button('Measure selected ZVs',panel.measure_selected_zvs)
                 layout.addWidget(panel.zv_candidates_label);layout.addWidget(panel.measure_zvs_button)
-            layout.addWidget(panel.recalculate_button);layout.addWidget(panel.response_cache_label)
+            layout.addWidget(panel.recalculate_button)
+            if snr_probe:
+                panel.current_beam_button=button('Reuse measured matrix on current beam',panel.use_current_beam)
+                layout.addWidget(panel.current_beam_button)
+            layout.addWidget(panel.response_cache_label)
     box,layout=group('3. Save and analyze');left.addWidget(box)
     layout.addWidget(button('Save data and plots',panel.save_bundle))
     layout.addWidget(button('Save plot',panel.save_figure))
@@ -163,3 +164,55 @@ def reflow_correction(panel):
     split=QSplitter();area=scroll(controls);area.setMinimumWidth(290);split.addWidget(area);split.addWidget(result)
     split.setSizes([310,800]);split.setStretchFactor(1,1);panel.layout().addWidget(split)
     panel.refresh()
+
+
+class MatrixProgress(QWidget):
+    """Current RF block, probe endpoint and BPM batch on both dispersion screens."""
+
+    def __init__(self):
+        super().__init__()
+        layout=QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(2)
+        self.point=QLabel()
+        self.point.setStyleSheet('font-weight: bold')
+        self.point.setWordWrap(True)
+        self.stage=QLabel()
+        self.stage.setWordWrap(True)
+        layout.addWidget(self.point)
+        layout.addWidget(self.stage)
+        bars=QHBoxLayout()
+        self.columns=QProgressBar()
+        self.shots=QProgressBar()
+        bars.addWidget(self.columns)
+        bars.addWidget(self.shots)
+        layout.addLayout(bars)
+        self.hide()
+
+    def show_activity(self, event):
+        self.show()
+        if 'columns' in event:
+            done,total,skipped=event['columns']
+            self.columns.setRange(0,total)
+            self.columns.setValue(done)
+            self.columns.setFormat(f'Columns %v / %m · {skipped} skipped')
+        self.columns.show()
+        self.point.setText(event['point'])
+        self.point.setVisible(bool(event['point']))
+        self.stage.setText(event['stage'])
+        shots=event.get('shots')
+        self.shots.setVisible(shots is not None)
+        if shots is not None:
+            count,total=shots
+            self.shots.setRange(0,total)
+            self.shots.setValue(count)
+            self.shots.setFormat('BPM samples %v / %m')
+
+    def finish(self, failed):
+        if self.isHidden():
+            return
+        status='Response scan stopped' if failed else 'Response matrix complete'
+        self.stage.setText(f'{status} · {self.columns.text()}')
+        self.point.hide()
+        self.columns.hide()
+        self.shots.hide()

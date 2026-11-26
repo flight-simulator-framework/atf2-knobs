@@ -14,10 +14,10 @@ def waveform_arrays(data):
         raise ValueError("Need consecutive turns and mm positions")
     valid=np.asarray(data["valid"],bool)
     if valid.shape!=shape:raise ValueError("Invalid TBT validity mask")
-    valid &= (arrays["tmit"]>0)&np.isfinite(arrays["x"])&np.isfinite(arrays["y"])
+    valid = valid & np.isfinite(arrays["tmit"]) & (arrays["tmit"]>0)&np.isfinite(arrays["x"])&np.isfinite(arrays["y"])
     return arrays,valid,turns
 
-def analyze_tbt(data,*,start_turn=1,stop_turn=None,reference=None):
+def analyze_tbt(data,*,start_turn=1,stop_turn=None,reference=None,excluded_bpms=()):
     """Tune/phase/amplitude fit and relative beta; absolute beta needs calibration.
 
 reference: {'x': {'bpm': 'dr:MB1R', 'beta_m': 8.}, ...}.
@@ -31,8 +31,8 @@ This is caller-supplied nominal or independently measured calibration.
         raise ValueError("Stop turn outside waveform")
     select=(turns>=start_turn)&(turns<=stop_turn);n=int(select.sum())
     if n<16:raise ValueError("At least 16 turns required for tune analysis")
-    good=np.all(valid[select],axis=0)
-    time=np.arange(n);result=dict(names=data["names"],planes={},
+    good=np.all(valid[select],axis=0) & ~np.isin(data["names"],excluded_bpms)
+    time=np.arange(n);result=dict(names=data["names"],planes={},excluded_bpms=list(excluded_bpms),
         method="Hann spectral peak + sinusoidal least-squares fit; amplitude beta",
         equilibrium_validated=False,normalization="relative beta unless external reference supplied",
         tune_convention="fractional real-waveform alias in [0.02,0.48]; integer tune unavailable",

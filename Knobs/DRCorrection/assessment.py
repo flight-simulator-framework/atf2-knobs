@@ -2,6 +2,14 @@
 import numpy as np
 
 
+def rms(values):
+    return float(np.sqrt(np.mean(values**2)))
+
+
+def improvement_pct(before,after):
+    return 100*(1-after/before) if before>1.e-12 else None
+
+
 def changed_indices(data):
     """Exactly the settings that SET will write; no display-only threshold."""
     before=np.asarray(data['centers'],float);delta=np.asarray(data['delta'],float)
@@ -32,12 +40,11 @@ def assess(data):
                  improvement_pct=None,mismatch_rms=None,mismatch_max=None,worst_bpm=None,
                  mismatch_to_predicted_change=None,bpm_mismatch=[None]*len(enabled))
         if count:
-            rms=lambda v:float(np.sqrt(np.mean(v*v)))
             b=rms((before[i]-target[i])[mask]);p=rms((predicted[i]-target[i])[mask]);a=rms((after[i]-target[i])[mask])
             diff=(after[i]-predicted[i])[mask];m=rms(diff)
             change=rms((predicted[i]-before[i])[mask])
             row.update(before_rms=b,predicted_rms=p,after_rms=a,
-                       improvement_pct=100*(1-a/b) if b>1.e-12 else None,
+                       improvement_pct=improvement_pct(b,a),
                        mismatch_rms=m,mismatch_max=float(np.max(abs(diff))),
                        worst_bpm=data['names'][np.flatnonzero(mask)[np.argmax(abs(diff))]],
                        mismatch_to_predicted_change=m/change if change>1.e-12 else None,

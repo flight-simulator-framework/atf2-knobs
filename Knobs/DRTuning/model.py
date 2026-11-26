@@ -484,6 +484,7 @@ class ModelManager:
         virtual=CorrectionService(model);virtual.cancel=service.cancel
         virtual.pause_requested=service.pause_requested;virtual.paused=service.paused
         options=copy.deepcopy(opt);options.response_source='measured';options.bpm_samples=1;options.bpm_interval_s=0.
+        options.orbit_target_snr=None
         options.adaptive_probe=False  # Model finite differences need no beam-driven amplitude search.
         progress(15,'Calculating magnet responses in RFTrack; machine magnets unchanged')
         data=virtual.acquire(mode,options,progress)

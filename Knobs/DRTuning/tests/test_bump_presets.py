@@ -107,6 +107,9 @@ class PresetBackend(BumpFixture):
         for j,label in enumerate(data['bpm_names']):
             i=self.bpm_names.index(label)
             self.response[np.ix_([i,i+n],columns)]=response[[j,j+saved_n]]
+        # Closure-helper probes also need a measurable orbit response.
+        helpers=np.flatnonzero(~np.any(self.response,axis=0))
+        self.response[:,helpers]=np.random.default_rng(89).normal(0,1.e-6,(2*n,len(helpers)))
         self.valid=np.ones(n,bool);self.valid[-1]=False
     def orbit(self):
         v=self.response@self.read('correctors',self.hcorrectors+self.vcorrectors);n=len(self.bpm_names)

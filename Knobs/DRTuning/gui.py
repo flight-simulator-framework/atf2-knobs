@@ -100,7 +100,7 @@ class TuningTBTPanel(TBTPanel):
             self.start_acquisition.setValue(self.start_acquisition.value()+direction*step)
         except ValueError:self.window.error('Turn step must be a positive integer')
     def select_save_directory(self,*_):
-        path=QFileDialog.getExistingDirectory(self,'TBT output directory')
+        path=QFileDialog.getExistingDirectory(self,'TBT output directory',self.window.correction_data_directory())
         if path:self.legacy.lineEditANALYSEFILEPATH.setText(path)
         else:self.legacy.checkBoxAutoSave.setChecked(False)
     def extraction_turn(self,checked):
@@ -114,7 +114,7 @@ class TuningTBTPanel(TBTPanel):
             if self.legacy.checkBoxSCANUP.isChecked():self.step_turn(1)
             elif self.legacy.checkBoxSCANDOWN.isChecked():self.step_turn(-1)
         b=self.window.backend;turns=self.turns.value();start=self.start_acquisition.value()
-        self.phase_result=None;self.acquisition_status.setText('Reading... Previous data is retained until success.')
+        self.acquisition_status.setText('Reading... Previous data is retained until success.')
         if hasattr(b,'tbt_acquire') and self.fresh.isChecked():
             self.window.start(lambda progress:b.tbt_acquire(turns,start,cancel=self.window.service.cancel,progress=progress),self.received,label='TBT new shot')
         else:
@@ -134,7 +134,9 @@ class TuningTBTPanel(TBTPanel):
         first=wave['turns'][0];last=wave['turns'][-1]
         self.start_turn.setRange(first,max(first,last-15));self.start_turn.setValue(min(first+2,last-15))
         from datetime import datetime
-        quality='Common shot ID unverified' if wave.get('readback_update_verified') else 'Existing waveform / simulation'
+        if wave.get('readback_update_verified'):quality='Waveform updates verified. Common shot ID unverified.'
+        elif wave.get('fresh_acquisition'):quality=f'Acquisition generation {wave["acquisition_generation"]}' if 'acquisition_generation' in wave else 'New acquisition'
+        else:quality='Existing waveform / simulation'
         self.acquisition_status.setText(f"Read complete {datetime.now():%H:%M:%S}\n{len(wave['names'])} BPM × {len(wave['turns'])} turns\n{quality}")
         self.statistics()
         if self.legacy.checkBoxAutoSave.isChecked():
@@ -144,7 +146,8 @@ class TuningTBTPanel(TBTPanel):
                 self.save(str(Path(path)/datetime.now().strftime('%Y%m%d-%H%M%S-%f')))
     def analyze(self):
         self.estimate=None
-        super().analyze()
+        self.phase_result=None
+        super().analyze(excluded_bpms=self.window.panels['orbit'].options.excluded_bpms)
     def draw(self,*_):
         if self.wave is None or self.bpm.currentIndex()<0:return
         import numpy as np
@@ -218,7 +221,7 @@ class TuningTBTPanel(TBTPanel):
         self.window.start(action,done,label='Calculate reference phase transport')
     def save(self,path=None):
         if self.wave is None:self.window.error('Read or load a waveform before saving');return
-        if not path:path=QFileDialog.getExistingDirectory(self,'Save TBT data and figures')
+        if not path:path=QFileDialog.getExistingDirectory(self,'Save TBT data and figures',self.window.correction_data_directory())
         if not path:return
         super().save(path)
         if self.phase_result:(Path(path)/'phase_beta.json').write_text(json.dumps(serial(self.phase_result),indent=2)+'\n')
@@ -253,7 +256,10 @@ class TuningSession(DRCorrectionWindow):
                 if mode in ('orbit','dispersion'):
                     panel.options.count_h=5 if mode=='orbit' else 10
                     panel.options.count_v=5
-            if mode!='dispersion':reflow_correction(panel)
+            if mode!='dispersion':
+                panel.options.orbit_target_snr=5.
+                panel.options.bpm_samples=10
+                reflow_correction(panel)
         layout=self.centralWidget().layout();layout.removeWidget(self.tabs)
         self.navigation=QListWidget();self.navigation.setMinimumWidth(160);self.navigation.setMaximumWidth(185)
         self.navigation.addItems(['COD correction','Vertical dispersion','QM dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance','Bump / XSR coupling'])
@@ -293,6 +299,7 @@ class TuningSession(DRCorrectionWindow):
         vertical = self.panels['dispersion']
         options = vertical.options
         self.service.dispersion_exclusions = lambda: options.excluded_bpms
+        self.service.matrix_activity = vertical.matrix_activity.emit
         self.service.dispersion_observed = vertical.baseline_observed.emit
         self.qm_dispersion.service.reader.dispersion_exclusions = self.service.dispersion_exclusions
         for plot in (vertical.plot, self.qm_dispersion.plot):
@@ -301,7 +308,10 @@ class TuningSession(DRCorrectionWindow):
         saved = self.bpm_settings.value(self.bpm_settings_key, [], type=list)
         if saved:
             self.set_bpm_selection(saved)
-        self._active_plot_controls = None
+        self._active_dispersion_panel = None
+
+    def correction_data_directory(self):
+        return self.panels['dispersion'].data_directory()
 
     def toggle_dispersion_bpm(self, name):
         excluded = set(self.panels['dispersion'].options.excluded_bpms)
@@ -326,6 +336,11 @@ class TuningSession(DRCorrectionWindow):
         self.statusBar().showMessage(f'BPM selection saved ({len(excluded)} excluded).', 5000)
 
     def correction_selection_changed(self):
+        if self.tbt.estimate is not None:
+            self.tbt.estimate=None
+            self.tbt.phase_result=None
+            self.tbt.note.setText('Selection changed. Calculate tune / relative beta again.')
+            self.tbt.draw()
         self.qm_dispersion.invalidate()
         self.coupling_panel.settings_changed()
 
@@ -394,8 +409,9 @@ class TuningSession(DRCorrectionWindow):
         self.service.cancel.clear()
         active_panel=self.tabs.currentWidget()
         if active_panel in (self.panels['dispersion'],self.qm_dispersion):
-            self._active_plot_controls=active_panel.splitter.widget(0)
-            self._active_plot_controls.setEnabled(False)
+            active_panel.matrix_progress.hide()
+            self._active_dispersion_panel=active_panel
+            active_panel.splitter.widget(0).setEnabled(False)
         else:
             self.tabs.setEnabled(False)
         self.navigation.setEnabled(False);self.cancel_button.setEnabled(True)
@@ -447,9 +463,10 @@ class TuningSession(DRCorrectionWindow):
         self.operation_status.setText((summary or self._active_label+'：'+message)+pending)
         if message.startswith(('SKIP ','PAUSED:','RESUMED:','BPM validity:','QM probe:','Resume:')):self.log(message)
     def task_finished(self):
-        if self._active_plot_controls is not None:
-            self._active_plot_controls.setEnabled(True)
-            self._active_plot_controls=None
+        if self._active_dispersion_panel is not None:
+            self._active_dispersion_panel.matrix_progress.finish(self._failed)
+            self._active_dispersion_panel.splitter.widget(0).setEnabled(True)
+            self._active_dispersion_panel=None
         self._rf_monitor=None
         self._rf_paused=False
         if self._rf_popup is not None:

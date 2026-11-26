@@ -216,6 +216,43 @@ class GuiTests(unittest.TestCase):
         finally:
             window.service.cancel.set();self.wait(window);window.close()
 
+    def test_measured_cod_skew_reuse_current_beam_and_tbt_exclusions(self):
+        from unittest.mock import patch
+        from Knobs.DRTuning.gui import TuningSession
+        backend=DemoBackend();w=TuningSession(backend)
+        try:
+            for mode in ('orbit','skew'):
+                panel=w.panels[mode];opt=panel.options
+                names=backend.vcorrectors if mode=='orbit' else backend.skews
+                opt.fixed_actuators=tuple(names[1:])
+                opt.adaptive_probe=True
+                panel.calculate();self.wait(w)
+                self.assertIsNotNone(panel.data,w.messages.toPlainText())
+                self.assertEqual(len(panel.data['probe_history']),1)
+                self.assertTrue(panel.data['probe_history'][0]['quality']['usable'])
+                matrix=panel.data['response'].copy()
+                kind=panel.data['kind']
+                backend.write(kind,names[:1],[.01 if mode=='orbit' else .00005])
+                current=backend.snapshot()
+                before=backend.acquisitions
+                with patch.object(backend,'write',wraps=backend.write) as write:
+                    panel.current_beam_button.click();self.wait(w)
+                    self.assertEqual(backend.acquisitions-before,10 if mode=='orbit' else 40)
+                    if mode=='orbit':write.assert_not_called()
+                    else:self.assertEqual({c.args[1][0] for c in write.call_args_list},{opt.probe1,opt.probe2})
+                np.testing.assert_equal(panel.data['response'],matrix)
+                self.assertEqual(panel.data['baseline'],current)
+                self.assertEqual(backend.snapshot(),current)
+            t=w.tbt;t.received(backend.tbt(128));t.analyze()
+            self.assertTrue(t.estimate['planes']['x']['valid_bpms'][0])
+            raw=t.wave['valid'].copy()
+            w.set_bpm_selection([backend.bpm_names[0]])
+            self.assertIsNone(t.estimate)
+            t.analysis_button.click()
+            self.assertFalse(t.estimate['planes']['x']['valid_bpms'][0])
+            np.testing.assert_equal(t.wave['valid'],raw)
+        finally:w.close()
+
     def test_redesigned_corrections_measure_apply_restore_and_small_window(self):
         from Knobs.DRTuning.gui import TuningSession
         window=TuningSession(DemoBackend());window.resize(1024,768);window.show();self.app.processEvents()

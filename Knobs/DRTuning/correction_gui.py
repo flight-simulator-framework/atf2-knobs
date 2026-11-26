@@ -11,7 +11,9 @@ from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,
                             QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar,QListWidget,QListWidgetItem,QMessageBox)
 from Knobs.DRCorrection.core import serial,Cancelled
 from Knobs.DRCorrection.gui import Plot
+from .presentation import MatrixProgress
 from .dispersion_plot import DispersionPlot
+from .dispersion_source import QM_FILES,local_time,matrix_caption,observation_from_result
 from .coupling import CouplingService,BumpOptions,BumpRangeUnavailable,BumpLimitUnavailable
 from .bump_fit import historical_sem_floor
 from .bump_presets import bump_preset
@@ -61,10 +63,12 @@ class CorrectionTool(QWidget):
                 self.update.emit(dict(kind='failure',data=copy.deepcopy(self.service.last_result)))
                 raise
         self.window.start(guarded,done,label=label)
+    def suggested_save_path(self,data):
+        return getattr(self,'autosave_directory','')
     def save(self):
         data=self.result
         if data is None:self.window.error('No acquired data to save');return
-        path,_=QFileDialog.getSaveFileName(self,'Save correction measurements',str(getattr(self,'autosave_directory','')),'JSON (*.json)')
+        path,_=QFileDialog.getSaveFileName(self,'Save correction measurements',str(self.suggested_save_path(data)),'JSON (*.json)')
         if path:
             try:
                 dest=Path(path).with_suffix('.json');dest.write_text(json.dumps(serial(data),indent=2,allow_nan=False))
@@ -112,6 +116,7 @@ class CouplingPanel(CorrectionTool):
         self.refine=control(self.form,'Refinement ± [mm]',.1,.001,1.)
         self.refine.setToolTip('Candidate offset from the fitted minimum. Measure one side at a time. Edge minima can expand the full window to 1 mm.')
         self.probe=control(self.form,'Corrector probe ± [A]',.05,.001,.5)
+        self.bump_snr=control(self.form,'Minimum response S/N',5.,1.,100.)
         self.step=control(self.form,'Max change from baseline [A]',2.,.001,5.)
         self.leak=control(self.form,'Outside COD max [µm]',30.,.1,1000.,1)
         self.rms=control(self.form,'Outside COD RMS [µm]',20.,.1,1000.,1)
@@ -139,7 +144,7 @@ class CouplingPanel(CorrectionTool):
         self.scan_button=self.add_button('2. Scan → fit → set optimum',self.scan)
         self.reset_button=self.add_button('Restore baseline currents',self.reset)
         self.scan_button.setEnabled(False);self.reset_button.setEnabled(False)
-        for widget in (self.amplitude,self.refine,self.probe,self.step,self.leak,self.rms,self.settle):widget.valueChanged.connect(self.settings_changed)
+        for widget in (self.amplitude,self.refine,self.probe,self.bump_snr,self.step,self.leak,self.rms,self.settle):widget.valueChanged.connect(self.settings_changed)
         self.target.currentIndexChanged.connect(self.invalidate)
         self.status.setText('Choose a bump position, then calibrate its preset BPMs / correctors.\nTarget mm uses saved nominal transport; corrector response is measured here.')
         self.preview_preset();self.redraw()
@@ -185,7 +190,7 @@ class CouplingPanel(CorrectionTool):
 
     def options(self):
         return BumpOptions(amplitude_mm=self.amplitude.value()/2,refine_mm=self.refine.value(),
-            calibration_mm=min(.1,self.amplitude.value()/2),probe_A=self.probe.value(),max_step_A=self.step.value(),
+            calibration_mm=min(.1,self.amplitude.value()/2),probe_A=self.probe.value(),target_snr=self.bump_snr.value(),max_step_A=self.step.value(),
             outside_max_mm=self.leak.value()/1000,outside_rms_mm=self.rms.value()/1000,settle_s=self.settle.value())
     def model_options(self):
         options=copy.deepcopy(self.window.panels['dispersion'].options)
@@ -596,8 +601,14 @@ class CouplingPanel(CorrectionTool):
 
 class QMDispersionPanel(CorrectionTool):
     plot_type=DispersionPlot
+    matrix_activity=pyqtSignal(object)
     def __init__(self,window):
         super().__init__(window);self.service=DispersionService(window.backend,window.service.cancel)
+        self.plot.dispersion_plane='x'
+        self.matrix_progress=MatrixProgress()
+        self.matrix_activity.connect(self.matrix_progress.show_activity)
+        self.service.reader.matrix_activity=self.matrix_activity.emit
+        self.right.insertWidget(0,self.matrix_progress)
         defaults=DispersionOptions()
         self.controls.setSpacing(6)
         self.splitter.setSizes([380,900]);self.splitter.setStretchFactor(0,0);self.splitter.setStretchFactor(1,1)
@@ -611,7 +622,7 @@ class QMDispersionPanel(CorrectionTool):
         self.probe=control(measurement,'Fallback probe [A]',defaults.probe_A,.01,3.,2);self.probe.setSingleStep(.01)
         self.probe.setToolTip('Used for a QM without an individual starting width.')
         correction=section('Correction')
-        self.step=control(correction,'Max change / Apply [A]',defaults.step_A,.01,3.,2)
+        self.step=control(correction,'Max change / Apply [A]',defaults.step_A,.01,np.finfo(float).max,2)
         self.step.setSingleStep(.01)
         self.step.setToolTip('Maximum absolute current change per Apply. Absolute current limits come from parameter A/B.')
         self.selection=QComboBox();self.selection.addItem('SVD — all QMs','all');self.selection.addItem('Greedy — select QMs','greedy')
@@ -619,6 +630,7 @@ class QMDispersionPanel(CorrectionTool):
         self.coil=QComboBox();self.coil.addItem('Trim','trim');self.coil.addItem('Main','main')
         correction.addRow('QM coil',self.coil)
         self.active_coil='trim'
+        self.matrix=None;self.matrix_path=None;self.observation=None
         self.coil_exclusions={'trim':', '.join(defaults.fixed_actuators),'main':''}
         self.maximum=control(correction,'Maximum QMs',defaults.maximum,1,16,0)
         correction.setRowVisible(self.maximum,False)
@@ -640,21 +652,19 @@ class QMDispersionPanel(CorrectionTool):
                 button=QPushButton(label);button.setMinimumHeight(32);button.clicked.connect(slot)
                 row.addWidget(button);buttons.append(button)
             return buttons
-        self.calc_button,self.set_button=button_row([
-            ('1. CALC',self.calculate),('2. Apply',self.apply)])
-        self.calc_button.setToolTip('Measure all selected QMs at each RF setting. Repeat only probes that need a different width.')
-        self.calc_button.setStyleSheet('font-weight: 600;')
+        self.calc_button,self.load_button=button_row([
+            ('Measure QM matrix',self.calculate),('Select matrix…',self.load_scan)])
+        self.matrix_label=QLabel('No matrix selected');self.matrix_label.setWordWrap(True)
+        self.buttons.addWidget(self.matrix_label)
+        self.update_dispersion_button,self.recalculate_button=button_row([
+            ('Update dispersion',self.update_dispersion),('Recalculate',self.recalculate)])
+        self.set_button,self.reset_button=button_row([
+            ('Apply',self.apply),('Restore original QM / RF',self.reset)])
         self.set_button.setStyleSheet('font-weight: 600;')
-        self.bpm_button,self.recalculate_button=button_row([
-            ('Select BPMs…',lambda:self.window.open_tool('selection')),('Recalculate',self.recalculate)])
-        self.recalculate_button.setToolTip('Reuse measured responses. After Apply, calculate the next correction from the measured dispersion / COD and applied currents.')
-        self.load_button,self.resume_button=button_row([
-            ('Load scan…',self.load_scan),('Resume',self.resume_scan)])
-        self.current_beam_button=self.add_button('Use matrix with current beam',self.use_current_beam)
-        self.current_beam_button.setToolTip('Read current QM currents and measure dispersion at three RF settings to calculate a new proposal.')
-        self.current_beam_button.setEnabled(False)
-        self.reset_button=self.add_button('Restore original QM / RF',self.reset)
-        for button in (self.set_button,self.recalculate_button,self.resume_button,self.reset_button):button.setEnabled(False)
+        self.bpm_button=QPushButton('Select BPMs…')
+        self.bpm_button.clicked.connect(lambda:self.window.open_tool('selection'))
+        correction.addRow(self.bpm_button)
+        for button in (self.set_button,self.recalculate_button,self.reset_button):button.setEnabled(False)
         self.controls.removeWidget(self.save_button)
         storage=QGroupBox('Data');storage_layout=QVBoxLayout(storage)
         self.autosave_directory=Path('/atf/data/flight-simulator/DRTuning')/datetime.now().strftime('%Y')
@@ -665,6 +675,9 @@ class QMDispersionPanel(CorrectionTool):
         self.save_status=QLabel('Measurements and applied results save automatically.');self.save_status.setWordWrap(True)
         self.save_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         storage_layout.addWidget(self.save_status)
+        self.resume_button=QPushButton('Resume interrupted scan…')
+        self.resume_button.clicked.connect(self.resume_interrupted)
+        storage_layout.addWidget(self.resume_button)
         row=QHBoxLayout();storage_layout.addLayout(row)
         self.folder_button=QPushButton('Change folder…');self.folder_button.clicked.connect(self.choose_autosave_directory)
         row.addWidget(self.folder_button);row.addWidget(self.save_button)
@@ -684,14 +697,16 @@ class QMDispersionPanel(CorrectionTool):
         self.set_table(['QM '+opt.coil,'Initial probe [A]'],[(n,f'{QM_PROBE_PRESETS_A.get(n,opt.probe_A):.2f}')
                        for n in opt.actuators()])
     def change_coil(self):
+        self.matrix_progress.hide()
         self.coil_exclusions[self.active_coil]=self.excluded.text()
         self.active_coil=self.coil.currentData()
+        self.observation=None;self.matrix=None;self.matrix_path=None;self.matrix_label.setText('No matrix selected')
         self.excluded.setText(self.coil_exclusions[self.active_coil])
-        if self.result and self.result['options'].get('coil','trim')==self.active_coil:
+        if self.result and self.result['options'].get('coil','trim')==self.active_coil and self.result.get('scan_state',{}).get('status')!='complete':
             self.display(self.result)
         else:
-            self.plot.clear_data();self.show_initial_probes()
-            for button in (self.set_button,self.recalculate_button,self.current_beam_button,self.resume_button,self.reset_button,self.save_button):
+            self.result=None;self.plot.clear_data();self.show_initial_probes()
+            for button in (self.set_button,self.recalculate_button,self.reset_button,self.save_button):
                 button.setEnabled(False)
             self.status.setText(f'{self.coil.currentText()} selected. Run CALC to measure the response.')
     def invalidate(self,*_):
@@ -712,39 +727,91 @@ class QMDispersionPanel(CorrectionTool):
         if path:
             self.autosave_directory=Path(path);self.save_directory.setText(path);self.save_directory.setToolTip(path)
             self.save_status.setText('Save folder updated.')
-    def new_checkpoint_path(self):
-        stamp=datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')
-        return Path(self.autosave_directory)/('qm_scan_'+stamp+'_'+uuid4().hex[:8]+'.checkpoint.json')
+    def qm_save_path(self,coil,*,checkpoint=False,stamp=None):
+        stamp=stamp or datetime.now().astimezone()
+        prefix='qm_scan' if checkpoint else 'qm_dispersion'
+        suffix='.checkpoint.json' if checkpoint else '.json'
+        return Path(self.autosave_directory)/f'{prefix}_{coil}_{stamp:%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}{suffix}'
+    def suggested_save_path(self,data):
+        return self.qm_save_path(data['options'].get('coil','trim'))
     def load_scan(self):
-        path,_=QFileDialog.getOpenFileName(self,'Load QM scan checkpoint',str(self.autosave_directory),'JSON (*.json)')
+        path,_=QFileDialog.getOpenFileName(self,'Select measured QM matrix',str(self.autosave_directory),QM_FILES)
+        if not path:return
+        opt=self.options()
+        existing={**self.coil_exclusions,self.active_coil:self.excluded.text()}
+        shared=set(self.window.panels['dispersion'].options.fixed_actuators)
+        def read_matrix(progress):
+            with Path(path).open(encoding='utf-8') as stream:data=self.service.matrix_from_scan(json.load(stream))
+            if (data['backend_id']!=self.window.backend.identity or data['names']!=list(self.window.backend.bpm_names)
+                    or data['profile_signature']!=self.service.profile_signature()):
+                raise ValueError('Machine, BPM order or hardware profile differs from the matrix')
+            if data.get('restoration_error'):raise ValueError('Unresolved restoration error in the matrix')
+            coil=data['acquisition_options'].get('coil','trim')
+            # Match the columns actually present. Preserve the current solver controls.
+            available=set(data['actuators'])
+            missing=set(DispersionOptions(coil=coil,fixed_actuators=()).actuators())-available
+            exclusions=sorted(missing|{n.strip() for n in existing[coil].split(',') if n.strip()})
+            opt.coil=coil
+            opt.fixed_actuators=tuple(shared|set(exclusions))
+            self.service.check_reuse_options(data,opt,current_beam=True)
+            return coil,data
+        def selected(result):
+            coil,data=result
+            self.coil.setCurrentIndex(self.coil.findData(coil))
+            self.matrix=data;self.matrix_path=path;self.result=None
+            self.matrix_label.setText(matrix_caption(data,'QM '+coil,path,self.observation))
+            self.plot.clear_data()
+            if self.observation is not None and 'names' in self.observation:self.plot.correction(self.observation)
+            self.set_table(['QM '+coil,'Measured column'],[(n,'Skipped' if rb.get('skipped') else 'Available') for n,rb in zip(data['actuators'],data['probe_readbacks'])])
+            for button in (self.set_button,self.reset_button,self.save_button):button.setEnabled(False)
+            self.recalculate_button.setEnabled(True)
+            self.status.setText('Matrix selected. Recalculate for the current beam.')
+        self.window.start(read_matrix,selected,label='Load measured QM matrix')
+
+    def update_dispersion(self):
+        opt=self.options();self.observation=None
+        self.set_button.setEnabled(False)
+        def done(obs):
+            self.observation=obs
+            self.matrix_label.setText(matrix_caption(self.matrix,'QM '+self.active_coil,self.matrix_path,obs))
+            self.plot.correction(obs);self.table.setRowCount(0);self.save_button.setEnabled(False)
+            self.status.setText('Dispersion measured '+local_time(obs['measured_at']))
+        self.window.start(lambda p:self.service.measure_current_dispersion(opt),done,label='Measure QM dispersion')
+
+    def resume_interrupted(self):
+        if self.result and self.result.get('scan_state',{}).get('status') in ('interrupted','probing','running'):
+            self.resume_scan()
+        else:
+            if self.load_interrupted_checkpoint():self.resume_scan()
+
+    def load_interrupted_checkpoint(self):
+        path,_=QFileDialog.getOpenFileName(self,'Load QM scan checkpoint',str(self.autosave_directory),'QM checkpoint (*.checkpoint.json)')
         if not path:return
         try:
             data=self.service.validate_checkpoint(load_checkpoint(path))
+            if data['scan_state']['status']=='complete':raise ValueError('Use Select matrix for a completed scan')
             saved=data['options'];self.coil.setCurrentIndex(self.coil.findData(saved.get('coil','trim')))
             shared=set(self.window.panels['dispersion'].options.fixed_actuators)
             self.excluded.setText(', '.join(n for n in saved['fixed_actuators'] if n not in shared))
             self.service.restore_width_cache(data);self.service.last_result=data;self.display(data)
             self.save_status.setText('Loaded: '+Path(path).name)
-            if self.current_beam_button.isEnabled():
-                self.status.setText('Showing saved scan. Choose Use matrix with current beam for a fresh proposal.')
+            self.matrix=None;self.matrix_path=None;self.observation=None
+            self.matrix_label.setText('Interrupted scan')
             self.window.log('Loaded QM scan: '+path)
+            return True
         except Exception as exc:self.window.error(str(exc))
-    def use_current_beam(self):
-        if self.result is None:return
-        data=self.result;opt=self.options();self.set_button.setEnabled(False)
-        self.run(lambda p:self.service.reuse_on_current_beam(data,opt,p),self.display,'Measure current QM baseline')
     def resume_scan(self):
         if self.result is None:return
-        data=self.result;opt=self.options();path=self.new_checkpoint_path();self.set_button.setEnabled(False)
+        data=self.result;opt=self.options();path=self.qm_save_path(opt.coil,checkpoint=True);self.set_button.setEnabled(False)
         self.run(lambda p:self.service.resume(data,opt,p,self.update.emit,checkpoint_path=path),
                  self.display,'Resume QM scan')
     def applied(self,data):
         self.display(data)
         # File errors must never roll back an already verified machine correction.
         try:
-            directory=Path(self.autosave_directory);directory.mkdir(parents=True,exist_ok=True)
             stamp=datetime.now().astimezone()
-            dest=directory/('qm_dispersion_'+stamp.strftime('%Y%m%d_%H%M%S_%f')+'_'+uuid4().hex[:8]+'.json')
+            dest=self.qm_save_path(data['options'].get('coil','trim'),stamp=stamp)
+            dest.parent.mkdir(parents=True,exist_ok=True)
             data['autosave']=dict(saved_at=stamp.isoformat(),json=str(dest),plot=str(dest.with_suffix('.png')))
             dest.write_text(json.dumps(serial(data),indent=2,allow_nan=False),encoding='utf-8')
             self.plot.save(dest.with_suffix('.png'))
@@ -755,6 +822,9 @@ class QMDispersionPanel(CorrectionTool):
             self.save_status.setText(message);self.window.log(message)
     def options(self):
         shared=self.window.panels['dispersion'].options
+        fixed=set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()}
+        if self.matrix is not None and self.matrix.get('matrix_only'):
+            fixed.update(set(DispersionOptions(coil=self.active_coil,fixed_actuators=()).actuators())-set(self.matrix['actuators']))
         return DispersionOptions(coil=self.coil.currentData(),probe_A=self.probe.value(),step_A=self.step.value(),frequency_change_khz=self.rf.value(),
             use_probe_presets=True,adaptive_probe=True,reuse_probe_widths=True,characterize_first_scan=False,
             target_snr=self.target_snr.value(),
@@ -762,18 +832,25 @@ class QMDispersionPanel(CorrectionTool):
             dispersion_weight=self.dispersion_weight.value(),orbit_weight=self.orbit_weight.value(),
             arc_weight=self.arc_weight.value(),arc_parity=self.arc_parity.currentData(),
             regularization=self.ridge.value(),selection=self.selection.currentData(),maximum=int(self.maximum.value()),
-            excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(sorted(set(shared.fixed_actuators)|{n.strip() for n in self.excluded.text().split(',') if n.strip()})))
+            excluded_bpms=shared.excluded_bpms,fixed_actuators=tuple(sorted(fixed)))
     def calculate(self):
-        opt=self.options();path=self.new_checkpoint_path();self.set_button.setEnabled(False)
+        self.matrix=None;self.matrix_path=None;self.observation=None;self.matrix_label.setText('Measuring matrix…')
+        opt=self.options();path=self.qm_save_path(opt.coil,checkpoint=True);self.set_button.setEnabled(False)
         self.run(lambda p:self.service.calculate(opt,p,self.update.emit,checkpoint_path=path,group_rf=True),self.display,'QM dispersion')
     def recalculate(self):
-        if self.result is None:return
-        data=self.result;opt=self.options();self.set_button.setEnabled(False)
-        self.run(lambda p:self.service.recalculate(data,opt,p),self.display,'Recalculate QM correction')
+        data=self.matrix
+        if data is None:return
+        opt=self.options();obs=self.observation
+        self.set_button.setEnabled(False)
+        keep_iterations=data is self.result
+        self.window.start(lambda p:self.service.reuse_on_current_beam(data,opt,p,observation=obs,keep_iterations=keep_iterations),self.display,
+                          label='Recalculate QM correction')
+
     def apply(self):
         if self.result is None:return
         if not self.proposal_matches_options(self.result):
             self.invalidate();self.window.error('Selection / options changed; recalculate before Apply');return
+        if not self.set_button.isEnabled():return
         data=self.result;self.set_button.setEnabled(False)
         self.run(lambda p:self.service.apply(data,p,self.update.emit),self.applied,'Apply QM correction')
     def reset(self):
@@ -823,25 +900,18 @@ class QMDispersionPanel(CorrectionTool):
                   probe_quality_text(qualities.get(n)),
                   f"{estimates[n]['width_A']:.2f}" if n in estimates else '')
                  for n in data['actuators']])
-        arc=data.get('arc_bpms',[])
-        self.arc_parity.setToolTip(', '.join(arc))
-        if arc and 'delta' in data:
-            rows=np.isin(data['names'],arc)
-            rms=[np.sqrt(np.mean(np.asarray(data[k],float)[0,rows]**2)) for k in ('full_measured','full_predicted')]
-            summary=f'Arc ηx RMS ({len(arc)} BPMs, mm): {rms[0]:.3g} before, {rms[1]:.3g} predicted'
-            if data.get('applied'):
-                actual=np.asarray(data['full_after'],float)[0,rows]
-                summary+=f', {np.sqrt(np.mean(actual**2)):.3g} measured'
-            self.status.setText(self.status.text()+'\n'+summary)
+        self.arc_parity.setToolTip(', '.join(data.get('arc_bpms',[])))
         if data.get('error'):
             self.status.setText(('Baseline restored.' if data.get('restored') else 'Operation failed; inspect restoration log.')+'\n'+data['error'])
         elif data.get('proposal_unavailable_reason'):self.status.setText('S/N below target. Run CALC to remeasure.')
         if data.get('skipped_qms'):
             self.status.setText(self.status.text()+'\nSkipped QM: '+', '.join(r['magnet'] for r in data['skipped_qms']))
         state=data.get('scan_state',{})
-        self.current_beam_button.setEnabled(bool(state.get('status')=='complete' and 'response' in data and
-                                           not data.get('restoration_error') and (not data.get('error') or data.get('restored'))))
-        self.resume_button.setEnabled(bool(state and state.get('status')!='complete' and not data.get('applied')))
+        if state.get('status')=='complete' and 'response' in data:
+            if not data.get('response_reused') and self.matrix is not data:self.matrix_path=data.get('checkpoint_file')
+            self.matrix=data
+            self.observation=observation_from_result(data)
+            self.matrix_label.setText(matrix_caption(data,'QM '+self.active_coil,self.matrix_path,self.observation))
         self.reset_button.setEnabled(bool(data.get('applied') or data.get('iteration_origin') or data.get('error') or state.get('active_magnet')))
         self.recalculate_button.setEnabled('response' in data and not data.get('restoration_error') and
                                            (not data.get('error') or bool(data.get('restored'))))

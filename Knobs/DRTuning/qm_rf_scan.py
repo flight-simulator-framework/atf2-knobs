@@ -6,7 +6,8 @@ import numpy as np
 from Knobs.DRCorrection.core import Options
 from .dispersion import (PROBE_INCREMENT_A, InsufficientProbeQuality, ProbeRangeUnavailable,
     next_probe_width, probe_floor, probe_pair, probe_scheme, quad_limits, restore_quads)
-from .rf_blocks import measure_blocks, momentum_span, response_column
+from .rf_blocks import (ScanFrequency, canonical_blocks, matrix_activity, measure_blocks, nominal_probe_resolved,
+                        probe_noise, response_column)
 
 
 def validate_rf_checkpoint(data,opt):
@@ -63,8 +64,12 @@ def validate_rf_checkpoint(data,opt):
     if partial is not None:
         if len(blocks)>=3:raise ValueError('Unexpected partial RF block')
         blocks.append(partial)
-    for block,shift in zip(blocks,(0.,-half,half)):
-        offset=data['baseline']['frequency']+shift
+    order=current.get('rf_order',[0,-1,1])
+    if (sorted(order)!=[-1,0,1] or any(type(sign)!=int for sign in order) or
+            (order!=[0,-1,1] and not data['rf_blocks'])):
+        raise ValueError('Invalid saved RF measurement order')
+    for block,sign in zip(blocks,order):
+        offset=data['baseline']['frequency']+sign*half
         present=set(block['pairs'])
         if abs(offset-block['offset_hz'])>1.e-6 or not present<=remaining or (block is not partial and present!=remaining):
             raise ValueError('Invalid saved RF block frequency or magnet list')
@@ -78,21 +83,6 @@ def validate_rf_checkpoint(data,opt):
             for i,v in zip(e['indices'],e['readbacks']):
                 check_frame(i,('probe','probe retry'),n,block['offset_hz'])
                 if frames[i]['current_A']!=v:raise ValueError('Saved probe readback differs for '+n)
-
-
-def probe_noise(frames,blocks,n,sampling,backend):
-    variances=[]
-    for block in blocks[1:]:
-        entry=block['pairs'][n]
-        endpoints=[]
-        for idx in entry['indices']:
-            f=frames[idx]
-            count=np.asarray(f['valid_sample_count'])
-            std=np.asarray(f['stdx'],float)
-            endpoints.append(np.divide(std**2,count-1,out=np.full_like(std,np.nan),where=count>1))
-        span=np.diff(entry['readbacks'])[0]
-        variances.append((endpoints[0]+endpoints[1])/span**2)
-    return np.sqrt(variances[0]+variances[1])/abs(momentum_span(sampling,backend))
 
 
 def measure_qms(service,data,opt,progress,event,path):
@@ -111,6 +101,10 @@ def measure_qms(service,data,opt,progress,event,path):
         if n not in results and n not in pending:
             width,source=service.initial_width(n,data,opt)
             pending[n]=dict(width=width,source=source,attempt=1,failed_width=None)
+    def report_columns(stage):
+        matrix_activity(reader, columns=(len(results), len(names), len(data['skipped_qms'])),
+                        point='', stage=stage, shots=None)
+
     def selection():
         reader.sync_dispersion_selection('dispersion',opt)
         data['options']['excluded_bpms']=opt.excluded_bpms
@@ -149,12 +143,17 @@ def measure_qms(service,data,opt,progress,event,path):
         data['skipped_qms'].append(dict(magnet=n,reason=reason))
         pending.pop(n);service.successful_widths.pop(n,None)
         progress(0,'SKIP QM probe: '+n+' '+reason)
+    def commit_round():
+        current=data.pop('rf_round')
+        order=current.get('rf_order',[0,-1,1])
+        current['blocks']=canonical_blocks(current['blocks'],order)
+        data['rf_blocks'].append(current)
+
     reducing=False
-    try:
-        data['options']=asdict(opt)
-        state['status']='running'
-        save()
+    def acquire_pending(rf):
+        nonlocal reducing
         while pending:
+            report_columns("Preparing probe currents")
             reader.check_cancel()
             current=data.get('rf_round')
             if current is None:
@@ -178,7 +177,13 @@ def measure_qms(service,data,opt,progress,event,path):
                     nominal_sources.add(source)
                     nominal=data['rf_blocks'][source]['blocks'][0]
                     nominal_pairs[n]=nominal['pairs'][n]
-            if not blocks and not current.get('partial') and len(nominal_sources)==1 and nominal_pairs.keys()==pairs.keys():
+            all_cached=len(nominal_sources)==1 and nominal_pairs.keys()==pairs.keys()
+            if 'rf_order' not in current and not blocks and 'partial' not in current:
+                order=[0,-1,1]
+                if rf.moved and not opt.constrain_cod and all(p.get('retry_reason')=='low S/N' for p in pending.values()):
+                    order=rf.retry_order(all_cached)
+                current['rf_order']=order
+            if not blocks and not current.get('partial') and all_cached and current.get('rf_order',[0])[0]==0:
                 # All outstanding probes need only the off-energy dispersion slopes.
                 nominal=data['rf_blocks'][next(iter(nominal_sources))]['blocks'][0]
                 blocks.append(dict(nominal,pairs=nominal_pairs))
@@ -194,11 +199,16 @@ def measure_qms(service,data,opt,progress,event,path):
             state['status']='probing'
             valid=measure_blocks(reader,sampling,pairs,centers,blocks,write=write,read=b.quadrupole_current,
                 restore=restore,selection=selection,strict_loss=opt.adaptive_probe,retry_names=pairs,
-                transaction=current,nominal_pairs=nominal_pairs,retry_labels=retry_labels,
-                progress=progress,saved=save,baseline_ready=baseline,nominal_ready=nominal_preview,
+                transaction=current,nominal_pairs=nominal_pairs,retry_labels=retry_labels,scan_frequency=rf,rf_order=current.get('rf_order',(0,-1,1)),
+                progress=progress,saved=save,baseline_ready=baseline if not data['rf_blocks'] else None,nominal_ready=nominal_preview,
                 loss_selection=lambda:~np.isin(data['names'],opt.excluded_bpms))
-            if not service.settings_match(service.snapshot(data['baseline']['quadrupoles']),data['baseline'],names):
+            report_columns("Checking response columns")
+            expected=rf.expected_settings(data['baseline'])
+            if not service.settings_match(service.snapshot(data['baseline']['quadrupoles']),expected,names):
                 raise ValueError('Settings changed during QM response scan')
+            # Column arithmetic and saved readbacks always use nominal, minus, plus.
+            order=current.get('rf_order',[0,-1,1])
+            blocks=canonical_blocks(blocks,order)
             valid &= np.asarray(state['common_valid'],bool)
             # Endpoint masks from committed columns remain binding after a restart.
             for r in results.values():
@@ -243,7 +253,7 @@ def measure_qms(service,data,opt,progress,event,path):
                     p.update(width=smaller,attempt=p['attempt']+1,retry_reason='reduced probe')
                     continue
                 signal=float(np.sqrt(np.mean(col[0,used]**2))*span)
-                noise=float(np.sqrt(np.mean(probe_noise(frames,blocks,n,sampling,b)[used]**2))*span)
+                noise=float(np.sqrt(np.mean(probe_noise(frames,blocks,n,sampling,b,'x')[used]**2))*span)
                 quality=service.quality_record(signal,noise,int(used.sum()),opt)
                 j=names.index(n)
                 larger=None
@@ -252,7 +262,10 @@ def measure_qms(service,data,opt,progress,event,path):
                     larger=next_probe_width(h,centers[n],limits[:,j],span,quality,opt,p['failed_width'])
                 entry.update(quality=quality,next_width_A=larger,accepted=larger is None)
                 if larger is not None:
-                    if not opt.constrain_cod:p['nominal_round']=len(data['rf_blocks'])
+                    resolved=nominal_probe_resolved(frames,blocks[0]['pairs'][n],valid & mask & ~np.isin(data['names'],opt.excluded_bpms),opt.target_snr,('x','y'))
+                    entry['nominal_reuse_qualified']=resolved
+                    if resolved and not opt.constrain_cod:p['nominal_round']=len(data['rf_blocks'])
+                    else:p.pop('nominal_round',None)
                     p.update(width=larger,attempt=p['attempt']+1,retry_reason='low S/N')
                     continue
                 valid &= mask
@@ -262,11 +275,26 @@ def measure_qms(service,data,opt,progress,event,path):
                 del pending[n]
             reducing=False
             state['common_valid']=valid
-            data['rf_blocks'].append(data.pop('rf_round'))
+            commit_round()
             save()
+    try:
+        data['options']=asdict(opt)
+        state['status']='running'
+        save()
+        rf=ScanFrequency(b)
+        if not service.settings_match(service.snapshot(data['baseline']['quadrupoles']),data['baseline'],names):
+            raise ValueError('Settings changed before QM response scan')
+        try:
+            acquire_pending(rf)
+        finally:
+            try:
+                report_columns("Restoring RF")
+            finally:
+                rf.restore()
         service.check()
         if not service.settings_match(service.snapshot(data['baseline']['quadrupoles']),data['baseline'],names):
             raise ValueError('Settings changed during QM response scan')
+        report_columns("Acquisition complete · calculating proposal")
         sync_columns()
         if all(r.get('skipped') for r in data['probe_readbacks']):
             raise ValueError('No measurable QM response: '+'; '.join(r['reason'] for r in data['skipped_qms']))
@@ -286,7 +314,7 @@ def measure_qms(service,data,opt,progress,event,path):
         # If reduction failed partway, some names may already be committed or
         # scheduled at another width. Only the remaining work may be probed.
         if reducing and data.get('rf_round'):
-            data['rf_blocks'].append(data.pop('rf_round'))
+            commit_round()
         data['error']=str(exc);state['status']='interrupted'
         try:data['restored']=bool(service.settings_match(service.snapshot(data['baseline']['quadrupoles']),data['baseline'],names))
         except Exception as restore_error:data.update(restored=False,restoration_error=str(restore_error))

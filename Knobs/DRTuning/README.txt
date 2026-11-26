@@ -34,7 +34,7 @@ ZVs to measure every eligible column and fit the correction with bounded SVD.
 Review the proposal and use Apply / remeasure. Recalculate reuses the matrix.
 After Apply it uses the measured after-Apply orbit, dispersion and currents for
 the next proposal. Each Apply still checks the machine against that baseline.
-Save data + plots and Load measured response also support full measured scans.
+Save data + plots and Select ZV matrix also support full measured scans.
 
 Vertical dispersion ranks ZVs in RFTrack mode and fits responses with a weight of 1
 on vertical dispersion error and 0.05 on the change from the measured vertical
@@ -43,14 +43,16 @@ Measure selected ZVs measures only those response columns. Review the proposed
 currents and predicted curves, then click Apply / remeasure to see the measured
 after curves. Select BPMs / magnets and Recalculate reuse the measured columns.
 The full and shortlisted ZV measurements automatically save their matrix JSON.
-Use Load measured response to open the timestamped
+Use Select ZV matrix to open the timestamped
 vertical_dispersion JSON (older saves use dispersion.json). JSON, CSV, PNG
 and PDF share the same filename stem. The Vertical Dispersion save and load
 dialogs open in /mnt/nas1/atf-data/flight-simulator/DRTuning/<year>/ each time.
-Loading recalculates the proposal using the current fit settings.
-For a valid ZV probe pair, the default acceptance threshold is 0.075 mm
-(0.1 mm target with 25% tolerance) in peak vertical COD half-difference over
-eligible BPMs. The scan accepts any response at or above this threshold immediately.
+Select ZV matrix imports the measured ZV columns. The label shows their acquisition
+time. Legacy files with no acquisition timestamp show "measurement time unknown".
+Both shortlisted and full ZV scans accept a measured vertical dispersion column
+at S/N >= 5 by default. The response is the RMS change in vertical dispersion
+over common enabled BPMs. The noise combines the measured endpoint standard
+errors at both RF offsets, using their actual current spans.
 Measure selected ZVs and QM CALC group probes by RF setting. At nominal RF
 measure the baseline orbit and all low/high current pairs, then repeat at the
 negative and positive RF offsets. Each probe moves one magnet and restores it
@@ -59,14 +61,27 @@ at the original magnet settings. The JSON stores both reference frames and
 the RMS change in X and Y. The solver uses the measured current span at each RF.
 One successful pass takes three RF changes including return to the initial
 RF state. Candidate selection and post-Apply measurements are separate.
+During dispersion baseline acquisition and after Apply, a newly invalid enabled
+BPM triggers one retry of the BPM batch after 3 s at the same RF. The second
+batch supplies that RF point, and persistent invalidity follows the existing
+BPM masking or Apply checks. Grouped QM and ZV reference orbits also retry.
 The grouped ZV scan waits three seconds and repeats the same BPM acquisition
 once if common coverage is lost at a probe endpoint. Persistent loss during
 the initial width search restores the ZV and retries it at a smaller width.
-Use matrix with current beam measures dispersion and COD once at the three RF
-settings, reads current ZV settings/limits, and calculates a proposal.
-Recalculate changes weights or exclusions on the displayed baseline offline.
+Update dispersion measures the current dispersion and COD at three RF settings,
+even before selecting a matrix. Recalculate reads the present magnet state and
+limits, then fits the latest observation. It measures dispersion if no current
+observation exists or if the settings have changed. Apply remains a separate step.
 The vertical weights default to 1 for dispersion and 0.05 for COD change.
 QM horizontal dispersion is directly below this page in the navigation.
+Both response scans show the RF offset and block, magnet index within the block,
+low/high current command and readback, and BPM samples at the current setting.
+The column counter advances after checking the response across RF settings and
+includes skipped magnets. Adaptive retries show their reason and probe width.
+The plots compare dispersion RMS before correction, as predicted, and measured
+after Apply on the same valid, included BPMs. Vertical uses the target residual.
+QM reports straight BPMs and, when weighted, the selected arc parity separately.
+The absolute and percentage changes refer to the pre-correction measurement.
 On either plot, hover over a measured point to read its BPM name, position
 and signal value. Click the point to exclude it or the grey point to include
 it again. The curves join the remaining points across operator exclusions.
@@ -123,7 +138,7 @@ QM dispersion:
   These are widths around the current allowed reference, not absolute currents.
   The fallback width is 0.1 A, used for a QM without an individual width
   (all main supplies on the first scan, and QM2R trims if enabled). It is editable in Measurement.
-  Maximum current change per Apply is 3 A and RF full span is 4 kHz
+  Maximum current change per Apply defaults to 3 A and accepts larger values. RF full span is 4 kHz
   (baseline +/-2 kHz). Absolute currents are bounded by the supply limits.
   The existing confirmed site mappings, coil calibration, current limits
   and readback checks are used. Explicit exclusions are available in the panel.
@@ -201,7 +216,10 @@ QM dispersion:
   A failed BPM coverage check retries the same RF/current point once after 3 s.
   If the probe must shrink, all three offsets are checked at the new width for
   that QM. For S/N-only growth, the accepted nominal COD slope is reused and
-  only the two off-energy pairs are acquired, unless the COD limit is enabled.
+  only the two off-energy pairs are acquired when nominal COD is resolved at
+  the S/N threshold and the COD limit is disabled. ZV scans use the same rule
+  with vertical COD. The retry starts at the current RF side and crosses once
+  to the opposite side. Otherwise nominal COD is also measured at the new width.
   The actual current endpoints for each RF are recorded in actual_by_rf.
   Magnet settling and BPM averaging still contribute to total acquisition time.
   "Lost all common valid straight-section BPMs" means no enabled straight BPM
@@ -278,6 +296,8 @@ QM dispersion:
   settings, including after preparing the next iteration. A response reused after
   optics changes is an approximation; use CALC again if prediction and measurement
   diverge. Next probe [A] is for a subsequent CALC at matching settings, not Apply.
+  QM filenames include the response coil (trim or main) after qm_scan or
+  qm_dispersion for checkpoints, applied JSON/PNG and manual save suggestions.
   CALC automatically writes qm_scan_*.checkpoint.json under /atf/data/flight-simulator/DRTuning/<year>/
   (or the chosen save folder). Each complete RF block is checkpointed, followed
   by the accepted columns and new probe widths when that pass completes.
@@ -300,11 +320,12 @@ QM dispersion:
   Restore original QM / RF settings explicitly restores those scan settings;
   any changed correctors/skews must separately match the saved baseline.
   To use a completed QM response matrix at a different operating point, use
-  Load scan, then Use matrix with current beam. This reads the current QM
-  readbacks and parameter A/B, and measures dispersion / COD with 10 BPM
-  updates at each of the three RF settings. RF returns to its starting value.
-  Review the plotted baseline and Proposed [A] before Apply. Restore original
-  QM / RF then refers to this new baseline. Recalculate refits offline.
+  Select matrix. Both trim and main files are recognized; the panel identifies
+  the coil and acquisition time. Update dispersion measures only the current
+  dispersion and COD (10 BPM updates at each of three RF settings). Recalculate
+  reads current QM settings and parameter A/B. It acquires an observation when
+  needed, or reuses the latest one taken at matching settings. Review Proposed
+  [A] before Apply. Restore original QM / RF refers to the current iteration series.
   Automatic scan resume does not resume or automatically perform Apply.
   Old files without committed scan state cannot recover partial responses.
   Successful Apply automatically saves JSON and PNG to /atf/data/flight-simulator/DRTuning/<year>/,
@@ -590,40 +611,16 @@ locations. Their count is displayed; raw data remain in saved sessions. Large
 values at VALID enabled BPMs are not clipped. The fitted correction component
 is retained in the saved data but no longer overlaid as another orbit curve.
 Live COD values use DR:monitors raw / 1000 = mm, as in InterfaceATF2_DR/SysID.
-Measured scans can adapt each magnet's probe amplitude using BPM feedback.
-"Adapt probe to BPM response (SysID rule)" defaults ON in Machine and RFTrack
-simulation DRTuning sessions. It is disabled for RFTrack model-response CALC;
-that path keeps fixed model finite differences and its existing live diagnostics.
-Defaults: initial corrector probe +/-0.05 A, target response 0.1 mm, target band
-+/-25%, maximum 8 measurement pairs per magnet, maximum probe +/-0.5 A about
-the captured current. Supply bounds, including the corrector +/-5 A absolute
-limit, always take precedence. All these adaptive controls are on the page.
-Turning adaptation OFF keeps the prior fixed-amplitude measurement behavior.
-
-Response means max(abs(BPM_plus - BPM_minus))/2 over enabled, common-valid BPMs
-in the selected plane. Dispersion uses the nominal COD row, not eta; skew uses
-the change in vertical responses to its horizontal probes. The shared
-machine_interfaces.Backend.Excitation module holds SysID's existing update:
-target/observed clipped to [0.8,2], then 80% new + 20% old; zero response uses
-1.5 before smoothing. SysID_GUI imports the same functions. Its worker and
-archive format are not replaced or invoked by DRTuning.
-
-Every pair restores the original current before retrying. The final pair
-provides the response column, normalized by its actual positive readback
-difference. A zero/reversed/nonfinite current span aborts after restoration.
-Target reached, amplitude/supply limit, and maximum-pair termination are
-recorded distinctly. Unreached targets do not masquerade as convergence: the
-proposal summary and detailed log identify them; a usable last measured column
-is still available for the correction solver. All attempts, measured response,
-commanded/readback currents and the selected final pair are saved in
-probe_history alongside the raw orbit measurements. Cancel/invalid BPM paths
-restore the current and do not proceed to the next pair or SET.
-Programmatic Options defaults adaptation OFF for old scripts/saved sessions;
-set adaptive_probe=True explicitly in an API caller. The new shared module is
-preferred, but older machine-interfaces packages without Backend.Excitation
-are supported by an identical bundled SysID rule in DRTuning and SysID_GUI.
-The correction session records probe_rule_source. Missing dependencies inside
-an installed shared module are not swallowed as a compatibility fallback.
+In DRTuning's measured COD and Skew modes, adaptive probing defaults on
+for Machine and RFTrack. Each endpoint uses 10 BPM updates by default.
+COD measures the RMS orbit difference in the selected plane. Skew measures
+the change of the two vertical difference orbits excited by the horizontal
+steerers. The noise estimate propagates the standard errors of those readings.
+Minimum response S/N defaults to 5. A sufficient column is accepted immediately.
+A weak column alone is remeasured with a larger probe, within the supply
+and probe limits. A column still below threshold at the limit is omitted.
+Model responses use fixed finite differences. The Bump shared and per-target
+matrices apply the same acceptance rule to the measured X/Y orbit response.
 
 XSR emittance estimate (2026-10-23)
 ---------------------------------
@@ -1054,12 +1051,46 @@ an acquisition counter. Acquisition settling defaults (1 s arm, 1 s readout,
 performance. Read-only previously acquired waveforms remain available by
 unchecking Acquire new shot.
 
+操作ガイド（DRTuning）
+---------------------
+QM dispersion は Select matrix で Trim / Main の実測行列、Vertical dispersion は
+Select ZV matrix で実測ZV行列を選ぶ。選択欄に種類、行列の測定日時とファイル名が出る。
+Update dispersion は行列の選択前でも使える。RFを切り替え、現在の分散とCODを測定・表示する。
+Recalculate は磁石の現在値と許容範囲を読み、同じ設定で最後に測った分散から提案を作る。
+分散が未測定、または磁石設定・測定条件が変わった場合は自動で再測定する。
+提案電流と予測曲線を確認し、Apply を押す。中断されたQMの応答測定は Resume interrupted scan から再開する。
+
+COD correction は水平または垂直の閉軌道を補正する。Plane と使用する
+BPM・磁石を選び、Measure response (CALC) を押す。RFTrack model response
+では選択面の軌道を測り、行列をモデルで計算する。Measured magnet
+response では ZH または ZV を順に振り、実測行列を作る。Magnet settings
+と予測軌道を確認し、Apply correction (SET) で反映後の軌道を測る。
+Undo correction (RESET) は直前の SET 前の設定へ戻す。
+
+Skew correction は水平励振で縦へ漏れる軌道応答を小さくする。
+異なる水平コレクターを probe1・probe2 に選び、各 full span と SD/SF
+の使用群を設定する。CALC は各水平コレクターの ± 電流で縦軌道を測る。
+Measured magnet response は各 skew 電源の両端でもこの測定を繰り返す。
+SET 後は同じ励振で残留応答を測定する。XSR の縦ビームサイズを目的に
+最適化する場合は Local bump / XSR coupling を使う。
+
+COD・Skew の実測行列は Save data and plots で保存できる。同じ面・励振条件で
+Measured magnet response を選び、Calculate from file で保存結果を開く。
+Recalculate (saved response) は保存時のビームで再計算する。
+Reuse measured matrix on current beam は現在の電流・制限とビームを測り直す。
+Skew では水平励振2台を動かす。補正の適用は SET で行う。
+
+TBT / beta は既存波形なら Read waveform (Update)、保存波形なら Open file
+を使う。BPM・Signal・Fit start turn を選び Calculate tune / relative beta
+で解析する。無効BPMと補正画面で除外したBPMはフィット対象から外れる。
+Waveform には元データを残す。絶対β[m]には既知の参照βを設定するか、
+独立の位相光学を読み込んで Calculate phase beta を使う。
+Acquire a new shot は対応バックエンドでTBTモードを一時設定して取得し、
+取得終了時にモードを戻す。実機での励振は外部exciterを使う。
+このタブから補正電流を適用する操作はない。
+
 Calibration files and remaining site configuration
 -------------------------------------------------
-COD and dispersion remember Target BPM response [mm] separately for H and V
-within the open GUI session (both initially 0.1 mm). This is the adaptive probe
-amplitude goal, not the nominal COD/dispersion correction target.
-
 Measure response (CALC) explicitly measures/replaces the response. Recalculate
 (saved response) reuses the current plane/source's saved response and beam data,
 without BPM acquisitions, RF changes or magnet scans. H/V results are retained

@@ -72,10 +72,11 @@ class QMIterationTests(unittest.TestCase):
         def dropping():
             frame=orbit();frame['valid'][missing]=False;return frame
         self.b.commands.clear();before=self.b.acquisitions
-        with patch.object(self.b,'orbit',side_effect=dropping),patch.object(self.b,'set_frequency',wraps=self.b.set_frequency) as rf:
+        with patch.object(self.b,'orbit',side_effect=dropping),patch.object(self.b,'set_frequency',wraps=self.b.set_frequency) as rf,patch.object(self.s.reader.cancel,'wait',return_value=False) as wait:
             result=self.s.reuse_on_current_beam(saved,self.opt)
         self.assertEqual([c.args[0] for c in rf.call_args_list],[-1700.,2300.,300.])
-        self.assertEqual(self.b.acquisitions-before,30)
+        wait.assert_called_once_with(3.)
+        self.assertEqual(self.b.acquisitions-before,40)
         self.assertEqual(self.b.commands,[])
         self.assertEqual(result['baseline'],original)
         self.assertEqual(result['centers'][0],.25)
@@ -226,32 +227,85 @@ class QMIterationGuiTests(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
 
-    def test_load_current_beam_button_plots_fresh_dispersion_before_apply(self):
+    def test_select_matrix_then_recalculate_from_current_beam(self):
         from PyQt6.QtWidgets import QFileDialog
         from Knobs.DRTuning.gui import TuningSession
         from Knobs.DRTuning.qm_checkpoint import save_checkpoint
         w=TuningSession(DispersionFixture())
         try:
             panel=w.qm_dispersion;opt=panel.options()
-            self.assertFalse(panel.current_beam_button.isEnabled())
+            self.assertFalse(panel.recalculate_button.isEnabled())
             source=panel.service.calculate(opt,group_rf=True)
             with tempfile.TemporaryDirectory() as folder:
                 path=Path(folder)/'saved.json';save_checkpoint(path,source)
                 original=path.read_bytes()
                 with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'JSON')):
-                    panel.load_scan()
-                self.assertTrue(panel.current_beam_button.isEnabled())
+                    with patch.object(w,'start',side_effect=lambda work,done,**kw:done(work(lambda *_:None))):panel.load_scan()
+                self.assertIsNone(panel.result)
+                self.assertFalse(panel.set_button.isEnabled())
+                self.assertIn("QM trim",panel.matrix_label.text())
+                self.assertTrue(panel.recalculate_button.isEnabled())
                 w.backend.q[source['actuators'][0]]=.14
                 w.backend.d0*=2.
                 w.backend.commands.clear()
                 with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):
-                    panel.current_beam_button.click()
+                    panel.recalculate_button.click()
                 self.assertEqual(w.backend.commands,[])
                 self.assertTrue(panel.set_button.isEnabled())
                 self.assertIs(panel.plot.data,panel.result)
                 self.assertEqual(panel.table.item(0,1).text(),'0.14000')
                 self.assertFalse(np.allclose(panel.result['full_measured'],source['full_measured']))
                 self.assertEqual(path.read_bytes(),original)
+        finally:w.close();self.app.processEvents()
+
+    def test_update_without_matrix_then_recalculate_reads_limits_and_changed_machine(self):
+        from PyQt6.QtWidgets import QFileDialog
+        from Knobs.DRTuning.gui import TuningSession
+        from Knobs.DRTuning.qm_checkpoint import save_checkpoint
+        b=DispersionFixture();w=TuningSession(b)
+        try:
+            panel=w.qm_dispersion
+            original=panel.service.calculate(panel.options(),group_rf=True)
+            n=original['actuators'][0];b.commands.clear()
+            def run(work,done,**kw):done(work(lambda *_:None))
+            with tempfile.TemporaryDirectory() as folder,patch.object(w,'start',side_effect=run):
+                path=Path(folder)/'qm_scan_trim_test.checkpoint.json'
+                save_checkpoint(path,original)
+                before=b.acquisitions
+                panel.update_dispersion_button.click()
+                self.assertIsNone(panel.result);self.assertFalse(panel.recalculate_button.isEnabled())
+                self.assertEqual(b.acquisitions-before,30)
+                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'')) as dialog:
+                    panel.load_button.click()
+                self.assertIn('qm_scan_',dialog.call_args.args[3])
+                self.assertNotIn('orbit_measurements',panel.matrix)
+                self.assertNotIn('delta',panel.matrix)
+                self.assertNotIn('baseline',panel.matrix)
+                before=b.acquisitions
+                b.quadrupoles[n]['limits_A']=[-.16,.17]
+                panel.recalculate_button.click()
+                self.assertEqual(b.acquisitions,before)
+                np.testing.assert_allclose(panel.result['limits'][:,0],[-.16,.17])
+                b.q[n]=.01
+                panel.recalculate_button.click()
+                self.assertEqual(b.acquisitions-before,30)
+                self.assertAlmostEqual(panel.result['centers'][0],.01)
+                np.testing.assert_equal(panel.service.matrix_from_scan(panel.result)['response'],panel.matrix['response'])
+                self.assertEqual(b.commands,[])
+                panel.rf.setValue(2.)
+                before=b.acquisitions
+                panel.recalculate_button.click()
+                self.assertEqual(b.acquisitions-before,30)
+                self.assertAlmostEqual(panel.result['centers'][0],.01)
+                # Filename filters are also backed by content checks.
+                fake=Path(folder)/'qm_dispersion_trim_other.json'
+                fake.write_text(json.dumps(dict(schema='dr-correction-1',mode='dispersion')))
+                selected=panel.matrix
+                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(fake),'')),self.assertRaisesRegex(ValueError,'QM trim or main'):
+                    panel.load_scan()
+                self.assertIs(panel.matrix,selected)
+                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'')),self.assertRaisesRegex(ValueError,'schema'):
+                    w.panels['dispersion'].load_measured_response()
         finally:w.close();self.app.processEvents()
 
     def test_legacy_proposal_requires_refit_for_new_qm_weights(self):

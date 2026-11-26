@@ -4,6 +4,7 @@ import copy
 import time
 import numpy as np
 from .rf_blocks import orbit_slope
+from Knobs.DRCorrection.probe_quality import mean_variance, response_quality, wider_probe
 from Knobs.DRCorrection.core import CorrectionService,Options,Cancelled
 from Knobs.DRCorrection.backends import MagnetCurrentLimitError
 from .bump_maps import constrained_step,BumpGeometryUnavailable,BumpRangeUnavailable,BumpLimitUnavailable
@@ -30,6 +31,8 @@ class BumpOptions:
     settle_s: float = 1.
     use_presets: bool = True  # Legacy serialized option; Bump now always uses presets.
 
+    target_snr: float = 5.
+
     @property
     def scan_widths_mm(self):
         widths=[2*self.amplitude_mm]
@@ -46,6 +49,10 @@ class BumpOptions:
         if self.calibration_mm>self.amplitude_mm or self.refine_mm>self.amplitude_mm:
             raise ValueError('Calibration / refinement exceeds scan range')
         if int(self.max_iterations)!=self.max_iterations:raise ValueError('Iteration count must be integer')
+
+
+class BumpProbeTooWeak(BumpLimitUnavailable):
+    pass
 
 
 class BumpLeakage(BumpRangeUnavailable):
@@ -325,8 +332,20 @@ class CouplingService:
             raise BumpLeakage(observed)
         raise BumpRangeUnavailable('Beam-based bump did not close within COD / target tolerances')
 
-    def probe_column(self,n,center,span,opt,required,j,total,event,*,essential=(),outside=()):
-        values=[];readbacks=[]
+    def probe_column(self,n,center,span,opt,required,j,total,event,*,essential=(),outside=(),quality_bpms=None):
+        while True:
+            column,record=self._probe_pair(n,center,span,opt,required,j,total,event,essential=essential,outside=outside,quality_bpms=quality_bpms)
+            quality=record['quality']
+            if quality['usable']:return column,record
+            low,high=np.asarray(self.backend.limits('correctors',[n]),float)[:,0]
+            larger=wider_probe(span,quality,min(opt.max_step_A,center-low,high-center))
+            if larger<=span+1.e-9:
+                raise BumpProbeTooWeak(f'{n}: orbit response below S/N {opt.target_snr:g} at ±{span:g} A')
+            self.status(event,'probe',f'{n}: low S/N, retry at ±{larger:.4g} A')
+            span=larger
+
+    def _probe_pair(self,n,center,span,opt,required,j,total,event,*,essential,outside,quality_bpms):
+        values=[];readbacks=[];variances=[]
         outside=np.asarray(outside,int)
         try:
             for sign in (-1,1):
@@ -337,13 +356,21 @@ class CouplingService:
                 readbacks.append(float(self.move([n],np.array([command]),opt)[0]))
                 orbit,mask=self.orbit(opt,self.acquisition_status(event,'probe',label+' — Acquiring BPM updates',readback_A=[readbacks[-1]],**details),required=required,essential=essential,outside=outside,event=event)
                 values.append(np.where(np.tile(mask,2),orbit,np.nan))
+                frame=self.reader.orbit_measurements[-1]
+                variances.append(np.concatenate([mean_variance(frame,axis) for axis in ('x','y')]))
                 outside=outside[mask[outside]]
         finally:
             self.status(event,'restore_probe',f'2/5 {n}: Sending restore command {center:+.4f} A')
             restore_correctors(self.backend,[n],[center])
         measured_span=readbacks[1]-readbacks[0]
         if measured_span<=max(1.e-6,span*.2):raise ValueError('No resolved corrector current probe: '+n)
-        return orbit_slope(values[0],values[1],readbacks), dict(magnet=n,requested=[center-span,center+span],actual=readbacks)
+        change=values[1]-values[0]
+        use=np.isfinite(change)
+        if quality_bpms is not None:use &= np.tile(quality_bpms,2)
+        if len(required):use &= np.tile(np.isin(np.arange(len(use)//2),required),2)
+        if not use.any():raise ValueError(f'{n}: no common valid BPM for orbit response')
+        quality=response_quality(np.sqrt(np.mean(change[use]**2)),np.sqrt(np.mean((variances[0]+variances[1])[use])),opt.target_snr)
+        return orbit_slope(values[0],values[1],readbacks), dict(magnet=n,requested=[center-span,center+span],actual=readbacks,quality=quality)
 
     def check_matrix_settings(self,matrix,baseline):
         if (matrix.get('schema')!='dr-bump-response-1' or matrix.get('machine')!=self.backend.identity
@@ -395,6 +422,8 @@ class CouplingService:
         fixed={name(n) for n in options.fixed_actuators}
         magnets=[n for n in self.backend.hcorrectors+self.backend.vcorrectors if name(n) not in fixed]
         tolerance=getattr(self.backend,'profile',{}).get('current_tolerance_A',1.e-5)
+        selected_bpms=~np.isin(self.backend.bpm_names,options.excluded_bpms)
+        if not selected_bpms.any():raise ValueError('No enabled BPM for shared response')
         for j,n in enumerate(magnets):
             self.check()
             if n in state['columns']:continue
@@ -410,7 +439,10 @@ class CouplingService:
                 state['settings_changed']=True
                 raise ValueError('Corrector baseline changed before probing '+n)
             try:
-                column,rb=self.probe_column(n,center,span,opt,(),j,len(magnets),event)
+                column,rb=self.probe_column(n,center,span,opt,(),j,len(magnets),event,quality_bpms=selected_bpms)
+            except BumpProbeTooWeak as exc:
+                state['skipped'][n]=str(exc)
+                continue
             finally:
                 # Restore only the probed supply. Retain its identity if recovery is needed.
                 try:
@@ -420,6 +452,7 @@ class CouplingService:
                     state.update(actuators=[n],centers=[center],restoration_error=str(exc))
                     raise
                 self.reader.orbit_measurements.clear()
+            state['skipped'].pop(n,None)
             state['columns'][n]=dict(response_mm_per_A=column,readback=rb)
             progress(round(99*(j+1)/len(magnets)),f'Measured {n} ({j+1}/{len(magnets)})')
         final=self.backend.snapshot()
@@ -471,7 +504,8 @@ class CouplingService:
                 entry=cached.get(n)
                 if entry is not None:
                     column=np.asarray(entry['response_mm_per_A'],float)
-                    if not np.isfinite(column[required_rows]).all():entry=None
+                    q=entry['readback'].get('quality')
+                    if not np.isfinite(column[required_rows]).all() or (q and q['signal_rms']<opt.target_snr*q['noise_rms']):entry=None
                 if entry is None:
                     column,readback=self.probe_column(n,center,span,opt,required,j,len(names),event,
                                                      essential=g['internal_indices'],outside=common)

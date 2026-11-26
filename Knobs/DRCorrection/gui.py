@@ -1,5 +1,6 @@
 """PyQt6 ports of the op-base DR correction panels with embedded plots."""
 from dataclasses import asdict
+from datetime import datetime
 import copy
 import json
 from pathlib import Path
@@ -227,12 +228,17 @@ class CorrectionPanel(QWidget):
         saved=self.response_cache.get((self.options.response_source,self.options.plane))
         issue=self.window.service.response_reuse_issue(saved,self.calculation_options()) if saved is not None else 'No saved response for this plane/source. Measure once.'
         self.recalculate_button.setEnabled(saved is not None and not issue)
+        if hasattr(self,'current_beam_button'):
+            self.current_beam_button.setEnabled(saved is not None and not issue and self.options.response_source=='measured')
         if saved is None or issue:self.response_cache_label.setText(issue)
         else:
             acquired=saved.get('acquisition_options',saved['options'])
             probe=(f'adaptive acquisition target {acquired.get("adaptive_target_mm",.1):g} mm'
                    if acquired.get('adaptive_probe') and acquired.get('response_source','measured')=='measured'
                    else 'fixed probe / model response')
+            if acquired.get('adaptive_probe') and acquired.get('response_source')=='measured':
+                snr=acquired.get('orbit_target_snr') if self.mode!='dispersion' else acquired.get('dispersion_target_snr')
+                if snr is not None:probe=f'minimum response S/N {snr:g}'
             self.response_cache_label.setText(f'Saved {len(saved["actuators"])} columns; {probe}.\n'
                 'Recalculate reuses saved beam data. Probe target changes apply to the next measurement.')
         if hasattr(self,'compaction_label'):
@@ -282,7 +288,7 @@ class CorrectionPanel(QWidget):
             verb='SET changed' if data.get('applied') else 'SET will change'
             self.proposal_summary.setText(f'{verb} {count} {scope}{bound}; {len(data["actuators"])} response candidates.\n'
                 'Only nonzero setting changes are written. Details: Magnet settings tab.')
-            probes=[p for p in data.get('probe_history',[]) if p['used_for_response']]
+            probes=[p for p in data.get('probe_history',[]) if p['used_for_response'] and 'target_reached' in p]
             if probes:
                 reached=sum(p['target_reached'] for p in probes)
                 self.proposal_summary.setText(self.proposal_summary.text()+
@@ -334,9 +340,15 @@ class CorrectionPanel(QWidget):
                           self.display,pausable=dataset is None)
 
     def calculate_file(self):
-        path,_=QFileDialog.getOpenFileName(self,'CALC (FILE): measured response session','','JSON (*.json)')
+        path,_=QFileDialog.getOpenFileName(self,'CALC (FILE): measured response session',self.data_directory(),'JSON (*.json)')
         if path:
-            try:self.calculate(load_session(path))
+            try:
+                data=load_session(path)
+                if self.options.orbit_target_snr is not None:
+                    if data.get('mode')!=self.mode:raise ValueError('Choose a response file for this correction')
+                    issue=self.window.service.response_reuse_issue(data,self.options)
+                    if issue:raise ValueError(issue)
+                self.calculate(data)
             except Exception as e:self.window.error(str(e))
 
     def measure_selected_zvs(self):
@@ -348,6 +360,14 @@ class CorrectionPanel(QWidget):
             self.display(data)
         self.window.start(lambda progress:self.window.service.measure_selected_zvs(proposal,progress),
                           finished,label='Measure selected ZV responses',pausable=True)
+
+    def use_current_beam(self):
+        options=self.calculation_options()
+        saved=self.response_cache.get(('measured',options.plane))
+        if saved is None:return
+        self.invalidate()
+        self.window.start(lambda p:self.window.service.reuse_on_current_beam(saved,options,p),self.display,
+                          label='Measure current beam with saved response')
 
     def recalculate(self):
         saved=self.response_cache.get((self.options.response_source,self.options.plane))
@@ -361,7 +381,7 @@ class CorrectionPanel(QWidget):
         self.data=data;self.plot.correction(data)
         if not data.get('applied'):
             for probe in data.get('probe_history',[]):
-                if probe['used_for_response']:
+                if probe['used_for_response'] and 'observed_mm' in probe:
                     self.window.log(f'Probe {probe["magnet"]}: {probe["pair"]} pairs; '
                         f'±{probe["amplitude"]:.6g} {probe["unit"]}; response {probe["observed_mm"]:.6g} / '
                         f'target {probe["target_mm"]:g} mm; {probe["status"]}')
@@ -410,13 +430,16 @@ class CorrectionPanel(QWidget):
         self.window.start(lambda _:self.window.service.reset(),finished)
 
     def data_directory(self):
-        return ''
+        folder=getattr(self.window,'correction_data_directory',None)
+        return folder() if folder else ''
 
     def save_bundle(self,path=None,*,stem=None):
         if not self.data:self.window.error('CALC first');return
         if not path:path=QFileDialog.getExistingDirectory(self,'Save data + graphs',self.data_directory())
         if path:
             root=Path(path);root.mkdir(parents=True,exist_ok=True)
+            if stem is None and hasattr(self.window,'correction_data_directory'):
+                stem=f'{self.mode}_{self.options.plane}_{datetime.now():%Y%m%d_%H%M%S_%f}'
             stem=stem or self.mode
             save_session(root/f'{stem}.json',self.data)
             export_curves(root/f'{stem}.csv',self.data)
@@ -476,20 +499,20 @@ class TBTPanel(QWidget):
     def received(self,wave):
         self.wave=None;self.estimate=None;self.bpm.clear();self.bpm.addItems(wave['names']);self.wave=wave;self.draw()
     def load(self):
-        path,_=QFileDialog.getOpenFileName(self,'TBT JSON session / measured waveform','','JSON (*.json)')
+        path,_=QFileDialog.getOpenFileName(self,'TBT JSON session / measured waveform',getattr(self.window,'correction_data_directory',lambda:'')(),'JSON (*.json)')
         if path:
             try:
                 data=json.loads(Path(path).read_text());wave=data.get('waveform',data.get('measurement',data))
                 from .tbt import waveform_arrays
-                waveform_arrays(wave);self.bpm.clear();self.bpm.addItems(wave['names']);self.received(wave)
+                waveform_arrays(wave);self.received(wave)
             except Exception as e:self.window.error(str(e))
-    def analyze(self):
+    def analyze(self,*,excluded_bpms=()):
         if self.wave is None:self.window.error('Acquire or load a waveform first');return
         reference=None
         planes=(('x','y'),('x',),('y',))[self.reference_planes.currentIndex()]
         if self.reference.isChecked():reference={axis:dict(bpm=self.bpm.currentText(),beta_m=w.value()) for axis,w in [('x',self.beta_x),('y',self.beta_y)] if axis in planes}
         try:
-            self.estimate=analyze_tbt(self.wave,start_turn=self.start_turn.value(),reference=reference)
+            self.estimate=analyze_tbt(self.wave,start_turn=self.start_turn.value(),reference=reference,excluded_bpms=excluded_bpms)
             states=[]
             for axis,result in self.estimate['planes'].items():
                 states.append(f'{axis.upper()}: '+(f"tune {result['tune']:.6f}, {sum(result['valid_bpms'])} valid BPMs" if result['valid'] else 'INVALID — '+result.get('reason','oscillation below signal/noise threshold')))

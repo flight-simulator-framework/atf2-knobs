@@ -290,15 +290,16 @@ class ModelRoutingTests(unittest.TestCase):
         orbit=self.machine.orbit
         def interrupted_update():
             result=orbit()
-            if self.machine.acquisitions==14:result['tmit'][:]=0.
+            if self.machine.acquisitions in (14,24):result['tmit'][:]=0.
             return result
-        with patch.object(self.machine,'orbit',side_effect=interrupted_update):
+        with patch.object(self.machine,'orbit',side_effect=interrupted_update),patch.object(self.service.cancel,'wait',return_value=False) as wait:
             with self.assertRaises(ValueError) as caught:self.service.calculate('dispersion',self.opt)
         message=str(caught.exception)
         self.assertIn('RF baseline: 94 BPMs valid on every update',message)
         self.assertIn('RF minus: 0 BPMs valid on every update; 0–94 per update',message)
         self.assertIn('RF plus: 94 BPMs valid on every update',message)
-        self.assertEqual(self.machine.acquisitions,30)
+        wait.assert_called_once_with(3.)
+        self.assertEqual(self.machine.acquisitions,40)
         self.assertEqual(self.machine.frequency(),0.)
         self.assertEqual([c[0] for c in self.machine.commands],['rf','rf','rf'])
     def test_skew_only_two_horizontal_diagnostic_probes(self):
@@ -592,8 +593,11 @@ class ModelGuiTests(unittest.TestCase):
                 self.assertTrue(panel.apply_button.isEnabled())
                 self.assertEqual(machine.acquisitions,before);self.assertEqual(machine.commands,[])
                 panel.set_option('orbit_weight',.1)
-                self.assertTrue(panel.current_beam_button.isEnabled())
-                panel.current_beam_button.click()
+                self.assertTrue(panel.update_dispersion_button.isEnabled())
+                panel.update_dispersion_button.click()
+                self.assertFalse(panel.apply_button.isEnabled())
+                self.assertIsNone(panel.data)
+                panel.recalculate_button.click()
                 self.assertEqual(machine.acquisitions-before,30)
                 self.assertEqual(panel.data['options']['orbit_weight'],.1)
                 with patch.object(window.service.cancel,'wait',return_value=False):
@@ -608,9 +612,42 @@ class ModelGuiTests(unittest.TestCase):
                 self.assertEqual(machine.acquisitions,before);self.assertEqual(machine.commands,[])
                 panel.options.fixed_actuators=()
                 panel.invalidate()
-                self.assertFalse(panel.recalculate_button.isEnabled())
+                self.assertTrue(panel.recalculate_button.isEnabled())
+                panel.recalculate_button.click()
+                self.assertNotIn('dr:ZV3R',panel.data['actuators'])
         finally:
             window.close();window.deleteLater();self.app.processEvents()
+
+    def test_vertical_update_without_matrix_and_recalculate_after_magnet_change(self):
+        from PyQt6.QtWidgets import QFileDialog
+        from Knobs.DRTuning.gui import TuningSession
+        b=CountedBackend();w=TuningSession(b);panel=w.panels['dispersion']
+        try:
+            def run(work,done,**kw):done(work(lambda *_:None))
+            with tempfile.TemporaryDirectory() as tmp,patch.object(panel,'data_directory',return_value=tmp),patch.object(w,'start',side_effect=run):
+                panel.update_dispersion_button.click()
+                self.assertFalse(panel.apply_button.isEnabled());self.assertIsNone(panel.data)
+                self.assertEqual(b.acquisitions,30)
+                panel.screening.setCurrentIndex(panel.screening.findData('all'))
+                panel.find_button.click()
+                path,=Path(tmp).glob('vertical_dispersion*.json')
+                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'')) as dialog:
+                    panel.load_measured_response()
+                self.assertIn('vertical_dispersion',dialog.call_args.args[3])
+                self.assertNotIn('full_measured',panel.matrix)
+                self.assertNotIn('delta',panel.matrix)
+                self.assertIn('Vertical ZV',panel.matrix_label.text())
+                self.assertNotIn('unknown',panel.matrix_label.text())
+                n=panel.matrix['actuators'][0];b.currents[n]=.02
+                before=b.acquisitions;b.commands.clear()
+                panel.recalculate_button.click()
+                self.assertEqual(b.acquisitions-before,30)
+                self.assertEqual([c[0] for c in b.commands],['rf','rf','rf'])
+                self.assertAlmostEqual(panel.data['centers'][0],.02)
+                before=b.acquisitions
+                panel.recalculate_button.click()
+                self.assertEqual(b.acquisitions,before)
+        finally:w.close();self.app.processEvents()
 
     def test_load_legacy_measured_zvs_refits_for_dispersion_without_scanning(self):
         from Knobs.DRCorrection.core import save_session
@@ -658,6 +695,10 @@ class ModelGuiTests(unittest.TestCase):
                     finished(action(lambda *_: None))
                 with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(path), '')) as dialog, patch.object(window, 'start', run):
                     panel.load_measured_response()
+                    self.assertIsNone(panel.data)
+                    self.assertFalse(panel.apply_button.isEnabled())
+                    self.assertEqual(machine.acquisitions,reads)
+                    panel.recalculate_button.click()
                 self.assertEqual(dialog.call_args.args[2], expected_directory)
                 folder = Path(root) / 'other'
                 with patch.object(QFileDialog, 'getExistingDirectory', return_value=str(folder)) as chooser:
@@ -676,14 +717,14 @@ class ModelGuiTests(unittest.TestCase):
             result = panel.data
             self.assertTrue(panel.apply_button.isEnabled())
             self.assertTrue(result['reused_response'])
-            np.testing.assert_array_equal(result['target'][1], saved['measured'][1])
+            np.testing.assert_array_equal(result['target'][1], result['measured'][1])
             np.testing.assert_array_equal(result['response'], saved['response'])
             self.assertFalse(result['valid'][0])
             self.assertTrue(np.isnan(result['full_predicted'][:, 0]).all())
             self.assertTrue(np.isfinite(result['full_predicted'][:, 1:]).all())
             np.testing.assert_allclose(result['delta'], [.05 / (1. + .05**2)], atol=1e-9)
-            self.assertEqual(machine.acquisitions, reads)
-            self.assertEqual(machine.commands, [])
+            self.assertEqual(machine.acquisitions, reads+30)
+            self.assertEqual([command[0] for command in machine.commands],['rf','rf','rf'])
         finally:
             window.close();window.deleteLater();self.app.processEvents()
 
@@ -714,15 +755,13 @@ class ModelGuiTests(unittest.TestCase):
             self.assertEqual(window.model_panel.preparation.currentData(),'sad_cod')
             panel=window.panels['orbit'];controls=panel.modern_fields
             self.assertTrue(controls['adaptive_probe'].isChecked())
-            self.assertFalse(controls['adaptive_target_mm'].isEnabled())
+            self.assertFalse(controls['orbit_target_snr'].isEnabled())
             panel.response_source_box.setCurrentIndex(0)
-            self.assertTrue(controls['adaptive_target_mm'].isEnabled())
-            controls['adaptive_target_mm'].setValue(.15)
-            controls['adaptive_target_tolerance'].setValue(20.)
-            self.assertEqual(panel.options.adaptive_target_mm,.15)
-            self.assertEqual(panel.options.adaptive_target_tolerance,.2)
+            self.assertTrue(controls['orbit_target_snr'].isEnabled())
+            controls['orbit_target_snr'].setValue(6.)
+            self.assertEqual(panel.options.orbit_target_snr,6.)
             controls['adaptive_probe'].setChecked(False)
-            self.assertFalse(controls['adaptive_target_mm'].isEnabled())
+            self.assertFalse(controls['orbit_target_snr'].isEnabled())
             panel.response_source_box.setCurrentIndex(1)
             for mode,h in [('orbit',5),('dispersion',10)]:
                 p=window.panels[mode]

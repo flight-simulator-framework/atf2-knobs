@@ -467,7 +467,7 @@ class QMCheckpointGuiTests(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
 
-    def test_load_checkpoint_with_unknown_bpm_positions_uses_index_without_changing_data(self):
+    def test_matrix_selection_retains_unknown_geometry_without_loading_old_measurement(self):
         from Knobs.DRTuning.gui import TuningSession
         from Knobs.DRTuning.correction_gui import QFileDialog
         window=TuningSession(DispersionFixture());panel=window.qm_dispersion
@@ -483,15 +483,14 @@ class QMCheckpointGuiTests(unittest.TestCase):
                     if not has_proposal:
                         result.pop('delta');save_checkpoint(path,result);original=path.read_bytes()
                     with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'JSON')),patch.object(window,'error') as error:
-                        panel.load_scan()
+                        with patch.object(window,'start',side_effect=lambda work,done,**kw:done(work(lambda *_:None))):panel.load_scan()
                     error.assert_not_called()
-                    self.assertIsNone(panel.result['positions_m'][-1])
-                    self.assertIsNone(panel.result['full_measured'][0][-1])
+                    self.assertIsNone(panel.matrix['positions_m'][-1])
+                    self.assertIsNone(panel.result)
+                    self.assertNotIn('full_measured',panel.matrix)
+                    self.assertIsNone(panel.plot.data)
+                    self.assertFalse(panel.set_button.isEnabled())
                     self.assertEqual(path.read_bytes(),original)
-                    for ax in panel.plot.figure.axes:
-                        self.assertEqual(ax.get_xlabel(),'BPM index (measurement order)')
-                        np.testing.assert_equal(ax.lines[0].get_xdata(),np.arange(1,len(result['names'])+1))
-                    self.assertEqual(panel.set_button.isEnabled(),has_proposal)
         finally:window.close();self.app.processEvents()
 
     def test_load_resume_buttons_preserve_current_initial_setting_and_save_new_checkpoint(self):
@@ -508,12 +507,13 @@ class QMCheckpointGuiTests(unittest.TestCase):
                 def progress(_,message):
                     if message.startswith('QM dispersion response') and '(1/3)' in message:window.service.cancel.set()
                 with self.assertRaises(Cancelled):panel.service.calculate(opt,progress,checkpoint_path=path)
-                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'JSON')):panel.load_scan()
+                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'JSON')):panel.load_interrupted_checkpoint()
                 self.assertEqual(panel.probe.value(),.1);self.assertTrue(panel.resume_button.isEnabled())
                 self.assertFalse(panel.set_button.isEnabled());window.service.cancel.clear()
                 with patch.object(window,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):panel.resume_scan()
-                self.assertFalse(panel.resume_button.isEnabled());self.assertTrue(panel.set_button.isEnabled())
+                self.assertTrue(panel.resume_button.isEnabled());self.assertTrue(panel.set_button.isEnabled())
                 self.assertEqual(len(list(Path(directory).glob('*.checkpoint.json'))),2)
+                self.assertEqual(len(list(Path(directory).glob('qm_scan_trim_*.checkpoint.json'))),1)
                 self.assertIn('Scan checkpoint: 3/3',panel.save_status.text())
                 for probe in panel.result['probe_readbacks'][1:]:
                     width=QM_PROBE_PRESETS_A[probe['magnet']]
@@ -546,7 +546,7 @@ class QMCheckpointGuiTests(unittest.TestCase):
             panel.excluded.setText(', '.join(n for n in QM_CANDIDATES if n not in ACTIVE[:2]))
             old_options=panel.options();old_options.use_probe_presets=False;old_options.characterize_first_scan=True
             result=panel.service.calculate(old_options);panel.display(result)
-            self.assertFalse(panel.set_button.isEnabled());self.assertFalse(panel.resume_button.isEnabled())
+            self.assertFalse(panel.set_button.isEnabled());self.assertTrue(panel.resume_button.isEnabled())
             self.assertIn('S/N below target',panel.status.text())
             self.assertEqual(panel.table.horizontalHeaderItem(3).text(),'Next probe [A]')
             self.assertGreater(float(panel.table.item(0,3).text()),.01)

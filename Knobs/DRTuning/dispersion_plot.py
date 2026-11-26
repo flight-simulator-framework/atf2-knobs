@@ -6,9 +6,64 @@ from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QToolTip
 
 from Knobs.DRCorrection.gui import Plot
+from Knobs.DRCorrection.assessment import rms, improvement_pct
+from .dispersion import arc_bpms, straight_bpms
+
+
+def dispersion_summary(data,plane,valid,baseline):
+    """Compare each measurement with its own correction target on identical BPMs."""
+    axis=0 if plane=='x' else 1
+    names=data['names']
+    baseline=np.asarray(baseline,float)
+    opts=data.get('options',{})
+    target=np.zeros_like(baseline)
+    if plane=='x':
+        regions=[('Straight ηx',straight_bpms(names))]
+        if opts.get('arc_weight',0)>0:
+            parity=opts.get('arc_parity','odd')
+            regions.append((f'Arc ηx ({parity})',arc_bpms(names,parity)))
+    else:
+        if 'target' in data:target=np.asarray(data['target'][0],float)
+        elif 'full_target' in data:target=np.asarray(data['full_target'][axis],float)
+        label='ηy − target' if np.any(target[valid]!=0) else 'ηy'
+        regions=[(label,np.ones(len(names),bool))]
+
+    curves={'Measured':baseline}
+    if 'full_predicted' in data:curves['Predicted']=np.asarray(data['full_predicted'][axis],float)
+    elif plane=='y' and 'predicted' in data:curves['Predicted']=np.asarray(data['predicted'][0],float)
+    if 'full_after' in data:
+        if data.get('restored'):after='Trial (restored)'
+        elif data.get('error'):after='Trial'
+        else:after='Measured after'
+        curves[after]=np.asarray(data['full_after'][axis],float)
+        valid=valid & np.asarray(data['after_valid'],bool)
+    common=valid & np.isfinite(target)
+    for curve in curves.values():common &= np.isfinite(curve)
+    lines=[]
+    for label,region in regions:
+        mask=common & region
+        if not mask.any():
+            lines.append(f'{label} RMS · no common valid BPMs')
+            continue
+        values={stage:rms((curve-target)[mask]) for stage,curve in curves.items()}
+        stages=[f'{stage} {value:.3g}' for stage,value in values.items()]
+        if len(values)>1:
+            stages[0]=f"Before {values['Measured']:.3g}"
+            last=list(values)[-1]
+            start=values['Measured'];end=values[last];difference=start-end
+            if difference:
+                direction='decrease' if difference>0 else 'increase'
+                pct=improvement_pct(start,end)
+                change=f'{direction} {abs(difference):.3g}'
+                if pct is not None:change+=f' ({abs(pct):.1f}%)'
+            else:change='unchanged'
+            stages[-1]+=f' · {change}'
+        lines.append(f'{label} RMS · {mask.sum()} BPMs · mm / (dp/p)\n' + '   |   '.join(stages))
+    return '\n'.join(lines)
 
 
 class DispersionPlot(Plot):
+    dispersion_plane = 'y'
     bpm_clicked = pyqtSignal(str)
     save_selection = pyqtSignal()
 
@@ -98,6 +153,10 @@ class DispersionPlot(Plot):
             if limits:
                 ax.set_xlim(limits[i][0])
                 ax.set_ylim(limits[i][1])
+        axis=0 if self.dispersion_plane=='x' else 1
+        baseline=np.asarray(before['full_measured'][axis],float)[rows]
+        summary=dispersion_summary(data,self.dispersion_plane,valid & ~excluded[rows],baseline)
+        self.figure.supxlabel(summary,fontsize=9)
         entries = {}
         for ax in axes:
             handles, labels = ax.get_legend_handles_labels()

@@ -8,11 +8,13 @@ import copy
 import csv
 import json
 from pathlib import Path
+from datetime import datetime,timezone
 import threading
 import numpy as np
 from scipy.optimize import lsq_linear
 from .assessment import changed_indices,assess
 from .backends import MagnetReadbackError
+from .probe_quality import mean_variance,response_quality,wider_probe
 
 
 try:
@@ -97,6 +99,8 @@ class Options:
     excluded_bpms: tuple = ()
     fixed_actuators: tuple = ()
     preserve_vertical_dispersion_orbit: bool = False
+    dispersion_target_snr: float = 5.
+    orbit_target_snr: float | None = None
 
 
 def checked_orbit(value,names):
@@ -289,10 +293,27 @@ class CorrectionService:
             raise NoCommonBPMs(message)
         raise ValueError(message)
 
-    def _signal(self,mode,opt):
+    def _checked_orbit(self,opt,expected,mode):
+        orbit=self._orbit(opt)
+        self.sync_dispersion_selection(mode,opt)
+        enabled=~np.isin(self.backend.bpm_names,opt.excluded_bpms)
+        if (enabled.any() and not (enabled & orbit[2]).any()) or (expected is not None and np.any(expected & enabled & ~orbit[2])):
+            if self.cancel.wait(3.):self.check_cancel()
+            orbit=self._orbit(opt)
+            # Keep the three accepted RF points contiguous for downstream fits.
+            # The rejected raw batch remains available inside the replacement.
+            rejected=self.orbit_measurements.pop(-2)
+            self.orbit_measurements[-1]['retry_of']=rejected
+        return orbit
+
+    def _signal(self,mode,opt,*,retry_dispersion=True):
         n=len(self.backend.bpm_names)
+        def orbit_point():
+            if opt.orbit_target_snr is None:return self._orbit(opt)
+            expected=self.orbit_measurements[-1]['valid'] if self.orbit_measurements else None
+            return self._checked_orbit(opt,expected,mode)
         if mode=='orbit':
-            x,y,mask=self._orbit(opt)
+            x,y,mask=orbit_point()
             self.full_signal=np.array([x,y])
             return np.array([x if opt.plane=='x' else y]),mask
         if mode=='dispersion':
@@ -302,18 +323,28 @@ class CorrectionService:
             if not np.isfinite(span) or span<=0 or not np.isfinite(opt.momentum_compaction) or opt.momentum_compaction<=0:
                 raise ValueError('Positive frequency span and momentum compaction required')
             self.backend.validate_frequency_targets([origin-span/2,origin+span/2])
-            baseline=self._orbit(opt)
+            def read_point(expected):
+                return self._checked_orbit(opt,expected,mode) if retry_dispersion else self._orbit(opt)
+            expected=np.ones(n,bool)
+            if self.orbit_measurements:
+                expected=np.asarray(self.orbit_measurements[-1]['valid'],bool)
+                if not expected.any():expected=np.ones(n,bool)
+            baseline=read_point(expected)
+            common=baseline[2].copy()
             try:
                 frames=[]
                 for sign in (-1,1):
                     self.backend.set_frequency(origin+sign*span/2)
-                    frames.append(self._orbit(opt))
+                    point=read_point(common)
+                    frames.append(point)
+                    common &= point[2]
             finally:self.backend.restore_frequency(frequency_state)
             index=0 if opt.plane=='x' else 1
             delta=-span/(self.backend.nominal_frequency_hz*opt.momentum_compaction)
             self.full_signal=np.array([(frames[1][0]-frames[0][0])/delta,(frames[1][1]-frames[0][1])/delta,baseline[0],baseline[1]])
             return np.array([(frames[1][index]-frames[0][index])/delta,baseline[index]]),baseline[2]&frames[0][2]&frames[1][2]
         if mode=='skew':
+            if opt.probe1==opt.probe2:raise ValueError('Choose two different horizontal steering probes')
             signals=[];mask=np.ones(n,bool)
             for name,span in ((opt.probe1,opt.change1_A),(opt.probe2,opt.change2_A)):
                 if name not in self.backend.hcorrectors or not np.isfinite(span) or span<=0:
@@ -323,7 +354,7 @@ class CorrectionService:
                     frames=[]
                     for sign in (-1,1):
                         self.backend.write('correctors',[name],[origin+sign*span/2])
-                        frames.append(self._orbit(opt))
+                        frames.append(orbit_point())
                 finally:self.backend.write('correctors',[name],[origin])
                 # Native op-base plots show the vertical orbit difference for
                 # each horizontal excitation, not a hidden coupling coefficient.
@@ -333,7 +364,8 @@ class CorrectionService:
         raise ValueError('Unknown correction mode')
 
     def _measure_probe_signal(self,mode,opt,previous_valid,names):
-        value,mask=self._signal(mode,opt)
+        # The serial probe path already implements its own recovery and adaptive shrink.
+        value,mask=self._signal(mode,opt,retry_dispersion=False)
         self.sync_dispersion_selection(mode,opt)
         valid=previous_valid & mask
         self.require_usable(self.backend.bpm_names,value,np.zeros_like(value),valid,names,opt)
@@ -351,6 +383,9 @@ class CorrectionService:
                 self.model_manager.model=None;self.model_manager.optics=None
                 raise
         if opt.response_source!='measured':raise ValueError('Unknown response source')
+        snr_scan=mode in ('orbit','skew') and opt.adaptive_probe and opt.orbit_target_snr is not None
+        if snr_scan and (opt.bpm_samples<2 or not np.isfinite(opt.orbit_target_snr) or opt.orbit_target_snr<=0):
+            raise ValueError('Adaptive response requires at least two BPM samples and positive minimum S/N')
         self.orbit_measurements=[]
         self.backend.validate_mode(mode)
         if opt.plane not in ('x','y'):raise ValueError('Select x or y')
@@ -484,16 +519,33 @@ class CorrectionService:
                     if mode=='dispersion':
                         self.sync_dispersion_selection(mode,opt)
                         enabled=np.array([n not in opt.excluded_bpms for n in self.backend.bpm_names])
-                    observed=finite_abs_max(signal[...,valid & enabled])
-                    relative_change=observed/opt.adaptive_target_mm
-                    if mode=='dispersion' and opt.plane=='y':
-                        reached=relative_change>=1-opt.adaptive_target_tolerance
+                    quality=None
+                    if snr_scan:
+                        use=pair_valid & enabled
+                        if mode=='orbit':
+                            noise2=sum(mean_variance(f,opt.plane) for f in self.orbit_measurements[-2:])
+                        else:
+                            # Each of the two diagnostic steerers contributes its own +/- Y pair at each skew endpoint.
+                            variances=np.array([mean_variance(f,'y') for f in self.orbit_measurements[-8:]])
+                            noise2=variances.reshape(2,2,2,-1).sum(axis=(0,2))
+                        quality=response_quality(np.sqrt(np.mean((values[1]-values[0])[...,use]**2)),
+                                                 np.sqrt(np.mean(noise2[...,use])),opt.orbit_target_snr)
+                        observed=quality['signal_rms']
+                        target_change=quality['noise_rms']*opt.orbit_target_snr
+                        reached=quality['usable']
                     else:
-                        reached=abs(relative_change-1)<=opt.adaptive_target_tolerance
+                        observed=finite_abs_max(signal[...,valid & enabled])
+                        target_change=opt.adaptive_target_mm
+                        relative_change=observed/target_change
+                        if mode=='dispersion' and opt.plane=='y':
+                            reached=relative_change>=1-opt.adaptive_target_tolerance
+                        else:
+                            reached=abs(relative_change-1)<=opt.adaptive_target_tolerance
                     record=dict(magnet=name,pair=attempt+1,amplitude=amplitude,unit=self.backend.unit(kind),
                         commanded=[lo,hi],readbacks=readbacks,readback_span=span,observed_mm=observed,
-                        target_mm=opt.adaptive_target_mm,target_reached=bool(reached),used_for_response=False,
+                        target_mm=target_change,target_reached=bool(reached),used_for_response=False,
                         valid_bpms=int(np.sum(valid & enabled)),status='retry')
+                    if quality:record['quality']=quality
                     probe_history.append(record)
                     if not np.isfinite(readbacks).all() or span<=1.e-12:
                         record['status']='invalid_current_span'
@@ -506,17 +558,21 @@ class CorrectionService:
                         progress(int(100*(j+(attempt+1)/pairs)/len(names)),
                             f'{name}: accepted pair {attempt+1} at ±{amplitude:g} {record["unit"]}; BPM response {observed:.5g} mm')
                         break
-                    next_amplitude=min(opt.adaptive_max_probe,
+                    next_amplitude=wider_probe(amplitude,quality,opt.adaptive_max_probe) if quality else min(opt.adaptive_max_probe,
                         next_excitation_amplitude(amplitude,observed,opt.adaptive_target_mm,opt.adaptive_max_probe))
                     next_lo=max(low[j],centers[j]-next_amplitude);next_hi=min(high[j],centers[j]+next_amplitude)
                     unchanged=np.allclose([next_lo,next_hi],[lo,hi],rtol=1.e-9,atol=1.e-12)
                     if unchanged:record['status']='amplitude_or_supply_limit'
                     elif attempt+1==pairs:record['status']='max_pairs'
                     progress(int(100*(j+(attempt+1)/pairs)/len(names)),
-                        f'{name}: pair {attempt+1}/{pairs}; BPM response {observed:.5g} / target {opt.adaptive_target_mm:g} mm; '
+                        f'{name}: pair {attempt+1}/{pairs}; BPM response {observed:.5g} / target {record["target_mm"]:g} mm; '
                         f'{record["status"]}; next probe ±{next_amplitude:.5g} {self.backend.unit(kind)}')
                     if record['status']!='retry':
-                        record['used_for_response']=True;break
+                        if quality:
+                            skip_reason=f'Below S/N {opt.orbit_target_snr:g} at ±{amplitude:g} {self.backend.unit(kind)}'
+                            valid=valid_before
+                        else:record['used_for_response']=True
+                        break
                     amplitude=next_amplitude
             except MagnetReadbackError as exc:
                 # A failed skew diagnostic excitation is a global measurement
@@ -539,7 +595,7 @@ class CorrectionService:
                 progress(int(100*(j+1)/len(names)),f"SKIP {name}: {error['error']}; {error['restoration']}")
                 continue
             if skip_reason:
-                scan_errors.append(dict(magnet=name,stage='initial ZV probe',error=skip_reason,
+                scan_errors.append(dict(magnet=name,stage='response probe' if snr_scan else 'initial ZV probe',error=skip_reason,
                     restored=True,restoration='original current restored; BPM coverage verified'))
                 progress(int(100*(j+1)/len(names)),f'SKIP {name}: {skip_reason}')
                 continue
@@ -563,7 +619,7 @@ class CorrectionService:
             orbit_measurements=self.orbit_measurements,
             probe_history=probe_history,scan_errors=scan_errors,ignored_readbacks=ignored,
             set_blocked_reason=set_blocked_reason,
-            probe_rule_source=EXCITATION_RULE_SOURCE if opt.adaptive_probe else 'fixed amplitude',
+            probe_rule_source='Measured response S/N' if snr_scan else EXCITATION_RULE_SOURCE if opt.adaptive_probe else 'fixed amplitude',
             full_measured=full_measured,full_response=np.column_stack(full_columns),
             full_signal_labels=['COD X','COD Y'] if mode=='orbit' else (['Dispersion X','Dispersion Y','COD X','COD Y'] if mode=='dispersion' else [opt.probe1,opt.probe2]),
             limits=[low,high],source='measured symmetric response',
@@ -607,7 +663,7 @@ class CorrectionService:
             n for n in actuators if not ((opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF')))})
         valid,available=self.require_usable(names,measured,target,data['valid'],actuators,selected,data.get('orbit_measurements',[]))
         mask=np.tile(valid,measured.shape[0])
-        if not np.isfinite(response[mask] if mode=='dispersion' else response).all():
+        if not np.isfinite(response[mask]).all():
             raise ValueError('Invalid response matrix')
         weights=np.ones_like(measured)
         if mode=='dispersion':weights[0]*=opt.dispersion_weight;weights[1]*=opt.orbit_weight
@@ -755,38 +811,59 @@ class CorrectionService:
         if missing:return 'No measured columns for: '+', '.join(sorted(missing))+'. Measure again.'
         return ''
 
-    def reuse_on_current_beam(self,data,opt,progress=lambda *_:None):
-        """Use measured ZV slopes with a fresh three-frequency observation and current limits."""
-        if (data['mode']!='dispersion' or opt.plane!='y' or opt.response_source!='measured'
-                or not (data.get('rftrack_candidates') or data.get('full_zv_candidates'))):
+    def observe_current_beam(self,mode,opt,ignored=(),*,before=None):
+        b=self.backend
+        b.validate_mode(mode);validate_bpm_sampling(opt);self.check_cancel()
+        def snapshot():return b.snapshot(excluded=ignored) if ignored else b.snapshot()
+        if before is None:before=snapshot()
+        self.orbit_measurements=[]
+        measured,valid=self._signal(mode,opt)
+        actual=snapshot()
+        if not b.same_settings(before,actual):raise ValueError(f'Settings changed during {mode} measurement')
+        if not (valid & ~np.isin(b.bpm_names,opt.excluded_bpms)).any():raise NoCommonBPMs('No valid enabled BPM in beam measurement')
+        self.check_cancel()
+        return dict(baseline=actual,measured=measured,valid=valid,full_measured=self.full_signal.copy(),
+                    frames=self.orbit_measurements,frequency_change_khz=opt.frequency_change_khz,
+                    momentum_compaction=opt.momentum_compaction,measured_at=datetime.now(timezone.utc).isoformat(),
+                    names=list(b.bpm_names),positions_m=b.positions_m,
+                    full_signal_labels=['Dispersion X','Dispersion Y','COD X','COD Y'] if mode=='dispersion' else [])
+
+    def reuse_on_current_beam(self,data,opt,progress=lambda *_:None,*,observation=None):
+        """Combine a measured matrix with the current observation, supply centers and limits."""
+        mode=data['mode']
+        if mode not in ('orbit','skew','dispersion') or opt.response_source!='measured':
+            raise ValueError('Select a measured response for this correction')
+        if mode=='dispersion' and (opt.plane!='y' or not (data.get('rftrack_candidates') or data.get('full_zv_candidates'))):
             raise ValueError('Load a measured vertical ZV response')
         issue=self.response_reuse_issue(data,opt)
         if issue:raise ValueError(issue)
         b=self.backend
-        if (list(data['names'])!=list(b.bpm_names) or not set(data['actuators'])<=set(b.vcorrectors)
-                or data.get('actuator_unit')!=b.unit('correctors')):
+        kind='skews' if mode=='skew' else 'correctors'
+        magnets=b.skews if mode=='skew' else b.vcorrectors if opt.plane=='y' else b.hcorrectors
+        if (data.get('kind')!=kind or list(data['names'])!=list(b.bpm_names)
+                or not set(data['actuators'])<=set(magnets) or data.get('actuator_unit')!=b.unit(kind)):
             raise ValueError('BPM or corrector mapping / units differ from the saved response')
         if data.get('set_blocked_reason'):raise ValueError(data['set_blocked_reason'])
         if data.get('model_settings'):
             from Knobs.DRTuning.model import verify_inputs
             verify_inputs(b,data['model_settings'])
-        b.validate_mode('dispersion')
+        b.validate_mode(mode)
         validate_bpm_sampling(opt)
         ignored=data.get('ignored_readbacks')
         def snapshot():return b.snapshot(excluded=ignored) if ignored else b.snapshot()
-        before=snapshot()
-        self.check_cancel()
-        self.orbit_measurements=[]
-        progress(0,'Measuring current vertical dispersion / COD')
-        measured,valid=self._signal('dispersion',opt)
         actual=snapshot()
-        if not b.same_settings(before,actual):raise ValueError('Settings changed during vertical dispersion measurement')
+        if (observation is None or observation['frequency_change_khz']!=opt.frequency_change_khz
+                or observation['momentum_compaction']!=opt.momentum_compaction or not b.same_settings(actual,observation['baseline'])):
+            progress(0,f'Measuring current beam for {mode}')
+            observation=self.observe_current_beam(mode,opt,ignored,before=actual)
+            actual=observation['baseline']
+        measured,valid=observation['measured'],observation['valid']
         saved=dict(data)
-        saved.setdefault('response_baseline',data['baseline'])
+        if 'baseline' in data:saved.setdefault('response_baseline',data['baseline'])
         saved.setdefault('response_valid',data.get('acquisition_valid',data['valid']))
-        saved.update(applied=False,baseline=actual,centers=[actual['correctors'][n] for n in data['actuators']],
-                     limits=b.limits('correctors',data['actuators']),full_measured=self.full_signal.copy(),measured=measured,
-                     baseline_orbit_measurements=self.orbit_measurements,
+        saved.update(applied=False,baseline=actual,centers=[actual[kind][n] for n in data['actuators']],
+                     limits=b.limits(kind,data['actuators']),full_measured=observation['full_measured'],measured=measured,
+                     baseline_orbit_measurements=observation['frames'],baseline_measured_at=observation['measured_at'],baseline_valid=valid,
                      acquisition_valid=np.asarray(saved['response_valid'],bool)&valid)
         saved.pop('applied_baseline',None)
         saved.pop('bpm_observations',None)

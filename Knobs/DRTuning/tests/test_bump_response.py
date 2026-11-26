@@ -27,6 +27,23 @@ class SharedResponseTests(unittest.TestCase):
         return self.s.measure_response_matrix(self.opt,options or Options(),state if state is not None else {},
                                               lambda *_:None,lambda _:None)
 
+    def test_shared_matrix_grows_only_weak_column_and_omits_unresolved(self):
+        self.b.response[:,0]=.04
+        self.b.response[:,1]=0.
+        read=self.b.orbit
+        def noisy():
+            frame=read()
+            for axis in ('x','y'):frame[axis]+=.005*(-1 if self.b.acquisitions%2 else 1)
+            return frame
+        self.opt.max_step_A=.3
+        with patch.object(self.b,'orbit',side_effect=noisy):
+            matrix=self.measure()
+        self.assertGreater(matrix['columns']['H0']['readback']['actual'][1],self.opt.probe_A)
+        self.assertEqual(matrix['columns']['V2']['readback']['actual'][1],self.opt.probe_A)
+        self.assertIn('below S/N',matrix['skipped']['H1'])
+        self.assertNotIn('H1',matrix['columns'])
+        self.assertEqual(matrix['baseline'],self.b.snapshot())
+
     def test_measured_matrix_roundtrip_and_different_steering_baseline(self):
         matrix=json.loads(json.dumps(serial(self.measure()),allow_nan=False))
         self.assertEqual(set(matrix['columns']),set(self.b.currents))

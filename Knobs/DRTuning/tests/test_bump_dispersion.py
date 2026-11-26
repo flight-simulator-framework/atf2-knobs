@@ -372,11 +372,11 @@ class DispersionTests(unittest.TestCase):
         self.assertEqual(settings[0]['max_invalid_streak'],[1]*int(region.sum()))
         self.assertEqual(len(data['orbit_measurements']),99)
         self.assertTrue(data['valid'][region].all());self.assertTrue(np.isfinite(data['response']).all())
-    def test_five_consecutive_invalid_updates_stop_scan_and_restore(self):
+    def test_five_consecutive_invalid_updates_on_both_attempts_stop_scan_and_restore(self):
         initial=self.b.snapshot();region=straight_bpms(self.b.bpm_names);original=self.b.orbit
         def dropout():
             frame=original()
-            if 32<=self.b.acquisitions<=36:frame['tmit'][region]=0.
+            if 32<=self.b.acquisitions<=36 or 42<=self.b.acquisitions<=46:frame['tmit'][region]=0.
             return frame
         with patch.object(self.b,'orbit',side_effect=dropout):
             with self.assertRaisesRegex(ValueError,'5 consecutive invalid'):self.s.calculate(self.o)
@@ -473,6 +473,7 @@ class CorrectionGuiTests(unittest.TestCase):
                 files=list(panel.autosave_directory.glob('*.json'));self.assertEqual(len(files),1)
                 saved=json.loads(files[0].read_text());self.assertTrue(saved['applied'])
                 np.testing.assert_allclose(saved['full_after'],panel.result['full_after'])
+                self.assertTrue(files[0].name.startswith('qm_dispersion_trim_'))
                 self.assertEqual(saved['autosave']['json'],str(files[0]))
                 self.assertTrue(files[0].with_suffix('.png').read_bytes().startswith(b'\x89PNG'))
                 self.assertIn('Auto-saved',panel.save_status.text());self.assertTrue(panel.recalculate_button.isEnabled())

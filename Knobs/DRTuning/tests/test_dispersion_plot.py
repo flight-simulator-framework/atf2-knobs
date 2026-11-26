@@ -35,6 +35,27 @@ class DispersionPlotTests(unittest.TestCase):
         event = MouseEvent(kind, plot.canvas, x, y, button=1 if click else None)
         plot.canvas.callbacks.process(kind, event)
 
+    def test_dispersion_rms_uses_same_bpms_and_distinguishes_prediction_from_measurement(self):
+        from Knobs.DRTuning.dispersion_plot import dispersion_summary
+        names=['MB1R','MB2R','MB19R','MB20R','MB21R']
+        before=np.array([12.,42.,4.,50.,80.])
+        data=dict(names=names,options=dict(arc_weight=1.,arc_parity='odd'),
+                  full_predicted=np.tile(before/2,(4,1)),full_after=np.tile(before/4,(4,1)),
+                  after_valid=[True,True,True,True,False])
+        valid=np.array([True,True,True,False,True])
+        text=dispersion_summary(data,'x',valid,before)
+        self.assertIn('Straight ηx RMS · 1 BPM',text)
+        self.assertIn('Before 4   |   Predicted 2   |   Measured after 1 · decrease 3 (75.0%)',text)
+        self.assertIn('Arc ηx (odd) RMS · 1 BPM',text)
+        self.assertIn('Before 12   |   Predicted 6',text)
+        data.update(target=[before], restored=True)
+        text=dispersion_summary(data,'y',valid,before)
+        self.assertIn('ηy − target RMS · 3 BPM',text)
+        self.assertIn('Trial (restored)',text)
+        self.assertIn('increase',text)
+        self.assertNotIn('%',text)
+        self.assertIn('no common valid BPMs',dispersion_summary(data,'y',valid & False,before))
+
     def test_invalid_observations_hidden_and_manual_exclusion_reversible(self):
         from Knobs.DRTuning.dispersion_plot import DispersionPlot
         plot = DispersionPlot()
@@ -104,6 +125,8 @@ class DispersionPlotTests(unittest.TestCase):
                 window.service.dispersion_observed = baseline
                 panel.measure_button.click()
                 self.wait_for(lambda: waiting.is_set() and 'options' not in panel.plot.data)
+                self.assertTrue(panel.matrix_progress.isVisible())
+                self.assertEqual(panel.matrix_progress.shots.value(),10)
                 name = machine.bpm_names[42]
                 self.point(panel.plot, panel.plot.figure.axes[1], name, click=True)
                 release.set()
@@ -158,6 +181,8 @@ class DispersionPlotTests(unittest.TestCase):
                               np.isfinite(panel.plot.data['full_measured'][0]).any())
                 self.assertFalse(panel.calc_button.isEnabled())
                 self.assertTrue(panel.plot.canvas.isEnabled())
+                self.assertTrue(panel.matrix_progress.isVisible())
+                self.assertIn('RF +2 kHz',panel.matrix_progress.point.text())
                 plot = panel.plot
                 ax = plot.figure.axes[0]
                 name = 'dr:MB25R'
