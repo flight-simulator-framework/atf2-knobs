@@ -225,7 +225,7 @@ class CorrectionPanel(QWidget):
             targets=dict(self.plane_probe_targets);targets[self.options.plane]=self.options.adaptive_target_mm
             self.adaptive_targets_label.setText(f'H: {targets["x"]:g} mm / V: {targets["y"]:g} mm (remembered separately)')
         saved=self.response_cache.get((self.options.response_source,self.options.plane))
-        issue=self.window.service.response_reuse_issue(saved,self.options) if saved is not None else 'No saved response for this plane/source. Measure once.'
+        issue=self.window.service.response_reuse_issue(saved,self.calculation_options()) if saved is not None else 'No saved response for this plane/source. Measure once.'
         self.recalculate_button.setEnabled(saved is not None and not issue)
         if saved is None or issue:self.response_cache_label.setText(issue)
         else:
@@ -324,8 +324,11 @@ class CorrectionPanel(QWidget):
             self.options.selection_method=selection.currentData()
             self.invalidate()
 
+    def calculation_options(self):
+        return copy.deepcopy(self.options)
+
     def calculate(self,dataset=None):
-        options=copy.deepcopy(self.options)
+        options=self.calculation_options()
         self.invalidate()
         self.window.start(lambda progress:self.window.service.calculate(self.mode,options,progress,dataset),
                           self.display,pausable=dataset is None)
@@ -349,7 +352,7 @@ class CorrectionPanel(QWidget):
     def recalculate(self):
         saved=self.response_cache.get((self.options.response_source,self.options.plane))
         if saved is None:self.window.error('No saved response for this plane/source. Measure once.');return
-        options=copy.deepcopy(self.options);self.invalidate()
+        options=self.calculation_options();self.invalidate()
         self.window.start(lambda progress:self.window.service.recalculate(saved,options,progress),self.display)
 
     def display(self,data):

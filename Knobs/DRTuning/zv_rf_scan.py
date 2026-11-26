@@ -1,10 +1,26 @@
-"""Measured ZV response for the RFTrack shortlist, grouped by RF frequency."""
+"""Measured vertical dispersion response, grouped by RF frequency."""
 from dataclasses import asdict
 import numpy as np
 
 from Knobs.DRCorrection.core import (EXCITATION_RULE_SOURCE, ZV_RETRY_STEP_A, NoCommonBPMs,
     finite_abs_max, next_excitation_amplitude, validate_adaptive_probe, validate_bpm_sampling)
 from .rf_blocks import measure_blocks,reference_signal,response_column
+
+
+VERTICAL_ZVS = frozenset(f'ZV{i}R' for i in (*range(1,9), *range(17,33), *range(43,52)))
+
+
+def eligible_zv(name):
+    return name.removeprefix('dr:') in VERTICAL_ZVS
+
+
+def measure_all_zvs(service,opt,progress):
+    if opt.plane!='y' or opt.response_source!='measured' or opt.selection_method!='all':
+        raise ValueError('Full ZV measurement requires vertical dispersion and the all-magnet solver')
+    data=acquire_zvs(service,opt,progress)
+    data['full_zv_candidates']=[n for n in service.backend.vcorrectors if eligible_zv(n)]
+    service.check_cancel()
+    return service.calculate('dispersion',opt,progress,dataset=data)
 
 
 def acquire_zvs(service,opt,progress):
@@ -18,7 +34,7 @@ def acquire_zvs(service,opt,progress):
     errors=[]
     baseline=b.measured_snapshot(errors) if hasattr(b,'measured_snapshot') else b.snapshot()
     ignored=[e['magnet'] for e in errors]
-    names=[n for n in b.vcorrectors if n not in opt.fixed_actuators and n not in ignored]
+    names=[n for n in b.vcorrectors if eligible_zv(n) and n not in opt.fixed_actuators and n not in ignored]
     if not names:raise ValueError('No readable, selected ZVs')
     centers={n:float(baseline['correctors'][n]) for n in names}
     limits=np.broadcast_to(np.array(b.limits('correctors',names)).T,(len(names),2))

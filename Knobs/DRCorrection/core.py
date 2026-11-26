@@ -749,8 +749,8 @@ class CorrectionService:
         if data['mode']=='skew':
             names=[n for n in self.backend.skews if (opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF'))]
         else:names=self.backend.hcorrectors if opt.plane=='x' else self.backend.vcorrectors
-        if 'rftrack_candidates' in data:
-            names=set(names).intersection(data['rftrack_candidates'])
+        for scope in ('rftrack_candidates','full_zv_candidates'):
+            if scope in data:names=set(names).intersection(data[scope])
         missing=set(names)-set(opt.fixed_actuators)-set(data['actuators'])-{e['magnet'] for e in data.get('scan_errors',[])}
         if missing:return 'No measured columns for: '+', '.join(sorted(missing))+'. Measure again.'
         return ''
@@ -760,6 +760,16 @@ class CorrectionService:
         issue=self.response_reuse_issue(data,opt)
         if issue:raise ValueError(issue)
         saved=copy.deepcopy(data)
+        if saved.get('full_zv_candidates') and saved.get('applied'):
+            # Reuse the measured slopes about the latest verified operating point.
+            state=saved['applied_baseline']
+            saved.setdefault('response_baseline',saved['baseline'])
+            saved['baseline']=state
+            saved['centers']=[state['correctors'][n] for n in saved['actuators']]
+            saved['full_measured']=np.asarray(saved['full_after'],float)
+            saved['measured']=np.asarray(saved['after'],float)
+            saved['acquisition_valid']=np.asarray(saved['acquisition_valid'],bool)&np.asarray(saved['after_valid'],bool)
+            saved.pop('applied_baseline')
         if saved['mode']=='dispersion' and opt.response_source=='measured':
             nominal=np.asarray(self.backend.target_dispersion(opt.plane),float)
             if nominal.shape!=(len(self.backend.bpm_names),) or not np.isfinite(nominal).all():
@@ -787,12 +797,13 @@ class CorrectionService:
             from Knobs.DRTuning.model import verify_inputs
             verify_inputs(self.backend,data['model_settings'])
         self.backend.validate_mode(data['mode'])
-        if data.get('scan_errors'):
-            # SET/RESET must never replay the faulty supplies just because
-            # their initial currents happened to be readable.
+        if data.get('scan_errors') or data.get('full_zv_candidates') or data.get('rftrack_candidates'):
+            # Rollback and Undo restore only supplies involved in this correction.
             touched={data['actuators'][i] for i in changed}
             if data['mode']=='skew':touched.update((data['options']['probe1'],data['options']['probe2']))
             before=copy.deepcopy(before)
+            if data.get('full_zv_candidates') or data.get('rftrack_candidates'):
+                before.pop('quadrupoles',None)
             for kind in ('correctors','skews','quadrupoles'):
                 if kind in before:before[kind]={n:v for n,v in before[kind].items() if n in touched}
         self.orbit_measurements=[]
@@ -807,6 +818,14 @@ class CorrectionService:
             self.check_cancel()
             progress(0,'Measuring after SET')
             measured,valid=self._signal(data['mode'],Options(**data['options']))
+            if data.get('full_zv_candidates'):
+                expected=copy.deepcopy(data['baseline'])
+                expected['correctors'].update((data['actuators'][i],values[i]) for i in changed)
+                actual=(self.backend.snapshot(excluded=data['ignored_readbacks']) if data.get('ignored_readbacks')
+                        else self.backend.snapshot())
+                if not self.backend.same_settings(actual,expected):
+                    raise ValueError('Settings changed during vertical dispersion Apply')
+                data['applied_baseline']=actual
         except Exception:
             self.backend.restore(before);raise
         self.undo.append(before)

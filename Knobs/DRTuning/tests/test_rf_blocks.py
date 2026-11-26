@@ -27,10 +27,56 @@ class RFBlockTests(unittest.TestCase):
             np.testing.assert_allclose(result[key],old[key],atol=1.e-10)
         self.assertEqual(b.snapshot(),baseline)
         blocks=result['rf_blocks'][0]['blocks']
+        for offset in (0.,-2000.,2000.):
+            at_rf=[f for f in result['orbit_measurements'] if f['rf_offset_hz']==offset]
+            self.assertEqual(len(at_rf),28)
+            self.assertEqual(sum(f['role']=='probe' for f in at_rf),26)
         self.assertEqual([f['role'] for f in result['orbit_measurements']].count('reference end'),3)
         for block in blocks:
             np.testing.assert_allclose(block['reference_drift_rms_mm'],[0.,0.])
         self.assertTrue(all(f['nshots']==10 for f in result['orbit_measurements']))
+
+    def test_full_vertical_response_probes_and_restores_only_allowed_ranges(self):
+        from Knobs.DRTuning.zv_rf_scan import measure_all_zvs
+        b=DemoBackend()
+        expected=[f'ZV{i}R' for i in range(1,52) if 1<=i<=8 or 17<=i<=32 or 43<=i<=51]
+        b.vcorrectors=[f'ZV{i}R' for i in range(1,52)]
+        b.hcorrectors=[f'ZH{i}R' for i in range(1,52)]
+        b.currents=dict.fromkeys(b.hcorrectors+b.vcorrectors,0.)
+        rng=np.random.default_rng(72)
+        for axis in ('x','y'):b.orm[axis]=b.basis@rng.normal(size=(8,51))
+        b.dispr=b.basis@rng.normal(size=(8,51))
+        s=CorrectionService(b)
+        opt=Options(plane='y',selection_method='all',count_v=5,bpm_samples=10,
+                    frequency_change_khz=4.,preserve_vertical_dispersion_orbit=True)
+        baseline=b.snapshot()
+        with patch.object(b,'set_frequency',wraps=b.set_frequency) as rf,patch.object(b,'write',wraps=b.write) as writes:
+            data=measure_all_zvs(s,opt,lambda *_:None)
+            self.assertEqual(data['actuators'],expected)
+            self.assertEqual(data['selected'],expected)
+            self.assertEqual(data['response'].shape,(192,33))
+            self.assertEqual(b.snapshot(),baseline)
+            self.assertEqual(rf.call_count,3)
+            before=b.acquisitions
+            opt.fixed_actuators=('ZV51R',)
+            data=s.recalculate(data,opt)
+            self.assertNotIn('ZV51R',data['selected'])
+            self.assertEqual(b.acquisitions,before)
+            self.assertEqual(rf.call_count,3)
+            writes.reset_mock()
+            with patch.object(s.cancel,'wait',return_value=False):
+                s.apply(data)
+            with patch.object(b,'orbit',side_effect=AssertionError),patch.object(b,'set_frequency',side_effect=AssertionError):
+                following=s.recalculate(data,opt)
+            np.testing.assert_array_equal(following['measured'],data['after'])
+            self.assertEqual(following['baseline'],b.snapshot())
+            self.assertEqual(following['response_baseline'],baseline)
+            np.testing.assert_array_equal(following['response'],data['response'])
+            s.reset()
+            touched={n for call in writes.call_args_list for n in call.args[1]}
+            self.assertTrue(touched)
+            self.assertLessEqual(touched,set(expected)-{'ZV51R'})
+            self.assertEqual(b.snapshot(),baseline)
 
     def test_vertical_shortlist_and_recalculate(self):
         b=DemoBackend();s=CorrectionService(b)
@@ -69,6 +115,67 @@ class RFBlockTests(unittest.TestCase):
         self.assertEqual(set(rounds[0]['targets']),{strong,weak})
         self.assertTrue(all(list(r['targets'])==[weak] for r in rounds[1:]))
         self.assertEqual(rf.call_count,3*len(rounds))
+        frames=data['orbit_measurements']
+        self.assertEqual(sum(f['rf_offset_hz']==0 for f in frames),6)
+        for r in rounds[1:]:
+            self.assertEqual(r['blocks'][0]['pairs'][weak],rounds[0]['blocks'][0]['pairs'][weak])
+        np.testing.assert_allclose(data['response'][:len(b.bpm_names),1],b.dr[:,1],atol=1e-9)
+        self.assertNotEqual(data['probe_readbacks'][1]['actual_by_rf'][0],data['probe_readbacks'][1]['actual_by_rf'][1])
+
+        opt.constrain_cod=True
+        with patch.object(b,'orbit',side_effect=noisy):
+            constrained=DispersionService(b,threading.Event()).calculate(opt,group_rf=True)
+        off_energy_retries=len(constrained['rf_blocks'])-1
+        self.assertGreater(off_energy_retries,0)
+        nominal=sum(f['rf_offset_hz']==0 for f in constrained['orbit_measurements'])
+        self.assertEqual(nominal,6+4*off_energy_retries)
+
+    def test_qm_transient_partial_loss_retries_only_one_rf_current_point(self):
+        b=DispersionFixture();s=DispersionService(b,threading.Event())
+        bad=QM_CANDIDATES[0]
+        opt=DispersionOptions(fixed_actuators=tuple(QM_CANDIDATES[2:]),use_probe_presets=False,probe_A=.05)
+        orbit=b.orbit
+        dropped=0
+        def noisy():
+            nonlocal dropped
+            frame=orbit()
+            if b.offset==-2000 and b.q[bad]<0 and dropped<10:
+                frame['valid'][0]=False
+                dropped+=1
+            return frame
+        with patch.object(b,'orbit',side_effect=noisy),patch.object(s.reader.cancel,'wait',return_value=False) as waits:
+            data=s.calculate(opt,group_rf=True)
+        self.assertEqual(dropped,10)
+        self.assertEqual(len(data['rf_blocks']),1)
+        retry=[f for f in data['orbit_measurements'] if f['role']=='probe retry']
+        self.assertEqual([(f['magnet'],f['rf_offset_hz'],f['current_A']) for f in retry],[(bad,-2000.,-.05)])
+        waits.assert_any_call(3.)
+        self.assertEqual(len(data['orbit_measurements']),19)
+
+
+    def test_mixed_qm_retries_only_shrinking_probe_at_nominal_rf(self):
+        b=DispersionFixture();s=DispersionService(b,threading.Event())
+        weak,shrinking=QM_CANDIDATES[:2]
+        b.dr[:,0]*=.2
+        b.dr[:,1]*=10.
+        opt=DispersionOptions(use_probe_presets=False,probe_A=.05,fixed_actuators=tuple(QM_CANDIDATES[2:]))
+        original=b.orbit
+        def orbit():
+            frame=original()
+            frame['x']+=.0002*(-1 if b.acquisitions%2 else 1)
+            if b.offset<0 and abs(b.q[shrinking])>.021:frame['valid'][:]=False
+            return frame
+        messages=[]
+        with patch.object(b,'orbit',side_effect=orbit),patch.object(s.reader.cancel,'wait',return_value=False):
+            data=s.calculate(opt,lambda pct,msg:messages.append(msg),group_rf=True)
+        rounds=data['rf_blocks']
+        self.assertEqual(set(rounds[1]['targets']),{weak,shrinking})
+        initial,second=[r['blocks'][0]['pairs'] for r in rounds[:2]]
+        self.assertEqual(second[weak]['indices'],initial[weak]['indices'])
+        self.assertNotEqual(second[shrinking]['indices'],initial[shrinking]['indices'])
+        self.assertTrue(any(weak in msg and 'low S/N' in msg for msg in messages))
+        self.assertTrue(any(shrinking in msg and 'reduced probe' in msg for msg in messages))
+        np.testing.assert_allclose(data['response'][:len(b.bpm_names),:2],b.dr[:,:2],atol=1e-9)
 
     def test_zv_pause_at_offset_only_waits_at_original_settings(self):
         from Knobs.DRTuning.zv_rf_scan import acquire_zvs
@@ -191,6 +298,7 @@ class RFBlockTests(unittest.TestCase):
             saved=load_checkpoint(path)
         self.assertTrue(saved['restored']);self.assertEqual(b.snapshot(),baseline)
         self.assertEqual(len(saved['rf_round']['blocks']),1)
+        self.assertEqual(list(saved['rf_round']['partial']['pairs']),[QM_CANDIDATES[0]])
         cancel.clear()
         corrupt=copy.deepcopy(saved)
         corrupt['rf_round']['targets']['other magnet']=[-.1,.1]
@@ -205,6 +313,7 @@ class RFBlockTests(unittest.TestCase):
         with patch.object(b,'set_quadrupole_current',side_effect=record):
             resumed=s.resume(saved,opt)
         self.assertNotIn(0.,[offset for offset,n in writes])
+        self.assertEqual({n for offset,n in writes if offset==-2000},{QM_CANDIDATES[1]})
         expected=s.calculate(opt)
         np.testing.assert_allclose(resumed['response'],expected['response'],atol=1.e-10)
         self.assertEqual(b.snapshot(),baseline)

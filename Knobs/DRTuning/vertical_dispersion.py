@@ -1,6 +1,5 @@
 """Vertical dispersion correction with RFTrack selection and measured ZV response."""
 
-import copy
 from datetime import datetime
 from uuid import uuid4
 
@@ -13,6 +12,7 @@ from Knobs.DRCorrection.core import load_session
 from Knobs.DRCorrection.gui import CorrectionPanel
 from .correction_gui import DispersionPlot, control
 from .presentation import scroll, table_style
+from .zv_rf_scan import eligible_zv, measure_all_zvs
 
 
 class VerticalDispersionPanel(CorrectionPanel):
@@ -40,13 +40,17 @@ class VerticalDispersionPanel(CorrectionPanel):
         self.screening.addItem('Current optics (no tune fit)', 'imported')
         self.screening.addItem('Current optics + tune fit', 'fit')
         self.screening.addItem('Saved nominal RFTrack', 'nominal')
+        self.screening.addItem('Full measured ZV matrix', 'all')
+        self.screening.setToolTip('Eligible ZVs: 1–8, 17–32, 43–51. Unchecked magnets are skipped.')
         self.set_screening_options()
         self.screening.currentIndexChanged.connect(self.change_screening)
-        form.addRow('ZV selection model', self.screening)
+        form.addRow('Response measurement', self.screening)
         maximum = QSpinBox()
-        maximum.setRange(1, max(1, len(window.backend.vcorrectors)))
+        maximum.setRange(1, max(1, sum(map(eligible_zv, window.backend.vcorrectors))))
         maximum.setValue(self.options.count_v)
         form.addRow('Maximum ZVs', maximum)
+        self.measurement_form = form
+        self.maximum = maximum
         maximum.valueChanged.connect(lambda v: self.set_option('count_v', v))
         for key, label, low, high in (
                 ('frequency_change_khz', 'RF span [kHz]', .01, 10.),
@@ -119,12 +123,26 @@ class VerticalDispersionPanel(CorrectionPanel):
     def set_screening_options(self):
         choice = self.screening.currentData()
         self.options.model_match_tunes = choice == 'fit'
-        self.options.response_source = 'rftrack_nominal' if choice == 'nominal' else 'rftrack'
+        self.options.response_source = {'all': 'measured', 'nominal': 'rftrack_nominal'}.get(choice, 'rftrack')
+
+    def calculation_options(self):
+        options = super().calculation_options()
+        options.plane = 'y'
+        options.selection_method = 'all' if self.screening.currentData() == 'all' else 'greedy'
+        outside = {n for n in self.window.backend.vcorrectors if not eligible_zv(n)}
+        options.fixed_actuators = tuple(sorted(set(options.fixed_actuators) | outside))
+        return options
 
     def calculate(self, dataset=None):
         self.set_screening_options()
         self.response_cache.clear()
-        super().calculate(dataset)
+        if self.screening.currentData() == 'all' and dataset is None:
+            options = self.calculation_options()
+            self.invalidate()
+            self.window.start(lambda p: measure_all_zvs(self.window.service, options, p),
+                              self.display, label='Measure full ZV matrix', pausable=True)
+        else:
+            super().calculate(dataset)
 
     def measure_candidates(self):
         preview = self.data
@@ -145,34 +163,51 @@ class VerticalDispersionPanel(CorrectionPanel):
                                               self.data_directory(), 'Correction session (*.json)')
         if not path:
             return
-        options = copy.deepcopy(self.options)
+        options = self.calculation_options()
         options.response_source = 'measured'
 
         def refit(progress):
             data = load_session(path)
-            if (data.get('mode') != 'dispersion' or not data.get('rftrack_candidates')
+            full = bool(data.get('full_zv_candidates'))
+            if (data.get('mode') != 'dispersion' or not (full or data.get('rftrack_candidates'))
                     or data['options']['plane'] != 'y' or data['options']['response_source'] != 'measured'):
-                raise ValueError('Select the correction JSON saved after Measure selected ZVs.')
+                raise ValueError('Select a saved measured vertical ZV response.')
+            if set(data['actuators']) - set(self.window.backend.vcorrectors):
+                raise ValueError('Saved response contains unknown vertical correctors.')
+            options.selection_method = 'all' if full else 'greedy'
             return self.window.service.recalculate(data, options, progress)
 
         self.window.start(refit, self.display, label='Recalculate saved ZV response')
 
     def display(self, data):
+        full = bool(data.get('full_zv_candidates'))
+        if full or (data.get('rftrack_candidates') and self.screening.currentData() == 'all'):
+            choice = 'all' if full else ('nominal' if data.get('reference_matrix') else 'imported')
+            self.screening.blockSignals(True)
+            self.screening.setCurrentIndex(self.screening.findData(choice))
+            self.screening.blockSignals(False)
         self.options.response_source = data['options']['response_source']
         if self.options.response_source in ('rftrack', 'rftrack_nominal') and not data.get('set_blocked_reason'):
             data['set_blocked_reason'] = 'Measure the selected ZVs before Apply.'
         super().display(data)
         if data.get('applied'):
             self.response_cache.clear()
+            if full:
+                self.response_cache[('measured', 'y')] = data
             self.refresh()
 
     def refresh(self):
         super().refresh()
         if not hasattr(self, 'undo_button'):
             return
+        full = self.screening.currentData() == 'all'
+        self.measurement_form.setRowVisible(self.maximum, not full)
+        self.measure_button.setVisible(not full)
+        self.find_button.setText('1. Measure all enabled ZVs' if full else '1. Find ZVs (RFTrack)')
+        self.apply_button.setText('2. Apply / remeasure' if full else '3. Apply / remeasure')
         data = self.data
         model = bool(data and data['options']['response_source'] in ('rftrack', 'rftrack_nominal'))
-        measured = bool(data and data.get('rftrack_candidates') and
+        measured = bool(data and (data.get('rftrack_candidates') or data.get('full_zv_candidates')) and
                         data['options']['response_source'] == 'measured')
         matches = bool(data and set(data['options']['excluded_bpms']) == self.plot.excluded)
         missing = set(self.window.backend.bpm_names) - self.plot.excluded - set(data['names']) if model else set()
@@ -198,7 +233,9 @@ class VerticalDispersionPanel(CorrectionPanel):
         elif self.recalculate_button.isEnabled():
             message = 'Measured response available. Recalculate after changing BPMs.'
         else:
-            message = 'Ready to select ZVs.'
+            message = 'Eligible ZVs: 1–8, 17–32, 43–51.' if full else 'Ready to select ZVs.'
+        if full and measured and data.get('applied'):
+            message = 'Applied. Recalculate uses the measured after-Apply dispersion and saved matrix.'
         if model and reference:
             unmapped = reference['unmapped_bpms'] + reference['unmapped_zvs']
             if unmapped:

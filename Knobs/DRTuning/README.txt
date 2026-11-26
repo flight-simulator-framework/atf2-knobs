@@ -27,7 +27,16 @@ Saved nominal RFTrack uses the bundled 4 kHz reference matrix.
 For mapped-channel differences use RFTrack model > Exclude unmapped BPMs /
 magnets. Measure selected ZVs measures the actual response before Apply.
 
-Vertical dispersion ranks ZVs and fits measured responses with a weight of 1
+Vertical dispersion uses ZV1R–ZV8R, ZV17R–ZV32R and ZV43R–ZV51R in
+both RFTrack selection and full measured mode. Operator exclusions also apply.
+Choose Response measurement > Full measured ZV matrix, then Measure all enabled
+ZVs to measure every eligible column and fit the correction with bounded SVD.
+Review the proposal and use Apply / remeasure. Recalculate reuses the matrix.
+After Apply it uses the measured after-Apply orbit, dispersion and currents for
+the next proposal. Each Apply still checks the machine against that baseline.
+Save data + plots and Load measured response also support full measured scans.
+
+Vertical dispersion ranks ZVs in RFTrack mode and fits responses with a weight of 1
 on vertical dispersion error and 0.05 on the change from the measured vertical
 orbit at nominal RF. Set Maximum ZVs (default 5) and click Find ZVs.
 Measure selected ZVs measures only those response columns. Review the proposed
@@ -193,7 +202,11 @@ QM dispersion:
   with 10 BPM updates at each setting; RF and temporary currents are restored.
   With one pair per default 13 active trims, three RF blocks acquire
   3 x (2 reference orbits + 26 probe orbits) x 10 BPM updates = 840 updates.
-  The next pass measures only magnets that need a different probe width.
+  A failed BPM coverage check retries the same RF/current point once after 3 s.
+  If the probe must shrink, all three offsets are checked at the new width for
+  that QM. For S/N-only growth, the accepted nominal COD slope is reused and
+  only the two off-energy pairs are acquired, unless the COD limit is enabled.
+  The actual current endpoints for each RF are recorded in actual_by_rf.
   Magnet settling and BPM averaging still contribute to total acquisition time.
   "Lost all common valid straight-section BPMs" means no enabled straight BPM
   remained usable through every accepted observation, not necessarily that all
@@ -270,8 +283,9 @@ QM dispersion:
   the scan after restoration; it does not continue accumulating unsaved pairs.
   Resume unfinished QM scan uses the current partial result, or first choose
   Load QM scan checkpoint after restarting the GUI. Completed response columns
-  and complete RF blocks of the pending pass are reused. An interrupted block
-  is repeated. Changing the probe definition replans the pending magnets. Loading a scan never overwrites the
+  and complete RF blocks of the pending pass are reused. On a handled stop,
+  the checkpoint also retains restored pairs in the interrupted RF block.
+  The unfinished pair is repeated after the resume baseline check. Changing the probe definition replans the pending magnets. Loading a scan never overwrites the
   current initial-width control.
   Resume checks machine identity/profile, BPM order, acquisition RF/tune
   settings, QM selection, supply limits and original machine settings before
