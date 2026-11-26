@@ -189,6 +189,56 @@ class RecoveryTests(unittest.TestCase):
 
 
 class QueueGuiTests(unittest.TestCase):
+    def test_operator_pause_restores_bump_and_resumes_at_interrupted_xsr_point(self):
+        app=QApplication.instance() or QApplication([])
+        backend=BumpFixture()
+        baseline=backend.snapshot()
+        window=TuningSession(backend)
+        panel=window.coupling_panel
+        panel.rank_started=True
+        panel.settle.setValue(0.)
+        panel.calibration=panel.service.calibrate(backend.geometry(),panel.options())
+        waiting=threading.Event()
+        amplitudes=[]
+        read=backend.sample_xsr
+        def interrupt_second_point(cancel,count,callback):
+            amplitudes.append(backend.vector()[8])
+            if len(amplitudes)==2:
+                waiting.set()
+                if not cancel.wait(8):raise AssertionError('Pause did not interrupt XSR')
+            return read(cancel,count,callback)
+        paused=[]
+        def popup(message,resume):
+            paused.append((message,backend.snapshot(),len(panel.scan_resume['points'])))
+            resume()
+        def wait_for(condition):
+            deadline=time.monotonic()+12
+            while not condition():
+                app.processEvents()
+                self.assertLess(time.monotonic(),deadline,window.operation_status.text())
+                time.sleep(.005)
+        try:
+            with tempfile.TemporaryDirectory() as folder,patch.object(panel,'recovery',side_effect=popup), \
+                 patch.object(backend,'sample_xsr',side_effect=interrupt_second_point):
+                panel.tempfiles_directory=Path(folder)/'tempfiles'
+                panel.run_data_directory=Path(folder)/'data'
+                window.show();window.open_tool('coupling')
+                panel.scan()
+                wait_for(waiting.is_set)
+                self.assertTrue(window.pause_button.isVisible() and window.pause_button.isEnabled())
+                window.pause_button.click()
+                wait_for(lambda: panel.completed and not window.task.isRunning())
+                self.assertEqual(paused[0][1:],(baseline,1))
+                self.assertIn('Operator pause',paused[0][0])
+                self.assertEqual(len(paused),1)
+                self.assertAlmostEqual(amplitudes[1],amplitudes[2])
+                self.assertEqual(sum(np.isclose(amplitudes,amplitudes[0])),1)
+                self.assertTrue(panel.completed[0]['result']['applied'])
+        finally:
+            window.service.cancel.set()
+            if window.task:window.task.wait(5000)
+            window.close();app.processEvents()
+
     def test_preset_current_limit_skips_before_writing_without_helpers(self):
         from Knobs.DRTuning.bump_presets import bump_preset
         app=QApplication.instance() or QApplication([])
@@ -197,7 +247,7 @@ class QueueGuiTests(unittest.TestCase):
         backend.currents[bump_preset(target)['actuators'][0]]=5.
         window=TuningSession(backend);panel=window.coupling_panel
         try:
-            with tempfile.TemporaryDirectory() as tmp, patch.object(window,'start',side_effect=lambda work,done,label:done(work(lambda *_:None))), \
+            with tempfile.TemporaryDirectory() as tmp, patch.object(window,'start',side_effect=lambda work,done,label,**kwargs:done(work(lambda *_:None))), \
                  patch.object(panel,'after_worker',side_effect=lambda run:run()),patch.object(panel,'recovery') as popup:
                 panel.run_data_directory=Path(tmp)
                 panel.target.clear();panel.target.addItem(target,target)
@@ -278,7 +328,7 @@ class QueueGuiTests(unittest.TestCase):
             panel.service.last_result=dict(calibration=g,restored=True,points=[])
             raise BumpLeakage(dict(outside=np.array([.06,0.]),outside_max_mm=.06,outside_rms_mm=.06))
         try:
-            with patch.object(window,'start',side_effect=lambda work,done,label:done(work(None))), \
+            with patch.object(window,'start',side_effect=lambda work,done,label,**kwargs:done(work(None))), \
                  patch.object(panel.service,'verify_geometry',side_effect=ValueError('readback mismatch')), \
                  patch.object(panel,'after_worker',side_effect=lambda f:f()),patch.object(panel,'recovery') as popup:
                 panel.run(interrupted,lambda _:self.fail('unexpected completion'),'scan')

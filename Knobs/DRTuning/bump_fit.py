@@ -8,11 +8,14 @@ class NoXSRMinimum(ValueError):
     """A completed scan found no actionable XSR minimum."""
 
 
-def historical_sem_floor(directory,machine):
+def historical_sem_floor(directory,machine,*,legacy_directory=None):
     """Use recent ten-update precision and independently verified prediction errors."""
     sems=[];errors=[]
     # Filenames contain target first; order by the timestamp suffix instead.
-    paths=sorted(directory.glob('bump_*.xsr.json'),key=lambda p:p.name.rsplit('_',3)[-3:],reverse=True)
+    candidates={p.name:p for p in legacy_directory.glob('bump_*.xsr.json')} if legacy_directory else {}
+    for pattern in ('bump_*.xsr.json','[0-9][0-9][0-9][0-9]/bump_*.xsr.json'):
+        candidates.update((p.name,p) for p in directory.glob(pattern))
+    paths=sorted(candidates.values(),key=lambda p:p.name.rsplit('_',3)[-3:],reverse=True)
     for path in paths:
         try:
             with path.open(encoding='utf-8') as f:record=json.load(f)

@@ -95,12 +95,16 @@ class AdaptiveXSRTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as root:
                 panel=window.coupling_panel
-                panel.tempfiles_directory=Path(root);panel.finish_scan(result)
-                path,=Path(root).glob('*.xsr.json')
+                panel.tempfiles_directory=Path(root)/'tempfiles'
+                panel.run_data_directory=Path(root)/'data'
+                panel.finish_scan(result)
+                path,=panel.run_data_directory.glob('*/*.xsr.json')
                 data=json.loads(path.read_text())
                 self.assertEqual(len(data['points']),6)
                 self.assertEqual(len(data['fits'][0]['ci95_mm']),2)
-                self.assertTrue(path.with_suffix('').with_suffix('.png').is_file())
-                self.assertGreater(historical_sem_floor(Path(root),self.b.identity),0.)
+                png,=panel.tempfiles_directory.iterdir()
+                self.assertEqual(png.name,path.name.removesuffix('.xsr.json')+'.png')
+                self.assertGreater(historical_sem_floor(panel.run_data_directory,self.b.identity),0.)
+                self.assertGreater(historical_sem_floor(Path(root)/'empty',self.b.identity,legacy_directory=path.parent),0.)
         finally:
             window.close();app.processEvents()

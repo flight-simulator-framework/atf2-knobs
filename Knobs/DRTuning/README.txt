@@ -73,11 +73,22 @@ even before selecting a matrix. Recalculate reads the present magnet state and
 limits, then fits the latest observation. It measures dispersion if no current
 observation exists or if the settings have changed. Apply remains a separate step.
 The vertical weights default to 1 for dispersion and 0.05 for COD change.
-QM horizontal dispersion is directly below this page in the navigation.
+Choose Horizontal (QM) or Vertical (ZV) under Dispersion Correction.
+Drag the divider between the dispersion plots and the results table to resize
+them. On narrow windows, use Controls and Plots and results to switch views.
+Bump scan is a top-level entry. Other tools are grouped under In development.
+During bump calibration, shared matrix measurement or an XSR scan, Pause bump
+scan interrupts acquisition and requests restoration of the temporary currents.
+The pause dialog offers Resume and Save and end. Resume retains completed XSR
+points and the target queue. An incomplete XSR point is measured again.
+An interrupted calibration restarts for the current target.
 Both response scans show the RF offset and block, magnet index within the block,
 low/high current command and readback, and BPM samples at the current setting.
 The column counter advances after checking the response across RF settings and
 includes skipped magnets. Adaptive retries show their reason and probe width.
+Completed dispersion measurements, matrix scans, proposals and Apply results
+export a timestamped PNG to /mnt/nas1/atf-data/op/tempfiles/. QM filenames
+include trim or main. JSON data and checkpoints use the normal data directory.
 The plots compare dispersion RMS before correction, as predicted, and measured
 after Apply on the same valid, included BPMs. Vertical uses the target residual.
 QM reports straight BPMs and, when weighted, the selected arc parity separately.
@@ -492,7 +503,8 @@ Bump / XSR coupling:
      Each fit uses a SEM floor based on the five coarse points and up to 20
      recent same-machine summaries. The historical estimate uses median SEM
      and (from three prior scans) the spread of verification errors. A
-     timestamped .xsr.json next to the PNG saves point statistics and fits.
+     timestamped .xsr.json under flight-simulator/DRTuning/<year>/ saves point
+     statistics and fits. Older summaries in op/tempfiles remain readable.
   The SD/SF-labelled XSR plot for each completed target is saved under
   /mnt/nas1/atf-data/op/tempfiles/. On error, Resume retries the interrupted
   stage. A scan restored to its baseline reuses completed XSR points. A failed
@@ -624,7 +636,7 @@ matrices apply the same acceptance rule to the measured X/Y orbit response.
 
 XSR emittance estimate (2026-10-23)
 ---------------------------------
-Open XSR emittance in the left navigation or Measurements menu. This worksheet
+Open In development > XSR emittance in the left navigation or Measurements menu. This worksheet
 estimates vertical emittance only; horizontal inputs and PVs are not required.
 1. Measure absolute beta with Q modulation or calibrated TBT / phase beta,
    then run SR / SR2 beta fit. Use Estimate XSR emittance in that fit dialog,
@@ -706,7 +718,7 @@ response is an added calculation route, NOT a claim that the old SAD programs
 have been reproduced numerically in every detail.
 
 Operator workflow:
-1. Open RFTrack model in the left navigation. Machine input defaults are the
+1. Open In development > RFTrack model in the left navigation. Machine input defaults are the
    old SAD energy/tune target PVs; no user-selected JSON is required. Tune PVs
    are settings, not asserted fresh TBT measurements. RFTrack simulation uses
    separately excited measured BPM waveforms to supply its tune targets.

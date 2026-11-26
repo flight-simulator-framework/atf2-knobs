@@ -143,7 +143,7 @@ class SharedResponseTests(unittest.TestCase):
         app=QApplication.instance() or QApplication([])
         window=TuningSession(self.b)
         panel=window.coupling_panel
-        def synchronous(action,done,label):
+        def synchronous(action,done,label,**kwargs):
             done(action(lambda *_:None))
         try:
             with tempfile.TemporaryDirectory() as tmp,patch.object(panel,'run',side_effect=synchronous):

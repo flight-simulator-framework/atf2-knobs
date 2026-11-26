@@ -1,4 +1,7 @@
 """Interactive measured dispersion and orbit plots shared by both dispersion tools."""
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 from matplotlib.backend_bases import MouseButton
 from PyQt6.QtCore import pyqtSignal
@@ -8,6 +11,29 @@ from PyQt6.QtWidgets import QToolTip
 from Knobs.DRCorrection.gui import Plot
 from Knobs.DRCorrection.assessment import rms, improvement_pct
 from .dispersion import arc_bpms, straight_bpms
+
+
+OP_TEMPFILES_DIRECTORY = Path('/mnt/nas1/atf-data/op/tempfiles')
+
+
+def save_dispersion_png(panel, stem):
+    """Export the completed plot independently of the correction and its data archive."""
+    destination = panel.tempfiles_directory / f'{stem}_{datetime.now():%Y%m%d_%H%M%S_%f}.png'
+    figure = panel.plot.figure
+    previous_size = figure.get_size_inches().copy()
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        figure.set_size_inches(10, 7, forward=False)
+        panel.plot.save(destination)
+    except Exception as exc:
+        message = f'Dispersion PNG export failed: {destination} ({exc})'
+        panel.window.log(message)
+        panel.window.statusBar().showMessage(message, 15000)
+    else:
+        panel.window.log(f'Saved dispersion plot: {destination}')
+    finally:
+        figure.set_size_inches(previous_size, forward=False)
+        panel.plot.canvas.draw_idle()
 
 
 def dispersion_summary(data,plane,valid,baseline):

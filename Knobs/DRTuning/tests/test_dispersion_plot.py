@@ -102,6 +102,7 @@ class DispersionPlotTests(unittest.TestCase):
             window.open_tool('dispersion')
             panel = window.panels['dispersion']
             panel.data_directory=lambda:root
+            panel.tempfiles_directory=Path(root)/'tempfiles'
             manager = window.service.model_manager
             def prepare(opt, cancel, progress):
                 manager.baseline = machine.snapshot()
@@ -138,6 +139,11 @@ class DispersionPlotTests(unittest.TestCase):
                     panel.apply_button.click()
                     self.wait_for(lambda: not window.task.isRunning() and panel.find_button.isEnabled())
                 self.assertTrue(panel.data['applied'])
+                exports=list(panel.tempfiles_directory.iterdir())
+                self.assertEqual(len(exports),3)
+                for stage in ('proposal','matrix','applied'):
+                    png,=[path for path in exports if path.name.startswith(f'vertical_dispersion_{stage}_')]
+                    self.assertEqual(png.read_bytes()[:8],bytes.fromhex('89504e470d0a1a0a'))
                 ax = panel.plot.figure.axes[1]
                 for label in ('Measured before','Predicted','Measured after SET'):
                     curve = next(line for line in ax.lines if line.get_label()==label)

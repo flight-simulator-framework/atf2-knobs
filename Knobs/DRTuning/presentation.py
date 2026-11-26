@@ -2,7 +2,7 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QGroupBox,
     QScrollArea,QSplitter,QPushButton,QLabel,QComboBox,QDoubleSpinBox,QHeaderView,
-    QAbstractItemView,QProgressBar,QSpinBox)
+    QAbstractItemView,QTabBar,QProgressBar,QSpinBox)
 
 
 STYLE = '''
@@ -12,11 +12,17 @@ QGroupBox { font-weight: bold; border: 1px solid #cbd5e1; border-radius: 5px;
             margin-top: 12px; padding: 12px 8px 8px 8px; }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; }
 QPushButton { padding: 6px 10px; min-height: 20px; }
-QPushButton[primary="true"] { background: #1764a0; color: white; border-radius: 4px; }
+QPushButton[primary="true"] { font-weight: bold; background: #1764a0; color: white; border-radius: 4px; }
 QPushButton[primary="true"]:disabled { background: #94a3b8; }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { padding: 4px; min-height: 20px; }
 QTableWidget { background: white; gridline-color: #dbe1e8; }
 QHeaderView::section { padding: 6px; background: #e8edf3; color: #172b4d; }
+QPushButton[applyAction="true"]:enabled { background: #216747; color: white; font-weight: bold; border-radius: 4px; }
+QPushButton#operationPause:enabled { background: #ffd166; color: #362200; font-weight: bold; border: 2px solid #935900; border-radius: 4px; }
+QTreeWidget { background: white; border: 1px solid #cbd5e1; }
+QTreeWidget::item { padding: 7px 2px; }
+QTreeWidget::item:selected { background: #dbeafe; color: #123b66; }
+QSplitter::handle:vertical { background: #cbd5e1; }
 QListWidget { background: white; border: 1px solid #cbd5e1; }
 QListWidget::item { padding: 10px 6px; }
 QListWidget::item:selected { background: #dbeafe; color: #123b66; }
@@ -37,6 +43,59 @@ def scroll(widget):
     area=QScrollArea();area.setWidgetResizable(True);area.setWidget(widget)
     area.setFrameShape(QScrollArea.Shape.NoFrame)
     return area
+
+
+class ControlSplitter(QSplitter):
+    """Keep controls and plots side by side whenever both have room."""
+    def __init__(self,layout):
+        super().__init__()
+        self.views=QTabBar()
+        self.views.addTab('Controls')
+        self.views.addTab('Plots and results')
+        self.views.setExpanding(False)
+        self.views.hide()
+        layout.addWidget(self.views)
+        layout.addWidget(self,1)
+        self.views.currentChanged.connect(self.select_view)
+        self.compact=None
+
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        if self.count()!=2:return
+        compact=self.width()<self.widget(0).minimumWidth()+440
+        if compact!=self.compact:
+            self.compact=compact
+            self.views.setVisible(compact)
+            self.select_view(self.views.currentIndex())
+            if not compact:self.setSizes([self.widget(0).minimumWidth(),800])
+
+    def select_view(self,index):
+        for i in range(self.count()):
+            self.widget(i).setVisible(not self.compact or i==index)
+
+def fit_controls(split):
+    """Allow the complete form and its vertical scrollbar to fit at startup."""
+    area=split.widget(0)
+    area.widget().ensurePolished()
+    width=area.widget().minimumSizeHint().width()+area.verticalScrollBar().sizeHint().width()+2*area.frameWidth()
+    area.setMinimumWidth(width)
+    split.setStretchFactor(0,0)
+    split.setStretchFactor(1,1)
+    split.setSizes([width,800])
+
+
+def plot_and_results(plot,results):
+    split=QSplitter(Qt.Orientation.Vertical)
+    split.addWidget(plot)
+    split.addWidget(results)
+    split.setHandleWidth(7)
+    split.setCollapsible(0,False)
+    plot.setMinimumHeight(230)
+    results.setMinimumHeight(68)
+    split.setStretchFactor(0,3)
+    split.setStretchFactor(1,1)
+    split.setSizes([450,145])
+    return split
 
 
 def table_style(table):

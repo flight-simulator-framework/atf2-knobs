@@ -113,11 +113,38 @@ class GuiTests(unittest.TestCase):
             self.app.processEvents();time.sleep(.01)
             if time.monotonic()>deadline:raise AssertionError('Qt task timeout')
         self.app.processEvents()
+    def test_grouped_navigation_and_resizable_dispersion_views(self):
+        from Knobs.DRTuning.gui import TuningSession
+        window=TuningSession(QuadFixture())
+        try:
+            window.resize(1440,900);window.show();self.app.processEvents()
+            tree=window.navigation
+            self.assertEqual([tree.topLevelItem(i).text(0) for i in range(3)],
+                             ['Dispersion Correction','Bump scan','In development'])
+            self.assertFalse(tree.topLevelItem(2).isExpanded())
+            self.assertIs(window.tabs.currentWidget(),window.qm_dispersion)
+            tree.setCurrentItem(tree.topLevelItem(0).child(1));self.app.processEvents()
+            panel=window.panels['dispersion']
+            self.assertIs(window.tabs.currentWidget(),panel)
+            self.assertEqual(panel.splitter.widget(0).horizontalScrollBar().maximum(),0)
+            before=panel.result_tabs.height()
+            panel.result_splitter.setSizes([300,300]);self.app.processEvents()
+            self.assertGreater(panel.result_tabs.height(),before)
+            self.assertGreaterEqual(panel.plot.height(),230)
+            window.resize(850,750);self.app.processEvents()
+            self.assertTrue(panel.splitter.views.isVisible())
+            panel.splitter.views.setCurrentIndex(1);self.app.processEvents()
+            self.assertGreater(panel.plot.width(),450)
+            window.open_tool('model')
+            self.assertTrue(tree.topLevelItem(2).isExpanded())
+            self.assertIs(tree.currentItem().parent(),tree.topLevelItem(2))
+        finally:window.close()
+
     def test_calc_pause_resume_and_cancel_controls(self):
         from Knobs.DRTuning.gui import TuningSession
         for cancel in (False,True):
             with self.subTest(cancel=cancel):
-                backend=QuadFixture();window=TuningSession(backend);window.show()
+                backend=QuadFixture();window=TuningSession(backend);window.open_tool('orbit');window.show()
                 original=backend.orbit;reading=threading.Event();release=threading.Event()
                 initial=backend.snapshot()
                 def orbit():

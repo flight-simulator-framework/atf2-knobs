@@ -8,14 +8,15 @@ import numpy as np
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                             QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget)
+                             QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from Knobs.DRCorrection.assessment import changed_indices
 from Knobs.DRCorrection.core import load_session
 from Knobs.DRCorrection.gui import CorrectionPanel
 from .dispersion_source import ZV_FILES,local_time,matrix_caption,measured_time,observation_from_result
-from .correction_gui import DispersionPlot, control
-from .presentation import MatrixProgress, scroll, table_style
+from .correction_gui import control
+from .dispersion_plot import DispersionPlot, OP_TEMPFILES_DIRECTORY, save_dispersion_png
+from .presentation import ControlSplitter, MatrixProgress, plot_and_results, scroll, table_style
 from .qm_checkpoint import save_checkpoint
 from .zv_rf_scan import eligible_zv, measure_all_zvs
 
@@ -27,6 +28,7 @@ class VerticalDispersionPanel(CorrectionPanel):
 
     def __init__(self, window, mode):
         super().__init__(window, mode)
+        self.tempfiles_directory=OP_TEMPFILES_DIRECTORY
         self.matrix=None;self.matrix_path=None;self.observation=None
         self.baseline_observed.connect(self.plot.correction)
         self.options.count_v = 5
@@ -100,18 +102,23 @@ class VerticalDispersionPanel(CorrectionPanel):
             button = QPushButton(label)
             button.clicked.connect(lambda _, slot=action: slot())
             row.addWidget(button)
+        self.apply_button.setProperty('applyAction',True)
+        for action in (self.find_button,self.measure_button,self.apply_button):
+            action.setProperty('primary',True)
+        for section in (settings,fit_box):
+            left.removeWidget(section)
+            left.addWidget(section)
         left.addStretch()
         right = QWidget()
         layout = QVBoxLayout(right)
         self.matrix_progress=MatrixProgress()
         self.matrix_activity.connect(self.matrix_progress.show_activity)
         layout.addWidget(self.matrix_progress)
-        layout.addWidget(self.plot, 1)
-        layout.addWidget(self.result_tabs)
-        self.result_tabs.setMaximumHeight(170)
+        self.result_splitter=plot_and_results(self.plot,self.result_tabs)
+        layout.addWidget(self.result_splitter,1)
         table_style(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        split = QSplitter()
+        split = ControlSplitter(self.layout())
         self.splitter = split
         area = scroll(controls)
         area.setMinimumWidth(340)
@@ -119,7 +126,6 @@ class VerticalDispersionPanel(CorrectionPanel):
         split.addWidget(right)
         split.setStretchFactor(1, 1)
         split.setSizes([355, 900])
-        self.layout().addWidget(split)
         self.refresh()
 
     def invalidate(self, clear_model_response=False):
@@ -157,12 +163,14 @@ class VerticalDispersionPanel(CorrectionPanel):
         self.set_screening_options()
         self.matrix=None;self.matrix_path=None;self.observation=None
         self.matrix_label.setText('No matrix selected');self.response_cache.clear()
+        options = self.calculation_options()
+        self.invalidate()
         if self.screening.currentData() == 'all' and dataset is None:
-            options = self.calculation_options()
-            self.invalidate()
             self.measure_and_save(lambda p:measure_all_zvs(self.window.service,options,p),'Measure full ZV matrix')
         else:
-            super().calculate(dataset)
+            stage='proposal' if dataset is None else 'recalculated'
+            self.window.start(lambda p:self.window.service.calculate(self.mode,options,p,dataset),
+                              lambda data:self.show_result(data,stage),pausable=dataset is None)
 
     def measure_candidates(self):
         preview = self.data
@@ -183,7 +191,7 @@ class VerticalDispersionPanel(CorrectionPanel):
                 return data,f'Matrix measured. Automatic save failed: {exc}. Use Save data + plots.',None
         def done(result):
             data,message,self.matrix_path=result
-            self.display(data)
+            self.show_result(data,'matrix')
             self.proposal_summary.setText(self.proposal_summary.text()+'\n'+message)
             self.window.log(message)
         self.window.start(work,done,label=label,pausable=True)
@@ -244,6 +252,7 @@ class VerticalDispersionPanel(CorrectionPanel):
             self.observation=obs;self.plot.correction(obs)
             self.matrix_label.setText(matrix_caption(self.matrix,'Vertical ZV',self.matrix_path,obs))
             self.proposal_summary.setText('Dispersion measured '+local_time(obs['measured_at']))
+            save_dispersion_png(self,'vertical_dispersion_measured')
         self.window.start(lambda p:self.window.service.observe_current_beam('dispersion',options,matrix.get('ignored_readbacks')),done,
                           label='Measure vertical dispersion')
 
@@ -252,7 +261,11 @@ class VerticalDispersionPanel(CorrectionPanel):
         data=self.matrix;obs=self.observation;options=self.calculation_options();options.response_source='measured'
         self.invalidate()
         self.window.start(lambda p:self.window.service.reuse_on_current_beam(data,options,p,observation=obs),
-                          self.display,label='Recalculate vertical correction')
+                          lambda result:self.show_result(result,'recalculated'),label='Recalculate vertical correction')
+
+    def show_result(self,data,stage):
+        self.display(data)
+        save_dispersion_png(self,'vertical_dispersion_'+stage)
 
     def display(self, data):
         full = bool(data.get('full_zv_candidates'))
@@ -323,4 +336,4 @@ class VerticalDispersionPanel(CorrectionPanel):
     def apply(self):
         data = self.data
         if data is not None and self.apply_button.isEnabled():
-            self.window.start(lambda progress: self.window.service.apply(data, progress), self.display)
+            self.window.start(lambda progress: self.window.service.apply(data, progress), lambda result:self.show_result(result,'applied'))

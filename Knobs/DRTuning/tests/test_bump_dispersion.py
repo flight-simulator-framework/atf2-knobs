@@ -467,6 +467,7 @@ class CorrectionGuiTests(unittest.TestCase):
             panel=w.qm_dispersion;panel.display(panel.service.calculate(panel.options()))
             with tempfile.TemporaryDirectory() as folder:
                 panel.autosave_directory=Path(folder)/'results'
+                panel.tempfiles_directory=Path(folder)/'tempfiles'
                 with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))),\
                      patch('Knobs.DRTuning.correction_gui.QFileDialog.getSaveFileName',side_effect=AssertionError('Unexpected dialog')):
                     panel.apply()
@@ -475,6 +476,9 @@ class CorrectionGuiTests(unittest.TestCase):
                 np.testing.assert_allclose(saved['full_after'],panel.result['full_after'])
                 self.assertTrue(files[0].name.startswith('qm_dispersion_trim_'))
                 self.assertEqual(saved['autosave']['json'],str(files[0]))
+                png,=panel.tempfiles_directory.iterdir()
+                self.assertTrue(png.name.startswith('qm_dispersion_trim_applied_'))
+                self.assertEqual(png.suffix,'.png')
                 self.assertTrue(files[0].with_suffix('.png').read_bytes().startswith(b'\x89PNG'))
                 self.assertIn('Auto-saved',panel.save_status.text());self.assertTrue(panel.recalculate_button.isEnabled())
                 panel.display(panel.result);self.assertEqual(len(list(panel.autosave_directory.glob('*.json'))),1)

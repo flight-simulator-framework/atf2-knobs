@@ -161,12 +161,16 @@ class MainCoilTests(unittest.TestCase):
             self.assertFalse(panel.recalculate_button.isEnabled())
             self.assertIn('QM3R.2', panel.excluded.text())
             with tempfile.TemporaryDirectory() as directory:
+                panel.tempfiles_directory=Path(directory)/'tempfiles'
                 path = Path(directory) / 'scan.json'
                 save_checkpoint(path, data)
                 with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(path), 'JSON')):
                     with patch.object(window,'start',side_effect=lambda work,done,**kw:done(work(lambda *_:None))):panel.load_scan()
                 self.assertIsNone(panel.result)
-                with patch.object(window,'start',side_effect=lambda work,done,**_:done(work(lambda *_:None))):panel.recalculate()
+                self.assertFalse(panel.tempfiles_directory.exists())
+                with patch.object(window,'start',side_effect=lambda work,done,**_:done(work(lambda *_:None))):
+                    panel.update_dispersion()
+                    panel.recalculate()
                 panel.autosave_directory = Path(directory)
                 with patch.object(QFileDialog, 'getSaveFileName', return_value=('', '')) as dialog:
                     panel.save()
@@ -176,6 +180,10 @@ class MainCoilTests(unittest.TestCase):
                 with patch.object(window, 'start', side_effect=lambda action, done, **kw: done(action(lambda *_: None))):
                     panel.calculate()
                     self.assertEqual(len(list(Path(directory).glob('qm_scan_main_*.checkpoint.json'))), 1)
+                    exports=list(panel.tempfiles_directory.iterdir())
+                    self.assertEqual(len(exports),3)
+                    for stage in ('measured','recalculated','matrix'):
+                        self.assertTrue(any(p.match(f'qm_dispersion_main_{stage}_*.png') for p in exports))
             self.assertEqual(panel.coil.currentText(), 'Main')
             self.assertEqual(panel.excluded.text(), 'QM4R')
             self.assertTrue(panel.set_button.isEnabled())

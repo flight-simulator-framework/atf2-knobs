@@ -6,7 +6,7 @@ import traceback
 from pathlib import Path
 from PyQt6.QtCore import Qt,QTimer,QSettings,pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QLabel,
-    QComboBox,QLineEdit,QPushButton,QFileDialog,QSpinBox,QCheckBox,QMessageBox,QDialog,QListWidget,QSplitter)
+    QComboBox,QLineEdit,QPushButton,QFileDialog,QSpinBox,QCheckBox,QMessageBox,QDialog,QTreeWidget,QTreeWidgetItem,QSplitter)
 from Knobs.DRCorrection.gui import DRCorrectionWindow,TBTPanel,Task
 from Knobs.DRCorrection.backends import DemoBackend,StoredBackend
 from Knobs.DRCorrection.core import serial
@@ -244,8 +244,11 @@ class TuningSession(DRCorrectionWindow):
         from .correction_gui import QMDispersionPanel,CouplingPanel
         self.qm_dispersion=QMDispersionPanel(self);self.tabs.insertTab(self.tabs.indexOf(self.panels['dispersion'])+1,self.qm_dispersion,'QM horizontal dispersion')
         self.coupling_panel=CouplingPanel(self);self.tabs.addTab(self.coupling_panel,'Local bump / XSR coupling')
-        from .presentation import STYLE,reflow_correction
-        self.setStyleSheet(STYLE);self.resize(1280,820)
+        from .presentation import STYLE,fit_controls,reflow_correction
+        self.setStyleSheet(STYLE)
+        screen=self.screen().availableGeometry()
+        self.resize(min(max(1280,int(.9*screen.width())),1680,screen.width()),
+                    min(max(820,int(.9*screen.height())),1080,screen.height()-42))
         default_fixed={n for n in backend.hcorrectors+backend.vcorrectors if magnet_name(n) in ('ZH15R','ZV16R')}
         for mode,panel in self.panels.items():
             panel.options.fixed_actuators=tuple(sorted(set(panel.options.fixed_actuators)|default_fixed))
@@ -261,19 +264,57 @@ class TuningSession(DRCorrectionWindow):
                 panel.options.bpm_samples=10
                 reflow_correction(panel)
         layout=self.centralWidget().layout();layout.removeWidget(self.tabs)
-        self.navigation=QListWidget();self.navigation.setMinimumWidth(160);self.navigation.setMaximumWidth(185)
-        self.navigation.addItems(['COD correction','Vertical dispersion','QM dispersion','Skew correction','TBT / beta','QF1R beta','QF2R beta','QM trim 1 beta','QM trim 2 beta','RFTrack model','XSR emittance','Bump / XSR coupling'])
-        self.tabs.tabBar().hide();self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
-        self.tabs.currentChanged.connect(self.navigation.setCurrentRow);self.navigation.setCurrentRow(0)
+        self.navigation=QTreeWidget()
+        self.navigation.setHeaderHidden(True)
+        self.navigation.setIndentation(14)
+        self.navigation.setMinimumWidth(192)
+        self.navigation.setMaximumWidth(235)
+        self.tabs.tabBar().hide()
+        self.navigation_items={}
+        def page(parent,title,panel):
+            item=QTreeWidgetItem(parent,[title])
+            index=self.tabs.indexOf(panel)
+            item.setData(0,Qt.ItemDataRole.UserRole,index)
+            self.navigation_items[index]=item
+        def section(title):
+            item=QTreeWidgetItem(self.navigation,[title])
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            font=item.font(0);font.setBold(True);item.setFont(0,font)
+            return item
+        dispersion=section('Dispersion Correction')
+        page(dispersion,'Horizontal',self.qm_dispersion)
+        page(dispersion,'Vertical',self.panels['dispersion'])
+        dispersion.setExpanded(True)
+        page(self.navigation,'Bump scan',self.coupling_panel)
+        development=section('In development')
+        for title,panel in [('COD correction',self.panels['orbit']),('Skew correction',self.panels['skew']),
+                            ('TBT / beta',self.tbt),*((family+' beta',self.qmod[key]) for key,(family,_) in FAMILIES.items()),
+                            ('RFTrack model',self.model_panel),('XSR emittance',self.emittance_panel)]:
+            page(development,title,panel)
+        def select_page(item,_previous):
+            if item is not None and item.data(0,Qt.ItemDataRole.UserRole) is not None:
+                self.tabs.setCurrentIndex(item.data(0,Qt.ItemDataRole.UserRole))
+        def select_item(index):
+            item=self.navigation_items[index]
+            if item.parent():item.parent().setExpanded(True)
+            self.navigation.setCurrentItem(item)
+        self.navigation.currentItemChanged.connect(select_page)
+        self.tabs.currentChanged.connect(select_item)
+        self.tabs.setCurrentWidget(self.qm_dispersion)
+        for panel in (self.qm_dispersion,self.panels['dispersion'],self.coupling_panel):
+            fit_controls(panel.splitter)
         content=QSplitter();content.addWidget(self.navigation);content.addWidget(self.tabs);content.setStretchFactor(1,1)
         from PyQt6.QtWidgets import QSizePolicy
         self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Ignored)
-        content.setSizes([170,1100])
+        content.setSizes([205,1100])
         layout.insertWidget(1,content,1)
         status=QWidget();row=QHBoxLayout(status);row.setContentsMargins(0,0,0,0)
         self.operation_status=QLabel('Ready. Select a tool from the left.');self.operation_status.setWordWrap(True)
         self.operation_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.elapsed_label=QLabel('');row.addWidget(self.operation_status,1);row.addWidget(self.elapsed_label);layout.insertWidget(1,status)
+        self.elapsed_label=QLabel('');row.addWidget(self.operation_status,1);row.addWidget(self.elapsed_label)
+        self.pause_button.setObjectName('operationPause')
+        row.addWidget(self.pause_button)
+        layout.insertWidget(1,status)
         self.messages.setMaximumHeight(130);self.messages.hide()
         self.log_toggle=QCheckBox('Show detailed log');self.log_toggle.toggled.connect(self.messages.setVisible);layout.insertWidget(layout.count()-1,self.log_toggle)
         self.cancel_button.setText('Cancel / restore');self.cancel_button.setEnabled(False)
@@ -363,6 +404,7 @@ class TuningSession(DRCorrectionWindow):
     def tick(self):
         self.elapsed_label.setText(f'{time.monotonic()-self._started:.1f} s')
     def cancel_requested(self):
+        self.coupling_panel.pause_requested=False
         if self.task is not None and self.task.isRunning():
             self.operation_status.setText('Cancel requested. Waiting for the current read / restoration.')
     def error(self,text):
@@ -375,7 +417,14 @@ class TuningSession(DRCorrectionWindow):
             self.log_toggle.setChecked(True)
             if self.tabs.currentWidget() is self.tbt:self.tbt.acquisition_status.setText('Failed: '+message+'\nSee the detailed log below.')
     def toggle_pause(self):
-        if not self._rf_paused:
+        if self._rf_paused or self.task is None or not self.task.isRunning():return
+        if self.tabs.currentWidget() is self.coupling_panel and self._manual_pause_enabled:
+            self.coupling_panel.pause_requested=True
+            self.service.cancel.set()
+            self.pause_button.setEnabled(False)
+            self.pause_button.setText('Pausing…')
+            self.operation_status.setText('Pause requested · waiting for acquisition and current restoration')
+        else:
             super().toggle_pause()
 
     def show_rf_pause(self,monitor,reason):
@@ -388,7 +437,9 @@ class TuningSession(DRCorrectionWindow):
         self._rf_paused=bool(reason)
         if not reason:
             self.operation_status.setText('RF recovered. Continuing measurement.')
-            self.pause_button.setText('Resume' if self.service.pause_requested.is_set() else 'Pause')
+            bump=self._manual_pause_enabled and self.tabs.currentWidget() is self.coupling_panel
+            self.pause_button.setText('Pause bump scan' if bump else
+                                      'Resume' if self.service.pause_requested.is_set() else 'Pause')
             self.pause_button.setEnabled(self._manual_pause_enabled)
             self.log('RF power pause resumed.')
             return
@@ -403,11 +454,17 @@ class TuningSession(DRCorrectionWindow):
         if self.task is not None and self.task.isRunning():
             self.log('An operation is running. Wait for completion or cancel.');return
         self.prepare_pause(pausable)
-        self._failed=False;self._started=time.monotonic();self._active_label=label or self.navigation.currentItem().text()
+        bump_pause=pausable and self.tabs.currentWidget() is self.coupling_panel
+        self.pause_button.setToolTip('Interrupt acquisition, restore temporary currents, then resume or save and end.'
+                                     if bump_pause else 'Pause at the next measurement checkpoint.')
+        if bump_pause:self.pause_button.setText('Pause bump scan')
+        self._failed=False;self._started=time.monotonic();self._active_label=label or self.tabs.tabText(self.tabs.currentIndex())
         self.operation_status.setStyleSheet('color:#175c91;font-weight:bold;')
         self.operation_status.setText(self._active_label+': working...');self.log(self._active_label+': started')
         self.service.cancel.clear()
         active_panel=self.tabs.currentWidget()
+        if active_panel in (self.panels['dispersion'],self.qm_dispersion) or bump_pause:
+            active_panel.splitter.views.setCurrentIndex(1)
         if active_panel in (self.panels['dispersion'],self.qm_dispersion):
             active_panel.matrix_progress.hide()
             self._active_dispersion_panel=active_panel
@@ -428,7 +485,7 @@ class TuningSession(DRCorrectionWindow):
         def done(result):
             try:
                 finished(result)
-                if not self._failed:
+                if not self._failed and not self.coupling_panel.pause_requested:
                     self.operation_status.setText(self._active_label+': complete');self.operation_status.setStyleSheet('color:#166534;font-weight:bold;')
             except Exception:self.error(traceback.format_exc())
         self.task.result.connect(done);self.task.failure.connect(self.error)
@@ -460,7 +517,8 @@ class TuningSession(DRCorrectionWindow):
             summary='QM correction applied; dispersion checked'
         elif message.startswith('No QM response reaches the target signal/noise ratio;'):
             summary='QM dispersion: S/N below target'
-        self.operation_status.setText((summary or self._active_label+'：'+message)+pending)
+        if not self.coupling_panel.pause_requested:
+            self.operation_status.setText((summary or self._active_label+'：'+message)+pending)
         if message.startswith(('SKIP ','PAUSED:','RESUMED:','BPM validity:','QM probe:','Resume:')):self.log(message)
     def task_finished(self):
         if self._active_dispersion_panel is not None:

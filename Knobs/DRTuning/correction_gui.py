@@ -8,11 +8,11 @@ from uuid import uuid4
 import numpy as np
 from PyQt6.QtCore import pyqtSignal,Qt,QTimer
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QComboBox,QCheckBox,
-                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QSplitter,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar,QListWidget,QListWidgetItem,QMessageBox)
+                            QDoubleSpinBox,QPushButton,QTableWidget,QTableWidgetItem,QFileDialog,QLineEdit,QGroupBox,QScrollArea,QSizePolicy,QProgressBar,QListWidget,QListWidgetItem,QMessageBox)
 from Knobs.DRCorrection.core import serial,Cancelled
 from Knobs.DRCorrection.gui import Plot
-from .presentation import MatrixProgress
-from .dispersion_plot import DispersionPlot
+from .presentation import ControlSplitter, MatrixProgress, plot_and_results
+from .dispersion_plot import DispersionPlot, OP_TEMPFILES_DIRECTORY, save_dispersion_png
 from .dispersion_source import QM_FILES,local_time,matrix_caption,observation_from_result
 from .coupling import CouplingService,BumpOptions,BumpRangeUnavailable,BumpLimitUnavailable
 from .bump_fit import historical_sem_floor
@@ -38,7 +38,7 @@ class CorrectionTool(QWidget):
     update=pyqtSignal(object)
     def __init__(self,window):
         super().__init__();self.window=window;self.result=None
-        layout=QVBoxLayout(self);split=QSplitter();self.splitter=split;layout.addWidget(split)
+        layout=QVBoxLayout(self);split=ControlSplitter(layout);self.splitter=split
         left=QWidget();self.controls=QVBoxLayout(left);self.form=QFormLayout();self.controls.addLayout(self.form)
         right=QWidget();self.right=QVBoxLayout(right);self.plot=self.plot_type();self.right.addWidget(self.plot,1)
         self.table=QTableWidget();self.table.setMaximumHeight(170);self.right.addWidget(self.table)
@@ -95,8 +95,8 @@ class CouplingPanel(CorrectionTool):
         self.right.insertWidget(0,activity)
         self.availability=None
         self.after_task=None;self.queue=[];self.running_queue=False;self.completed=[];self.skipped=[]
-        self.rank_started=False;self.scan_resume=None;self.plot_target=''
-        self.tempfiles_directory=Path('/mnt/nas1/atf-data/op/tempfiles')
+        self.pause_requested=False;self.rank_started=False;self.scan_resume=None;self.plot_target=''
+        self.tempfiles_directory=OP_TEMPFILES_DIRECTORY
         self.run_data_directory=Path('/mnt/nas1/atf-data/flight-simulator/DRTuning')
         targets=QGroupBox('SD/SF by |trim current|')
         target_layout=QVBoxLayout(targets)
@@ -110,7 +110,9 @@ class CouplingPanel(CorrectionTool):
         self.queue_button.setEnabled(False)
         self.queue_list.itemChanged.connect(self.refresh_queue_button)
         self.target=QComboBox();self.target.addItems([f'{f}.{i}' for f in ('SD1R','SF1R') for i in range(1,35)])
-        self.form.addRow('SD / SF bump position',self.target)
+        single=QGroupBox('Single target')
+        single_layout=QVBoxLayout(single)
+        single_layout.addWidget(self.target)
         self.amplitude=control(self.form,'Scan width [mm]',.8,.02,4.)
         self.amplitude.setToolTip('Full scan width. Try centered and shifted windows containing zero, then narrow down to 0.2 mm.')
         self.refine=control(self.form,'Refinement ± [mm]',.1,.001,1.)
@@ -142,7 +144,11 @@ class CouplingPanel(CorrectionTool):
         self.add_button('Check BPMs / current limits',self.check_positions)
         self.calibrate_button=self.add_button('1. Calibrate and close bump',self.calibrate)
         self.scan_button=self.add_button('2. Scan → fit → set optimum',self.scan)
+        single_layout.addWidget(self.calibrate_button)
+        single_layout.addWidget(self.scan_button)
+        self.controls.insertWidget(1,single)
         self.reset_button=self.add_button('Restore baseline currents',self.reset)
+        for action in (self.queue_button,self.calibrate_button,self.scan_button):action.setProperty('primary',True)
         self.scan_button.setEnabled(False);self.reset_button.setEnabled(False)
         for widget in (self.amplitude,self.refine,self.probe,self.bump_snr,self.step,self.leak,self.rms,self.settle):widget.valueChanged.connect(self.settings_changed)
         self.target.currentIndexChanged.connect(self.invalidate)
@@ -175,7 +181,7 @@ class CouplingPanel(CorrectionTool):
             matrix=self.service.measure_response_matrix(opt,options,state,progress,self.update.emit)
             save_checkpoint(path,matrix)
             return matrix
-        self.run(work,lambda matrix:self.matrix_ready(matrix,path),'Measure shared bump response')
+        self.run(work,lambda matrix:self.matrix_ready(matrix,path),'Measure shared bump response',pausable=True)
 
     def load_matrix(self):
         path,_=QFileDialog.getOpenFileName(self,'Load measured bump response',
@@ -316,8 +322,12 @@ class CouplingPanel(CorrectionTool):
         if self.window.tabs.isEnabled():QTimer.singleShot(0,action)
         else:self.after_task=action
 
-    def run(self,action,done,label):
+    def run(self,action,done,label,*,pausable=False):
         recovery_data=None
+        def start():
+            self.pause_requested=False
+            self.window.start(work,finished,label=label,pausable=pausable)
+
         target=self.queue[0] if self.running_queue else self.target.currentData() or self.target.currentText()
         def work(progress):
             try:
@@ -325,6 +335,7 @@ class CouplingPanel(CorrectionTool):
                     self.service.reset(recovery_data)
                     self.service.verify_geometry(recovery_data.get('pending_geometry') or recovery_data.get('calibration',recovery_data))
                     recovery_data.pop('restoration_error',None)
+                self.service.last_result=None
                 return action(progress)
             except Exception as exc:
                 partial=self.service.last_result
@@ -344,20 +355,34 @@ class CouplingPanel(CorrectionTool):
                 return dict(bump_error=str(exc),cancelled=isinstance(exc,Cancelled),partial=partial)
         def finished(value):
             nonlocal recovery_data
-            if isinstance(value,dict) and 'skip_target' in value:
-                self.finish_skipped(value);return
             if not isinstance(value,dict) or 'bump_error' not in value:
-                done(value);return
+                if isinstance(value,dict) and 'skip_target' in value:self.finish_skipped(value)
+                else:done(value)
+                # A request can arrive after the worker has committed the point or target.
+                if self.pause_requested and self.after_task is not None:
+                    next_action=self.after_task
+                    self.after_task=lambda:self.recovery('Paused before the next operation.',next_action)
+                else:self.pause_requested=False
+                return
             partial=value['partial']
             recovery_data=partial
             self.on_update(dict(kind='failure',data=partial))
-            self.window.error(value['bump_error'])
-            if value['cancelled']:
+            message=value['bump_error']
+            if self.pause_requested and value['cancelled'] and not (partial and partial.get('restoration_error')):
+                points=len((partial or {}).get('points',()))
+                message=f'Operator pause · {points} completed XSR points retained.'
+                if partial and partial.get('restored'):message+=' Baseline restore commands completed.'
+                self.activity_label.setText(message)
+                self.window.operation_status.setText(message)
+                self.window.log(message)
+            else:
+                self.window.error(message)
+            if value['cancelled'] and not self.pause_requested:
                 self.running_queue=False;self.queue=[];self.refresh_queue_button();self.invalidate();return
             if partial and partial.get('schema')=='dr-coupling-bump-1' and (partial.get('restored') or partial.get('restoration_error')):
                 self.scan_resume=partial
-            self.after_worker(lambda:self.recovery(value['bump_error'],lambda:self.window.start(work,finished,label=label)))
-        self.window.start(work,finished,label=label)
+            self.after_worker(lambda:self.recovery(message,start))
+        start()
 
     def finish_skipped(self,value):
         target=value['skip_target'];reason=value['reason']
@@ -382,6 +407,7 @@ class CouplingPanel(CorrectionTool):
             self.queue.pop(0);self.after_worker(self.next_target)
 
     def recovery(self,message,retry):
+        self.pause_requested=False
         box=QMessageBox(self)
         box.setWindowTitle('Bump paused')
         box.setText((self.plot_target+'\n' if self.plot_target else '')+message)
@@ -411,15 +437,16 @@ class CouplingPanel(CorrectionTool):
                 dest=Path(path)
         self.running_queue=False;self.queue=[];self.refresh_queue_button();self.invalidate()
 
-    def finish_scan(self,result):
+    def finish_scan(self,result,*,stamp=None):
         from matplotlib.figure import Figure
+        stamp=stamp or datetime.now()
         target=result['calibration']['target']
         try:
             figure=Figure(figsize=(8,5),layout='constrained')
             self.draw_xsr(figure.subplots(),target,result['points'],result['fits'],
                           [(p['amplitude_mm'],p['xsr']) for p in result['points']])
             self.tempfiles_directory.mkdir(parents=True,exist_ok=True)
-            dest=self.tempfiles_directory/f'bump_{target}_{datetime.now():%Y%m%d_%H%M%S_%f}.png'
+            dest=self.tempfiles_directory/f'bump_{target}_{stamp:%Y%m%d_%H%M%S_%f}.png'
             figure.savefig(dest,dpi=150)
             if result['fits'] and result['fits'][-1].get('point_count'):
                 points=result['points'];fit=result['fits'][-1]
@@ -429,10 +456,12 @@ class CouplingPanel(CorrectionTool):
                     points=[dict(amplitude_mm=p['amplitude_mm'],requested_amplitude_mm=p['requested_amplitude_mm'],
                                  phase=p['phase'],mean_um=p['xsr']['mean'],sem_um=p['xsr']['sem']) for p in points],
                     fits=result['fits'],sem_floor_um=result['sem_floor_um'],xsr_bounds_mm=result['xsr_bounds_mm'])
-                save_checkpoint(dest.with_suffix('.xsr.json'),summary)
+                history=self.run_data_directory/f'{stamp:%Y}'/dest.with_suffix('.xsr.json').name
+                history.parent.mkdir(parents=True,exist_ok=True)
+                save_checkpoint(history,summary)
         except Exception as exc:
-            message='Optimum applied. XSR plot export failed: '+str(exc)
-            self.after_worker(lambda:self.recovery(message,lambda:self.finish_scan(result)))
+            message='Optimum applied. XSR result export failed: '+str(exc)
+            self.after_worker(lambda:self.recovery(message,lambda:self.finish_scan(result,stamp=stamp)))
             return
         self.window.log('Saved '+str(dest))
         self.completed.append(dict(target=target,result=result,plot=str(dest)))
@@ -460,7 +489,7 @@ class CouplingPanel(CorrectionTool):
                                 f"{total-shared} measured here. Baseline restored. Ready for XSR scan.")
             self.activity_label.setText(value['target']+': Calibration complete; baseline currents verified. Ready to scan.')
             if self.running_queue:self.after_task=self.scan
-        self.run(lambda p:self.service.calibrate_target(target,opt,options,p,self.update.emit),done,'Calibrate preset bump')
+        self.run(lambda p:self.service.calibrate_target(target,opt,options,p,self.update.emit),done,'Calibrate preset bump',pausable=True)
     def scan(self):
         if self.calibration is None:return
         opt=self.options();g=copy.deepcopy(self.calibration)
@@ -475,10 +504,10 @@ class CouplingPanel(CorrectionTool):
             self.finish_scan(value)
         def measure(p):
             if not self.scan_resume:
-                self.service.xsr_history_floor_um=historical_sem_floor(self.tempfiles_directory,self.window.backend.identity)
+                self.service.xsr_history_floor_um=historical_sem_floor(self.run_data_directory,self.window.backend.identity,legacy_directory=self.tempfiles_directory)
                 self.update.emit(dict(kind='scan_restart',target=g['target']))
             return self.service.scan(g,opt,p,self.update.emit,resume=self.scan_resume)
-        self.run(measure,done,'Local bump / XSR minimization')
+        self.run(measure,done,'Local bump / XSR minimization',pausable=True)
     def reset(self):
         if self.result is None:return
         data=self.result
@@ -604,7 +633,11 @@ class QMDispersionPanel(CorrectionTool):
     matrix_activity=pyqtSignal(object)
     def __init__(self,window):
         super().__init__(window);self.service=DispersionService(window.backend,window.service.cancel)
+        self.tempfiles_directory=OP_TEMPFILES_DIRECTORY
         self.plot.dispersion_plane='x'
+        self.table.setMaximumHeight(16777215)
+        self.result_splitter=plot_and_results(self.plot,self.table)
+        self.right.addWidget(self.result_splitter,1)
         self.matrix_progress=MatrixProgress()
         self.matrix_activity.connect(self.matrix_progress.show_activity)
         self.service.reader.matrix_activity=self.matrix_activity.emit
@@ -658,9 +691,12 @@ class QMDispersionPanel(CorrectionTool):
         self.buttons.addWidget(self.matrix_label)
         self.update_dispersion_button,self.recalculate_button=button_row([
             ('Update dispersion',self.update_dispersion),('Recalculate',self.recalculate)])
+        self.controls.removeItem(self.buttons)
+        self.controls.insertLayout(0,self.buttons)
         self.set_button,self.reset_button=button_row([
             ('Apply',self.apply),('Restore original QM / RF',self.reset)])
-        self.set_button.setStyleSheet('font-weight: 600;')
+        self.set_button.setProperty('applyAction',True)
+        for action in (self.calc_button,self.recalculate_button,self.set_button):action.setProperty('primary',True)
         self.bpm_button=QPushButton('Select BPMs…')
         self.bpm_button.clicked.connect(lambda:self.window.open_tool('selection'))
         correction.addRow(self.bpm_button)
@@ -725,6 +761,9 @@ class QMDispersionPanel(CorrectionTool):
     def choose_autosave_directory(self):
         path=QFileDialog.getExistingDirectory(self,'Automatic save folder',str(self.autosave_directory))
         if path:
+            if Path(path).resolve().is_relative_to(self.tempfiles_directory.resolve()):
+                self.save_status.setText('Choose a data folder for QM measurements. The tempfiles folder is for plots.')
+                return
             self.autosave_directory=Path(path);self.save_directory.setText(path);self.save_directory.setToolTip(path)
             self.save_status.setText('Save folder updated.')
     def qm_save_path(self,coil,*,checkpoint=False,stamp=None):
@@ -776,6 +815,7 @@ class QMDispersionPanel(CorrectionTool):
             self.matrix_label.setText(matrix_caption(self.matrix,'QM '+self.active_coil,self.matrix_path,obs))
             self.plot.correction(obs);self.table.setRowCount(0);self.save_button.setEnabled(False)
             self.status.setText('Dispersion measured '+local_time(obs['measured_at']))
+            self.export_plot('measured')
         self.window.start(lambda p:self.service.measure_current_dispersion(opt),done,label='Measure QM dispersion')
 
     def resume_interrupted(self):
@@ -804,9 +844,17 @@ class QMDispersionPanel(CorrectionTool):
         if self.result is None:return
         data=self.result;opt=self.options();path=self.qm_save_path(opt.coil,checkpoint=True);self.set_button.setEnabled(False)
         self.run(lambda p:self.service.resume(data,opt,p,self.update.emit,checkpoint_path=path),
-                 self.display,'Resume QM scan')
+                 self.matrix_measured,'Resume QM scan')
+    def export_plot(self,stage):
+        save_dispersion_png(self,f'qm_dispersion_{self.active_coil}_{stage}')
+
+    def matrix_measured(self,data):
+        self.display(data)
+        self.export_plot('matrix')
+
     def applied(self,data):
         self.display(data)
+        self.export_plot('applied')
         # File errors must never roll back an already verified machine correction.
         try:
             stamp=datetime.now().astimezone()
@@ -836,14 +884,17 @@ class QMDispersionPanel(CorrectionTool):
     def calculate(self):
         self.matrix=None;self.matrix_path=None;self.observation=None;self.matrix_label.setText('Measuring matrix…')
         opt=self.options();path=self.qm_save_path(opt.coil,checkpoint=True);self.set_button.setEnabled(False)
-        self.run(lambda p:self.service.calculate(opt,p,self.update.emit,checkpoint_path=path,group_rf=True),self.display,'QM dispersion')
+        self.run(lambda p:self.service.calculate(opt,p,self.update.emit,checkpoint_path=path,group_rf=True),self.matrix_measured,'QM dispersion')
     def recalculate(self):
         data=self.matrix
         if data is None:return
         opt=self.options();obs=self.observation
         self.set_button.setEnabled(False)
         keep_iterations=data is self.result
-        self.window.start(lambda p:self.service.reuse_on_current_beam(data,opt,p,observation=obs,keep_iterations=keep_iterations),self.display,
+        def done(result):
+            self.display(result)
+            self.export_plot('recalculated')
+        self.window.start(lambda p:self.service.reuse_on_current_beam(data,opt,p,observation=obs,keep_iterations=keep_iterations),done,
                           label='Recalculate QM correction')
 
     def apply(self):
