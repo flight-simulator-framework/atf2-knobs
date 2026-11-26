@@ -296,6 +296,12 @@ QM dispersion:
   If a crash left a QM or RF offset applied, Resume refuses to move anything.
   Restore original QM / RF settings explicitly restores those scan settings;
   any changed correctors/skews must separately match the saved baseline.
+  To use a completed QM response matrix at a different operating point, use
+  Load scan, then Use matrix with current beam. This reads the current QM
+  readbacks and parameter A/B, and measures dispersion / COD with 10 BPM
+  updates at each of the three RF settings. RF returns to its starting value.
+  Review the plotted baseline and Proposed [A] before Apply. Restore original
+  QM / RF then refers to this new baseline. Recalculate refits offline.
   Automatic scan resume does not resume or automatically perform Apply.
   Old files without committed scan state cannot recover partial responses.
   Successful Apply automatically saves JSON and PNG to /atf/data/flight-simulator/DRTuning/<year>/,

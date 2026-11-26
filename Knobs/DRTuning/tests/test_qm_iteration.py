@@ -51,6 +51,71 @@ class QMIterationTests(unittest.TestCase):
         self.assertEqual(reset_fit['baseline'],original)
         self.assertEqual(reset_fit['iteration_index'],0)
 
+    def test_saved_matrix_on_current_beam_uses_live_limits_masks_and_restore_origin(self):
+        self.opt.measure_tunes=False
+        name=QM_CANDIDATES[0]
+        self.opt.fixed_actuators=QM_CANDIDATES[1:]
+        self.b.d0=-self.b.dr[:,0]
+        source=self.s.calculate(self.opt,group_rf=True)
+        self.s.apply(source)
+        source=self.s.recalculate(source,self.opt)
+        self.s.apply(source)
+        saved=json.loads(json.dumps(serial(source),allow_nan=False))
+        self.b.q[name]=.25
+        self.b.offset=300.
+        self.b.d0=-1.5*self.b.dr[:,0]
+        self.b.quadrupoles[name]['limits_A']=[-.1,.7]
+        original=self.b.snapshot()
+        lost,missing=np.flatnonzero(source['straight'])[:2]
+        saved['iteration_origin']['acquisition_valid'][lost]=False
+        orbit=self.b.orbit
+        def dropping():
+            frame=orbit();frame['valid'][missing]=False;return frame
+        self.b.commands.clear();before=self.b.acquisitions
+        with patch.object(self.b,'orbit',side_effect=dropping),patch.object(self.b,'set_frequency',wraps=self.b.set_frequency) as rf:
+            result=self.s.reuse_on_current_beam(saved,self.opt)
+        self.assertEqual([c.args[0] for c in rf.call_args_list],[-1700.,2300.,300.])
+        self.assertEqual(self.b.acquisitions-before,30)
+        self.assertEqual(self.b.commands,[])
+        self.assertEqual(result['baseline'],original)
+        self.assertEqual(result['centers'][0],.25)
+        self.assertEqual(result['response_origin']['baseline']['quadrupoles'][name],0.)
+        self.assertNotIn('iteration_history',result)
+        self.assertTrue(saved['applied']);self.assertFalse(result['applied'])
+        self.assertFalse(result['valid'][lost]);self.assertFalse(result['valid'][missing])
+        valid=result['valid']
+        np.testing.assert_allclose(result['full_measured'][0,valid],-1.25*self.b.dr[valid,0])
+        np.testing.assert_array_equal(result['response'],source['response'])
+        self.assertAlmostEqual(result['delta'][0],.45)
+        self.s.apply(result)
+        self.assertAlmostEqual(self.b.q[name],.7)
+        again=self.s.recalculate(result,self.opt)
+        self.s.reset(again)
+        self.assertEqual(self.b.snapshot(),original)
+        fresh=self.s.reuse_on_current_beam(again,self.opt)
+        self.assertFalse(fresh['valid'][lost]);self.assertTrue(fresh['valid'][missing])
+        self.s.validate_checkpoint(json.loads(json.dumps(serial(fresh),allow_nan=False)))
+
+    def test_current_baseline_detects_incompatible_file_and_changes_during_or_after_read(self):
+        self.opt.measure_tunes=False
+        source=self.s.calculate(self.opt,group_rf=True)
+        source['profile_signature']='different'
+        with patch.object(self.b,'set_frequency',side_effect=AssertionError),self.assertRaisesRegex(ValueError,'profile'):
+            self.s.reuse_on_current_beam(source,self.opt)
+        source['profile_signature']=self.s.profile_signature()
+        n=source['actuators'][0]
+        def drift(opt):
+            self.b.q[n]+=.2
+            return signal(opt)
+        signal=self.s.signal
+        with patch.object(self.s,'signal',side_effect=drift),self.assertRaisesRegex(ValueError,'settings changed'):
+            self.s.reuse_on_current_beam(source,self.opt)
+        proposal=self.s.reuse_on_current_beam(source,self.opt)
+        self.b.q[n]+=.01
+        self.b.commands.clear()
+        with self.assertRaisesRegex(ValueError,'Settings changed'):self.s.apply(proposal)
+        self.assertEqual(self.b.commands,[])
+
     def test_three_amp_steps_accumulate_until_the_hardware_limit(self):
         name=QM_CANDIDATES[0]
         self.b.quadrupoles[name]['limits_A']=[-5.,5.]
@@ -132,6 +197,34 @@ class QMIterationGuiTests(unittest.TestCase):
     def setUpClass(cls):
         from PyQt6.QtWidgets import QApplication
         cls.app=QApplication.instance() or QApplication([])
+
+    def test_load_current_beam_button_plots_fresh_dispersion_before_apply(self):
+        from PyQt6.QtWidgets import QFileDialog
+        from Knobs.DRTuning.gui import TuningSession
+        from Knobs.DRTuning.qm_checkpoint import save_checkpoint
+        w=TuningSession(DispersionFixture())
+        try:
+            panel=w.qm_dispersion;opt=panel.options()
+            self.assertFalse(panel.current_beam_button.isEnabled())
+            source=panel.service.calculate(opt,group_rf=True)
+            with tempfile.TemporaryDirectory() as folder:
+                path=Path(folder)/'saved.json';save_checkpoint(path,source)
+                original=path.read_bytes()
+                with patch.object(QFileDialog,'getOpenFileName',return_value=(str(path),'JSON')):
+                    panel.load_scan()
+                self.assertTrue(panel.current_beam_button.isEnabled())
+                w.backend.q[source['actuators'][0]]=.14
+                w.backend.d0*=2.
+                w.backend.commands.clear()
+                with patch.object(w,'start',side_effect=lambda action,done,**_:done(action(lambda *_:None))):
+                    panel.current_beam_button.click()
+                self.assertEqual(w.backend.commands,[])
+                self.assertTrue(panel.set_button.isEnabled())
+                self.assertIs(panel.plot.data,panel.result)
+                self.assertEqual(panel.table.item(0,1).text(),'0.14000')
+                self.assertFalse(np.allclose(panel.result['full_measured'],source['full_measured']))
+                self.assertEqual(path.read_bytes(),original)
+        finally:w.close();self.app.processEvents()
 
     def test_apply_recalculate_apply_saves_both_iterations_and_can_reload(self):
         from Knobs.DRTuning.gui import TuningSession

@@ -640,6 +640,9 @@ class QMDispersionPanel(CorrectionTool):
         self.recalculate_button.setToolTip('Reuse measured responses. After Apply, calculate the next correction from the measured dispersion / COD and applied currents.')
         self.load_button,self.resume_button=button_row([
             ('Load scan…',self.load_scan),('Resume',self.resume_scan)])
+        self.current_beam_button=self.add_button('Use matrix with current beam',self.use_current_beam)
+        self.current_beam_button.setToolTip('Read current QM currents and measure dispersion at three RF settings to calculate a new proposal.')
+        self.current_beam_button.setEnabled(False)
         self.reset_button=self.add_button('Restore original QM / RF',self.reset)
         for button in (self.set_button,self.recalculate_button,self.resume_button,self.reset_button):button.setEnabled(False)
         self.controls.removeWidget(self.save_button)
@@ -678,7 +681,7 @@ class QMDispersionPanel(CorrectionTool):
             self.display(self.result)
         else:
             self.plot.clear_data();self.show_initial_probes()
-            for button in (self.set_button,self.recalculate_button,self.resume_button,self.reset_button,self.save_button):
+            for button in (self.set_button,self.recalculate_button,self.current_beam_button,self.resume_button,self.reset_button,self.save_button):
                 button.setEnabled(False)
             self.status.setText(f'{self.coil.currentText()} selected. Run CALC to measure the response.')
     def invalidate(self,*_):
@@ -712,8 +715,14 @@ class QMDispersionPanel(CorrectionTool):
             self.excluded.setText(', '.join(n for n in saved['fixed_actuators'] if n not in shared))
             self.service.restore_width_cache(data);self.service.last_result=data;self.display(data)
             self.save_status.setText('Loaded: '+Path(path).name)
+            if self.current_beam_button.isEnabled():
+                self.status.setText('Showing saved scan. Choose Use matrix with current beam for a fresh proposal.')
             self.window.log('Loaded QM scan: '+path)
         except Exception as exc:self.window.error(str(exc))
+    def use_current_beam(self):
+        if self.result is None:return
+        data=self.result;opt=self.options();self.set_button.setEnabled(False)
+        self.run(lambda p:self.service.reuse_on_current_beam(data,opt,p),self.display,'Measure current QM baseline')
     def resume_scan(self):
         if self.result is None:return
         data=self.result;opt=self.options();path=self.new_checkpoint_path();self.set_button.setEnabled(False)
@@ -785,6 +794,9 @@ class QMDispersionPanel(CorrectionTool):
             if data.get('applied'):message='Applied. Dispersion remeasured. Recalculate for the next iteration.'
             elif not self.proposal_matches_options(data):message='Settings changed. Recalculate before Apply.'
             elif not np.any(abs(np.asarray(data['delta']))>1.e-12):message='No correction proposed.'
+            elif data.get('baseline_measured_at') and not data.get('iteration_index'):
+                stamp=datetime.fromisoformat(data['baseline_measured_at']).astimezone()
+                message=f'Current beam measured {stamp:%Y-%m-%d %H:%M:%S}. Ready to apply.'
             else:message=f"Ready to apply (iteration {data.get('iteration_index',0)+1})."
             self.status.setText(message+f'\nFit BPMs: {valid.sum()} / {len(valid)}')
         else:
@@ -805,6 +817,8 @@ class QMDispersionPanel(CorrectionTool):
         if data.get('skipped_qms'):
             self.status.setText(self.status.text()+'\nSkipped QM: '+', '.join(r['magnet'] for r in data['skipped_qms']))
         state=data.get('scan_state',{})
+        self.current_beam_button.setEnabled(bool(state.get('status')=='complete' and 'response' in data and
+                                           not data.get('restoration_error') and (not data.get('error') or data.get('restored'))))
         self.resume_button.setEnabled(bool(state and state.get('status')!='complete' and not data.get('applied')))
         self.reset_button.setEnabled(bool(data.get('applied') or data.get('iteration_origin') or data.get('error') or state.get('active_magnet')))
         self.recalculate_button.setEnabled('response' in data and not data.get('restoration_error') and

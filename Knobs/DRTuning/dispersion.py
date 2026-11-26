@@ -613,8 +613,7 @@ class DispersionService:
             return measure_qms(self,data,opt,progress,event,checkpoint_path)
         return self.measure_remaining(data,opt,progress,event,checkpoint_path)
 
-    def recalculate(self,data,opt,progress=lambda *_:None):
-        """Refit a complete response without reading or writing any machine setting."""
+    def check_reuse_options(self,data,opt):
         opt.validate();self.check()
         if 'response' not in data:raise ValueError('No complete measured response; CALC first')
         if data.get('restoration_error') or (data.get('error') and not data.get('restored')):
@@ -624,18 +623,72 @@ class DispersionService:
             if getattr(opt,key)!=acquired[key]:raise ValueError('RF / momentum settings changed; CALC again')
         expected=opt.actuators()
         if expected!=list(data['actuators']):raise ValueError('QM selection changed; CALC again')
+
+    def recalculate(self,data,opt,progress=lambda *_:None):
+        """Refit a complete response without reading or writing any machine setting."""
+        self.check_reuse_options(data,opt)
         result=copy.deepcopy(data)
         if data.get('applied'):
             self._advance_iteration(result,opt)
+        self.fit_reused_response(result,opt)
+        progress(100,'Recalculated from measured response; no BPM acquisition or magnet / RF writes')
+        return result
+
+    def reuse_on_current_beam(self,data,opt,progress=lambda *_:None):
+        """Measure the current baseline once, then solve with the stored QM response."""
+        self.check_reuse_options(data,opt)
+        self.validate_checkpoint(data)
+        b=self.backend
+        if data['scan_state']['status']!='complete':
+            raise ValueError('A complete QM response matrix is required')
+        if data['backend_id']!=b.identity or data['names']!=list(b.bpm_names) or data['profile_signature']!=self.profile_signature():
+            raise ValueError('Machine, BPM order or hardware profile differs from the saved response')
+        names=data['actuators']
+        if np.shape(data['response'])!=(4*len(b.bpm_names),len(names)):
+            raise ValueError('Invalid saved QM response dimensions')
+        if opt.measure_tunes and np.shape(data.get('tune_response'))!=(2,len(names)):
+            raise ValueError('No measured tune response in the saved matrix')
+        b.validate_mode('dispersion')
+        if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
+        progress(0,'Reading current QM settings and measuring dispersion / COD')
+        before=self.snapshot(names,include_other_mains=opt.coil=='trim')
+        self.reader.reset_sampling()
+        measured,valid,tunes,evidence=self.signal(opt)
+        self.check()
+        baseline=self.snapshot(before['quadrupoles'])
+        if not self.settings_match(baseline,before,names):
+            raise ValueError('Machine settings changed while measuring the current dispersion; measure again')
+        centers=np.array([baseline['quadrupoles'][n] for n in names],float)
+        limits=np.array([quad_limits(b,n) for n in names],float).T
+        if not np.isfinite(np.r_[centers,limits.ravel()]).all() or np.any(limits[0]>=limits[1]):
+            raise ValueError('Invalid current QM limits / readbacks')
+
+        result=copy.deepcopy(data)
+        if 'response_origin' not in result:
+            origin=data.get('iteration_origin',data)
+            matrix_valid=origin.get('acquisition_valid',data.get('acquisition_valid',data['scan_state']['common_valid']))
+            result['response_origin']=dict(baseline=copy.deepcopy(origin['baseline']),
+                measured_at=data.get('created_at'),checkpoint_file=data.get('checkpoint_file'),valid=copy.deepcopy(matrix_valid))
+        for key in ('iteration_origin','iteration_history','iteration_valid','iteration_index',
+                    'initial_scan_measured','checkpoint_file','checkpoint_saved_at'):
+            result.pop(key,None)
+        result.update(baseline=baseline,centers=centers,limits=limits,full_measured=measured,
+                      initial_tunes=tunes,initial_tune_evidence=evidence,
+                      acquisition_valid=np.asarray(result['response_origin']['valid'],bool)&valid,
+                      baseline_measured_at=datetime.now(timezone.utc).isoformat(),
+                      baseline_orbit_measurements=self.reader.orbit_measurements.copy())
+        self.fit_reused_response(result,opt)
+        progress(100,'Current dispersion measured. Review the QM proposal before Apply.')
+        return result
+
+    def fit_reused_response(self,result,opt):
         for key in ('error','restoration_error','restored','full_after','after_valid','after_tunes',
                     'after_tune_evidence','after_orbit_measurements','tune_check_performed','applied_currents_A',
                     'applied_baseline','applied_at','autosave'):
             result.pop(key,None)
-        result.setdefault('acquisition_options',copy.deepcopy(acquired))
-        result.update(applied=False,response_reused=True,recalculation_count=data.get('recalculation_count',0)+1)
+        result.setdefault('acquisition_options',copy.deepcopy(result['options']))
+        result.update(applied=False,response_reused=True,recalculation_count=result.get('recalculation_count',0)+1)
         self.solve(result,opt);self.last_result=result
-        progress(100,'Recalculated from measured response; no BPM acquisition or magnet / RF writes')
-        return result
 
     def _advance_iteration(self,data,opt):
         """Use the verified post-Apply observation, never the old residual or prediction."""
