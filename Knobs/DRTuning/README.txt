@@ -105,6 +105,9 @@ QM dispersion:
   from Trim (default) to Main. Main starts with all eight shared supplies,
   including QM2R. CALC measures one response per main supply. Apply and Restore
   use the same coil as the scan. Exclusions are independent for Trim and Main.
+  On live QM main supplies, setting and restoring a current accepts a readback
+  within 1% of the absolute target, with the configured absolute tolerance
+  (default 0.02 A) as the minimum. At 100 A the accepted range is 99 to 101 A.
   Older scans load as Trim.
   Trim defaults: per-QM initial widths inferred from the 2026-11-19 13:58 scan,
   targeting S/N 6.5 (30% above acceptance threshold 5), in A:

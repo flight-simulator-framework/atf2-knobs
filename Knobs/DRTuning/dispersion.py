@@ -329,6 +329,11 @@ class DispersionService:
         self.successful_widths[n]=dict(width_A=estimate,measured_width_A=h,quality=copy.deepcopy(quality),
             context=self.width_context(data,opt),baseline=copy.deepcopy(data['baseline']))
 
+    def settings_match(self,actual,expected,targets):
+        compare=getattr(self.backend,'same_qm_settings',None)
+        if compare is not None:return compare(actual,expected,targets)
+        return self.backend.same_settings(actual,expected)
+
     def snapshot(self,names,include_other_mains=False):
         snapshot=self.backend.snapshot()
         for n in names:
@@ -496,7 +501,7 @@ class DispersionService:
                 self.checkpoint(data,checkpoint_path,event)
                 progress(round(90*(j+1)/len(names)),f'QM dispersion response {n} ({j+1}/{len(names)})')
             self.check()
-            if not b.same_settings(self.snapshot(data['baseline']['quadrupoles']),data['baseline']):raise ValueError('Settings changed during QM response scan; calculate again')
+            if not self.settings_match(self.snapshot(data['baseline']['quadrupoles']),data['baseline'],names):raise ValueError('Settings changed during QM response scan; calculate again')
             data.update(response=np.column_stack(columns),tune_response=np.column_stack(qcolumns) if opt.measure_tunes else None,
                         acquisition_valid=valid.copy(),valid=valid&enabled,
                         response_column_measured=[not r.get('skipped',False) for r in data['probe_readbacks']],
@@ -511,7 +516,7 @@ class DispersionService:
             return data
         except BaseException as exc:
             data['error']=str(exc);state['status']='interrupted'
-            try:data['restored']=bool(b.same_settings(self.snapshot(data['baseline']['quadrupoles']),data['baseline']))
+            try:data['restored']=bool(self.settings_match(self.snapshot(data['baseline']['quadrupoles']),data['baseline'],names))
             except Exception as restoration_error:data['restoration_error']=str(restoration_error);data['restored']=False
             try:self.checkpoint(data,checkpoint_path,event)
             except Exception as save_error:data['checkpoint_error']=str(save_error)
@@ -561,11 +566,14 @@ class DispersionService:
             raise ValueError('BPM validity policy differs from the saved scan; CALC again')
         b.validate_mode('dispersion')
         if opt.measure_tunes and hasattr(b,'validate_tune_measurement'):b.validate_tune_measurement()
-        if not b.same_settings(self.snapshot(saved['baseline']['quadrupoles']),saved['baseline']):
+        if not self.settings_match(self.snapshot(saved['baseline']['quadrupoles']),saved['baseline'],names):
             raise ValueError('Settings differ from the scan baseline. Restore original QM currents / RF and other changed settings before Resume.')
         centers=np.asarray(saved['centers'],float)
         tolerance=getattr(b,'profile',{}).get('current_tolerance_A',1.e-6)
-        if not np.allclose([b.quadrupole_current(n) for n in names],centers,rtol=0,atol=tolerance):
+        if hasattr(b,'quadrupole_tolerance'):
+            tolerance=np.array([b.quadrupole_tolerance(n,c) for n,c in zip(names,centers)])
+        readings=np.array([b.quadrupole_current(n) for n in names])
+        if not np.all((centers-tolerance<=readings)&(readings<=centers+tolerance)):
             raise ValueError('QM currents differ from the saved scan baseline')
         limits=np.asarray([quad_limits(b,n) for n in names]).T
         if not np.array_equal(limits,np.asarray(saved['limits'])):raise ValueError('QM supply limits changed; CALC again')
@@ -736,7 +744,7 @@ class DispersionService:
         if data.get('applied') or data['backend_id']!=b.identity:raise ValueError('Stale or already applied QM proposal')
         names=data['actuators']
         if names!=opt.actuators():raise ValueError('QM selection differs from the measured response')
-        if not b.same_settings(self.snapshot(data['baseline']['quadrupoles']),data['baseline']):raise ValueError('Settings changed since QM CALC')
+        if not self.settings_match(self.snapshot(data['baseline']['quadrupoles']),data['baseline'],names):raise ValueError('Settings changed since QM CALC')
         centers=np.asarray(data['centers']);delta=np.asarray(data['delta']);changed=np.flatnonzero(abs(delta)>1.e-12)
         if not len(changed):raise ValueError('No QM correction proposed')
         if np.any(abs(delta[changed])>opt.step_A+1.e-9):
@@ -765,7 +773,7 @@ class DispersionService:
             expected=copy.deepcopy(data['baseline'])
             expected['quadrupoles'].update(zip(names,(centers+delta).tolist()))
             applied_baseline=self.snapshot(data['baseline']['quadrupoles'])
-            if not b.same_settings(applied_baseline,expected):
+            if not self.settings_match(applied_baseline,expected,names):
                 raise ValueError('Settings changed or QM targets were not reached after Apply; restored changed currents')
             data['applied_currents_A']=[applied_baseline['quadrupoles'][n] for n in names]
             data['applied_baseline']=applied_baseline

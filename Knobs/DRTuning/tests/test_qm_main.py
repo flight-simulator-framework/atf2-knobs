@@ -68,6 +68,33 @@ class MainCoilTests(unittest.TestCase):
         self.assertEqual(client.caput.call_count, 2)
         self.assertEqual(values['QM2R:currentRead'], 12.)
 
+    def test_main_set_and_restore_accept_one_percent_of_signed_target(self):
+        profile=load_hardware_profile()
+        profile['readback_timeout_s']=.001
+        client=Mock(spec=['caget','caput'])
+        client.caput.return_value=1
+        values={'QM1R:parameter.A':-120.,'QM1R:parameter.B':120.}
+        client.caget.side_effect=lambda pv,**kw:values[pv]
+        b=LiveBackend(profile,client)
+        with patch('Knobs.DRTuning.epics.time.sleep'):
+            for target,reading in [(100.,99.),(-100.,-101.),(0.,.02)]:
+                with self.subTest(target=target):
+                    values['QM1R:currentRead']=reading
+                    b.set_quadrupole_current('QM1R',target)
+                    b.restore_quadrupole_current('QM1R',target)
+            values['QM1R:currentRead']=101.01
+            with self.assertRaisesRegex(TimeoutError,'QM1R:currentRead=101.01 A'):
+                b.restore_quadrupole_current('QM1R',100.)
+        b.ramp=None
+        expected=dict(correctors={},skews={},quadrupoles={'QM1R':100.,'QM1R.1':3.},frequency=0.)
+        actual=copy.deepcopy(expected)
+        actual['quadrupoles']['QM1R']=99.
+        service=DispersionService(b,threading.Event())
+        self.assertTrue(service.settings_match(actual,expected,['QM1R']))
+        self.assertFalse(service.settings_match(actual,expected,['QM1R.1']))
+        actual['quadrupoles']['QM1R.1']=3.03
+        self.assertFalse(service.settings_match(actual,expected,['QM1R','QM1R.1']))
+
     def test_main_scan_apply_refit_restore(self):
         b = MainFixture()
         s = DispersionService(b, threading.Event())

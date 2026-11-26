@@ -158,7 +158,7 @@ def measure_qms(service,data,opt,progress,event,path):
                 restore=restore,selection=selection,strict_loss=opt.adaptive_probe,retry_names=(),
                 progress=progress,saved=save,baseline_ready=baseline,nominal_ready=nominal_preview,
                 loss_selection=lambda:~np.isin(data['names'],opt.excluded_bpms))
-            if not b.same_settings(service.snapshot(data['baseline']['quadrupoles']),data['baseline']):
+            if not service.settings_match(service.snapshot(data['baseline']['quadrupoles']),data['baseline'],names):
                 raise ValueError('Settings changed during QM response scan')
             valid &= np.asarray(state['common_valid'],bool)
             # Endpoint masks from committed columns remain binding after a restart.
@@ -219,7 +219,7 @@ def measure_qms(service,data,opt,progress,event,path):
             data['rf_blocks'].append(data.pop('rf_round'))
             save()
         service.check()
-        if not b.same_settings(service.snapshot(data['baseline']['quadrupoles']),data['baseline']):
+        if not service.settings_match(service.snapshot(data['baseline']['quadrupoles']),data['baseline'],names):
             raise ValueError('Settings changed during QM response scan')
         sync_columns()
         if all(r.get('skipped') for r in data['probe_readbacks']):
@@ -242,7 +242,7 @@ def measure_qms(service,data,opt,progress,event,path):
         if data.get('rf_round') and len(data['rf_round']['blocks'])==3:
             data['rf_blocks'].append(data.pop('rf_round'))
         data['error']=str(exc);state['status']='interrupted'
-        try:data['restored']=bool(b.same_settings(service.snapshot(data['baseline']['quadrupoles']),data['baseline']))
+        try:data['restored']=bool(service.settings_match(service.snapshot(data['baseline']['quadrupoles']),data['baseline'],names))
         except Exception as restore_error:data.update(restored=False,restoration_error=str(restore_error))
         try:save()
         except Exception as save_error:data['checkpoint_error']=str(save_error)

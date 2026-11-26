@@ -6,7 +6,7 @@ from Knobs.DRCorrection.backends import EpicsBackend
 from Knobs.DRCorrection.tbt import analyze_tbt
 from .acquisition import TBTController,ReadbackTBTController,tbt_orbit_mode
 from .calibration import coil_k1l
-from .hardware import main_supply_mappings,quadrupole_supply
+from .hardware import QM_MAIN_CANDIDATES,main_supply_mappings,quadrupole_supply
 from . import power_pause
 from .fresh import AcquisitionUnavailable
 
@@ -150,31 +150,40 @@ class LiveBackend(EpicsBackend):
         if not np.isfinite([lo,hi]).all() or lo>=hi or not np.isfinite(v).all() or np.any(v<lo) or np.any(v>hi):
             raise ValueError('Quadrupole outside supply current limits')
         for value in v:self.quadrupole_k1l(name,float(value))
+    def quadrupole_tolerance(self,name,target):
+        absolute=self.profile['current_tolerance_A']
+        return max(absolute,.01*abs(target)) if name in QM_MAIN_CANDIDATES else absolute
+
+    def wait_quadrupole_current(self,name,target,description):
+        deadline=time.monotonic()+self.profile['readback_timeout_s']
+        tolerance=self.quadrupole_tolerance(name,target)
+        while True:
+            reading=self.quadrupole_current(name)
+            if np.isfinite(reading) and target-tolerance<=reading<=target+tolerance:return
+            if time.monotonic()>=deadline:
+                pv=quadrupole_supply(self,name)['read']
+                raise TimeoutError(f'{description}: {name}, target={target:g} A, {pv}={reading:g} A, tolerance={tolerance:g} A')
+            time.sleep(.05)
+
     def set_quadrupole_current(self,name,value):
         self.validate_quadrupole_targets(name,[value]);p=quadrupole_supply(self,name)
         original=self.quadrupole_current(name)
-        def wait(target):
-            deadline=time.monotonic()+self.profile['readback_timeout_s']
-            while abs(self.quadrupole_current(name)-target)>self.profile['current_tolerance_A']:
-                if time.monotonic()>=deadline:raise TimeoutError('Quadrupole readback did not settle')
-                time.sleep(.05)
         try:
-            self.put(p['set'],float(value));wait(value)
+            self.put(p['set'],float(value))
+            self.wait_quadrupole_current(name,value,'Quadrupole readback did not settle')
             delay=float(p['settle_s'])
             if not np.isfinite(delay) or delay<0:raise ValueError('Invalid quadrupole settling time')
             time.sleep(delay)
         except Exception:
-            self.put(p['set'],original);wait(original);raise
+            self.put(p['set'],original)
+            self.wait_quadrupole_current(name,original,'QM restoration readback did not settle')
+            raise
     @power_pause.restoration
     def restore_quadrupole_current(self,name,value):
         """Known original current can be commanded even after a readback failure."""
         self.validate_quadrupole_targets(name,[value]);p=quadrupole_supply(self,name)
-        self.put(p['set'],float(value));deadline=time.monotonic()+self.profile['readback_timeout_s']
-        while True:
-            reading=self.quadrupole_current(name)
-            if np.isfinite(reading) and abs(reading-value)<=self.profile['current_tolerance_A']:break
-            if time.monotonic()>=deadline:raise TimeoutError('QM restoration readback did not settle: '+name)
-            time.sleep(.05)
+        self.put(p['set'],float(value))
+        self.wait_quadrupole_current(name,value,'QM restoration readback did not settle')
         time.sleep(float(p['settle_s']))
     @power_pause.fresh_measurement(retry_errors=())
     def tbt_acquire(self,turns=1024,start_turn=1,cancel=None,progress=lambda *_:None):
@@ -254,9 +263,15 @@ class LiveBackend(EpicsBackend):
         result['quadrupoles']=self.snapshot_magnets(self.quadrupoles,self.quadrupole_current,readback_errors,excluded)
         return result
     def same_settings(self,left,right):
+        return self.same_qm_settings(left,right,())
+
+    def same_qm_settings(self,left,right,targets):
         a=left.get('quadrupoles',{});b=right.get('quadrupoles',{})
-        return (super().same_settings(left,right) and set(a)==set(b) and
-                all(abs(a[n]-b[n])<=self.profile['current_tolerance_A'] for n in a))
+        if not super().same_settings(left,right) or set(a)!=set(b):return False
+        for n,target in b.items():
+            tol=self.quadrupole_tolerance(n,target) if n in targets else self.profile['current_tolerance_A']
+            if not np.isfinite([a[n],target]).all() or not target-tol<=a[n]<=target+tol:return False
+        return True
     @power_pause.restoration
     def restore(self,snapshot):
         super().restore(snapshot)
