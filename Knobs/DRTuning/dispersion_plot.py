@@ -8,6 +8,7 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QToolTip
 
+from Knobs.DRCorrection.dispersion_bpms import vertical_arc_bpms, cod_change_bpms
 from Knobs.DRCorrection.gui import Plot
 from Knobs.DRCorrection.assessment import rms, improvement_pct
 from .dispersion import arc_bpms, straight_bpms
@@ -52,7 +53,7 @@ def dispersion_summary(data,plane,valid,baseline):
         if 'target' in data:target=np.asarray(data['target'][0],float)
         elif 'full_target' in data:target=np.asarray(data['full_target'][axis],float)
         label='ηy − target' if np.any(target[valid]!=0) else 'ηy'
-        regions=[(label,np.ones(len(names),bool))]
+        regions=[('Arc '+label,vertical_arc_bpms(names))]
 
     curves={'Measured':baseline}
     if 'full_predicted' in data:curves['Predicted']=np.asarray(data['full_predicted'][axis],float)
@@ -86,6 +87,16 @@ def dispersion_summary(data,plane,valid,baseline):
             stages[-1]+=f' · {change}'
         lines.append(f'{label} RMS · {mask.sum()} BPMs · mm / (dp/p)\n' + '   |   '.join(stages))
     return '\n'.join(lines)
+
+
+def plot_region(ax, x, y, style, label, region, **kwargs):
+    if region is None:
+        ax.plot(x, y, style, label=label, **kwargs)
+        return
+    line, = ax.plot(x, y, style, alpha=.28, **kwargs)
+    ax.plot(x, np.where(region, y, np.nan), color=line.get_color(),
+            linestyle=line.get_linestyle(), linewidth=line.get_linewidth(),
+            marker='.', markersize=4, label=label)
 
 
 class DispersionPlot(Plot):
@@ -147,8 +158,14 @@ class DispersionPlot(Plot):
             values = np.asarray(before['full_measured'][i], float)
             title = data['full_signal_labels'][i]
             unit = 'mm / (dp/p)' if i < 2 else 'mm'
-            ax.plot(x[active], np.where(observed, values, np.nan)[active], 'k.-',
-                    linewidth=.65, markersize=4, label='Measured before')
+            region = None
+            if i >= 2:
+                region = cod_change_bpms(names)
+            elif i == 1 and self.dispersion_plane == 'y':
+                region = vertical_arc_bpms(names)
+            plot_region(ax, x[active], np.where(observed, values, np.nan)[active], 'k.-',
+                        'Measured before', None if region is None else region[active],
+                        linewidth=.65, markersize=4)
             visible = observed & np.isfinite(values)
             grey = excluded & visible
             if grey.any():
@@ -171,8 +188,8 @@ class DispersionPlot(Plot):
                     mask = valid & np.asarray(data['after_valid'], bool)
                     if data.get('restored'):
                         label = 'After SET (since restored)'
-                ax.plot(x[rows][curve_rows], np.where(mask, curve, np.nan)[curve_rows], style,
-                        label=label, **({'color':'gray'} if key == 'full_target' else {}))
+                plot_region(ax, x[rows][curve_rows], np.where(mask, curve, np.nan)[curve_rows], style,
+                        label, None if region is None else region[rows][curve_rows], **({'color':'gray'} if key == 'full_target' else {}))
             ax.set(xlabel='s [m]' if known else 'BPM index (measurement order)',
                    ylabel='η [mm / (dp/p)]' if i < 2 else 'COD [mm]', title=title)
             ax.grid(alpha=.2)

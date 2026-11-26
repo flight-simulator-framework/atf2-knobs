@@ -5,6 +5,7 @@ import numpy as np
 
 from Knobs.DRCorrection.core import (ZV_RETRY_STEP_A, NoCommonBPMs,
     validate_adaptive_probe, validate_bpm_sampling)
+from Knobs.DRCorrection.dispersion_bpms import vertical_arc_bpms
 from Knobs.DRCorrection.probe_quality import response_quality, wider_probe
 from .rf_blocks import (ScanFrequency, canonical_blocks, matrix_activity, measure_blocks, momentum_span, nominal_probe_resolved,
                         probe_noise, reference_signal, response_column)
@@ -51,6 +52,7 @@ def acquire_zvs(service,opt,progress):
     service.last_scan_errors=errors
     rounds=[];columns={};reduced=set();previous_good=set()
     common=np.ones(len(b.bpm_names),bool)
+    dispersion_region=vertical_arc_bpms(b.bpm_names) if opt.preserve_vertical_dispersion_orbit else common.copy()
     def report_columns(stage):
         skipped=sum(error.get('stage')=='ZV probe' for error in errors)
         matrix_activity(service, columns=(len(columns)+skipped, len(names), skipped),
@@ -113,7 +115,7 @@ def acquire_zvs(service,opt,progress):
                     errors.append(dict(magnet=n,stage='ZV probe',error='Unresolved current span',restored=True,restoration='baseline restored'))
                     continue
                 col,mask=response_column(frames,blocks,n,opt,b)
-                use=common & mask & selected()
+                use=common & mask & selected() & dispersion_region
                 if not use.any():raise NoCommonBPMs(f'{n}: no common enabled BPM for measured response')
                 record.update(readbacks=readbacks[0],actual_by_rf=readbacks,readback_span=np.diff(readbacks[0])[0],
                               nominal_reused=n in reused,status='fixed amplitude')

@@ -662,7 +662,19 @@ class CorrectionService:
         if mode=='skew':selected.fixed_actuators=tuple(set(opt.fixed_actuators)|{
             n for n in actuators if not ((opt.sd and n.startswith('SD')) or (opt.sf and n.startswith('SF')))})
         valid,available=self.require_usable(names,measured,target,data['valid'],actuators,selected,data.get('orbit_measurements',[]))
-        mask=np.tile(valid,measured.shape[0])
+        signal_regions=None
+        if mode=='dispersion' and opt.plane=='y' and opt.preserve_vertical_dispersion_orbit:
+            from .dispersion_bpms import vertical_arc_bpms,cod_change_bpms
+            signal_regions=np.stack((vertical_arc_bpms(names),cod_change_bpms(names)))
+            if opt.dispersion_weight and not (valid & signal_regions[0]).any():
+                raise ValueError('No valid enabled vertical arc BPMs for dispersion correction')
+            data['fit_bpm_regions']=signal_regions
+            mask=(signal_regions & valid).ravel()
+            if not (mask & np.repeat([opt.dispersion_weight>0,opt.orbit_weight>0],len(names))).any():
+                raise ValueError('No valid enabled BPMs for the weighted dispersion or COD-change region')
+        else:
+            data.pop('fit_bpm_regions',None)
+            mask=np.tile(valid,measured.shape[0])
         if not np.isfinite(response[mask]).all():
             raise ValueError('Invalid response matrix')
         weights=np.ones_like(measured)
@@ -716,7 +728,7 @@ class CorrectionService:
             solver='All enabled magnets: bounded regularized truncated SVD'
         elif symmetric and constraints is None and np.linalg.norm(residual)>1e-14:
             from .ported_solver import propose,ClosedOrbitError
-            try:delta,selected_names,singular_values,rank=propose(data,opt,valid,available,maximum,step_limit)
+            try:delta,selected_names,singular_values,rank=propose(data,opt,valid,available,maximum,step_limit,signal_regions)
             except ClosedOrbitError as exc:
                 if str(exc)!='No useful corrector columns were selected':raise
                 raise ValueError('Measured response could not reduce the selected COD/dispersion residual within the correction limits. '+diagnostic+

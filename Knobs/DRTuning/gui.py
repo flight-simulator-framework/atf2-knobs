@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QLabel,
     QComboBox,QLineEdit,QPushButton,QFileDialog,QSpinBox,QCheckBox,QMessageBox,QDialog,QTreeWidget,QTreeWidgetItem,QSplitter)
 from Knobs.DRCorrection.gui import DRCorrectionWindow,TBTPanel,Task
 from Knobs.DRCorrection.backends import DemoBackend,StoredBackend
-from Knobs.DRCorrection.core import serial
+from Knobs.DRCorrection.core import Options,serial
 from .qmod_gui import QModPanel,HERE,FAMILIES
 from .optics import phase_beta
 from .hardware import load_hardware_profile
@@ -351,6 +351,36 @@ class TuningSession(DRCorrectionWindow):
             self.set_bpm_selection(saved)
         self._active_dispersion_panel = None
 
+    def load_latest_matrices(self):
+        from .dispersion_source import latest_matrices
+        qm=self.qm_dispersion
+        vertical=self.panels['dispersion']
+        bump=self.coupling_panel
+        directories=(qm.autosave_directory, vertical.data_directory(), bump.run_data_directory)
+        options=vertical.calculation_options()
+        options.response_source='measured'
+        def read_vertical(path):
+            data=vertical.read_matrix(path)
+            # Matrix-only reuse fits the available columns, even for a partial scan.
+            opt=Options(**vars(options))
+            opt.fixed_actuators=tuple(set(opt.fixed_actuators) | (set(self.backend.vcorrectors)-set(data['actuators'])))
+            issue=self.service.response_reuse_issue(data,opt)
+            if issue:raise ValueError(issue)
+            return data
+        readers=dict(qm=qm.matrix_reader(),vertical=read_vertical,bump=bump.read_matrix)
+        def load(progress):
+            return latest_matrices(directories,readers,self.service.check_cancel,progress)
+        def done(found):
+            for coil in ('trim','main'):
+                if coil in found:qm.coil_matrices[coil]=found[coil]
+            if qm.active_coil in found:qm.select_matrix(*found[qm.active_coil])
+            if 'vertical' in found:vertical.select_matrix(*found['vertical'])
+            if 'bump' in found:bump.matrix_ready(*found['bump'])
+            for key,(_,path) in found.items():self.log(f'{key} response matrix: {path}')
+            missing=[key for key in ('trim','main','vertical','bump') if key not in found]
+            if missing:self.log('No compatible measured matrix: '+', '.join(missing))
+        self.start(load,done,label='Load latest response matrices',show_plot=False)
+
     def correction_data_directory(self):
         return self.panels['dispersion'].data_directory()
 
@@ -450,7 +480,7 @@ class TuningSession(DRCorrectionWindow):
         from Knobs.rf_power_popup import show_power_pause
         self._rf_popup=show_power_pause(self,reason)
 
-    def start(self,action,finished,label=None,pausable=False):
+    def start(self,action,finished,label=None,pausable=False,*,show_plot=True):
         if self.task is not None and self.task.isRunning():
             self.log('An operation is running. Wait for completion or cancel.');return
         self.prepare_pause(pausable)
@@ -463,7 +493,7 @@ class TuningSession(DRCorrectionWindow):
         self.operation_status.setText(self._active_label+': working...');self.log(self._active_label+': started')
         self.service.cancel.clear()
         active_panel=self.tabs.currentWidget()
-        if active_panel in (self.panels['dispersion'],self.qm_dispersion) or bump_pause:
+        if show_plot and (active_panel in (self.panels['dispersion'],self.qm_dispersion) or bump_pause):
             active_panel.splitter.views.setCurrentIndex(1)
         if active_panel in (self.panels['dispersion'],self.qm_dispersion):
             active_panel.matrix_progress.hide()

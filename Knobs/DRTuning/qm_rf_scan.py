@@ -5,7 +5,7 @@ import numpy as np
 
 from Knobs.DRCorrection.core import Options
 from .dispersion import (PROBE_INCREMENT_A, InsufficientProbeQuality, ProbeRangeUnavailable,
-    next_probe_width, probe_floor, probe_pair, probe_scheme, quad_limits, restore_quads)
+    next_probe_width, required_cod_bpms, probe_floor, probe_pair, probe_scheme, quad_limits, restore_quads)
 from .rf_blocks import (ScanFrequency, canonical_blocks, matrix_activity, measure_blocks, nominal_probe_resolved,
                         probe_noise, response_column)
 
@@ -237,9 +237,10 @@ def measure_qms(service,data,opt,progress,event,path):
                     used=valid & selection() & mask
                     if not used.any():failure='No common valid straight BPM'
                     if opt.constrain_cod and used.any():
-                        cod=np.asarray(data['full_measured'])[2:,used]
+                        monitors=required_cod_bpms(data['names'],valid & mask & ~np.isin(data['names'],opt.excluded_bpms))
+                        cod=np.asarray(data['full_measured'])[2:,monitors]
                         for idx in blocks[0]['pairs'][n]['indices']:
-                            xy=np.array([frames[idx]['x'],frames[idx]['y']],float)[:,used]
+                            xy=np.array([frames[idx]['x'],frames[idx]['y']],float)[:,monitors]
                             if np.max(abs(xy-cod))>opt.orbit_tolerance_mm:failure='Measured COD change exceeds QM tolerance'
                 if failure:
                     if not opt.adaptive_probe:raise ValueError(n+': '+failure)

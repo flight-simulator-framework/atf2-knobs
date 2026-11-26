@@ -163,6 +163,25 @@ class RFBlockTests(unittest.TestCase):
             self.assertLessEqual(touched,set(expected)-{'ZV51R'})
             self.assertEqual(b.snapshot(),baseline)
 
+    def test_outside_dispersion_and_cod_rows_do_not_change_greedy_or_svd(self):
+        from Knobs.DRTuning.zv_rf_scan import measure_all_zvs
+        b=DemoBackend()
+        service=CorrectionService(b)
+        opt=Options(plane='y',selection_method='all',preserve_vertical_dispersion_orbit=True,
+                    dispersion_weight=1.,orbit_weight=.1)
+        measured=measure_all_zvs(service,opt,lambda *_:None)
+        arc=np.isin(np.arange(1,97),[*range(1,19),*range(32,65),*range(81,97)])
+        cod=np.isin(np.arange(1,97),[65,66,19,22,23,24])
+        for method in ('all','greedy'):
+            opt.selection_method=method
+            result=service.recalculate(measured,opt)
+            disturbed=copy.deepcopy(measured)
+            disturbed['measured'][0,~arc]+=1.e5
+            disturbed['response'][~np.r_[arc,cod],:]=1.e5
+            again=service.recalculate(disturbed,opt)
+            np.testing.assert_allclose(again['delta'],result['delta'])
+            self.assertEqual(again['selected'],result['selected'])
+
     def test_vertical_current_beam_reads_three_settings_and_refits_weights_offline(self):
         from Knobs.DRTuning.zv_rf_scan import measure_all_zvs
         b=DemoBackend();s=CorrectionService(b)

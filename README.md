@@ -14,7 +14,7 @@ the best recorded settings. See the [operator guide](Knobs/RandomExcitation/READ
 for range selection, timing, logging, completion and validation details.
 
 DR optics tools are available through `python -m Knobs.DRTuning` (or `DRTuning`
-after installation). Select RFTrack or the configured machine interface, then
+after installation). The launcher opens the configured EPICS machine interface and selects the latest compatible measured matrices. Use `--select-interface` for an offline session. Then
 open COD, dispersion, skew, TBT beta or quadrupole-modulation measurements from
 the shared launcher. See [DRTuning usage and validation](Knobs/DRTuning/README.txt).
 

@@ -74,6 +74,8 @@ class VerticalDispersionPanel(CorrectionPanel):
         left.addWidget(fit_box)
         for key,label in (('dispersion_weight','Vertical dispersion'),('orbit_weight','Vertical COD change')):
             spin=control(fit,label,getattr(self.options,key),0.,1000.,4)
+            spin.setToolTip('Arc BPMs 1–18, 32–64 and 81–96.' if key=='dispersion_weight'
+                            else 'COD Y change at MB19R, MB22R–MB24R, MB65R and MB66R.')
             spin.setSingleStep(.01)
             spin.valueChanged.connect(lambda value,k=key:self.set_option(k,value))
         left.addWidget(self.proposal_summary)
@@ -206,43 +208,45 @@ class VerticalDispersionPanel(CorrectionPanel):
     def load_measured_response(self):
         path,_=QFileDialog.getOpenFileName(self,'Select measured vertical ZV matrix',self.data_directory(),ZV_FILES)
         if not path:return
-        def read_matrix(progress):
-            data=load_session(path)
-            opts=data.get('options',{});full=bool(data.get('full_zv_candidates'))
-            if (data.get('mode')!='dispersion' or opts.get('plane')!='y' or opts.get('response_source')!='measured'
-                    or not (full or data.get('rftrack_candidates')) or data.get('kind')!='correctors'
-                    or data.get('backend_id')!=self.window.backend.identity or list(data['names'])!=list(self.window.backend.bpm_names)
-                    or data.get('actuator_unit')!=self.window.backend.unit('correctors')
-                    or not data.get('actuators') or any(not eligible_zv(n) or n not in self.window.backend.vcorrectors for n in data['actuators'])):
-                raise ValueError('Select a measured vertical ZV matrix for this machine')
-            if data.get('set_blocked_reason'):raise ValueError(data['set_blocked_reason'])
-            choice='all' if full else ('nominal' if data.get('reference_matrix') else 'imported')
-            n=len(data['names']);m=len(data['actuators'])
-            valid=np.asarray(data.get('response_valid',data.get('acquisition_valid',data['valid'])),bool)
-            matrix=np.asarray(data['response'],float)
-            if (len(set(data['actuators']))!=m or valid.shape!=(n,) or matrix.shape!=(2*n,m)
-                    or not np.isfinite(matrix[np.tile(valid,2)]).all() or np.shape(data.get('full_response'))!=(4*n,m)):
-                raise ValueError('Invalid ZV matrix dimensions or BPM data')
-            keep=('schema','mode','options','acquisition_options','actuators','actuator_unit','backend_id','kind',
-                  'names','positions_m','response','full_response','full_signal_labels','signal_labels','source',
-                  'rftrack_candidates','full_zv_candidates','scan_errors','ignored_readbacks','constraints',
-                  'model_settings','reference_matrix','matrix_measured_at','selection_model_sha256')
-            stamp=measured_time(data)
-            data={k:data[k] for k in keep if k in data}
-            data['matrix_measured_at']=stamp
-            data.update(matrix_only=True,valid=valid,response_valid=valid,target=np.zeros((2,n)))
-            return choice,data
-        def selected(result):
-            choice,data=result
-            self.screening.blockSignals(True);self.screening.setCurrentIndex(self.screening.findData(choice));self.screening.blockSignals(False)
-            self.matrix=data;self.matrix_path=path
-            self.options.response_source='measured'
-            self.response_cache={('measured','y'):data}
-            self.invalidate()
-            self.matrix_label.setText(matrix_caption(data,'Vertical ZV',path,self.observation))
-            if self.observation is not None and 'names' in self.observation:self.plot.correction(self.observation)
-            self.proposal_summary.setText('Matrix selected. Recalculate for the current beam.')
-        self.window.start(read_matrix,selected,label='Load measured ZV matrix')
+        self.window.start(lambda _:self.read_matrix(path),lambda data:self.select_matrix(data,path),label='Load measured ZV matrix')
+
+    def read_matrix(self,path):
+        data=load_session(path)
+        opts=data.get('options',{});full=bool(data.get('full_zv_candidates'))
+        if (data.get('mode')!='dispersion' or opts.get('plane')!='y' or opts.get('response_source')!='measured'
+                or not (full or data.get('rftrack_candidates')) or data.get('kind')!='correctors'
+                or data.get('backend_id')!=self.window.backend.identity or list(data['names'])!=list(self.window.backend.bpm_names)
+                or data.get('actuator_unit')!=self.window.backend.unit('correctors')
+                or not data.get('actuators') or any(not eligible_zv(n) or n not in self.window.backend.vcorrectors for n in data['actuators'])):
+            raise ValueError('Select a measured vertical ZV matrix for this machine')
+        if data.get('set_blocked_reason'):raise ValueError(data['set_blocked_reason'])
+        n=len(data['names']);m=len(data['actuators'])
+        valid=np.asarray(data.get('response_valid',data.get('acquisition_valid',data['valid'])),bool)
+        matrix=np.asarray(data['response'],float)
+        if (len(set(data['actuators']))!=m or valid.shape!=(n,) or matrix.shape!=(2*n,m)
+                or not np.isfinite(matrix[np.tile(valid,2)]).all() or np.shape(data.get('full_response'))!=(4*n,m)):
+            raise ValueError('Invalid ZV matrix dimensions or BPM data')
+        keep=('schema','mode','options','acquisition_options','actuators','actuator_unit','backend_id','kind',
+              'names','positions_m','response','full_response','full_signal_labels','signal_labels','source',
+              'rftrack_candidates','full_zv_candidates','scan_errors','ignored_readbacks','constraints',
+              'model_settings','reference_matrix','matrix_measured_at','selection_model_sha256')
+        stamp=measured_time(data)
+        data={k:data[k] for k in keep if k in data}
+        data['matrix_measured_at']=stamp
+        data.update(matrix_only=True,valid=valid,response_valid=valid,target=np.zeros((2,n)))
+        return data
+
+    def select_matrix(self,data,path):
+        choice='all' if data.get('full_zv_candidates') else ('nominal' if data.get('reference_matrix') else 'imported')
+        self.screening.blockSignals(True);self.screening.setCurrentIndex(self.screening.findData(choice));self.screening.blockSignals(False)
+        self.matrix=data;self.matrix_path=path
+        self.options.response_source='measured'
+        self.response_cache={('measured','y'):data}
+        self.invalidate()
+        self.matrix_label.setText(matrix_caption(data,'Vertical ZV',path,self.observation))
+        if self.observation is not None and 'names' in self.observation:self.plot.correction(self.observation)
+        self.proposal_summary.setText('Matrix selected. Recalculate for the current beam.')
+
 
     def update_dispersion(self):
         options=self.calculation_options();self.observation=None

@@ -21,6 +21,17 @@ class QMIterationTests(unittest.TestCase):
         self.opt=DispersionOptions(probe_A=.01,use_probe_presets=False,adaptive_probe=False,
                                    regularization=.3,fixed_actuators=(),measure_tunes=True)
 
+    def test_qm_cod_change_rows_only_use_the_six_selected_monitors(self):
+        from Knobs.DRTuning.dispersion import qm_objective,straight_bpms
+        names=[f'dr:MB{i}R' for i in range(1,97)]
+        before=np.arange(4*96).reshape(4,96).astype(float)
+        data=dict(names=names,full_measured=before,straight=straight_bpms(names))
+        valid=np.ones(96,bool)
+        target,weights,_=qm_objective(data,self.opt,valid)
+        for row in weights[2:]:
+            np.testing.assert_array_equal(np.flatnonzero(row)+1,[19,22,23,24,65,66])
+        np.testing.assert_array_equal(target[2:],before[2:])
+
     def test_repeated_apply_uses_measured_residual_and_currents_without_rescanning(self):
         original=self.b.snapshot();data=self.s.calculate(self.opt);response=data['response'].copy()
         norms=[np.linalg.norm(data['full_measured'][0])]

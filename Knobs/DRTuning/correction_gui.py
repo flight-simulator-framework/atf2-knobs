@@ -187,12 +187,12 @@ class CouplingPanel(CorrectionTool):
         path,_=QFileDialog.getOpenFileName(self,'Load measured bump response',
             str(self.run_data_directory/f'{datetime.now():%Y}'),'Bump response (bump_response_*.json);;JSON (*.json)')
         if not path:return
-        def work(_):
-            self.service.last_result=None
-            matrix=json.loads(Path(path).read_text(encoding='utf-8'))
-            self.service.validate_response_matrix(matrix)
-            return matrix
-        self.run(work,lambda matrix:self.matrix_ready(matrix,path),'Load shared bump response')
+        self.run(lambda _:self.read_matrix(path),lambda matrix:self.matrix_ready(matrix,path),'Load shared bump response')
+
+    def read_matrix(self,path):
+        with Path(path).open(encoding='utf-8') as stream:matrix=json.load(stream)
+        self.service.validate_response_matrix(matrix)
+        return matrix
 
     def options(self):
         return BumpOptions(amplitude_mm=self.amplitude.value()/2,refine_mm=self.refine.value(),
@@ -662,6 +662,7 @@ class QMDispersionPanel(CorrectionTool):
         correction.addRow('Solver',self.selection)
         self.coil=QComboBox();self.coil.addItem('Trim','trim');self.coil.addItem('Main','main')
         correction.addRow('QM coil',self.coil)
+        self.coil_matrices={}
         self.active_coil='trim'
         self.matrix=None;self.matrix_path=None;self.observation=None
         self.coil_exclusions={'trim':', '.join(defaults.fixed_actuators),'main':''}
@@ -670,6 +671,7 @@ class QMDispersionPanel(CorrectionTool):
         self.excluded=QLineEdit(', '.join(defaults.fixed_actuators));correction.addRow('Exclude QMs',self.excluded)
         self.dispersion_weight=control(correction,'Straight dispersion weight',defaults.dispersion_weight,0.,1000.,4)
         self.orbit_weight=control(correction,'COD change weight',defaults.orbit_weight,0.,1000.,4)
+        self.orbit_weight.setToolTip('COD X/Y change at MB19R, MB22R–MB24R, MB65R and MB66R.')
         self.arc_weight=control(correction,'Arc dispersion RMS weight',defaults.arc_weight,0.,1000.,4)
         for field in (self.dispersion_weight,self.orbit_weight,self.arc_weight):field.setSingleStep(.01)
         self.arc_weight.setToolTip('Zero disables the arc target. Recalculate fits the changed weights using the same measurements.')
@@ -740,6 +742,8 @@ class QMDispersionPanel(CorrectionTool):
         self.excluded.setText(self.coil_exclusions[self.active_coil])
         if self.result and self.result['options'].get('coil','trim')==self.active_coil and self.result.get('scan_state',{}).get('status')!='complete':
             self.display(self.result)
+        elif self.active_coil in self.coil_matrices:
+            self.select_matrix(*self.coil_matrices[self.active_coil])
         else:
             self.result=None;self.plot.clear_data();self.show_initial_probes()
             for button in (self.set_button,self.recalculate_button,self.reset_button,self.save_button):
@@ -776,10 +780,14 @@ class QMDispersionPanel(CorrectionTool):
     def load_scan(self):
         path,_=QFileDialog.getOpenFileName(self,'Select measured QM matrix',str(self.autosave_directory),QM_FILES)
         if not path:return
+        read=self.matrix_reader()
+        self.window.start(lambda _:read(path),lambda data:self.select_matrix(data,path),label='Load measured QM matrix')
+
+    def matrix_reader(self):
         opt=self.options()
         existing={**self.coil_exclusions,self.active_coil:self.excluded.text()}
         shared=set(self.window.panels['dispersion'].options.fixed_actuators)
-        def read_matrix(progress):
+        def read_matrix(path):
             with Path(path).open(encoding='utf-8') as stream:data=self.service.matrix_from_scan(json.load(stream))
             if (data['backend_id']!=self.window.backend.identity or data['names']!=list(self.window.backend.bpm_names)
                     or data['profile_signature']!=self.service.profile_signature()):
@@ -793,19 +801,24 @@ class QMDispersionPanel(CorrectionTool):
             opt.coil=coil
             opt.fixed_actuators=tuple(shared|set(exclusions))
             self.service.check_reuse_options(data,opt,current_beam=True)
-            return coil,data
-        def selected(result):
-            coil,data=result
+            return data
+        return read_matrix
+
+    def select_matrix(self,data,path):
+        coil=data['acquisition_options'].get('coil','trim')
+        self.coil_matrices[coil]=(data,path)
+        if self.active_coil!=coil:
             self.coil.setCurrentIndex(self.coil.findData(coil))
-            self.matrix=data;self.matrix_path=path;self.result=None
-            self.matrix_label.setText(matrix_caption(data,'QM '+coil,path,self.observation))
-            self.plot.clear_data()
-            if self.observation is not None and 'names' in self.observation:self.plot.correction(self.observation)
-            self.set_table(['QM '+coil,'Measured column'],[(n,'Skipped' if rb.get('skipped') else 'Available') for n,rb in zip(data['actuators'],data['probe_readbacks'])])
-            for button in (self.set_button,self.reset_button,self.save_button):button.setEnabled(False)
-            self.recalculate_button.setEnabled(True)
-            self.status.setText('Matrix selected. Recalculate for the current beam.')
-        self.window.start(read_matrix,selected,label='Load measured QM matrix')
+            return
+        self.matrix=data;self.matrix_path=path;self.result=None
+        self.matrix_label.setText(matrix_caption(data,'QM '+coil,path,self.observation))
+        self.plot.clear_data()
+        if self.observation is not None and 'names' in self.observation:self.plot.correction(self.observation)
+        self.set_table(['QM '+coil,'Measured column'],[(n,'Skipped' if rb.get('skipped') else 'Available') for n,rb in zip(data['actuators'],data['probe_readbacks'])])
+        for button in (self.set_button,self.reset_button,self.save_button):button.setEnabled(False)
+        self.recalculate_button.setEnabled(True)
+        self.status.setText('Matrix selected. Recalculate for the current beam.')
+
 
     def update_dispersion(self):
         opt=self.options();self.observation=None
@@ -850,6 +863,7 @@ class QMDispersionPanel(CorrectionTool):
 
     def matrix_measured(self,data):
         self.display(data)
+        self.coil_matrices[self.active_coil]=(self.service.matrix_from_scan(data),self.matrix_path)
         self.export_plot('matrix')
 
     def applied(self,data):

@@ -1,6 +1,7 @@
 """Provenance of measured response matrices and current dispersion observations."""
 from datetime import datetime
 from pathlib import Path
+import re
 
 
 QM_FILES='QM trim / main response (qm_scan_*.json qm_dispersion_*.json qm_dispersion.json qm_scan.checkpoint.json)'
@@ -47,3 +48,51 @@ def observation_from_result(data):
                 tunes=data.get('after_tunes' if applied else 'initial_tunes'),
                 evidence=data.get('after_tune_evidence' if applied else 'initial_tune_evidence'),
                 measured_at=(data.get('applied_at') if applied else data.get('baseline_measured_at')) or datetime.now().astimezone().isoformat())
+
+
+def latest_matrices(directories, readers, check_cancel, progress):
+    """Find the latest usable measurement for each tool. Inspect data off the GUI thread."""
+    folders=set()
+    for directory in map(Path,directories):
+        folders.add(directory.resolve())
+        root=directory.parent if re.fullmatch(r'\d{4}',directory.name) else directory
+        folders.update(p.resolve() for p in root.glob('[0-9][0-9][0-9][0-9]') if p.is_dir())
+    files=[]
+    for folder in folders:
+        check_cancel()
+        for path in folder.glob('*.json'):
+            name=path.name
+            if name.startswith(('qm_scan','qm_dispersion')):kind='qm'
+            elif name.startswith('vertical_dispersion') or name=='dispersion.json':kind='vertical'
+            elif name.startswith('bump_response_'):kind='bump'
+            else:continue
+            try:mtime=path.stat().st_mtime
+            except OSError:continue
+            match=re.search(r'_(\d{8}_\d{6})(?:_(\d{6}))?',name)
+            file_time=mtime
+            if match:
+                try:file_time=datetime.strptime(match[1]+(match[2] or '000000'),'%Y%m%d_%H%M%S%f').timestamp()
+                except ValueError:pass
+            files.append((max(file_time,mtime),path,kind,file_time))
+
+    latest={};times={}
+    for index,(written,path,kind,file_time) in enumerate(sorted(files,reverse=True)):
+        check_cancel()
+        keys=('trim','main') if kind=='qm' else (kind,)
+        if all(times.get(key,float('-inf'))>written for key in keys):continue
+        if kind=='qm':
+            coil=re.match(r'qm_(?:scan|dispersion)_(trim|main)_',path.name)
+            if coil and times.get(coil[1],float('-inf'))>written:continue
+        progress(int(100*index/len(files)),f'Checking {path.name}')
+        try:
+            data=readers[kind](path)
+            key=data['acquisition_options'].get('coil','trim') if kind=='qm' else kind
+            stamp=measured_time(data)
+            when=(float(data['measured_unix_s']) if kind=='bump' else
+                  datetime.fromisoformat(stamp).timestamp() if stamp else file_time)
+        except (OSError,ValueError,TypeError,KeyError,IndexError,AttributeError,OverflowError):
+            continue
+        if when>times.get(key,float('-inf')):
+            times[key]=when
+            latest[key]=(data,path)
+    return latest

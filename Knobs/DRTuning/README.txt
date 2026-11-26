@@ -73,6 +73,9 @@ even before selecting a matrix. Recalculate reads the present magnet state and
 limits, then fits the latest observation. It measures dispersion if no current
 observation exists or if the settings have changed. Apply remains a separate step.
 The vertical weights default to 1 for dispersion and 0.05 for COD change.
+Vertical dispersion uses MB1–18, MB32–64 and MB81–96 (inclusive). Both vertical
+and QM horizontal correction weight COD changes only at MB65,66,19,22,23,24.
+Reference BPMs outside these regions are shown faintly on the respective plots.
 Choose Horizontal (QM) or Vertical (ZV) under Dispersion Correction.
 Drag the divider between the dispersion plots and the results table to resize
 them. On narrow windows, use Controls and Plots and results to switch views.
@@ -876,11 +879,12 @@ Start from flight-simulator-framework:
 
 Or launch Knobs/GUIs/DRTuning_GUI.py directly with the same Python interpreter.
 After package installation, the DRTuning GUI entry point is also available.
-First select an interface with the radio buttons and press OK, as in SysID.
-The selector closes and the DRTuning measurement/correction window opens
-directly. Cancel exits without creating an interface. There is no Initialize
-step or profile-file picker. Close DRTuning and relaunch to choose another
-interface; closing during a scan waits for cancellation/restoration first.
+The launcher opens the configured Machine (EPICS) session directly. To choose
+RFTrack, Stored DR or DEMO, launch with --select-interface.
+At startup the yearly DRTuning data folders are searched for compatible completed
+QM trim, QM main, vertical ZV and shared bump matrices. Switching QM coil selects
+its saved matrix. Recalculate uses a current beam observation and current magnet
+settings. Apply is a separate action. With no compatible file, measure normally.
 Measurements, Corrections and Utilities menus expose all the former launcher
 tools, including BPM/magnet selection, orbit buffers, Delta-f Ramp and SR fits.
 

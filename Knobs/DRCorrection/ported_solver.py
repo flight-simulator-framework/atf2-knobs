@@ -21,10 +21,15 @@ class MeasuredProposal(ATFDRRingCorrection):
     def _measure_vertical_response_to_horizontal_probes(self,*args,**kwargs):return (),self.measured
 
 
-def propose(data,opt,valid,available,maximum,step):
+def propose(data,opt,valid,available,maximum,step,signal_regions=None):
     mode=data['mode'];measured=np.asarray(data['measured'])[:,valid];target=np.asarray(data['target'])[:,valid]
     count=len(data['names']);rows=np.tile(valid,measured.shape[0]);columns=np.flatnonzero(available)
     matrix=np.asarray(data['response'])[rows][:,columns]
+    if signal_regions is not None:
+        region=signal_regions[:,valid]
+        measured=np.where(region,measured,0.)
+        target=np.where(region,target,0.)
+        matrix=np.where(region.reshape(-1,1),matrix,0.)
     names=tuple(np.array(data['names'])[valid]);actuators=tuple(np.array(data['actuators'])[columns])
     engine=MeasuredProposal(mode,opt.plane,measured)
     common=dict(rcond=opt.svd_cut,max_abs_delta=step)

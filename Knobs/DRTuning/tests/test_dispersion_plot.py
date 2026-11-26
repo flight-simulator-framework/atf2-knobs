@@ -50,7 +50,7 @@ class DispersionPlotTests(unittest.TestCase):
         self.assertIn('Before 12   |   Predicted 6',text)
         data.update(target=[before], restored=True)
         text=dispersion_summary(data,'y',valid,before)
-        self.assertIn('ηy − target RMS · 3 BPM',text)
+        self.assertIn('Arc ηy − target RMS · 2 BPM',text)
         self.assertIn('Trial (restored)',text)
         self.assertIn('increase',text)
         self.assertNotIn('%',text)
@@ -149,7 +149,10 @@ class DispersionPlotTests(unittest.TestCase):
                     curve = next(line for line in ax.lines if line.get_label()==label)
                     self.assertEqual(len(curve.get_xdata()), len(machine.bpm_names)-1)
                     self.assertNotIn(machine.positions_m[42], curve.get_xdata())
-                    self.assertTrue(np.isfinite(curve.get_ydata()).all())
+                    arc={*range(1,19),*range(32,65),*range(81,97)}
+                    highlighted=[int(n.split('MB')[1][:-1]) in arc for n in machine.bpm_names if n!=name]
+                    np.testing.assert_array_equal(np.isfinite(curve.get_ydata()),highlighted)
+                self.assertTrue(any(line.get_alpha()==.28 and np.isfinite(line.get_ydata()).all() for line in ax.lines))
                 self.point(panel.plot, ax, name, click=True)
                 self.assertNotIn(name, panel.plot.excluded)
                 self.assertIsNotNone(panel.plot.data)

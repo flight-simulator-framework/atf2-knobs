@@ -29,13 +29,14 @@ def assess(data):
     if before.shape!=predicted.shape or before.shape!=target.shape or before.shape!=after.shape:
         raise ValueError('Assessment signal shape mismatch')
     enabled=np.asarray(data['valid'],bool);after_valid=np.asarray(data['after_valid'],bool)
-    common=enabled&after_valid
+    regions=data.get('fit_bpm_regions',np.ones_like(before,bool))
     rows=[]
     for i,label in enumerate(data['signal_labels']):
-        mask=common&np.isfinite([before[i],predicted[i],target[i],after[i]]).all(axis=0)
+        selected=enabled & regions[i]
+        mask=selected&after_valid&np.isfinite([before[i],predicted[i],target[i],after[i]]).all(axis=0)
         count=int(mask.sum());unit='mm / (dp/p)' if data['mode']=='dispersion' and i==0 else 'mm'
-        row=dict(signal=label,unit=unit,valid_bpms=count,enabled_bpms=int(enabled.sum()),
-                 excluded_from_comparison=int(enabled.sum())-count,
+        row=dict(signal=label,unit=unit,valid_bpms=count,enabled_bpms=int(selected.sum()),
+                 excluded_from_comparison=int(selected.sum())-count,
                  status='unavailable',before_rms=None,predicted_rms=None,after_rms=None,
                  improvement_pct=None,mismatch_rms=None,mismatch_max=None,worst_bpm=None,
                  mismatch_to_predicted_change=None,bpm_mismatch=[None]*len(enabled))

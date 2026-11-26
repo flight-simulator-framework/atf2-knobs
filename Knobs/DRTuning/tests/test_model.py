@@ -722,7 +722,8 @@ class ModelGuiTests(unittest.TestCase):
             self.assertFalse(result['valid'][0])
             self.assertTrue(np.isnan(result['full_predicted'][:, 0]).all())
             self.assertTrue(np.isfinite(result['full_predicted'][:, 1:]).all())
-            np.testing.assert_allclose(result['delta'], [.05 / (1. + .05**2)], atol=1e-9)
+            # One of 67 arc BPMs is invalid. Six BPMs penalize COD change.
+            np.testing.assert_allclose(result['delta'], [.05*66 / (66 + 6*.05**2)], atol=1e-9)
             self.assertEqual(machine.acquisitions, reads+30)
             self.assertEqual([command[0] for command in machine.commands],['rf','rf','rf'])
         finally:

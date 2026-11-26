@@ -4,12 +4,11 @@ from datetime import datetime,timezone
 import copy
 import hashlib
 import json
-import re
 import numpy as np
 from scipy.optimize import minimize,LinearConstraint
 from Knobs.DRCorrection.backends import MagnetReadbackError
 from Knobs.DRCorrection.core import CorrectionService,Options,serial
-from .model import name
+from Knobs.DRCorrection.dispersion_bpms import mb_numbers,cod_change_bpms
 from Knobs.DRCorrection.probe_quality import response_quality
 from .qm_checkpoint import prepare_destination,save_checkpoint
 from .hardware import QM_CANDIDATES,QM_MAIN_CANDIDATES,quadrupole_supply
@@ -94,14 +93,6 @@ class DispersionOptions:
                 int(self.maximum)!=self.maximum or not 1<=self.maximum<=16):raise ValueError('Invalid dispersion solver options')
 
 
-def mb_numbers(names):
-    numbers=[]
-    for bpm in names:
-        match=re.fullmatch(r'MB(\d+)R',name(bpm))
-        numbers.append(int(match[1]) if match else -1)
-    return np.asarray(numbers,int)
-
-
 def straight_bpms(names):
     n=mb_numbers(names)
     return ((19<=n)&(n<=31)) | ((66<=n)&(n<=80))
@@ -113,6 +104,13 @@ def arc_bpms(names,parity):
     return in_arc & (n%2==int(parity=='odd'))
 
 
+def required_cod_bpms(names, valid):
+    selected=valid & cod_change_bpms(names)
+    if not selected.any():
+        raise ValueError('No valid enabled COD-change BPMs for the QM tolerance')
+    return selected
+
+
 def qm_objective(data,opt,valid):
     measured=np.asarray(data['full_measured'],float)
     straight=np.asarray(data['straight'],bool)
@@ -121,7 +119,7 @@ def qm_objective(data,opt,valid):
     target[0,straight]=0.
     weights=np.empty_like(measured)
     weights[:2]=opt.dispersion_weight
-    weights[2:]=opt.orbit_weight
+    weights[2:]=opt.orbit_weight*cod_change_bpms(data['names'])
     if opt.arc_weight:
         if not arc.any():raise ValueError('No valid '+opt.arc_parity+' arc BPMs for the dispersion objective')
         target[0,arc]=0.
@@ -483,8 +481,10 @@ class DispersionService:
                                         '. A BPM is excluded after 5 consecutive invalid updates; averages use valid samples only.')
                                 if opt.adaptive_probe and np.any(valid&enabled&~mask):
                                     raise ProbeSignalRejected('New invalid BPMs during adaptive QM probe. '+diagnostic['message'])
-                                if opt.constrain_cod and np.max(abs(frame[2:,pair_valid&enabled]-np.asarray(data['full_measured'],float)[2:,pair_valid&enabled]))>opt.orbit_tolerance_mm:
-                                    raise ProbeSignalRejected('Measured COD change exceeds QM probe tolerance; restored')
+                                if opt.constrain_cod:
+                                    cod=required_cod_bpms(data['names'],pair_valid & enabled)
+                                    if np.max(abs(frame[2:,cod]-np.asarray(data['full_measured'],float)[2:,cod]))>opt.orbit_tolerance_mm:
+                                        raise ProbeSignalRejected('Measured COD change exceeds QM probe tolerance; restored')
                                 frames.append(frame);variances.append(self.signal_variance.copy())
                                 if opt.measure_tunes:
                                     qs.append(q);data['scan_tunes'].append(dict(magnet=n,current_A=target,measurement=evidence))
@@ -831,11 +831,12 @@ class DispersionService:
         # apply the recorded validity mask before checking the fitted rows.
         measured=np.asarray(data['full_measured'],float)
         target,weights,arc=qm_objective(data,opt,valid)
-        response=np.asarray(data['response'],float);mask=np.tile(valid,4)
+        response=np.asarray(data['response'],float);mask=((weights!=0) & valid).ravel()
+        if not mask.any():raise ValueError('No valid enabled BPMs for the weighted QM correction objectives')
         a=(response*weights.reshape(-1,1))[mask];residual=((measured-target)*weights).ravel()[mask]
         c=np.asarray(data['centers']);lo,hi=np.asarray(data['limits'])
         lower=np.maximum(lo-c,-opt.step_A);upper=np.minimum(hi-c,opt.step_A)
-        constraints=response[2*len(valid):][np.tile(valid,2)] if opt.constrain_cod else np.empty((0,len(c)))
+        constraints=response[2*len(valid):][np.tile(required_cod_bpms(data['names'],valid),2)] if opt.constrain_cod else np.empty((0,len(c)))
         tolerance=np.full(len(constraints),opt.orbit_tolerance_mm)
         if opt.measure_tunes:
             tune_response=np.asarray(data.get('tune_response'),float)
@@ -909,14 +910,16 @@ class DispersionService:
             mask=np.asarray(data['valid'],bool)
             if not valid[mask].all():raise ValueError('A fitted BPM became invalid after SET')
             dt=(tunes-np.asarray(data['initial_tunes'])+.5)%1-.5 if opt.measure_tunes else None
-            orbit_change=after[2:,mask]-np.asarray(data['full_measured'],float)[2:,mask]
             data.update(full_after=after,after_valid=valid,after_tunes=tunes,after_tune_evidence=evidence,
                         tune_check_performed=opt.measure_tunes,
                         after_orbit_measurements=copy.deepcopy(self.reader.orbit_measurements))
             if opt.measure_tunes and np.max(abs(dt))>opt.tune_tolerance:
                 raise ValueError('Measured tune change exceeds QM correction tolerance; restored')
-            if opt.constrain_cod and np.max(abs(orbit_change))>opt.orbit_tolerance_mm:
-                raise ValueError('Measured COD change exceeds QM correction tolerance; restored')
+            if opt.constrain_cod:
+                cod=required_cod_bpms(data['names'],mask)
+                orbit_change=after[2:,cod]-np.asarray(data['full_measured'],float)[2:,cod]
+                if np.max(abs(orbit_change))>opt.orbit_tolerance_mm:
+                    raise ValueError('Measured COD change exceeds QM correction tolerance; restored')
             _,weights,arc=qm_objective(data,opt,mask)
             targets=mask & (np.asarray(data['straight'],bool) | (arc & bool(opt.arc_weight)))
             before=np.asarray(data['full_measured'],float)
